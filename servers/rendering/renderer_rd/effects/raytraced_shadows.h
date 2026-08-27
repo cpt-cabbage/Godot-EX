@@ -91,7 +91,8 @@ public:
 	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances);
 
 	// Traces the shadow mask for one view into the RB_SCOPE_RT_SHADOWS texture.
-	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun);
+	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size.
+	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun, float p_tan_half_angle);
 
 	RaytracedShadows();
 	~RaytracedShadows();

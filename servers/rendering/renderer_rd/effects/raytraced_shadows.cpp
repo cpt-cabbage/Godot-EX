@@ -210,7 +210,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	return rd->tlas_build(tlas, as_instances) == OK;
 }
 
-void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun) {
+void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun, float p_tan_half_angle) {
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -234,7 +234,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	push_constant.to_sun[0] = p_to_sun.x;
 	push_constant.to_sun[1] = p_to_sun.y;
 	push_constant.to_sun[2] = p_to_sun.z;
-	push_constant.to_sun[3] = 0.0f;
+	push_constant.to_sun[3] = p_tan_half_angle;
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.ray_bias = 0.08f;

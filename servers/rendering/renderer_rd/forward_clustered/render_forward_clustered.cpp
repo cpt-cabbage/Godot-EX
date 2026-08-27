@@ -2213,12 +2213,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 		// Find the first directional light to trace shadows for.
 		Vector3 to_sun;
+		float tan_half_angle = 0.0f;
 		bool has_sun = false;
 		for (uint64_t i = 0; i < p_render_data->lights->size(); i++) {
 			RID light_instance = (*p_render_data->lights)[i];
 			RID light = light_storage->light_instance_get_base_light(light_instance);
 			if (light_storage->light_get_type(light) == RSE::LIGHT_DIRECTIONAL) {
 				to_sun = light_storage->light_instance_get_base_transform(light_instance).basis.get_column(2).normalized();
+				// LIGHT_PARAM_SIZE is the angular diameter in degrees for directional lights.
+				tan_half_angle = Math::tan(Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE)) * 0.5f);
 				has_sun = true;
 				break;
 			}
@@ -2231,7 +2234,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			Projection world_from_view = Projection(p_render_data->scene_data->get_cam_transform());
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				Projection world_from_ndc = world_from_view * p_render_data->scene_data->get_view_projection(v).inverse();
-				rt_shadows->process(rb, v, world_from_ndc, to_sun);
+				rt_shadows->process(rb, v, world_from_ndc, to_sun, tan_half_angle);
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}
