@@ -2230,11 +2230,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		if (has_sun && rt_shadows->update_scene(*p_render_data->instances)) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
+			rt_shadows->advance_frame();
 			// get_view_projection() applies the NDC depth correction the depth buffer was rendered with.
-			Projection world_from_view = Projection(p_render_data->scene_data->get_cam_transform());
+			RenderSceneDataRD *scene_data = p_render_data->scene_data;
+			Projection world_from_view = Projection(scene_data->get_cam_transform());
+			Projection prev_correction;
+			prev_correction.set_depth_correction(true);
+			prev_correction.add_jitter_offset(scene_data->prev_taa_jitter);
+			Projection prev_view_from_world = Projection(scene_data->prev_cam_transform.affine_inverse());
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-				Projection world_from_ndc = world_from_view * p_render_data->scene_data->get_view_projection(v).inverse();
-				rt_shadows->process(rb, v, world_from_ndc, to_sun, tan_half_angle);
+				Projection world_from_ndc = world_from_view * scene_data->get_view_projection(v).inverse();
+				Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[v] * prev_view_from_world;
+				rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle);
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}

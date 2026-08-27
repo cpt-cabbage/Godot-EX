@@ -35,12 +35,16 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_SCOPE_RT_SHADOWS SNAME("rb_rt_shadows")
 #define RB_RT_SHADOW_MASK SNAME("mask")
 #define RB_RT_SHADOW_RAW SNAME("raw")
+#define RB_RT_SHADOW_BLURRED SNAME("blurred")
+#define RB_RT_SHADOW_HISTORY_0 SNAME("history_0")
+#define RB_RT_SHADOW_HISTORY_1 SNAME("history_1")
 
 namespace RendererRD {
 
@@ -56,6 +60,8 @@ private:
 		int32_t screen_size[2];
 		float ray_bias;
 		float max_distance;
+		uint32_t frame_index;
+		uint32_t pad[3];
 	};
 
 	RaytracedShadowsShaderRD shader;
@@ -76,6 +82,20 @@ private:
 		float depth_tolerance;
 		float pad;
 	};
+
+	RaytracedShadowsTemporalShaderRD temporal_shader;
+	RID temporal_shader_version;
+	RID temporal_pipeline;
+
+	struct TemporalPushConstant {
+		float reproject[16];
+		int32_t screen_size[2];
+		float blend_alpha;
+		float pad;
+	};
+
+	uint32_t frame_index = 0;
+	bool history_parity = false;
 
 	struct DecodePushConstant {
 		float aabb_position[4];
@@ -103,8 +123,13 @@ public:
 	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances);
 
 	// Traces the shadow mask for one view into the RB_SCOPE_RT_SHADOWS texture.
-	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size.
-	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun, float p_tan_half_angle);
+	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size,
+	// denoised spatially and accumulated temporally (p_reproject maps current
+	// NDC to the previous frame's NDC).
+	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle);
+
+	// Call once per frame before the per-view process() calls.
+	void advance_frame() { frame_index++; history_parity = !history_parity; }
 
 	RaytracedShadows();
 	~RaytracedShadows();

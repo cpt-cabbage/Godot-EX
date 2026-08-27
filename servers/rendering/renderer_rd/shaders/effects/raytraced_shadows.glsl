@@ -18,6 +18,10 @@ layout(push_constant, std430) uniform Params {
 	ivec2 screen_size;
 	float ray_bias;
 	float max_distance;
+	uint frame_index; // Varies the sampling pattern for temporal accumulation.
+	uint pad0;
+	uint pad1;
+	uint pad2;
 }
 params;
 
@@ -59,6 +63,8 @@ void main() {
 		vec3 basis_u = normalize(cross(to_sun, abs(to_sun.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
 		vec3 basis_v = cross(to_sun, basis_u);
 		float noise = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+		// Advance the pattern each frame with the golden ratio for temporal accumulation.
+		noise = fract(noise + float(params.frame_index % 64u) * 0.61803398875);
 
 		uint hits = 0u;
 		for (uint s = 0u; s < SOFT_SHADOW_SAMPLES; s++) {

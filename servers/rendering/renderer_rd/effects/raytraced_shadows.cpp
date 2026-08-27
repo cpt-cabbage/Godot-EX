@@ -56,6 +56,12 @@ RaytracedShadows::RaytracedShadows() {
 	blur_shader_version = blur_shader.version_create();
 	blur_pipeline = RD::get_singleton()->compute_pipeline_create(blur_shader.version_get_shader(blur_shader_version, 0));
 
+	Vector<String> temporal_modes;
+	temporal_modes.push_back("");
+	temporal_shader.initialize(temporal_modes);
+	temporal_shader_version = temporal_shader.version_create();
+	temporal_pipeline = RD::get_singleton()->compute_pipeline_create(temporal_shader.version_get_shader(temporal_shader_version, 0));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 }
@@ -69,6 +75,7 @@ RaytracedShadows::~RaytracedShadows() {
 	shader.version_free(shader_version);
 	decode_shader.version_free(decode_shader_version);
 	blur_shader.version_free(blur_shader_version);
+	temporal_shader.version_free(temporal_shader_version);
 }
 
 RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
@@ -217,7 +224,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	return rd->tlas_build(tlas, as_instances) == OK;
 }
 
-void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_to_sun, float p_tan_half_angle) {
+void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle) {
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -233,6 +240,12 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	if (soft && !p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW)) {
 		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_BLURRED, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_0, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_1, RD::DATA_FORMAT_R8_UNORM,
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 	}
 	RID mask_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK, p_view, 0);
@@ -254,6 +267,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	push_constant.screen_size[1] = size.y;
 	push_constant.ray_bias = 0.08f;
 	push_constant.max_distance = 10000.0f;
+	push_constant.frame_index = frame_index;
 
 	(void)view_count;
 
@@ -272,6 +286,9 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->compute_list_end();
 
 	if (soft) {
+		// Spatial denoise: raw -> blurred.
+		RID blurred_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_BLURRED, p_view, 0);
+
 		BlurPushConstant blur_push_constant = {};
 		blur_push_constant.screen_size[0] = size.x;
 		blur_push_constant.screen_size[1] = size.y;
@@ -280,7 +297,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RID blur_shader_rid = blur_shader.version_get_shader(blur_shader_version, 0);
 		RD::Uniform u_blur_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, trace_target }));
 		RD::Uniform u_blur_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
-		RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
+		RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ blurred_slice }));
 
 		RD::ComputeListID blur_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(blur_list, blur_pipeline);
@@ -288,6 +305,37 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 1, u_blur_dst), 1);
 		rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
 		rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
+		rd->compute_list_end();
+
+		// Temporal accumulation: blurred + reprojected history -> mask (+ new history).
+		const StringName &history_read_name = history_parity ? RB_RT_SHADOW_HISTORY_1 : RB_RT_SHADOW_HISTORY_0;
+		const StringName &history_write_name = history_parity ? RB_RT_SHADOW_HISTORY_0 : RB_RT_SHADOW_HISTORY_1;
+		RID history_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_read_name, p_view, 0);
+		RID history_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_write_name, p_view, 0);
+
+		TemporalPushConstant temporal_push_constant = {};
+		for (int col = 0; col < 4; col++) {
+			for (int row = 0; row < 4; row++) {
+				temporal_push_constant.reproject[col * 4 + row] = p_reproject.columns[col][row];
+			}
+		}
+		temporal_push_constant.screen_size[0] = size.x;
+		temporal_push_constant.screen_size[1] = size.y;
+		temporal_push_constant.blend_alpha = 0.15f;
+
+		RID temporal_shader_rid = temporal_shader.version_get_shader(temporal_shader_version, 0);
+		RD::Uniform u_temporal_current(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, blurred_slice }));
+		RD::Uniform u_temporal_history(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, history_read }));
+		RD::Uniform u_temporal_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
+		RD::Uniform u_temporal_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
+		RD::Uniform u_temporal_history_out(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ history_write }));
+
+		RD::ComputeListID temporal_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(temporal_list, temporal_pipeline);
+		rd->compute_list_bind_uniform_set(temporal_list, uniform_set_cache->get_cache(temporal_shader_rid, 0, u_temporal_current, u_temporal_history, u_temporal_depth), 0);
+		rd->compute_list_bind_uniform_set(temporal_list, uniform_set_cache->get_cache(temporal_shader_rid, 1, u_temporal_mask, u_temporal_history_out), 1);
+		rd->compute_list_set_push_constant(temporal_list, &temporal_push_constant, sizeof(TemporalPushConstant));
+		rd->compute_list_dispatch_threads(temporal_list, size.x, size.y, 1);
 		rd->compute_list_end();
 	}
 }
