@@ -192,6 +192,9 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		if (inst->mesh_instance.is_valid()) {
 			continue; // Skinned or blend-shaped: base geometry would be wrong; skip.
 		}
+		if (!inst->data->casts_shadows) {
+			continue; // Respects GeometryInstance3D's shadow casting setting (e.g. editor gizmos).
+		}
 		RID mesh = inst->data->base;
 
 		MeshBlas *entry = blas_cache.getptr(mesh);
