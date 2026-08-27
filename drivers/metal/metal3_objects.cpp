@@ -109,6 +109,8 @@ void MDCommandBuffer::end() {
 			return _end_compute_dispatch();
 		case MDCommandBufferStateType::Blit:
 			return _end_blit();
+		case MDCommandBufferStateType::AccelerationStructure:
+			return _end_accel();
 	}
 }
 
@@ -154,6 +156,8 @@ void MDCommandBuffer::_encode_barrier(MTL::CommandEncoder *p_enc) {
 		stage = STAGE_COMPUTE;
 	} else if (blit.encoder.get() == p_enc && pending_after_stages[STAGE_BLIT] != 0) {
 		stage = STAGE_BLIT;
+	} else if (accel.encoder.get() == p_enc && pending_after_stages[STAGE_ACCEL] != 0) {
+		stage = STAGE_ACCEL;
 	}
 
 	if (stage == STAGE_MAX) {
@@ -211,6 +215,11 @@ void MDCommandBuffer::pipeline_barrier(BitField<RDD::PipelineStageBits> p_src_st
 		pending_after_stages[STAGE_BLIT] |= after_stages;
 		pending_before_queue_stages[STAGE_BLIT] |= before_stages;
 	}
+
+	if (before_stages & MTL::StageAccelerationStructure) {
+		pending_after_stages[STAGE_ACCEL] |= after_stages;
+		pending_before_queue_stages[STAGE_ACCEL] |= before_stages;
+	}
 }
 
 void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
@@ -222,6 +231,8 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 		_end_compute_dispatch();
 	} else if (type == MDCommandBufferStateType::Blit) {
 		_end_blit();
+	} else if (type == MDCommandBufferStateType::AccelerationStructure) {
+		_end_accel();
 	}
 
 	if (p->type == MDPipelineType::Render) {
@@ -295,6 +306,9 @@ MTL::BlitCommandEncoder *MDCommandBuffer::_ensure_blit_encoder() {
 		case MDCommandBufferStateType::Compute:
 			_end_compute_dispatch();
 			break;
+		case MDCommandBufferStateType::AccelerationStructure:
+			_end_accel();
+			break;
 		case MDCommandBufferStateType::Blit:
 			return blit.encoder.get();
 	}
@@ -304,6 +318,68 @@ MTL::BlitCommandEncoder *MDCommandBuffer::_ensure_blit_encoder() {
 	_encode_barrier(blit.encoder.get());
 
 	return blit.encoder.get();
+}
+
+MTL::AccelerationStructureCommandEncoder *MDCommandBuffer::_ensure_accel_encoder() {
+	switch (type) {
+		case MDCommandBufferStateType::None:
+			break;
+		case MDCommandBufferStateType::Render:
+			render_end_pass();
+			break;
+		case MDCommandBufferStateType::Compute:
+			_end_compute_dispatch();
+			break;
+		case MDCommandBufferStateType::Blit:
+			_end_blit();
+			break;
+		case MDCommandBufferStateType::AccelerationStructure:
+			return accel.encoder.get();
+	}
+
+	type = MDCommandBufferStateType::AccelerationStructure;
+	accel.encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	_encode_barrier(accel.encoder.get());
+
+	return accel.encoder.get();
+}
+
+void MDCommandBuffer::_end_accel() {
+	DEV_ASSERT(type == MDCommandBufferStateType::AccelerationStructure);
+
+	accel.encoder->endEncoding();
+	accel.reset();
+	reset();
+}
+
+void MDCommandBuffer::build_blas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch) {
+	RDM::AccelerationStructureInfo *as_info = (RDM::AccelerationStructureInfo *)(p_accel.id);
+	const RDM::BufferInfo *scratch = (const RDM::BufferInfo *)(p_scratch.id);
+
+	MTL::AccelerationStructureCommandEncoder *enc = _ensure_accel_encoder();
+	enc->buildAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), scratch->buffer.get(), 0);
+}
+
+void MDCommandBuffer::build_tlas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch, RDD::BufferID p_instances, uint32_t p_instance_offset, uint32_t p_instance_count) {
+	RDM::AccelerationStructureInfo *as_info = (RDM::AccelerationStructureInfo *)(p_accel.id);
+	const RDM::BufferInfo *scratch = (const RDM::BufferInfo *)(p_scratch.id);
+	const RDM::BufferInfo *instances = (const RDM::BufferInfo *)(p_instances.id);
+
+	// Late-bind the indirect build inputs: the instance descriptor buffer is allocated by the
+	// common RenderingDevice code and only known now, and the instance count lives in a small
+	// shared buffer the descriptor references.
+	MTL::IndirectInstanceAccelerationStructureDescriptor *desc = (MTL::IndirectInstanceAccelerationStructureDescriptor *)as_info->descriptor.get();
+	desc->setInstanceDescriptorBuffer(instances->buffer.get());
+	desc->setInstanceDescriptorBufferOffset(p_instance_offset);
+	*(uint32_t *)as_info->instance_count_buffer->contents() = p_instance_count;
+
+	MTL::AccelerationStructureCommandEncoder *enc = _ensure_accel_encoder();
+	// Instances reference BLASes indirectly by MTL::ResourceID, so the encoder cannot infer
+	// residency from the descriptor; mark every live BLAS resident.
+	for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
+		enc->useResource(blas, MTL::ResourceUsageRead);
+	}
+	enc->buildAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), scratch->buffer.get(), 0);
 }
 
 void MDCommandBuffer::resolve_texture(RDD::TextureID p_src_texture, RDD::TextureLayout p_src_texture_layout, uint32_t p_src_layer, uint32_t p_src_mipmap, RDD::TextureID p_dst_texture, RDD::TextureLayout p_dst_texture_layout, uint32_t p_dst_layer, uint32_t p_dst_mipmap) {
@@ -710,6 +786,9 @@ MTL::RenderCommandEncoder *MDCommandBuffer::get_new_render_encoder_with_descript
 			break;
 		case MDCommandBufferStateType::Blit:
 			_end_blit();
+			break;
+		case MDCommandBufferStateType::AccelerationStructure:
+			_end_accel();
 			break;
 	}
 
@@ -1604,6 +1683,18 @@ void DirectEncoder::set(MTL::Buffer *p_buffer, NS::UInteger p_offset, uint32_t p
 	}
 }
 
+void DirectEncoder::set(MTL::AccelerationStructure *p_accel, uint32_t p_index) {
+	switch (mode) {
+		case RENDER: {
+			ERR_PRINT("acceleration structures are not supported in render pipelines");
+		} break;
+		case COMPUTE: {
+			MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(encoder);
+			enc->setAccelerationStructure(p_accel, p_index);
+		} break;
+	}
+}
+
 void DirectEncoder::set(MTL::SamplerState **p_samplers, NS::Range p_range) {
 	if (cache.update(p_range, p_samplers)) {
 		switch (mode) {
@@ -1770,6 +1861,18 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				}
 				NS::Range texture_range = { indexes.texture, count };
 				p_enc.set(objects, texture_range);
+			} break;
+			case RDD::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+				const RDM::AccelerationStructureInfo *as_info = (const RDM::AccelerationStructureInfo *)uniform.ids[0].id;
+				p_enc.set(as_info->accel.get(), indexes.buffer);
+				// The TLAS dereferences its BLASes by MTL::ResourceID, which direct binding
+				// cannot make resident; mark every live BLAS resident on the encoder.
+				if (p_enc.mode == DirectEncoder::COMPUTE) {
+					MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(p_enc.encoder);
+					for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
+						enc->useResource(blas, MTL::ResourceUsageRead);
+					}
+				}
 			} break;
 			default: {
 				DEV_ASSERT(false);

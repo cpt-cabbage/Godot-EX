@@ -187,6 +187,16 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.metal_fx_temporal = false;
 #endif
 	}
+
+	// Acceleration structures with indirect instance descriptors (MTL::ResourceID based)
+	// require macOS 14 / iOS 17; intersection queries require MSL 2.4.
+	if (__builtin_available(macOS 14.0, iOS 17.0, tvOS 17.0, visionOS 1.0, *)) {
+		features.supports_raytracing = p_device->supportsRaytracing() && features.msl_target_version >= MSL_VERSION_24;
+	}
+
+	if (OS::get_singleton()->get_environment("GODOT_MTL_DISABLE_RAYTRACING") == "1") {
+		features.supports_raytracing = false;
+	}
 }
 
 void MetalDeviceProperties::init_limits(MTL::Device *p_device) {

@@ -255,6 +255,7 @@ struct DirectEncoder {
 	void set(MTL::Buffer *p_buffer, NS::UInteger p_offset, uint32_t p_index);
 	void set(MTL::Texture **p_textures, NS::Range p_range);
 	void set(MTL::SamplerState **p_samplers, NS::Range p_range);
+	void set(MTL::AccelerationStructure *p_accel, uint32_t p_index);
 
 	DirectEncoder(MTL::CommandEncoder *p_encoder, BindingCache &p_cache, Mode p_mode) :
 			encoder(p_encoder), cache(p_cache), mode(p_mode) {}
@@ -288,11 +289,12 @@ private:
 		STAGE_RENDER,
 		STAGE_COMPUTE,
 		STAGE_BLIT,
+		STAGE_ACCEL,
 		STAGE_MAX,
 	};
 	bool use_barriers = false;
-	MTL::Stages pending_after_stages[STAGE_MAX] = { 0, 0, 0 };
-	MTL::Stages pending_before_queue_stages[STAGE_MAX] = { 0, 0, 0 };
+	MTL::Stages pending_after_stages[STAGE_MAX] = { 0, 0, 0, 0 };
+	MTL::Stages pending_before_queue_stages[STAGE_MAX] = { 0, 0, 0, 0 };
 	void _encode_barrier(MTL::CommandEncoder *p_enc);
 
 	void reset();
@@ -306,6 +308,8 @@ private:
 	void _end_compute_dispatch();
 	void _end_blit();
 	MTL::BlitCommandEncoder *_ensure_blit_encoder();
+	void _end_accel();
+	MTL::AccelerationStructureCommandEncoder *_ensure_accel_encoder();
 
 	enum class CopySource {
 		Buffer,
@@ -498,6 +502,14 @@ public:
 		}
 	} blit;
 
+	// State specific to an acceleration structure build pass.
+	struct {
+		NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder;
+		_FORCE_INLINE_ void reset() {
+			encoder.reset();
+		}
+	} accel;
+
 	_FORCE_INLINE_ MTL::CommandBuffer *get_command_buffer() const {
 		return commandBuffer.get();
 	}
@@ -543,6 +555,11 @@ public:
 	void compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) override;
 	void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) override;
 	void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) override;
+
+#pragma mark - Acceleration Structures
+
+	void build_blas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch) override;
+	void build_tlas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch, RDD::BufferID p_instances, uint32_t p_instance_offset, uint32_t p_instance_count) override;
 
 #pragma mark - Transfer
 

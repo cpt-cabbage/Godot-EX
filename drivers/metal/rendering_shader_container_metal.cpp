@@ -265,6 +265,12 @@ MetalDeviceProfile::MinimumRequirements RenderingShaderContainerMetal::inspect_s
 			spv::Op opcode = static_cast<spv::Op>(instruction & 0xFFFF);
 			if (opcode == spv::OpImageTexelPointer) {
 				atomic_image_ids.insert(words[3]);
+			} else if (opcode == spv::OpCapability && words[1] == spv::CapabilityRayQueryKHR) {
+				// Intersection queries require Apple6+ and MSL 2.4+ (raytracing::acceleration_structure<instancing>).
+				if (reqs.gpu < MetalDeviceProfile::GPU::Apple6) {
+					reqs.gpu = MetalDeviceProfile::GPU::Apple6;
+				}
+				reqs.msl_version = MAX(reqs.msl_version, MSL_VERSION_24);
 			}
 			words += word_count;
 		}
@@ -562,6 +568,20 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 						found->get_indexes(UniformData::IndexType::SLOT).texture = next_index(Texture, binding_stride);
 						found->get_indexes(UniformData::IndexType::ARG).texture = next_arg_index(binding_stride);
 						rb.basetype = SPIRType::BaseType::Image;
+					} break;
+					case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+						// SPIRV-Cross routes acceleration structures through the buffer index space,
+						// emitting [[buffer(n)]] entry-point arguments in slot mode.
+						found->data_type = MTL::DataTypeInstanceAccelerationStructure;
+						found->access = MTL::BindingAccessReadOnly;
+						found->usage = MTL::ResourceUsageRead;
+						found->get_indexes(UniformData::IndexType::SLOT).buffer = next_index(Buffer, binding_stride);
+						found->get_indexes(UniformData::IndexType::ARG).buffer = next_arg_index(binding_stride);
+						// Registered as Void (buffer) rather than AccelerationStructure: the
+						// argument-buffer padding lookup in SPIRV-Cross only accepts buffer,
+						// image, and sampler base types, and acceleration structures occupy a
+						// buffer slot in its resource index routing.
+						rb.basetype = SPIRType::BaseType::Void;
 					} break;
 					case RDC::UNIFORM_TYPE_MAX:
 					default:

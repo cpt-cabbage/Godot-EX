@@ -122,6 +122,7 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool supports_border_color = false; /**< If true, sampler border color (clamp-to-border) is supported. Requires Apple7+. */
 	bool supports_residency_sets = false; /**< If true, residency sets (MTLResidencySet) are supported by the OS. */
 	bool supports_msaa_depth_resolve = false;
+	bool supports_raytracing = false; /**< If true, acceleration structures and intersection queries (MSL 2.4+, indirect instance descriptors) are supported. */
 
 	/*!
 	 * Check if argument buffers are fully supported, which requires tier 2 support and no need for argument encoders.

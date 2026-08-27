@@ -476,6 +476,24 @@ public:
 
 	// ----- ACCELERATION STRUCTURE -----
 
+public:
+	struct AccelerationStructureInfo {
+		NS::SharedPtr<MTL::AccelerationStructure> accel;
+		NS::SharedPtr<MTL::AccelerationStructureDescriptor> descriptor; // MTL::PrimitiveAccelerationStructureDescriptor (BLAS) or MTL::IndirectInstanceAccelerationStructureDescriptor (TLAS).
+		NS::SharedPtr<NS::Array> geometry_descriptors; // BLAS only; keeps the triangle geometry descriptors referenced by descriptor alive.
+		NS::SharedPtr<MTL::Buffer> instance_count_buffer; // TLAS only; 4-byte shared buffer holding the instance count for the indirect build.
+		uint32_t scratch_size = 0;
+		bool is_tlas = false;
+	};
+
+private:
+	// All live BLASes. TLAS builds and dispatches reference BLASes indirectly (by MTL::ResourceID
+	// written into the instance descriptor buffer), so they must be made resident explicitly.
+	HashSet<MTL::AccelerationStructure *> blas_registry;
+
+public:
+	const HashSet<MTL::AccelerationStructure *> &get_blas_registry() const { return blas_registry; }
+
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;

@@ -581,6 +581,16 @@ _FORCE_INLINE_ static MTL::Stages convert_src_pipeline_stages_to_metal(BitField<
 		mtlStages |= MTL::StageBlit;
 	}
 
+	// Acceleration structure builds.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
+	}
+
+	// Ray queries run in compute on Metal.
+	if (p_stages & RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT) {
+		mtlStages |= MTL::StageDispatch;
+	}
+
 	// ALL_GRAPHICS_BIT special case.
 	if (p_stages & RDD::PIPELINE_STAGE_ALL_GRAPHICS_BIT) {
 		mtlStages |= (MTL::StageVertex | MTL::StageFragment);
@@ -620,6 +630,16 @@ _FORCE_INLINE_ static MTL::Stages convert_dst_pipeline_stages_to_metal(BitField<
 		mtlStages |= MTL::StageBlit;
 	}
 
+	// Acceleration structure builds.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
+	}
+
+	// Ray queries run in compute on Metal.
+	if (p_stages & RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT) {
+		mtlStages |= MTL::StageDispatch;
+	}
+
 	// ALL_GRAPHICS_BIT special case.
 	if (p_stages & RDD::PIPELINE_STAGE_ALL_GRAPHICS_BIT) {
 		mtlStages |= (MTL::StageVertex | MTL::StageFragment);
@@ -637,6 +657,7 @@ enum class MDCommandBufferStateType {
 	Render,
 	Compute,
 	Blit, // Only used by Metal 3
+	AccelerationStructure, // Only used by Metal 3
 };
 
 /// Base struct for render state shared between MTL3 and MTL4 implementations.
@@ -753,6 +774,11 @@ public:
 	virtual void compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
 	virtual void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) = 0;
 	virtual void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) = 0;
+
+#pragma mark - Acceleration Structures
+
+	virtual void build_blas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch) = 0;
+	virtual void build_tlas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch, RDD::BufferID p_instances, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
 
 #pragma mark - Transfer
 
