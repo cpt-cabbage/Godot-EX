@@ -44,6 +44,12 @@ RaytracedShadows::RaytracedShadows() {
 
 	pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, 0));
 
+	Vector<String> decode_modes;
+	decode_modes.push_back("");
+	decode_shader.initialize(decode_modes);
+	decode_shader_version = decode_shader.version_create();
+	decode_pipeline = RD::get_singleton()->compute_pipeline_create(decode_shader.version_get_shader(decode_shader_version, 0));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 }
@@ -55,6 +61,38 @@ RaytracedShadows::~RaytracedShadows() {
 	// double-free. Any still alive are reclaimed at device shutdown.
 	RD::get_singleton()->free_rid(sampler);
 	shader.version_free(shader_version);
+	decode_shader.version_free(decode_shader_version);
+}
+
+RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+
+	RID decoded = rd->vertex_buffer_create(p_vertex_count * sizeof(float) * 3, Vector<uint8_t>(),
+			BitField<RD::BufferCreationBits>(uint32_t(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) | uint32_t(RD::BUFFER_CREATION_AS_STORAGE_BIT)));
+	ERR_FAIL_COND_V(decoded.is_null(), RID());
+
+	DecodePushConstant push_constant = {};
+	push_constant.aabb_position[0] = p_aabb.position.x;
+	push_constant.aabb_position[1] = p_aabb.position.y;
+	push_constant.aabb_position[2] = p_aabb.position.z;
+	push_constant.aabb_size[0] = p_aabb.size.x;
+	push_constant.aabb_size[1] = p_aabb.size.y;
+	push_constant.aabb_size[2] = p_aabb.size.z;
+	push_constant.vertex_count = p_vertex_count;
+
+	RID decode_shader_rid = decode_shader.version_get_shader(decode_shader_version, 0);
+	RD::Uniform u_src(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ p_source_buffer }));
+	RD::Uniform u_dst(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ decoded }));
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, decode_pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(decode_shader_rid, 0, u_src, u_dst), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(DecodePushConstant));
+	rd->compute_list_dispatch_threads(compute_list, p_vertex_count, 1, 1);
+	rd->compute_list_end();
+
+	return decoded;
 }
 
 void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
@@ -72,9 +110,7 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
 			continue;
 		}
 		uint64_t format = mesh_storage->mesh_surface_get_format(surface);
-		if (format & (RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES | RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
-			// Compressed positions (R16G16B16A16_UNORM in AABB space) can't feed an
-			// acceleration structure build directly; requires a decode pass (TODO).
+		if (format & RSE::ARRAY_FLAG_USE_2D_VERTICES) {
 			continue;
 		}
 		uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(surface);
@@ -82,14 +118,26 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
 		if (index_count > 0 ? (index_count % 3) != 0 : (vertex_count % 3) != 0) {
 			continue;
 		}
+		RID vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, i);
+		if (vertex_buffer.is_null()) {
+			continue;
+		}
 
 		RD::AccelerationStructureGeometry geometry;
 		geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
-		geometry.vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, i);
-		if (geometry.vertex_buffer.is_null()) {
-			continue;
+		if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+			// Compressed positions (R16G16B16A16_UNORM normalized into the surface AABB)
+			// can't feed an acceleration structure build directly; decode to float3 first.
+			RID decoded = _decode_compressed_positions(vertex_buffer, vertex_count, mesh_storage->mesh_surface_get_aabb(surface));
+			if (decoded.is_null()) {
+				continue;
+			}
+			r_entry.decoded_buffers.push_back(decoded);
+			geometry.vertex_buffer = decoded;
+		} else {
+			// Uncompressed 3D positions are tightly packed floats at the start of the buffer.
+			geometry.vertex_buffer = vertex_buffer;
 		}
-		// Uncompressed 3D positions are tightly packed floats at the start of the buffer.
 		geometry.vertex_offset = 0;
 		geometry.vertex_stride = sizeof(float) * 3;
 		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;

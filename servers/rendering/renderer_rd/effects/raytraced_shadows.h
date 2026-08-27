@@ -33,6 +33,7 @@
 #include "core/templates/hash_map.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -60,8 +61,20 @@ private:
 	RID pipeline;
 	RID sampler;
 
+	RaytracedShadowsDecodeShaderRD decode_shader;
+	RID decode_shader_version;
+	RID decode_pipeline;
+
+	struct DecodePushConstant {
+		float aabb_position[4];
+		float aabb_size[4];
+		uint32_t vertex_count;
+		uint32_t pad[3];
+	};
+
 	struct MeshBlas {
 		RID blas; // Null if the mesh has no BLAS-eligible surfaces.
+		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
 		bool built = false;
 	};
 	HashMap<RID, MeshBlas> blas_cache;
@@ -69,6 +82,7 @@ private:
 	RID tlas;
 	uint32_t tlas_capacity = 0;
 
+	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb);
 	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry);
 
 public:
