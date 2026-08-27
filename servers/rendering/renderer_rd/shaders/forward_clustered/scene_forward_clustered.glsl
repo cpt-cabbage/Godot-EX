@@ -2724,6 +2724,16 @@ void fragment_shader(in SceneData scene_data) {
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);
 #endif
 
+			// Ray-traced shadow mask (bound to a white texture when inactive).
+			// Only the first directional light is traced for now.
+			if (i == 0) {
+#ifdef USE_MULTIVIEW
+				shadow = min(shadow, texture(sampler2DArray(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r);
+#else
+				shadow = min(shadow, texture(sampler2D(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), screen_uv).r);
+#endif
+			}
+
 			blur_shadow(shadow);
 
 #ifdef DEBUG_DRAW_PSSM_SPLITS

@@ -376,8 +376,13 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	const bool use_as_storage = (new_surface.skin_data.size() || mesh->blend_shape_count > 0);
 	const bool requested_storage_buffer = (new_surface.format & RSE::ARRAY_FLAG_USE_STORAGE_BUFFER);
-	const BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
-	const BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	// Allow surface buffers to be used as acceleration structure build inputs so
+	// renderers can build BLASes directly from mesh geometry.
+	const BitField<RD::BufferCreationBits> as_input_flag = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) ? RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT : 0;
+	BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	as_storage_flag = BitField<RD::BufferCreationBits>(uint32_t(as_storage_flag) | uint32_t(as_input_flag));
+	requested_storage_flag = BitField<RD::BufferCreationBits>(uint32_t(requested_storage_flag) | uint32_t(as_input_flag));
 
 	if (new_surface.vertex_data.size()) {
 		// If we have an uncompressed surface that contains normals, but not tangents, we need to differentiate the array

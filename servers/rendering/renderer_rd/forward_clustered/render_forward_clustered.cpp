@@ -2209,6 +2209,34 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
+	if (rt_shadows != nullptr && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
+		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+		// Find the first directional light to trace shadows for.
+		Vector3 to_sun;
+		bool has_sun = false;
+		for (uint64_t i = 0; i < p_render_data->lights->size(); i++) {
+			RID light_instance = (*p_render_data->lights)[i];
+			RID light = light_storage->light_instance_get_base_light(light_instance);
+			if (light_storage->light_get_type(light) == RSE::LIGHT_DIRECTIONAL) {
+				to_sun = light_storage->light_instance_get_base_transform(light_instance).basis.get_column(2).normalized();
+				has_sun = true;
+				break;
+			}
+		}
+
+		if (has_sun && rt_shadows->update_scene(*p_render_data->instances)) {
+			RENDER_TIMESTAMP("Raytraced Shadows");
+			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
+			// get_view_projection() applies the NDC depth correction the depth buffer was rendered with.
+			Projection world_from_view = Projection(p_render_data->scene_data->get_cam_transform());
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				Projection world_from_ndc = world_from_view * p_render_data->scene_data->get_view_projection(v).inverse();
+				rt_shadows->process(rb, v, world_from_ndc, to_sun);
+			}
+			RD::get_singleton()->draw_command_end_label();
+		}
+	}
+
 	if (current_cluster_builder) {
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 	}
@@ -3800,6 +3828,16 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 	}
 #endif // MODULE_TEXTURE_STREAMING_ENABLED
 
+	{
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID mask = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) : RID();
+		RID texture = mask.is_valid() ? mask : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.get_default_shader_rd(is_multiview), RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
@@ -5302,6 +5340,9 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
+	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")) {
+		rt_shadows = memnew(RendererRD::RaytracedShadows);
+	}
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
@@ -5309,6 +5350,11 @@ RenderForwardClustered::RenderForwardClustered() {
 }
 
 RenderForwardClustered::~RenderForwardClustered() {
+	if (rt_shadows != nullptr) {
+		memdelete(rt_shadows);
+		rt_shadows = nullptr;
+	}
+
 	if (ss_effects != nullptr) {
 		memdelete(ss_effects);
 		ss_effects = nullptr;

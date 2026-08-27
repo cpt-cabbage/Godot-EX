@@ -489,6 +489,14 @@ layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
 
+// Screen-space visibility mask from ray-traced directional shadows (1.0 = lit).
+// Bound to a default white texture when the effect is inactive.
+#ifdef USE_MULTIVIEW
+layout(set = 1, binding = 38) uniform texture2DArray rt_shadow_mask;
+#else
+layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
+#endif // USE_MULTIVIEW
+
 #endif
 
 vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {

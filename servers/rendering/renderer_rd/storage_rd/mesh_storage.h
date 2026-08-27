@@ -467,6 +467,11 @@ public:
 		return s->index_count ? s->index_count : s->vertex_count;
 	}
 
+	_FORCE_INLINE_ uint32_t mesh_surface_get_index_count(void *p_surface) const {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->index_count;
+	}
+
 	_FORCE_INLINE_ AABB mesh_surface_get_aabb(void *p_surface) {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
 		return s->aabb;
