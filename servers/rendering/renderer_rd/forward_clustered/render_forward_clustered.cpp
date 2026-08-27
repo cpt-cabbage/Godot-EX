@@ -2211,23 +2211,37 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	if (rt_shadows != nullptr && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
 		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
-		// Find the first directional light to trace shadows for.
+		// Find the first directional and first area light to trace shadows for.
 		Vector3 to_sun;
 		float tan_half_angle = 0.0f;
 		bool has_sun = false;
+		Vector3 area_pos;
+		Vector3 area_axis_u;
+		Vector3 area_axis_v;
+		bool has_area = false;
 		for (uint64_t i = 0; i < p_render_data->lights->size(); i++) {
 			RID light_instance = (*p_render_data->lights)[i];
 			RID light = light_storage->light_instance_get_base_light(light_instance);
-			if (light_storage->light_get_type(light) == RSE::LIGHT_DIRECTIONAL) {
+			RSE::LightType type = light_storage->light_get_type(light);
+			if (type == RSE::LIGHT_DIRECTIONAL && !has_sun) {
 				to_sun = light_storage->light_instance_get_base_transform(light_instance).basis.get_column(2).normalized();
 				// LIGHT_PARAM_SIZE is the angular diameter in degrees for directional lights.
 				tan_half_angle = Math::tan(Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE)) * 0.5f);
 				has_sun = true;
+			} else if (type == RSE::LIGHT_AREA && !has_area) {
+				Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
+				Vector2 area_size = light_storage->light_area_get_size(light);
+				area_pos = light_transform.origin;
+				area_axis_u = light_transform.basis.get_column(0) * area_size.x;
+				area_axis_v = light_transform.basis.get_column(1) * area_size.y;
+				has_area = true;
+			}
+			if (has_sun && has_area) {
 				break;
 			}
 		}
 
-		if (has_sun && rt_shadows->update_scene(*p_render_data->instances)) {
+		if ((has_sun || has_area) && rt_shadows->update_scene(*p_render_data->instances)) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
 			rt_shadows->advance_frame();
@@ -2241,7 +2255,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				Projection world_from_ndc = world_from_view * scene_data->get_view_projection(v).inverse();
 				Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[v] * prev_view_from_world;
-				rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle);
+				if (has_sun) {
+					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle);
+				}
+				if (has_area) {
+					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v);
+				}
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}
@@ -3843,6 +3862,16 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.binding = 38;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID mask = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) : RID();
+		RID texture = mask.is_valid() ? mask : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	{
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID mask = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK) : RID();
 		RID texture = mask.is_valid() ? mask : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 		u.append_id(texture);
 		uniforms.push_back(u);

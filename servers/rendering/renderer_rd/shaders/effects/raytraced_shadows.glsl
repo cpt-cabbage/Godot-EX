@@ -14,24 +14,28 @@ layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D shadow_mask;
 
 layout(push_constant, std430) uniform Params {
 	mat4 inv_view_proj; // NDC -> world.
-	vec4 to_sun; // xyz: direction toward the sun (world space), w: tan of the sun's angular half-size.
+#ifdef MODE_AREA
+	vec4 light_pos; // xyz: area light center (world space).
+	vec4 axis_u; // xyz: full extent along the rect's U axis, w: ray bias.
+	vec4 axis_v; // xyz: full extent along the rect's V axis, w: max distance.
+#else
+	vec4 light_pos; // xyz: direction toward the sun (world space), w: tan of the sun's angular half-size.
+	vec4 axis_u; // w: ray bias.
+	vec4 axis_v; // w: max distance.
+#endif
 	ivec2 screen_size;
-	float ray_bias;
-	float max_distance;
 	uint frame_index; // Varies the sampling pattern for temporal accumulation.
 	uint pad0;
-	uint pad1;
-	uint pad2;
 }
 params;
 
 #define SOFT_SHADOW_SAMPLES 4u
 
-bool trace_occluded(vec3 p_origin, vec3 p_dir) {
+bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas,
 			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, p_origin, params.ray_bias, p_dir, params.max_distance);
+			0xFF, p_origin, params.axis_u.w, p_dir, p_max_dist);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }
@@ -53,18 +57,38 @@ void main() {
 	vec4 world = params.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	world.xyz /= world.w;
 
-	vec3 to_sun = normalize(params.to_sun.xyz);
-	float tan_half_angle = params.to_sun.w;
+	float noise = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+	// Advance the pattern each frame with the golden ratio for temporal accumulation.
+	noise = fract(noise + float(params.frame_index % 64u) * 0.61803398875);
 
 	float visibility;
+
+#ifdef MODE_AREA
+	// Sample the light's rectangle with stratified jittered points.
+	uint hits = 0u;
+	for (uint s = 0u; s < SOFT_SHADOW_SAMPLES; s++) {
+		vec2 strat = vec2(float(s % 2u), float(s / 2u)) * 0.5;
+		vec2 jitter = fract(vec2(noise, noise * 1.6180339887) + strat + vec2(0.25));
+		vec3 target = params.light_pos.xyz + params.axis_u.xyz * (jitter.x - 0.5) + params.axis_v.xyz * (jitter.y - 0.5);
+		vec3 delta = target - world.xyz;
+		float dist = length(delta);
+		if (dist < 1e-4) {
+			continue;
+		}
+		if (trace_occluded(world.xyz, delta / dist, min(dist - params.axis_u.w, params.axis_v.w))) {
+			hits++;
+		}
+	}
+	visibility = 1.0 - float(hits) / float(SOFT_SHADOW_SAMPLES);
+#else
+	vec3 to_sun = normalize(params.light_pos.xyz);
+	float tan_half_angle = params.light_pos.w;
+
 	if (tan_half_angle > 0.0001) {
 		// Sample the sun's disk: concentric-ish disk samples rotated per pixel
 		// with interleaved gradient noise.
 		vec3 basis_u = normalize(cross(to_sun, abs(to_sun.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
 		vec3 basis_v = cross(to_sun, basis_u);
-		float noise = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
-		// Advance the pattern each frame with the golden ratio for temporal accumulation.
-		noise = fract(noise + float(params.frame_index % 64u) * 0.61803398875);
 
 		uint hits = 0u;
 		for (uint s = 0u; s < SOFT_SHADOW_SAMPLES; s++) {
@@ -72,14 +96,15 @@ void main() {
 			float radius = sqrt((float(s) + 0.5) / float(SOFT_SHADOW_SAMPLES));
 			vec2 disk = vec2(cos(angle), sin(angle)) * radius;
 			vec3 dir = normalize(to_sun + (basis_u * disk.x + basis_v * disk.y) * tan_half_angle);
-			if (trace_occluded(world.xyz, dir)) {
+			if (trace_occluded(world.xyz, dir, params.axis_v.w)) {
 				hits++;
 			}
 		}
 		visibility = 1.0 - float(hits) / float(SOFT_SHADOW_SAMPLES);
 	} else {
-		visibility = trace_occluded(world.xyz, to_sun) ? 0.0 : 1.0;
+		visibility = trace_occluded(world.xyz, to_sun, params.axis_v.w) ? 0.0 : 1.0;
 	}
+#endif
 
 	imageStore(shadow_mask, pixel, vec4(visibility));
 }

@@ -38,11 +38,13 @@ using namespace RendererRD;
 RaytracedShadows::RaytracedShadows() {
 	Vector<String> shader_modes;
 	shader_modes.push_back("");
+	shader_modes.push_back("\n#define MODE_AREA\n");
 
 	shader.initialize(shader_modes);
 	shader_version = shader.version_create();
 
-	pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, 0));
+	pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, SHADER_VARIANT_DIRECTIONAL));
+	area_pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, SHADER_VARIANT_AREA));
 
 	Vector<String> decode_modes;
 	decode_modes.push_back("");
@@ -259,19 +261,19 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			push_constant.inv_view_proj[col * 4 + row] = p_world_from_ndc.columns[col][row];
 		}
 	}
-	push_constant.to_sun[0] = p_to_sun.x;
-	push_constant.to_sun[1] = p_to_sun.y;
-	push_constant.to_sun[2] = p_to_sun.z;
-	push_constant.to_sun[3] = p_tan_half_angle;
+	push_constant.light_pos[0] = p_to_sun.x;
+	push_constant.light_pos[1] = p_to_sun.y;
+	push_constant.light_pos[2] = p_to_sun.z;
+	push_constant.light_pos[3] = p_tan_half_angle;
+	push_constant.axis_u[3] = 0.08f; // Ray bias.
+	push_constant.axis_v[3] = 10000.0f; // Max distance.
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
-	push_constant.ray_bias = 0.08f;
-	push_constant.max_distance = 10000.0f;
 	push_constant.frame_index = frame_index;
 
 	(void)view_count;
 
-	RID shader_rid = shader.version_get_shader(shader_version, 0);
+	RID shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_DIRECTIONAL);
 
 	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
@@ -338,4 +340,76 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->compute_list_dispatch_threads(temporal_list, size.x, size.y, 1);
 		rd->compute_list_end();
 	}
+}
+
+void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v) {
+	ERR_FAIL_COND(tlas.is_null());
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+
+	Size2i size = p_render_buffers->get_internal_size();
+
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK)) {
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_RAW, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+	}
+	RID mask_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK, p_view, 0);
+	RID raw_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_RAW, p_view, 0);
+	RID depth = p_render_buffers->get_depth_texture(p_view);
+
+	PushConstant push_constant = {};
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			push_constant.inv_view_proj[col * 4 + row] = p_world_from_ndc.columns[col][row];
+		}
+	}
+	push_constant.light_pos[0] = p_light_pos.x;
+	push_constant.light_pos[1] = p_light_pos.y;
+	push_constant.light_pos[2] = p_light_pos.z;
+	push_constant.axis_u[0] = p_axis_u.x;
+	push_constant.axis_u[1] = p_axis_u.y;
+	push_constant.axis_u[2] = p_axis_u.z;
+	push_constant.axis_u[3] = 0.08f; // Ray bias.
+	push_constant.axis_v[0] = p_axis_v.x;
+	push_constant.axis_v[1] = p_axis_v.y;
+	push_constant.axis_v[2] = p_axis_v.z;
+	push_constant.axis_v[3] = 10000.0f; // Max distance.
+	push_constant.screen_size[0] = size.x;
+	push_constant.screen_size[1] = size.y;
+	push_constant.frame_index = frame_index;
+
+	RID area_shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_AREA);
+
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
+	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_slice }));
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, area_pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 0, u_tlas, u_depth), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 1, u_mask), 1);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
+	rd->compute_list_end();
+
+	// Spatial denoise into the final area mask.
+	BlurPushConstant blur_push_constant = {};
+	blur_push_constant.screen_size[0] = size.x;
+	blur_push_constant.screen_size[1] = size.y;
+	blur_push_constant.depth_tolerance = 0.1f;
+
+	RID blur_shader_rid = blur_shader.version_get_shader(blur_shader_version, 0);
+	RD::Uniform u_blur_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_slice }));
+	RD::Uniform u_blur_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
+	RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
+
+	RD::ComputeListID blur_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(blur_list, blur_pipeline);
+	rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 0, u_blur_src, u_blur_depth), 0);
+	rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 1, u_blur_dst), 1);
+	rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
+	rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
+	rd->compute_list_end();
 }

@@ -45,6 +45,8 @@
 #define RB_RT_SHADOW_BLURRED SNAME("blurred")
 #define RB_RT_SHADOW_HISTORY_0 SNAME("history_0")
 #define RB_RT_SHADOW_HISTORY_1 SNAME("history_1")
+#define RB_RT_AREA_SHADOW_MASK SNAME("area_mask")
+#define RB_RT_AREA_SHADOW_RAW SNAME("area_raw")
 
 namespace RendererRD {
 
@@ -56,17 +58,24 @@ class RaytracedShadows {
 private:
 	struct PushConstant {
 		float inv_view_proj[16];
-		float to_sun[4];
+		float light_pos[4]; // Directional: xyz to-sun dir, w tan half-angle. Area: xyz center.
+		float axis_u[4]; // Area: xyz rect U extent. w: ray bias.
+		float axis_v[4]; // Area: xyz rect V extent. w: max distance.
 		int32_t screen_size[2];
-		float ray_bias;
-		float max_distance;
 		uint32_t frame_index;
-		uint32_t pad[3];
+		uint32_t pad0;
+	};
+
+	enum ShaderVariant {
+		SHADER_VARIANT_DIRECTIONAL,
+		SHADER_VARIANT_AREA,
+		SHADER_VARIANT_MAX,
 	};
 
 	RaytracedShadowsShaderRD shader;
 	RID shader_version;
-	RID pipeline;
+	RID pipeline; // Directional variant.
+	RID area_pipeline;
 	RID sampler;
 
 	RaytracedShadowsDecodeShaderRD decode_shader;
@@ -127,6 +136,10 @@ public:
 	// denoised spatially and accumulated temporally (p_reproject maps current
 	// NDC to the previous frame's NDC).
 	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle);
+
+	// Traces a shadow mask for one area light (its rect spans p_axis_u/p_axis_v
+	// around p_light_pos) into RB_RT_AREA_SHADOW_MASK, spatially denoised.
+	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
