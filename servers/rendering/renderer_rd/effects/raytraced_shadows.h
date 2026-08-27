@@ -33,12 +33,14 @@
 #include "core/templates/hash_map.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_SCOPE_RT_SHADOWS SNAME("rb_rt_shadows")
 #define RB_RT_SHADOW_MASK SNAME("mask")
+#define RB_RT_SHADOW_RAW SNAME("raw")
 
 namespace RendererRD {
 
@@ -64,6 +66,16 @@ private:
 	RaytracedShadowsDecodeShaderRD decode_shader;
 	RID decode_shader_version;
 	RID decode_pipeline;
+
+	RaytracedShadowsBlurShaderRD blur_shader;
+	RID blur_shader_version;
+	RID blur_pipeline;
+
+	struct BlurPushConstant {
+		int32_t screen_size[2];
+		float depth_tolerance;
+		float pad;
+	};
 
 	struct DecodePushConstant {
 		float aabb_position[4];

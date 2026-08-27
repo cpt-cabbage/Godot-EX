@@ -50,6 +50,12 @@ RaytracedShadows::RaytracedShadows() {
 	decode_shader_version = decode_shader.version_create();
 	decode_pipeline = RD::get_singleton()->compute_pipeline_create(decode_shader.version_get_shader(decode_shader_version, 0));
 
+	Vector<String> blur_modes;
+	blur_modes.push_back("");
+	blur_shader.initialize(blur_modes);
+	blur_shader_version = blur_shader.version_create();
+	blur_pipeline = RD::get_singleton()->compute_pipeline_create(blur_shader.version_get_shader(blur_shader_version, 0));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 }
@@ -62,6 +68,7 @@ RaytracedShadows::~RaytracedShadows() {
 	RD::get_singleton()->free_rid(sampler);
 	shader.version_free(shader_version);
 	decode_shader.version_free(decode_shader_version);
+	blur_shader.version_free(blur_shader_version);
 }
 
 RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
@@ -218,11 +225,19 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	Size2i size = p_render_buffers->get_internal_size();
 	uint32_t view_count = p_render_buffers->get_view_count();
 
+	const bool soft = p_tan_half_angle > 0.0001f;
+
 	if (!p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK)) {
 		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK, RD::DATA_FORMAT_R8_UNORM,
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 	}
+	if (soft && !p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW)) {
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW, RD::DATA_FORMAT_R8_UNORM,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+	}
 	RID mask_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK, p_view, 0);
+	// Soft shadows are traced into a raw target and denoised into the final mask.
+	RID trace_target = soft ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW, p_view, 0) : mask_slice;
 	RID depth = p_render_buffers->get_depth_texture(p_view);
 
 	PushConstant push_constant;
@@ -246,7 +261,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 
 	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
-	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
+	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ trace_target }));
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
@@ -255,4 +270,24 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+
+	if (soft) {
+		BlurPushConstant blur_push_constant = {};
+		blur_push_constant.screen_size[0] = size.x;
+		blur_push_constant.screen_size[1] = size.y;
+		blur_push_constant.depth_tolerance = 0.1f;
+
+		RID blur_shader_rid = blur_shader.version_get_shader(blur_shader_version, 0);
+		RD::Uniform u_blur_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, trace_target }));
+		RD::Uniform u_blur_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
+		RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
+
+		RD::ComputeListID blur_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(blur_list, blur_pipeline);
+		rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 0, u_blur_src, u_blur_depth), 0);
+		rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 1, u_blur_dst), 1);
+		rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
+		rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
+		rd->compute_list_end();
+	}
 }
