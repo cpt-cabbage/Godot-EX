@@ -174,6 +174,13 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
 bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
 	RD *rd = RD::get_singleton();
 
+	if (tlas.is_valid() && !rd->acceleration_structure_is_valid(tlas)) {
+		// The TLAS depends on every BLAS it was built with, so freeing any mesh
+		// cascades into freeing the TLAS. Recreate it below.
+		tlas = RID();
+		tlas_capacity = 0;
+	}
+
 	thread_local LocalVector<RD::AccelerationStructureInstance> as_instances;
 	as_instances.clear();
 
@@ -188,6 +195,12 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		RID mesh = inst->data->base;
 
 		MeshBlas *entry = blas_cache.getptr(mesh);
+		if (entry != nullptr && entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas)) {
+			// The BLAS was freed behind our back (e.g. the mesh was reimported and its
+			// surface buffers were recreated, cascading the free). Rebuild it.
+			blas_cache.erase(mesh);
+			entry = nullptr;
+		}
 		if (entry == nullptr) {
 			MeshBlas new_entry;
 			_create_blas_for_mesh(mesh, new_entry);

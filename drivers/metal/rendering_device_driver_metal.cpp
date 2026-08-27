@@ -1487,10 +1487,9 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 
 					ADD_USAGE(as_info->accel.get(), ui.active_stages, MTL::ResourceUsageRead);
 					// TLAS traversal dereferences BLASes by MTL::ResourceID, which the encoder
-					// cannot infer; make every live BLAS resident alongside the TLAS.
-					for (MTL::AccelerationStructure *blas : blas_registry) {
-						ADD_USAGE(blas, ui.active_stages, MTL::ResourceUsageRead);
-					}
+					// cannot infer. BLASes can be freed while this cached set is still alive,
+					// so residency for them is resolved from the live registry at bind time.
+					set->uses_acceleration_structure = true;
 				} break;
 				default: {
 					DEV_ASSERT(false);

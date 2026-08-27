@@ -1029,6 +1029,11 @@ public:
 	Vector<uint8_t> arg_buffer_data; // Stored for dynamic uniform sets.
 	ResourceUsageMap usage_to_resources; // Used by Metal 3 for resource tracking.
 	Vector<RDD::BoundUniform> uniforms;
+	// True if the set binds an acceleration structure. BLAS residency is then
+	// resolved from the driver's live registry at bind time; BLAS pointers must
+	// never be baked into usage_to_resources, as BLASes can be freed while the
+	// cached set is still alive.
+	bool uses_acceleration_structure = false;
 };
 
 #pragma mark - Pipeline Types

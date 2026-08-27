@@ -1888,6 +1888,15 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
 	compute.resource_tracker.merge_from(p_set->usage_to_resources);
 
+	if (p_set->uses_acceleration_structure) {
+		// TLAS traversal dereferences BLASes by MTL::ResourceID; make every
+		// currently live BLAS resident (the set must not cache BLAS pointers,
+		// as they can be freed while the set is still alive).
+		for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
+			enc->useResource(blas, MTL::ResourceUsageRead);
+		}
+	}
+
 	const UniformSet &shader_set = p_shader->sets[p_set_index];
 
 	// Check if this set has dynamic uniforms.
