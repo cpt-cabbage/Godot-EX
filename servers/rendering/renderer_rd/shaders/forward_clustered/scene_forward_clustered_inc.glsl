@@ -496,11 +496,13 @@ layout(set = 1, binding = 38) uniform texture2DArray rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2DArray rt_area_shadow_mask;
 layout(set = 1, binding = 40) uniform texture2DArray stochastic_diffuse_buffer;
 layout(set = 1, binding = 41) uniform texture2DArray stochastic_specular_buffer;
+layout(set = 1, binding = 42) uniform texture2DArray stochastic_depth_buffer;
 #else
 layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2D rt_area_shadow_mask;
 layout(set = 1, binding = 40) uniform texture2D stochastic_diffuse_buffer;
 layout(set = 1, binding = 41) uniform texture2D stochastic_specular_buffer;
+layout(set = 1, binding = 42) uniform texture2D stochastic_depth_buffer;
 #endif // USE_MULTIVIEW
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 

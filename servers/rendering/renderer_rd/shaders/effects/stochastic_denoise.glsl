@@ -20,18 +20,23 @@ layout(set = 0, binding = 2) uniform sampler2D depth_texture;
 layout(set = 0, binding = 3) uniform sampler2D history_diffuse;
 layout(set = 0, binding = 4) uniform sampler2D history_specular;
 layout(set = 0, binding = 5) uniform sampler2D history_moments;
+// r: shading confidence from the sampling pass.
+layout(set = 0, binding = 6) uniform sampler2D raw_meta;
+// r: accumulated frames / 64, g: shading confidence.
+layout(set = 0, binding = 7) uniform sampler2D history_meta;
 
-layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
-// xy: diffuse luminance 1st/2nd moment, zw: specular, plus accumulated frames
-// encoded in the alpha of the lighting targets.
+layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
+// xy: diffuse luminance 1st/2nd moment, zw: specular.
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_moments;
+layout(set = 1, binding = 3, rg8) uniform restrict writeonly image2D out_meta;
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
 layout(set = 0, binding = 4) uniform sampler2D normal_roughness_texture;
+layout(set = 0, binding = 5) uniform sampler2D meta_texture;
 
-layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
+layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
 #endif
 
 layout(push_constant, std430) uniform Params {
@@ -41,7 +46,7 @@ layout(push_constant, std430) uniform Params {
 	float depth_tolerance;
 	float variance_threshold; // Relative variance below which filtering is skipped.
 	int stride; // Spatial kernel stride.
-	float pad0;
+	int depth_scale; // 2 when the lighting buffers are half resolution.
 	float pad1;
 }
 params;
@@ -80,11 +85,12 @@ void main() {
 		return;
 	}
 
-	float center_depth = texelFetch(depth_texture, pixel, 0).r;
+	float center_depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
 	if (center_depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
 		imageStore(out_specular, pixel, vec4(0.0));
 		imageStore(out_moments, pixel, vec4(0.0));
+		imageStore(out_meta, pixel, vec4(0.0));
 		return;
 	}
 
@@ -122,8 +128,8 @@ void main() {
 	vec4 moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	float frames = 1.0;
 	// Shading confidence from the sampling pass (share of energy carried by
-	// the strongest single light), carried in the specular history alpha.
-	float dominance = texelFetch(in_diffuse, pixel, 0).a;
+	// the strongest single light).
+	float dominance = texelFetch(raw_meta, pixel, 0).r;
 
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(params.screen_size);
 	vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, center_depth, 1.0);
@@ -133,6 +139,7 @@ void main() {
 			vec4 hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
 			vec4 hist_s4 = textureLod(history_specular, prev_uv, 0.0);
 			vec4 hist_moments = textureLod(history_moments, prev_uv, 0.0);
+			vec2 hist_meta = textureLod(history_meta, prev_uv, 0.0).rg;
 
 			const float gamma = 1.5;
 			float outside_d;
@@ -143,19 +150,20 @@ void main() {
 			// History confidence: the further the history was from the current
 			// neighborhood, the faster it is discarded (reduces ghosting).
 			float confidence = clamp(1.0 - max(outside_d, outside_s), 0.0, 1.0);
-			frames = min(hist_d4.a * confidence + 1.0, 1.0 / max(params.blend_alpha, 1e-3));
+			frames = min(hist_meta.r * 64.0 * confidence + 1.0, 1.0 / max(params.blend_alpha, 1e-3));
 			float alpha = max(1.0 / frames, params.blend_alpha);
 
 			result_diffuse = mix(hist_d, current_diffuse, alpha);
 			result_specular = mix(hist_s, current_specular, alpha);
 			moments = mix(hist_moments, moments, alpha);
-			dominance = mix(hist_s4.a, dominance, alpha);
+			dominance = mix(hist_meta.g, dominance, alpha);
 		}
 	}
 
-	imageStore(out_diffuse, pixel, vec4(result_diffuse, frames));
-	imageStore(out_specular, pixel, vec4(result_specular, dominance));
+	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));
+	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
 	imageStore(out_moments, pixel, moments);
+	imageStore(out_meta, pixel, vec4(frames / 64.0, dominance, 0.0, 0.0));
 }
 
 #else // MODE_SPATIAL
@@ -166,7 +174,7 @@ void main() {
 		return;
 	}
 
-	float center_depth = texelFetch(depth_texture, pixel, 0).r;
+	float center_depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
 	vec4 center_d4 = texelFetch(in_diffuse, pixel, 0);
 	vec4 center_s4 = texelFetch(in_specular, pixel, 0);
 	if (center_depth == 0.0) {
@@ -187,8 +195,9 @@ void main() {
 	// only soften the edge.
 	float rel_d = var_d / max(moments.x * moments.x, 1e-6);
 	float rel_s = var_s / max(moments.z * moments.z, 1e-6);
-	float frames = center_d4.a;
-	float dominance = center_s4.a;
+	vec2 meta = texelFetch(meta_texture, pixel, 0).rg;
+	float frames = meta.r * 64.0;
+	float dominance = meta.g;
 	bool newly_revealed = frames < 4.0;
 	if (!newly_revealed && (max(rel_d, rel_s) < params.variance_threshold || (dominance > 0.8 && frames >= 8.0))) {
 		imageStore(out_diffuse, pixel, center_d4);
@@ -196,7 +205,7 @@ void main() {
 		return;
 	}
 
-	vec3 center_normal = normalize(texelFetch(normal_roughness_texture, pixel, 0).xyz * 2.0 - 1.0);
+	vec3 center_normal = normalize(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).xyz * 2.0 - 1.0);
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
 
@@ -221,7 +230,7 @@ void main() {
 				continue;
 			}
 			ivec2 sp = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride)))), ivec2(0), params.screen_size - 1);
-			float sd = texelFetch(depth_texture, sp, 0).r;
+			float sd = texelFetch(depth_texture, sp * params.depth_scale, 0).r;
 			if (sd == 0.0) {
 				continue;
 			}
@@ -231,7 +240,7 @@ void main() {
 			if (depth_diff >= params.depth_tolerance) {
 				continue;
 			}
-			vec3 n = normalize(texelFetch(normal_roughness_texture, sp, 0).xyz * 2.0 - 1.0);
+			vec3 n = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);
 			float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
 			if (w_normal <= 0.0) {
 				continue;
@@ -255,8 +264,8 @@ void main() {
 		}
 	}
 
-	imageStore(out_diffuse, pixel, vec4(sum_d / weight_d, frames));
-	imageStore(out_specular, pixel, vec4(sum_s / weight_s, dominance));
+	imageStore(out_diffuse, pixel, vec4(sum_d / weight_d, 0.0));
+	imageStore(out_specular, pixel, vec4(sum_s / weight_s, 0.0));
 }
 
 #endif

@@ -59,8 +59,13 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint cluster_type_size;
 	float z_far;
 	uint area_light_count;
-	float pad1;
-	float pad2;
+	ivec2 full_screen_size;
+	// 2 when sampling at half resolution (screen_size is then the half size
+	// and every depth / normal / cluster lookup scales up to full pixels).
+	uint depth_scale;
+	uint pad0;
+	uint pad1;
+	uint pad2;
 }
 params;
 
@@ -91,10 +96,14 @@ layout(set = 0, binding = 11) uniform texture2D ltc_lut2;
 layout(set = 0, binding = 12) uniform texture2D area_light_atlas;
 layout(set = 0, binding = 13) uniform sampler material_sampler;
 
-layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
+layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
 // One light this pixel found visible, gathered next frame into the tile lists.
 layout(set = 1, binding = 2, r32ui) uniform restrict writeonly uimage2D out_visible_light;
+// Shading confidence, consumed by the denoiser.
+layout(set = 1, binding = 3, r8) uniform restrict writeonly image2D out_meta;
+// View depth of the lit texel, for the half-resolution upsample.
+layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_depth;
 
 #define RESERVOIR_COUNT 4u
 #define TILE_SIZE 8
@@ -392,19 +401,22 @@ void main() {
 		return;
 	}
 
-	float depth = texelFetch(depth_texture, pixel, 0).r;
+	ivec2 full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	float depth = texelFetch(depth_texture, full_pixel, 0).r;
 	if (depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
 		imageStore(out_specular, pixel, vec4(0.0));
 		imageStore(out_visible_light, pixel, uvec4(INVALID_LIGHT));
+		imageStore(out_meta, pixel, vec4(0.0));
+		imageStore(out_view_depth, pixel, vec4(0.0));
 		return;
 	}
 
-	vec2 uv = (vec2(pixel) + 0.5) / vec2(params.screen_size);
+	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
 	vec4 view_pos4 = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	vec3 view_pos = view_pos4.xyz / view_pos4.w;
 
-	vec4 nr = texelFetch(normal_roughness_texture, pixel, 0);
+	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
 	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
 	float roughness = nr.w;
 	if (roughness > 0.5) {
@@ -480,7 +492,7 @@ void main() {
 	// keeps the subset an unbiased stand-in for the cell's full light list, and
 	// bounds the per-pixel cost regardless of how many lights the scene has.
 	{
-		uvec2 cluster_pos = uvec2(pixel) >> params.cluster_shift;
+		uvec2 cluster_pos = uvec2(full_pixel) >> params.cluster_shift;
 		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
 		uint cluster_z = uint(clamp((-view_pos.z / params.z_far) * 32.0, 0.0, 31.0));
 
@@ -728,7 +740,9 @@ void main() {
 		dominance /= visible_energy;
 	}
 
-	imageStore(out_diffuse, pixel, vec4(diffuse, dominance));
-	imageStore(out_specular, pixel, vec4(specular, 1.0));
+	imageStore(out_diffuse, pixel, vec4(diffuse, 0.0));
+	imageStore(out_specular, pixel, vec4(specular, 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
+	imageStore(out_meta, pixel, vec4(dominance));
+	imageStore(out_view_depth, pixel, vec4(-view_pos.z));
 }

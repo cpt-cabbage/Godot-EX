@@ -734,7 +734,8 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
 	// Only valid where the stochastic pass runs: opaque main-view rendering.
-	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? 1 : 0;
+	// 1: full resolution buffers, 2: half resolution (depth-aware upsample).
+	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? 2 : 1) : 0;
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -2271,7 +2272,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
-							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far);
+							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, use_stochastic_half_res);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -3889,11 +3890,11 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
-	for (uint32_t i = 0; i < 2; i++) {
+	for (uint32_t i = 0; i < 3; i++) {
 		RD::Uniform u;
 		u.binding = 40 + i;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : RB_RT_STOCHASTIC_SPECULAR;
+		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_SPECULAR : RB_RT_STOCHASTIC_VIEW_DEPTH);
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		// Additive terms: black when inactive.
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
@@ -5411,6 +5412,7 @@ RenderForwardClustered::RenderForwardClustered() {
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
 	use_stochastic_lighting = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/enabled");
+	use_stochastic_half_res = GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/half_resolution");
 	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && (use_stochastic_lighting || bool(GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")))) {
 		rt_shadows = memnew(RendererRD::RaytracedShadows);
 	}

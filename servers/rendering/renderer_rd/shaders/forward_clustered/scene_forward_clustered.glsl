@@ -2974,7 +2974,7 @@ void fragment_shader(in SceneData scene_data) {
 	// Stochastic direct lighting (mini-MegaLights): omni/spot/area
 	// contribution computed by the ray-traced compute pass. Demodulated:
 	// albedo, AO and metallic are applied by the common composite below.
-	if (implementation_data.stochastic_direct_lights != 0u) {
+	if (implementation_data.stochastic_direct_lights == 1u) {
 #ifdef USE_MULTIVIEW
 		diffuse_light += textureLod(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
 		direct_specular_light += textureLod(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
@@ -2982,6 +2982,43 @@ void fragment_shader(in SceneData scene_data) {
 		diffuse_light += textureLod(sampler2D(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
 		direct_specular_light += textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
 #endif
+	} else if (implementation_data.stochastic_direct_lights == 2u) {
+		// Half resolution buffers: depth-aware upsample. Each half-res texel
+		// stores the view depth it was lit at; weight the four nearest by
+		// bilinear distance and how well that depth matches ours, so lighting
+		// does not bleed across silhouettes.
+		uvec2 full_size = uvec2(1.0 / scene_data.screen_pixel_size);
+		ivec2 half_size = ivec2((full_size + uvec2(1)) >> 1);
+		vec2 pos = screen_uv * vec2(half_size) - 0.5;
+		ivec2 base = ivec2(floor(pos));
+		vec2 fr = pos - vec2(base);
+		float own_depth = -vertex.z;
+		vec3 up_diffuse = vec3(0.0);
+		vec3 up_specular = vec3(0.0);
+		float up_weight = 0.0;
+		for (int i = 0; i < 4; i++) {
+			ivec2 off = ivec2(i & 1, i >> 1);
+			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
+#ifdef USE_MULTIVIEW
+			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
+#else
+			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
+#endif
+			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y));
+			w *= exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
+#ifdef USE_MULTIVIEW
+			up_diffuse += texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
+			up_specular += texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
+#else
+			up_diffuse += texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
+			up_specular += texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
+#endif
+			up_weight += w;
+		}
+		if (up_weight > 1e-6) {
+			diffuse_light += up_diffuse / up_weight;
+			direct_specular_light += up_specular / up_weight;
+		}
 	}
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 

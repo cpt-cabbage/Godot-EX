@@ -61,6 +61,10 @@
 #define RB_RT_STOCHASTIC_MOMENTS_0 SNAME("stochastic_moments_0")
 #define RB_RT_STOCHASTIC_MOMENTS_1 SNAME("stochastic_moments_1")
 #define RB_RT_STOCHASTIC_VISIBLE_LIGHT SNAME("stochastic_visible_light")
+#define RB_RT_STOCHASTIC_RAW_META SNAME("stochastic_raw_meta")
+#define RB_RT_STOCHASTIC_VIEW_DEPTH SNAME("stochastic_view_depth")
+#define RB_RT_STOCHASTIC_META_0 SNAME("stochastic_meta_0")
+#define RB_RT_STOCHASTIC_META_1 SNAME("stochastic_meta_1")
 
 namespace RendererRD {
 
@@ -152,8 +156,11 @@ private:
 		uint32_t cluster_type_size;
 		float z_far;
 		uint32_t area_light_count;
-		float pad1;
-		float pad2;
+		int32_t full_screen_size[2];
+		uint32_t depth_scale;
+		uint32_t pad0;
+		uint32_t pad1;
+		uint32_t pad2;
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 
@@ -194,7 +201,7 @@ private:
 		float depth_tolerance;
 		float variance_threshold;
 		int32_t stride;
-		float pad0;
+		int32_t depth_scale;
 		float pad1;
 	};
 
@@ -238,7 +245,7 @@ public:
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, bool p_half_resolution);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
