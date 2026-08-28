@@ -44,8 +44,25 @@ layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_dif
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
 
 #define M_PI 3.14159265359
-#define RESERVOIR_COUNT 2u
+#define RESERVOIR_COUNT 4u
 #define SPOT_BIT 0x80000000u
+// Bounds the RIS estimator. Rarely selected lights produce a huge
+// weight_sum/selected_weight ratio, which shows up as fireflies and, once
+// filtered, as blotches. Slightly biased, but far lower variance.
+#define ESTIMATOR_CLAMP 48.0
+
+// PCG hash: decorrelates the per-pixel random variables. A screen-space
+// gradient pattern makes neighboring pixels select the same lights, which
+// spatial filtering turns into blotches rather than smooth gradients.
+uint pcg_hash(uint v) {
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+float hash_to_float(uint h) {
+	return float(h & 0x00FFFFFFu) / float(0x01000000u);
+}
 
 float get_omni_attenuation(float dist, float inv_range, float decay) {
 	float nd = dist * inv_range;
@@ -177,9 +194,7 @@ void main() {
 	}
 	roughness /= (127.0 / 255.0);
 
-	// Interleaved gradient noise advanced per frame with the golden ratio.
-	float ign = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
-	float golden = float(params.frame_index % 64u) * 0.61803398875;
+	uint pixel_seed = pcg_hash(uint(pixel.x) + pcg_hash(uint(pixel.y) + pcg_hash(params.frame_index)));
 
 	Reservoir reservoirs[RESERVOIR_COUNT];
 	float rngs[RESERVOIR_COUNT];
@@ -187,7 +202,7 @@ void main() {
 		reservoirs[r].light_index = 0xFFFFFFFFu;
 		reservoirs[r].weight_sum = 0.0;
 		reservoirs[r].selected_weight = 0.0;
-		rngs[r] = fract(ign + golden + float(r) * 0.38196601125);
+		rngs[r] = hash_to_float(pcg_hash(pixel_seed + r * 0x9E3779B9u));
 	}
 
 	vec3 unused;
@@ -228,9 +243,9 @@ void main() {
 			continue;
 		}
 
-		// Unbiased RIS estimator: f * (weight_sum / selected_weight), averaged
-		// over the independent reservoirs.
-		float estimator = (reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6)) / float(RESERVOIR_COUNT);
+		// RIS estimator: f * (weight_sum / selected_weight), averaged over the
+		// independent reservoirs and clamped to bound variance.
+		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
 		diffuse += f * estimator;
 		specular += light_specular_contribution(is_spot, idx, view_pos, view_normal, roughness, f) * estimator;
 	}

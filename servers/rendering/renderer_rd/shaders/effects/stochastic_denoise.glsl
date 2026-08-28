@@ -55,30 +55,40 @@ void main() {
 	vec3 min_specular = vec3(1e30);
 	vec3 max_specular = vec3(-1e30);
 
-	for (int y = -2; y <= 2; y++) {
-		for (int x = -2; x <= 2; x++) {
-			ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
-			float sd = texelFetch(depth_texture, sp, 0).r;
-			if (sd == 0.0) {
-				continue;
-			}
-			vec3 d = texelFetch(raw_diffuse, sp, 0).rgb;
-			vec3 s = texelFetch(raw_specular, sp, 0).rgb;
+	// Two a-trous levels: a tight kernel preserves detail, a strided one
+	// removes the low frequency blotches a 5x5 kernel alone cannot reach.
+	for (int level = 0; level < 2; level++) {
+		int stride = level == 0 ? 1 : 4;
+		float level_scale = level == 0 ? 1.0 : 0.6;
+		for (int y = -2; y <= 2; y++) {
+			for (int x = -2; x <= 2; x++) {
+				if (level == 1 && x == 0 && y == 0) {
+					continue; // Already accumulated by the tight kernel.
+				}
+				ivec2 sp = clamp(pixel + ivec2(x, y) * stride, ivec2(0), params.screen_size - 1);
+				float sd = texelFetch(depth_texture, sp, 0).r;
+				if (sd == 0.0) {
+					continue;
+				}
 
-			float depth_diff = abs(sd - center_depth) / max(center_depth, 1e-6);
-			if (depth_diff >= params.depth_tolerance) {
-				continue;
-			}
-			float weight = exp(-0.3 * float(x * x + y * y));
-			sum_diffuse += d * weight;
-			sum_specular += s * weight;
-			total_weight += weight;
+				float depth_diff = abs(sd - center_depth) / max(center_depth, 1e-6);
+				if (depth_diff >= params.depth_tolerance) {
+					continue;
+				}
+				vec3 d = texelFetch(raw_diffuse, sp, 0).rgb;
+				vec3 s = texelFetch(raw_specular, sp, 0).rgb;
 
-			if (abs(x) <= 1 && abs(y) <= 1) {
-				min_diffuse = min(min_diffuse, d);
-				max_diffuse = max(max_diffuse, d);
-				min_specular = min(min_specular, s);
-				max_specular = max(max_specular, s);
+				float weight = exp(-0.3 * float(x * x + y * y)) * level_scale;
+				sum_diffuse += d * weight;
+				sum_specular += s * weight;
+				total_weight += weight;
+
+				if (level == 0 && abs(x) <= 1 && abs(y) <= 1) {
+					min_diffuse = min(min_diffuse, d);
+					max_diffuse = max(max_diffuse, d);
+					min_specular = min(min_specular, s);
+					max_specular = max(max_specular, s);
+				}
 			}
 		}
 	}

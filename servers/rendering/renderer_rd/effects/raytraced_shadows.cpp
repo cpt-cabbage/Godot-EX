@@ -536,7 +536,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	denoise_push_constant.screen_size[0] = size.x;
 	denoise_push_constant.screen_size[1] = size.y;
-	denoise_push_constant.blend_alpha = 0.15f;
+	denoise_push_constant.blend_alpha = 0.08f; // ~12 frames of accumulation.
 	denoise_push_constant.depth_tolerance = 0.05f;
 
 	RID denoise_shader_rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, 0);
