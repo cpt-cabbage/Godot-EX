@@ -319,6 +319,11 @@ private:
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
 			uint32_t stochastic_direct_lights;
+
+			uint32_t rt_sun_shadow;
+			uint32_t pad3;
+			uint32_t pad4;
+			uint32_t pad5;
 		};
 
 		struct PushConstantUbershader {
@@ -766,6 +771,10 @@ private:
 	// Reads the live ray tracing project settings (called once per frame) and
 	// lazily creates the ray tracing backend when first enabled.
 	void _update_ray_tracing_settings();
+
+	// The directional light whose shadow the ray traced path owns this frame
+	// (null when none): its shadow map is neither rendered nor sampled.
+	RID _get_rt_sun_base(const RenderDataRD *p_render_data) const;
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;

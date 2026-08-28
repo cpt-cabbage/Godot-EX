@@ -736,6 +736,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Only valid where the stochastic pass runs: opaque main-view rendering.
 	// 1: full resolution buffers, 2: half resolution (depth-aware upsample).
 	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? 2 : 1) : 0;
+	// When the sun's shadow is ray traced, its shadow map is neither rendered
+	// nor sampled: the traced mask fully owns that light's shadow.
+	scene_state.ubo.rt_sun_shadow = (p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && _get_rt_sun_base(p_render_data).is_valid()) ? 1 : 0;
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1579,11 +1582,15 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	float lod_distance_multiplier = p_render_data->scene_data->cam_projection.get_lod_multiplier();
 	{
+		RID rt_sun_base = _get_rt_sun_base(p_render_data);
 		for (int i = 0; i < p_render_data->render_shadow_count; i++) {
 			RID li = p_render_data->render_shadows[i].light;
 			RID base = light_storage->light_instance_get_base_light(li);
 
 			if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
+				if (base == rt_sun_base) {
+					continue; // Ray traced this frame: skip its shadow map entirely.
+				}
 				p_render_data->directional_shadows.push_back(i);
 			} else if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI && light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
 				p_render_data->cube_shadows.push_back(i);
@@ -1733,6 +1740,22 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 		RID depth_texture = p_render_buffers->get_depth_texture(v);
 		ss_effects->sub_surface_scattering(p_render_buffers, internal_texture, depth_texture, p_camera, internal_size);
 	}
+}
+
+RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) const {
+	// The directional light whose shadow the ray traced path owns this frame:
+	// the first one with shadows enabled (matching the tracing pass's pick).
+	if (!use_raytraced_shadows || p_render_data == nullptr || p_render_data->lights == nullptr) {
+		return RID();
+	}
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	for (uint64_t i = 0; i < p_render_data->lights->size(); i++) {
+		RID base = light_storage->light_instance_get_base_light((*p_render_data->lights)[i]);
+		if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL && light_storage->light_has_shadow(base)) {
+			return base;
+		}
+	}
+	return RID();
 }
 
 void RenderForwardClustered::_update_ray_tracing_settings() {

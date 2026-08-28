@@ -2422,7 +2422,9 @@ void fragment_shader(in SceneData scene_data) {
 
 				float shadow = 1.0;
 
-				if (directional_lights.data[i].shadow_opacity > 0.001) {
+				// The ray traced mask owns the first directional light's shadow
+				// when active; its shadow map is stale and must not be sampled.
+				if (directional_lights.data[i].shadow_opacity > 0.001 && !(implementation_data.rt_sun_shadow != 0u && i == 0u)) {
 					float depth_z = -vertex.z;
 					vec3 light_dir = directional_lights.data[i].direction;
 					vec3 base_normal_bias = geo_normal * (1.0 - max(0.0, dot(light_dir, -geo_normal)));

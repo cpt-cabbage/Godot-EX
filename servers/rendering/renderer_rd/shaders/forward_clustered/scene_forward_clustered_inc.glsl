@@ -348,6 +348,11 @@ struct ImplementationData {
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
 	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass.
+
+	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
+	uint pad3;
+	uint pad4;
+	uint pad5;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
