@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -59,6 +60,7 @@
 #define RB_RT_STOCHASTIC_HIST_SPECULAR_1 SNAME("stochastic_hist_specular_1")
 #define RB_RT_STOCHASTIC_MOMENTS_0 SNAME("stochastic_moments_0")
 #define RB_RT_STOCHASTIC_MOMENTS_1 SNAME("stochastic_moments_1")
+#define RB_RT_STOCHASTIC_VISIBLE_LIGHT SNAME("stochastic_visible_light")
 
 namespace RendererRD {
 
@@ -125,14 +127,36 @@ private:
 	struct StochasticParamsUBO {
 		float view_from_ndc[16];
 		float world_from_view[16];
+		float reproject[16];
 		int32_t screen_size[2];
 		uint32_t omni_light_count;
 		uint32_t spot_light_count;
 		uint32_t frame_index;
 		float ray_bias;
-		uint32_t pad[2];
+		int32_t tiles_x;
+		int32_t tiles_y;
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
+
+	// Visible light lists, one fixed-size list per 8x8 tile, ping-ponged so the
+	// sampling pass reads the list the previous frame produced.
+	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = 8;
+	static constexpr uint32_t LIGHT_LIST_SIZE = 8;
+	struct LightListBuffers {
+		RID buffers[2];
+		Size2i tiles;
+	};
+	LocalVector<LightListBuffers> light_lists; // Per view.
+
+	StochasticLightListShaderRD light_list_shader;
+	RID light_list_shader_version;
+	RID light_list_pipeline;
+
+	struct LightListPushConstant {
+		int32_t screen_size[2];
+		int32_t tiles_x;
+		int32_t pad0;
+	};
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,

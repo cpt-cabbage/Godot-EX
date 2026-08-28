@@ -27,24 +27,40 @@ layout(set = 0, binding = 4, std430) restrict readonly buffer SpotLights {
 }
 spot_lights;
 
-layout(set = 0, binding = 5, std140) uniform Params {
+// Visible light list from the previous frame, one fixed-size list per 8x8 tile.
+layout(set = 0, binding = 5, std430) restrict readonly buffer LightList {
+	uint data[];
+}
+prev_light_list;
+
+layout(set = 0, binding = 6, std140) uniform Params {
 	mat4 view_from_ndc; // Inverse of the (depth-corrected) projection.
 	mat4 world_from_view; // Camera transform.
+	mat4 reproject; // Current NDC -> previous frame NDC, for the tile lookup.
 	ivec2 screen_size;
 	uint omni_light_count;
 	uint spot_light_count;
 	uint frame_index;
 	float ray_bias;
-	uint pad0;
-	uint pad1;
+	int tiles_x;
+	int tiles_y;
 }
 params;
 
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
+// One light this pixel found visible, gathered next frame into the tile lists.
+layout(set = 1, binding = 2, r32ui) uniform restrict writeonly uimage2D out_visible_light;
 
 #define M_PI 3.14159265359
 #define RESERVOIR_COUNT 4u
+// Reservoirs drawn from the guided (visible) list; the rest go to lights not
+// on the list, so newly visible lights are still discovered. Mirrors the
+// paper's hidden light sample budget.
+#define VISIBLE_RESERVOIR_COUNT 3u
+#define TILE_SIZE 8
+#define LIST_SIZE 8
+#define INVALID_LIGHT 0xFFFFFFFFu
 #define SPOT_BIT 0x80000000u
 // Bounds the RIS estimator. Rarely selected lights produce a huge
 // weight_sum/selected_weight ratio, which shows up as fireflies and, once
@@ -179,6 +195,7 @@ void main() {
 	if (depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
 		imageStore(out_specular, pixel, vec4(0.0));
+		imageStore(out_visible_light, pixel, uvec4(INVALID_LIGHT));
 		return;
 	}
 
@@ -196,26 +213,81 @@ void main() {
 
 	uint pixel_seed = pcg_hash(uint(pixel.x) + pcg_hash(uint(pixel.y) + pcg_hash(params.frame_index)));
 
+	// Look up the visible light list built last frame, reprojecting into the
+	// previous frame's tile grid. The tile is jittered stochastically so the
+	// transition between neighboring tile lists is dithered instead of showing
+	// up as an 8 pixel grid.
+	uint visible_list[LIST_SIZE];
+	uint visible_count = 0u;
+	{
+		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
+		if (prev_ndc.w > 0.0) {
+			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
+			vec2 jitter = vec2(hash_to_float(pcg_hash(pixel_seed + 0x51u)), hash_to_float(pcg_hash(pixel_seed + 0x97u))) - 0.5;
+			vec2 tile_coord = (prev_uv * vec2(params.screen_size)) / float(TILE_SIZE) + jitter;
+			ivec2 tile = ivec2(floor(tile_coord));
+			if (all(greaterThanEqual(tile, ivec2(0))) && tile.x < params.tiles_x && tile.y < params.tiles_y) {
+				uint base = uint(tile.y * params.tiles_x + tile.x) * uint(LIST_SIZE);
+				for (uint i = 0u; i < uint(LIST_SIZE); i++) {
+					uint entry = prev_light_list.data[base + i];
+					if (entry == INVALID_LIGHT) {
+						break;
+					}
+					// Drop stale entries from lights that no longer exist.
+					uint idx = entry & ~SPOT_BIT;
+					uint count = (entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count;
+					if (idx < count) {
+						visible_list[visible_count++] = entry;
+					}
+				}
+			}
+		}
+	}
+
+	// Split the sample budget between the guided list and everything else. The
+	// stream probabilities are folded into the estimator, so the result stays
+	// an unbiased estimate of the full light sum either way.
+	uint visible_reservoirs = visible_count > 0u ? VISIBLE_RESERVOIR_COUNT : 0u;
+	float q_visible = float(visible_reservoirs) / float(RESERVOIR_COUNT);
+	float q_hidden = 1.0 - q_visible;
+
 	Reservoir reservoirs[RESERVOIR_COUNT];
 	float rngs[RESERVOIR_COUNT];
 	for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
-		reservoirs[r].light_index = 0xFFFFFFFFu;
+		reservoirs[r].light_index = INVALID_LIGHT;
 		reservoirs[r].weight_sum = 0.0;
 		reservoirs[r].selected_weight = 0.0;
 		rngs[r] = hash_to_float(pcg_hash(pixel_seed + r * 0x9E3779B9u));
 	}
 
 	vec3 unused;
-	for (uint i = 0u; i < params.omni_light_count; i++) {
-		float w = light_weight(light_diffuse_contribution(false, i, view_pos, view_normal, unused));
-		for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
-			reservoir_update(reservoirs[r], i, w, rngs[r]);
+	// Guided stream: only the lights the tile saw last frame.
+	for (uint i = 0u; i < visible_count; i++) {
+		uint entry = visible_list[i];
+		bool is_spot = (entry & SPOT_BIT) != 0u;
+		float w = light_weight(light_diffuse_contribution(is_spot, entry & ~SPOT_BIT, view_pos, view_normal, unused));
+		for (uint r = 0u; r < visible_reservoirs; r++) {
+			reservoir_update(reservoirs[r], entry, w, rngs[r]);
 		}
 	}
-	for (uint i = 0u; i < params.spot_light_count; i++) {
-		float w = light_weight(light_diffuse_contribution(true, i, view_pos, view_normal, unused));
-		for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
-			reservoir_update(reservoirs[r], i | SPOT_BIT, w, rngs[r]);
+
+	// Discovery stream: every light that is not already on the list.
+	for (uint i = 0u; i < params.omni_light_count + params.spot_light_count; i++) {
+		bool is_spot = i >= params.omni_light_count;
+		uint entry = is_spot ? ((i - params.omni_light_count) | SPOT_BIT) : i;
+		bool listed = false;
+		for (uint j = 0u; j < visible_count; j++) {
+			if (visible_list[j] == entry) {
+				listed = true;
+				break;
+			}
+		}
+		if (listed) {
+			continue;
+		}
+		float w = light_weight(light_diffuse_contribution(is_spot, entry & ~SPOT_BIT, view_pos, view_normal, unused));
+		for (uint r = visible_reservoirs; r < RESERVOIR_COUNT; r++) {
+			reservoir_update(reservoirs[r], entry, w, rngs[r]);
 		}
 	}
 
@@ -224,8 +296,14 @@ void main() {
 
 	vec3 diffuse = vec3(0.0);
 	vec3 specular = vec3(0.0);
+	uint chosen_visible_light = INVALID_LIGHT;
+	uint visible_found = 0u;
 	for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
-		if (reservoirs[r].light_index == 0xFFFFFFFFu) {
+		if (reservoirs[r].light_index == INVALID_LIGHT) {
+			continue;
+		}
+		float q_stream = r < visible_reservoirs ? q_visible : q_hidden;
+		if (q_stream <= 0.0) {
 			continue;
 		}
 		bool is_spot = (reservoirs[r].light_index & SPOT_BIT) != 0u;
@@ -243,13 +321,21 @@ void main() {
 			continue;
 		}
 
-		// RIS estimator: f * (weight_sum / selected_weight), averaged over the
-		// independent reservoirs and clamped to bound variance.
-		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
+		// Pick one visible light uniformly to seed next frame's tile list.
+		visible_found++;
+		if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + visible_found)) < 1.0 / float(visible_found)) {
+			chosen_visible_light = reservoirs[r].light_index;
+		}
+
+		// RIS estimator f * (weight_sum / selected_weight), divided by the
+		// probability of having drawn from this stream, averaged over the
+		// reservoirs and clamped to bound variance.
+		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight * q_stream, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
 		diffuse += f * estimator;
 		specular += light_specular_contribution(is_spot, idx, view_pos, view_normal, roughness, f) * estimator;
 	}
 
 	imageStore(out_diffuse, pixel, vec4(diffuse, 1.0));
 	imageStore(out_specular, pixel, vec4(specular, 1.0));
+	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 }

@@ -71,6 +71,12 @@ RaytracedShadows::RaytracedShadows() {
 	stochastic_shader_version = stochastic_shader.version_create();
 	stochastic_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0));
 
+	Vector<String> light_list_modes;
+	light_list_modes.push_back("");
+	light_list_shader.initialize(light_list_modes);
+	light_list_shader_version = light_list_shader.version_create();
+	light_list_pipeline = RD::get_singleton()->compute_pipeline_create(light_list_shader.version_get_shader(light_list_shader_version, 0));
+
 	Vector<String> stochastic_denoise_modes;
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n");
@@ -93,12 +99,20 @@ RaytracedShadows::~RaytracedShadows() {
 	for (const RID &ubo : stochastic_params_ubos) {
 		RD::get_singleton()->free_rid(ubo);
 	}
+	for (const LightListBuffers &lists : light_lists) {
+		for (const RID &buffer : lists.buffers) {
+			if (buffer.is_valid()) {
+				RD::get_singleton()->free_rid(buffer);
+			}
+		}
+	}
 	shader.version_free(shader_version);
 	decode_shader.version_free(decode_shader_version);
 	blur_shader.version_free(blur_shader_version);
 	temporal_shader.version_free(temporal_shader_version);
 	stochastic_shader.version_free(stochastic_shader_version);
 	stochastic_denoise_shader.version_free(stochastic_denoise_shader_version);
+	light_list_shader.version_free(light_list_shader_version);
 }
 
 RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
@@ -475,7 +489,31 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 			p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 		}
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, RD::DATA_FORMAT_R32_UINT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 	}
+
+	// Visible light lists, sized to the tile grid.
+	Size2i tiles((size.x + LIGHT_LIST_TILE_SIZE - 1) / LIGHT_LIST_TILE_SIZE, (size.y + LIGHT_LIST_TILE_SIZE - 1) / LIGHT_LIST_TILE_SIZE);
+	while (light_lists.size() <= p_view) {
+		light_lists.push_back(LightListBuffers());
+	}
+	LightListBuffers &lists = light_lists[p_view];
+	if (lists.tiles != tiles || lists.buffers[0].is_null()) {
+		for (RID &buffer : lists.buffers) {
+			if (buffer.is_valid()) {
+				rd->free_rid(buffer);
+			}
+			uint32_t list_bytes = tiles.x * tiles.y * LIGHT_LIST_SIZE * sizeof(uint32_t);
+			Vector<uint8_t> empty;
+			empty.resize_initialized(list_bytes);
+			memset(empty.ptrw(), 0xFF, list_bytes); // All entries invalid.
+			buffer = rd->storage_buffer_create(list_bytes, empty);
+		}
+		lists.tiles = tiles;
+	}
+	RID list_read = lists.buffers[history_parity ? 1 : 0];
+	RID list_write = lists.buffers[history_parity ? 0 : 1];
 	// The sampling pass traces into the raw targets; the denoiser filters them
 	// into the buffers the scene shader reads.
 	RID diffuse_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_DIFFUSE, p_view, 0);
@@ -498,12 +536,19 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 			params.world_from_view[col * 4 + row] = world_from_view_proj.columns[col][row];
 		}
 	}
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			params.reproject[col * 4 + row] = p_reproject.columns[col][row];
+		}
+	}
 	params.screen_size[0] = size.x;
 	params.screen_size[1] = size.y;
 	params.omni_light_count = p_omni_light_count;
 	params.spot_light_count = p_spot_light_count;
 	params.frame_index = frame_index;
 	params.ray_bias = 0.08f;
+	params.tiles_x = tiles.x;
+	params.tiles_y = tiles.y;
 	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
@@ -513,16 +558,40 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
 	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ light_storage->get_omni_light_buffer() }));
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ light_storage->get_spot_light_buffer() }));
-	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, Vector<RID>({ stochastic_params_ubos[p_view] }));
+	RD::Uniform u_list(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ list_read }));
+	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ stochastic_params_ubos[p_view] }));
+	RID visible_light = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, p_view, 0);
 	RD::Uniform u_diffuse(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ diffuse_slice }));
 	RD::Uniform u_specular(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ specular_slice }));
+	RD::Uniform u_visible(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ visible_light }));
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_params), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular), 1);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+
+	// Gather the lights that were actually visible into this frame's tile
+	// lists, which the next frame's sampling pass will use for guidance.
+	{
+		LightListPushConstant list_push_constant = {};
+		list_push_constant.screen_size[0] = size.x;
+		list_push_constant.screen_size[1] = size.y;
+		list_push_constant.tiles_x = tiles.x;
+
+		RID list_shader_rid = light_list_shader.version_get_shader(light_list_shader_version, 0);
+		RD::Uniform u_visible_in(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ visible_light }));
+		RD::Uniform u_list_out(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ list_write }));
+
+		RD::ComputeListID list_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list_list, light_list_pipeline);
+		rd->compute_list_bind_uniform_set(list_list, uniform_set_cache->get_cache(list_shader_rid, 0, u_visible_in), 0);
+		rd->compute_list_bind_uniform_set(list_list, uniform_set_cache->get_cache(list_shader_rid, 1, u_list_out), 1);
+		rd->compute_list_set_push_constant(list_list, &list_push_constant, sizeof(LightListPushConstant));
+		rd->compute_list_dispatch(list_list, tiles.x, tiles.y, 1);
+		rd->compute_list_end();
+	}
 
 	// Denoise: temporal accumulation of lighting and luminance moments, then a
 	// variance-driven spatial pass into the buffers the scene shader reads.
