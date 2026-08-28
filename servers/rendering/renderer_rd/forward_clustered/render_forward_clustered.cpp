@@ -1742,6 +1742,15 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+bool RenderForwardClustered::needs_ray_tracing_instances() {
+	_update_ray_tracing_settings();
+	return use_raytraced_shadows || use_stochastic_lighting;
+}
+
+void RenderForwardClustered::update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
+	rt_scene_ready = rt_shadows != nullptr && rt_shadows->update_scene(p_instances);
+}
+
 RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) const {
 	// The directional light whose shadow the ray traced path owns this frame:
 	// the first one with shadows enabled (matching the tracing pass's pick).
@@ -2320,7 +2329,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool run_stochastic = use_stochastic_lighting && rb_data->has_normal_roughness() && current_cluster_builder != nullptr &&
 				(light_storage->get_omni_light_count() > 0 || light_storage->get_spot_light_count() > 0 || light_storage->get_area_light_count() > 0);
 
-		if ((has_sun || has_area || run_stochastic) && rt_shadows->update_scene(*p_render_data->instances)) {
+		if ((has_sun || has_area || run_stochastic) && rt_scene_ready) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
 			rt_shadows->advance_frame();

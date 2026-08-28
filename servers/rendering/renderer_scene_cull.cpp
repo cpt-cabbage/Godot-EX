@@ -3712,6 +3712,25 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
+	if (p_reflection_probe.is_null() && scene_render->needs_ray_tracing_instances()) {
+		// The ray tracing scene gets every visible geometry instance in the
+		// scenario, not just the frustum survivors: an occluder behind the
+		// camera still has to block rays toward the light.
+		rt_geometry_instances.clear();
+		for (uint64_t i = 0; i < scenario->instance_data.size(); i++) {
+			const InstanceData &idata = scenario->instance_data[i];
+			uint32_t base_type = idata.flags & InstanceData::FLAG_BASE_TYPE_MASK;
+			if (((1 << base_type) & RSE::INSTANCE_GEOMETRY_MASK) == 0) {
+				continue;
+			}
+			if (idata.flags & InstanceData::FLAG_VISIBILITY_DEPENDENCY_HIDDEN) {
+				continue;
+			}
+			rt_geometry_instances.push_back(idata.instance_geometry);
+		}
+		scene_render->update_ray_tracing_scene(rt_geometry_instances);
+	}
+
 	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
 
 	if (p_viewport.is_valid()) {
@@ -4516,6 +4535,7 @@ RendererSceneCull::RendererSceneCull() {
 	}
 
 	scene_cull_result.init(&rid_cull_page_pool, &geometry_instance_cull_page_pool, &instance_cull_page_pool);
+	rt_geometry_instances.set_page_pool(&geometry_instance_cull_page_pool);
 	scene_cull_result_threads.resize(WorkerThreadPool::get_singleton()->get_thread_count());
 	for (InstanceCullResult &thread : scene_cull_result_threads) {
 		thread.init(&rid_cull_page_pool, &geometry_instance_cull_page_pool, &instance_cull_page_pool);

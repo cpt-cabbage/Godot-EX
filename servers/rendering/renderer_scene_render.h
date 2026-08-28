@@ -276,6 +276,11 @@ public:
 	virtual RID voxel_gi_instance_create(RID p_voxel_gi) = 0;
 	virtual void voxel_gi_instance_set_transform_to_data(RID p_probe, const Transform3D &p_xform) = 0;
 	virtual bool voxel_gi_needs_update(RID p_probe) const = 0;
+	// Ray tracing wants the whole scene's geometry, not the frustum-culled
+	// subset: off-screen occluders must still block rays.
+	virtual bool needs_ray_tracing_instances() { return false; }
+	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {}
+
 	virtual void voxel_gi_update(RID p_probe, bool p_update_light_instances, const Vector<RID> &p_light_instances, const PagedArray<RenderGeometryInstance *> &p_dynamic_objects) = 0;
 
 	virtual void voxel_gi_set_quality(RSE::VoxelGIQuality) = 0;

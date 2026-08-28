@@ -776,6 +776,16 @@ private:
 	// (null when none): its shadow map is neither rendered nor sampled.
 	RID _get_rt_sun_base(const RenderDataRD *p_render_data) const;
 
+	// Whether this frame's TLAS holds traceable geometry (built from the full
+	// scene handed over by the culler, so off-screen occluders block rays).
+	bool rt_scene_ready = false;
+
+public:
+	virtual bool needs_ray_tracing_instances() override;
+	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) override;
+
+private:
+
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
 #endif

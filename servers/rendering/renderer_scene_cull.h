@@ -878,6 +878,9 @@ public:
 
 	PagedArray<Instance *> instance_cull_result;
 	PagedArray<Instance *> instance_shadow_cull_result;
+	// Every visible geometry instance in the scenario, for the ray tracing
+	// scene (rays must hit off-screen occluders the frustum cull drops).
+	PagedArray<RenderGeometryInstance *> rt_geometry_instances;
 
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
