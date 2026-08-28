@@ -30,6 +30,7 @@
 
 #include "raytraced_shadows.h"
 
+#include "servers/rendering/renderer_rd/effects/stochastic_stbn_data.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -88,6 +89,26 @@ RaytracedShadows::RaytracedShadows() {
 
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
+
+	{
+		// Spatio-temporal blue noise driving the stochastic sampling pass
+		// (one 64x64 RG slice per frame over a 16 frame cycle).
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R8G8_UNORM;
+		tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		tf.width = STBN_SIZE_XY;
+		tf.height = STBN_SIZE_XY;
+		tf.array_layers = STBN_SIZE_T;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		stbn_texture = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		const uint32_t layer_bytes = STBN_SIZE_XY * STBN_SIZE_XY * 2;
+		for (uint32_t layer = 0; layer < STBN_SIZE_T; layer++) {
+			Vector<uint8_t> layer_data;
+			layer_data.resize(layer_bytes);
+			memcpy(layer_data.ptrw(), STBN_RG_64X64X16 + layer * layer_bytes, layer_bytes);
+			RD::get_singleton()->texture_update(stbn_texture, layer, layer_data);
+		}
+	}
 }
 
 RaytracedShadows::~RaytracedShadows() {
@@ -96,6 +117,7 @@ RaytracedShadows::~RaytracedShadows() {
 	// teardown typically runs before this destructor), so freeing here would
 	// double-free. Any still alive are reclaimed at device shutdown.
 	RD::get_singleton()->free_rid(sampler);
+	RD::get_singleton()->free_rid(stbn_texture);
 	for (const RID &ubo : stochastic_params_ubos) {
 		RD::get_singleton()->free_rid(ubo);
 	}
@@ -571,6 +593,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	RD::Uniform u_list(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ list_read }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ stochastic_params_ubos[p_view] }));
 	RD::Uniform u_cluster(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, Vector<RID>({ p_cluster_buffer }));
+	RD::Uniform u_stbn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, stbn_texture }));
 	RID visible_light = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, p_view, 0);
 	RD::Uniform u_diffuse(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ diffuse_slice }));
 	RD::Uniform u_specular(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ specular_slice }));
@@ -578,7 +601,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

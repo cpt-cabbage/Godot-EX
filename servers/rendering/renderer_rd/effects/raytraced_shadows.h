@@ -120,6 +120,9 @@ private:
 	uint32_t frame_index = 0;
 	bool history_parity = false;
 
+	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.
+	RID stbn_texture;
+
 	StochasticDirectLightingShaderRD stochastic_shader;
 	RID stochastic_shader_version;
 	RID stochastic_pipeline;

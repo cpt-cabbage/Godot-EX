@@ -65,6 +65,13 @@ layout(set = 0, binding = 7, std430) restrict readonly buffer ClusterBuffer {
 }
 cluster_buffer;
 
+// Spatio-temporal blue noise, one 64x64 RG slice per frame over a 16 frame
+// cycle. Blue in space (neighboring pixels make maximally different random
+// decisions, which the spatial filter averages into smooth gradients instead
+// of blotches) and blue in time (each pixel's sequence over frames converges
+// faster under temporal accumulation than white noise would).
+layout(set = 0, binding = 8) uniform sampler2DArray stbn_texture;
+
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
 // One light this pixel found visible, gathered next frame into the tile lists.
@@ -112,6 +119,19 @@ uint pcg_hash(uint v) {
 
 float hash_to_float(uint h) {
 	return float(h & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+// STBN lookup for one random stream. Different streams (reservoir chains, the
+// tile jitter) use toroidal shifts of the same slice: a shifted blue noise
+// pattern stays blue, while staying decorrelated from the other streams. The
+// 16 frame cycle is decorrelated across epochs the same way.
+vec2 stbn_sample(ivec2 pixel, uint stream) {
+	uint epoch = params.frame_index >> 4;
+	uint k = stream + epoch * 8u;
+	// R2 low-discrepancy sequence for the shift.
+	ivec2 shift = ivec2(fract(vec2(k) * vec2(0.7548776662, 0.5698402909)) * 64.0);
+	ivec2 p = (pixel + shift) & 63;
+	return texelFetch(stbn_texture, ivec3(p, int(params.frame_index & 15u)), 0).rg;
 }
 
 float get_omni_attenuation(float dist, float inv_range, float decay) {
@@ -263,7 +283,7 @@ void main() {
 		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		if (prev_ndc.w > 0.0) {
 			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
-			vec2 jitter = vec2(hash_to_float(pcg_hash(pixel_seed + 0x51u)), hash_to_float(pcg_hash(pixel_seed + 0x97u))) - 0.5;
+			vec2 jitter = stbn_sample(pixel, 4u) - 0.5;
 			vec2 tile_coord = (prev_uv * vec2(params.screen_size)) / float(TILE_SIZE) + jitter;
 			ivec2 tile = ivec2(floor(tile_coord));
 			if (all(greaterThanEqual(tile, ivec2(0))) && tile.x < params.tiles_x && tile.y < params.tiles_y) {
@@ -329,7 +349,7 @@ void main() {
 		}
 
 		uint stride = max(1u, (cell_count + MAX_DISCOVERY_CANDIDATES - 1u) / MAX_DISCOVERY_CANDIDATES);
-		uint start = uint(hash_to_float(pcg_hash(pixel_seed + 0x3Du)) * float(stride));
+		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
 		float stride_mult = float(stride);
 
 		uint cell_index = 0u;
@@ -400,7 +420,10 @@ void main() {
 		reservoirs[r].candidate = INVALID_LIGHT;
 		reservoirs[r].weight_sum = 0.0;
 		reservoirs[r].selected_weight = 0.0;
-		rngs[r] = hash_to_float(pcg_hash(pixel_seed + r * 0x9E3779B9u));
+		// One STBN value drives each reservoir's whole selection chain (the
+		// warping in reservoir_update stretches it back to [0;1) after every
+		// decision), so the blue noise property survives the loop.
+		rngs[r] = min(stbn_sample(pixel, r).r, 0.9999999);
 	}
 	for (uint i = 0u; i < candidate_count; i++) {
 		for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
