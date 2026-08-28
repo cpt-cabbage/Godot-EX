@@ -183,6 +183,13 @@ void main() {
 		return;
 	}
 
+	// Denoiser disabled (sentinel threshold): pass the input through.
+	if (params.variance_threshold >= 1e5) {
+		imageStore(out_diffuse, pixel, center_d4);
+		imageStore(out_specular, pixel, center_s4);
+		return;
+	}
+
 	vec4 moments = texelFetch(moments_texture, pixel, 0);
 	float var_d = max(moments.y - moments.x * moments.x, 0.0);
 	float var_s = max(moments.w - moments.z * moments.z, 0.0);

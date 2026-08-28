@@ -158,9 +158,9 @@ private:
 		uint32_t area_light_count;
 		int32_t full_screen_size[2];
 		uint32_t depth_scale;
+		uint32_t reservoir_count;
+		uint32_t flags; // 1: light guiding, 2: screen traces.
 		uint32_t pad0;
-		uint32_t pad1;
-		uint32_t pad2;
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 
@@ -226,6 +226,20 @@ private:
 	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry);
 
 public:
+	// Live quality settings for the stochastic pass, read from the project
+	// settings every frame so changes apply without a restart.
+	struct StochasticQuality {
+		uint32_t rays_per_pixel = 4; // Reservoir count, 1..8.
+		bool half_resolution = false;
+		bool light_guiding = true; // Visible light list sample guiding.
+		bool screen_traces = true; // Screen-space contact traces.
+		float ray_bias = 0.08f;
+		bool denoise = true;
+		uint32_t temporal_frames = 16; // Accumulation cap.
+		int32_t spatial_stride = 2;
+		float variance_threshold = 0.02f;
+	};
+
 	// Rebuilds the TLAS from the frame's instances.
 	// Returns false if there is no geometry to trace against.
 	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances);
@@ -245,7 +259,7 @@ public:
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, bool p_half_resolution);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }

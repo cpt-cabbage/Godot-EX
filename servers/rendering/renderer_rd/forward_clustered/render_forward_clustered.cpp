@@ -1735,8 +1735,33 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+void RenderForwardClustered::_update_ray_tracing_settings() {
+	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	use_raytraced_shadows = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
+	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
+	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
+	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
+
+	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
+	stochastic_quality.half_resolution = use_stochastic_half_res;
+	stochastic_quality.light_guiding = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/light_guiding");
+	stochastic_quality.screen_traces = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces");
+	stochastic_quality.ray_bias = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/ray_bias");
+	stochastic_quality.denoise = GLOBAL_GET("rendering/ray_tracing/denoiser/enabled");
+	stochastic_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/denoiser/temporal_frames"));
+	stochastic_quality.spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/denoiser/spatial_stride"));
+	stochastic_quality.variance_threshold = GLOBAL_GET("rendering/ray_tracing/denoiser/variance_threshold");
+
+	// Lazily create the ray tracing backend the first frame anything needs it.
+	if ((use_raytraced_shadows || use_stochastic_lighting) && rt_shadows == nullptr) {
+		rt_shadows = memnew(RendererRD::RaytracedShadows);
+	}
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
+
+	_update_ray_tracing_settings();
 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -2217,7 +2242,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
-	if (rt_shadows != nullptr && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
+	if (rb_data.is_valid() && !is_reflection_probe && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) && !use_raytraced_shadows) {
+		// Toggled off this frame: drop the context so stale masks are not
+		// sampled (the scene shader falls back to its white/black defaults).
+		rb->clear_context(RB_SCOPE_RT_SHADOWS);
+	} else if (rb_data.is_valid() && !is_reflection_probe && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE) && !use_stochastic_lighting) {
+		rb->clear_context(RB_SCOPE_RT_SHADOWS);
+	}
+
+	if (rt_shadows != nullptr && (use_raytraced_shadows || use_stochastic_lighting) && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
 		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 		// Find the first directional and first area light to trace shadows for.
 		Vector3 to_sun;
@@ -2227,7 +2260,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		Vector3 area_axis_u;
 		Vector3 area_axis_v;
 		bool has_area = false;
-		for (uint64_t i = 0; i < p_render_data->lights->size(); i++) {
+		for (uint64_t i = 0; use_raytraced_shadows && i < p_render_data->lights->size(); i++) {
 			RID light_instance = (*p_render_data->lights)[i];
 			RID light = light_storage->light_instance_get_base_light(light_instance);
 			RSE::LightType type = light_storage->light_get_type(light);
@@ -2276,7 +2309,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
-							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, use_stochastic_half_res);
+							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, stochastic_quality);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -5415,12 +5448,6 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
-	use_stochastic_lighting = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/enabled");
-	use_stochastic_half_res = GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/half_resolution");
-	use_stochastic_fog_shadows = GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/volumetric_fog_shadows");
-	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && (use_stochastic_lighting || bool(GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")))) {
-		rt_shadows = memnew(RendererRD::RaytracedShadows);
-	}
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);

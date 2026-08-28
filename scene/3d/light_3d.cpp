@@ -345,6 +345,20 @@ void Light3D::_validate_property(PropertyInfo &p_property) const {
 	} else if (get_light_type() == RSE::LIGHT_AREA && p_property.name == "light_projector") {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
+
+	// When ray-traced paths own this light's shadows, the shadow-map-only
+	// tuning properties do nothing: hide them so the inspector shows only
+	// what actually has an effect (shadow_enabled, shadow_opacity and the
+	// light size / angular distance still apply - they drive the rays).
+	bool rt_local = GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/stochastic_direct_lighting/enabled") && get_light_type() != RSE::LIGHT_DIRECTIONAL;
+	bool rt_sun = GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/raytraced_shadows/enabled") && get_light_type() == RSE::LIGHT_DIRECTIONAL;
+	if (rt_local || rt_sun) {
+		if (p_property.name == "shadow_bias" || p_property.name == "shadow_normal_bias" || p_property.name == "shadow_transmittance_bias" ||
+				p_property.name == "shadow_blur" || p_property.name == "shadow_reverse_cull_face" || p_property.name == "shadow_caster_mask" ||
+				p_property.name.begins_with("directional_shadow_")) {
+			p_property.usage = PROPERTY_USAGE_NONE;
+		}
+	}
 }
 
 void Light3D::_bind_methods() {

@@ -518,7 +518,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->compute_list_end();
 }
 
-void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, bool p_half_resolution) {
+void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality) {
 	ERR_FAIL_COND(tlas.is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cluster_buffer.is_null());
@@ -529,8 +529,17 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// The paper's downsampled sampling: all stochastic targets at half
 	// resolution, with a depth-aware upsample in the scene shader composite.
 	Size2i full_size = p_render_buffers->get_internal_size();
-	uint32_t depth_scale = p_half_resolution ? 2 : 1;
-	Size2i size = p_half_resolution ? Size2i((full_size.x + 1) / 2, (full_size.y + 1) / 2) : full_size;
+	uint32_t depth_scale = p_quality.half_resolution ? 2 : 1;
+	Size2i size = p_quality.half_resolution ? Size2i((full_size.x + 1) / 2, (full_size.y + 1) / 2) : full_size;
+
+	// The resolution setting is live: drop the whole context when the target
+	// size changed so everything is recreated at the new size.
+	if (p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE)) {
+		RD::TextureFormat tf = p_render_buffers->get_texture_format(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE);
+		if (tf.width != (uint32_t)size.x || tf.height != (uint32_t)size.y) {
+			p_render_buffers->clear_context(RB_SCOPE_RT_SHADOWS);
+		}
+	}
 
 	if (!p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE)) {
 		// Lighting in packed floats (the paper's format), frame counts and
@@ -621,7 +630,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	params.omni_light_count = p_omni_light_count;
 	params.spot_light_count = p_spot_light_count;
 	params.frame_index = frame_index;
-	params.ray_bias = 0.08f;
+	params.ray_bias = p_quality.ray_bias;
 	params.tiles_x = tiles.x;
 	params.tiles_y = tiles.y;
 	params.cluster_shift = Math::get_shift_from_power_of_2(p_cluster_size);
@@ -637,6 +646,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	params.full_screen_size[0] = full_size.x;
 	params.full_screen_size[1] = full_size.y;
 	params.depth_scale = depth_scale;
+	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 8u);
+	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0);
 	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
@@ -717,10 +728,13 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	denoise_push_constant.screen_size[0] = size.x;
 	denoise_push_constant.screen_size[1] = size.y;
-	denoise_push_constant.blend_alpha = 0.06f; // Caps accumulation at ~16 frames.
+	denoise_push_constant.blend_alpha = 1.0f / float(MAX(p_quality.temporal_frames, 1u));
 	denoise_push_constant.depth_tolerance = 0.05f;
-	denoise_push_constant.variance_threshold = 0.02f;
-	denoise_push_constant.stride = 2;
+	// A huge threshold is the denoiser-off sentinel: the temporal pass then
+	// keeps only the current frame and the spatial pass passes through.
+	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
+	denoise_push_constant.blend_alpha = p_quality.denoise ? denoise_push_constant.blend_alpha : 1.0f;
+	denoise_push_constant.stride = p_quality.spatial_stride;
 	denoise_push_constant.depth_scale = (int32_t)depth_scale;
 
 	// Temporal pass.

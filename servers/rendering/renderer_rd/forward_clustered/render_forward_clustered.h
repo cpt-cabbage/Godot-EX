@@ -756,9 +756,15 @@ private:
 	RendererRD::FSR2Effect *fsr2_effect = nullptr;
 	RendererRD::SSEffects *ss_effects = nullptr;
 	RendererRD::RaytracedShadows *rt_shadows = nullptr;
+	bool use_raytraced_shadows = false;
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
 	bool use_stochastic_fog_shadows = false;
+	RendererRD::RaytracedShadows::StochasticQuality stochastic_quality;
+
+	// Reads the live ray tracing project settings (called once per frame) and
+	// lazily creates the ray tracing backend when first enabled.
+	void _update_ray_tracing_settings();
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;

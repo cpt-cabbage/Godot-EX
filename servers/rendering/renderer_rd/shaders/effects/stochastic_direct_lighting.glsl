@@ -63,11 +63,14 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	// 2 when sampling at half resolution (screen_size is then the half size
 	// and every depth / normal / cluster lookup scales up to full pixels).
 	uint depth_scale;
+	uint reservoir_count; // Rays per pixel, 1..MAX_RESERVOIRS.
+	uint flags; // FLAG_*.
 	uint pad0;
-	uint pad1;
-	uint pad2;
 }
 params;
+
+#define FLAG_LIGHT_GUIDING 1u
+#define FLAG_SCREEN_TRACES 2u
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -105,7 +108,7 @@ layout(set = 1, binding = 3, r8) uniform restrict writeonly image2D out_meta;
 // View depth of the lit texel, for the half-resolution upsample.
 layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_depth;
 
-#define RESERVOIR_COUNT 4u
+#define MAX_RESERVOIRS 8u
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
@@ -432,7 +435,7 @@ void main() {
 	// up as an 8 pixel grid.
 	uint visible_list[LIST_SIZE];
 	uint visible_count = 0u;
-	{
+	if ((params.flags & FLAG_LIGHT_GUIDING) != 0u) {
 		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		if (prev_ndc.w > 0.0) {
 			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
@@ -576,9 +579,9 @@ void main() {
 		}
 	}
 
-	Reservoir reservoirs[RESERVOIR_COUNT];
-	float rngs[RESERVOIR_COUNT];
-	for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
+	Reservoir reservoirs[MAX_RESERVOIRS];
+	float rngs[MAX_RESERVOIRS];
+	for (uint r = 0u; r < params.reservoir_count; r++) {
 		reservoirs[r].candidate = INVALID_LIGHT;
 		reservoirs[r].weight_sum = 0.0;
 		reservoirs[r].selected_weight = 0.0;
@@ -588,7 +591,7 @@ void main() {
 		rngs[r] = min(stbn_sample(pixel, r).r, 0.9999999);
 	}
 	for (uint i = 0u; i < candidate_count; i++) {
-		for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
+		for (uint r = 0u; r < params.reservoir_count; r++) {
 			reservoir_update(reservoirs[r], i, candidate_weights[i], rngs[r]);
 		}
 	}
@@ -598,9 +601,9 @@ void main() {
 
 	// Trace each unique selected light once (reservoirs frequently agree when
 	// few lights dominate; duplicate rays would hit the same target).
-	uint traced_candidates[RESERVOIR_COUNT];
-	bool traced_visible[RESERVOIR_COUNT];
-	uint traced_quadrant[RESERVOIR_COUNT];
+	uint traced_candidates[MAX_RESERVOIRS];
+	float traced_visibility[MAX_RESERVOIRS];
+	uint traced_quadrant[MAX_RESERVOIRS];
 	uint traced_count = 0u;
 
 	// Ratio estimator: the rays only measure what fraction of the (RIS
@@ -614,13 +617,13 @@ void main() {
 	float vis_num_s = 0.0;
 	float vis_den_s = 0.0;
 	// Per-unique-light visible energy, for the shading confidence heuristic.
-	float traced_energy[RESERVOIR_COUNT];
-	for (uint t = 0u; t < RESERVOIR_COUNT; t++) {
+	float traced_energy[MAX_RESERVOIRS];
+	for (uint t = 0u; t < MAX_RESERVOIRS; t++) {
 		traced_energy[t] = 0.0;
 	}
 	uint chosen_visible_light = INVALID_LIGHT;
 	uint visible_found = 0u;
-	for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
+	for (uint r = 0u; r < params.reservoir_count; r++) {
 		uint c = reservoirs[r].candidate;
 		if (c == INVALID_LIGHT) {
 			continue;
@@ -635,13 +638,13 @@ void main() {
 		vec3 f, s;
 		entry_eval(entry, view_pos, view_normal, roughness, f, s);
 
-		bool visible = false;
+		float visibility = 1.0;
 		uint quadrant = 0u;
 		uint slot = 0u;
 		bool found = false;
 		for (uint t = 0u; t < traced_count; t++) {
 			if (traced_candidates[t] == c) {
-				visible = traced_visible[t];
+				visibility = traced_visibility[t];
 				quadrant = traced_quadrant[t];
 				slot = t;
 				found = true;
@@ -683,15 +686,37 @@ void main() {
 			} else {
 				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
 				view_target = ld.position;
+				// Light size drives the penumbra: sample a disk of that
+				// radius perpendicular to the shadow ray, like the paper's
+				// area sampling but for the sphere approximation.
+				if (ld.size > 0.0) {
+					vec3 dir = normalize(view_target - view_pos);
+					vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+					vec3 tangent = normalize(cross(up, dir));
+					vec3 bitangent = cross(dir, tangent);
+					vec2 rnd = stbn_sample(pixel, 6u);
+					float ang = rnd.x * 6.2831853;
+					float rad = sqrt(rnd.y) * ld.size;
+					view_target += (tangent * cos(ang) + bitangent * sin(ang)) * rad;
+				}
 			}
-			if (screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
-				visible = false;
+			// The light's own shadow settings: shadows disabled skips the ray
+			// entirely, partial opacity blends toward unshadowed.
+			float shadow_opacity = ((entry & AREA_BIT) != 0u ? area_lights.data[entry & ENTRY_ID_MASK].shadow_opacity : ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].shadow_opacity : omni_lights.data[entry & ENTRY_ID_MASK].shadow_opacity));
+			if (shadow_opacity < 0.001) {
+				visibility = 1.0;
 			} else {
-				vec3 world_light = world_pos + world_basis * (view_target - view_pos);
-				visible = trace_visible(world_pos, world_light);
+				bool occluded;
+				if ((params.flags & FLAG_SCREEN_TRACES) != 0u && screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
+					occluded = true;
+				} else {
+					vec3 world_light = world_pos + world_basis * (view_target - view_pos);
+					occluded = !trace_visible(world_pos, world_light);
+				}
+				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			}
 			traced_candidates[traced_count] = c;
-			traced_visible[traced_count] = visible;
+			traced_visibility[traced_count] = visibility;
 			traced_quadrant[traced_count] = quadrant;
 			slot = traced_count;
 			traced_count++;
@@ -699,17 +724,17 @@ void main() {
 
 		// RIS estimator weight_sum / selected_weight, averaged over the
 		// reservoirs and clamped to bound variance.
-		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
+		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(params.reservoir_count);
 		float lum_d = luminance(f);
 		float lum_s = luminance(s);
 		vis_den_d += estimator * lum_d;
 		vis_den_s += estimator * lum_s;
-		if (!visible) {
+		if (visibility <= 0.0) {
 			continue;
 		}
-		vis_num_d += estimator * lum_d;
-		vis_num_s += estimator * lum_s;
-		traced_energy[slot] += estimator * (lum_d + lum_s);
+		vis_num_d += estimator * lum_d * visibility;
+		vis_num_s += estimator * lum_s * visibility;
+		traced_energy[slot] += estimator * (lum_d + lum_s) * visibility;
 
 		// Pick one visible light uniformly to seed next frame's tile list;
 		// area lights record which rect quadrant the ray reached.
