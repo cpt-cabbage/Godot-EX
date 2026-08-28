@@ -758,6 +758,7 @@ private:
 	RendererRD::RaytracedShadows *rt_shadows = nullptr;
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
+	bool use_stochastic_fog_shadows = false;
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;

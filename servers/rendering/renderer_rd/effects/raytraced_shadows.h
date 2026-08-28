@@ -250,6 +250,9 @@ public:
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
 
+	// The frame's acceleration structure (for consumers like volumetric fog).
+	RID get_tlas() const { return tlas; }
+
 	RaytracedShadows();
 	~RaytracedShadows();
 };

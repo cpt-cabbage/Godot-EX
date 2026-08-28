@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_default.h"
 
@@ -317,6 +318,8 @@ ALBEDO = vec3(1.0);
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_FILTER\n", false));
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_FOG\n", false));
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_COPY\n", false));
+				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_DENSITY\n#define USE_RAY_QUERY\n", false));
+				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_DENSITY\n#define ENABLE_SDFGI\n#define USE_RAY_QUERY\n", false));
 				shader_group++;
 			}
 		}
@@ -324,8 +327,19 @@ ALBEDO = vec3(1.0);
 		volumetric_fog.process_shader.initialize(volumetric_fog_modes, defines);
 		volumetric_fog.process_shader.enable_group(_get_fog_shader_group());
 
+		bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+		if (!supports_ray_query) {
+			for (int group = 0; group < 4; group++) {
+				volumetric_fog.process_shader.set_variant_enabled(group * VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_MAX + VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RQ, false);
+				volumetric_fog.process_shader.set_variant_enabled(group * VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_MAX + VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI_RQ, false);
+			}
+		}
+
 		volumetric_fog.process_shader_version = volumetric_fog.process_shader.version_create();
 		for (int i = 0; i < VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_MAX; i++) {
+			if (!supports_ray_query && (i == VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RQ || i == VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI_RQ)) {
+				continue;
+			}
 			volumetric_fog.process_pipelines[i].create_compute_pipeline(volumetric_fog.process_shader.version_get_shader(volumetric_fog.process_shader_version, _get_fog_process_variant(i)));
 		}
 		volumetric_fog.params_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(VolumetricFogShader::ParamsUBO));
@@ -1131,6 +1145,9 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.cam_rotation[9] = p_cam_transform.basis[1][2];
 	params.cam_rotation[10] = p_cam_transform.basis[2][2];
 	params.cam_rotation[11] = 0;
+	params.cam_origin[0] = p_cam_transform.origin.x;
+	params.cam_origin[1] = p_cam_transform.origin.y;
+	params.cam_origin[2] = p_cam_transform.origin.z;
 	params.filter_axis = 0;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
@@ -1173,12 +1190,24 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
-	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, volumetric_fog.process_pipelines[using_sdfgi ? VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI : VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY].get_rid());
+	bool use_ray_query = p_settings.tlas.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	int density_shader;
+	if (use_ray_query) {
+		density_shader = using_sdfgi ? VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI_RQ : VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RQ;
+	} else {
+		density_shader = using_sdfgi ? VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI : VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY;
+	}
+	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, volumetric_fog.process_pipelines[density_shader].get_rid());
 
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, fog->gi_dependent_sets.process_uniform_set_density, 0);
 
 	if (using_sdfgi) {
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, fog->sdfgi_uniform_set, 1);
+	}
+	if (use_ray_query) {
+		RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ p_settings.tlas }));
+		RID rq_shader = volumetric_fog.process_shader.version_get_shader(volumetric_fog.process_shader_version, _get_fog_process_variant(density_shader));
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(rq_shader, 2, u_tlas), 2);
 	}
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, fog->width, fog->height, fog->depth);
 	RD::get_singleton()->compute_list_add_barrier(compute_list);

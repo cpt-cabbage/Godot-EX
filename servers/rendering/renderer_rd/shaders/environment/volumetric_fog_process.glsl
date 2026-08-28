@@ -1,8 +1,12 @@
 #[compute]
 
-#version 450
+#version 460
 
 #VERSION_DEFINES
+
+#ifdef USE_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 #ifdef USE_VULKAN_MEMORY_MODEL
 #pragma use_vulkan_memory_model
@@ -191,6 +195,9 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	mat4 to_prev_view;
 
 	mat3 radiance_inverse_xform;
+
+	vec3 cam_origin;
+	float pad_rq;
 }
 params;
 #ifndef MODE_COPY
@@ -220,6 +227,41 @@ layout(set = 0, binding = 20) uniform texture2D sky_texture;
 #endif // MODE_COPY
 
 layout(set = 0, binding = 21) uniform texture2D area_light_atlas;
+
+#ifdef USE_RAY_QUERY
+// Stochastic ray-traced fog shadows (mini-MegaLights): instead of sampling
+// shadow maps, each froxel accumulates its local light in-scatter analytically
+// while reservoir-sampling one light proportionally to its contribution, then
+// traces a single ray to that light and applies its visibility to the whole
+// local sum (a one-sample ratio estimate; the fog's temporal reprojection
+// averages it over frames).
+layout(set = 2, binding = 0) uniform accelerationStructureEXT tlas;
+
+vec3 rq_local_light = vec3(0.0);
+float rq_weight_sum = 0.0;
+vec3 rq_selected_pos = vec3(0.0);
+float rq_rng = 0.0;
+
+uint rq_pcg_hash(uint v) {
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+void rq_accumulate(vec3 contrib, vec3 light_pos) {
+	rq_local_light += contrib;
+	float w = max(dot(contrib, vec3(0.2126, 0.7152, 0.0722)), 1e-8);
+	rq_weight_sum += w;
+	float p = w / rq_weight_sum;
+	if (rq_rng < p) {
+		rq_selected_pos = light_pos;
+		rq_rng = rq_rng / p;
+	} else {
+		rq_rng = (rq_rng - p) / (1.0 - p);
+	}
+	rq_rng = clamp(rq_rng, 0.0, 0.9999999);
+}
+#endif // USE_RAY_QUERY
 
 float get_depth_at_pos(float cell_depth_size, int z) {
 	float d = float(z) * cell_depth_size + cell_depth_size * 0.5; //center of voxels
@@ -365,6 +407,11 @@ void main() {
 
 	vec3 total_light = vec3(0.0);
 
+#ifdef USE_RAY_QUERY
+	uint rq_seed = rq_pcg_hash(uint(pos.x) + rq_pcg_hash(uint(pos.y) + rq_pcg_hash(uint(pos.z) + rq_pcg_hash(params.temporal_frame))));
+	rq_rng = float(rq_seed & 0x00FFFFFFu) / float(0x01000000u);
+#endif
+
 	float total_density = params.base_density;
 #ifdef NO_IMAGE_ATOMICS
 	uint local_density = density_only_map[lpos];
@@ -496,6 +543,7 @@ void main() {
 
 						vec3 light = omni_lights.data[light_index].color;
 
+#ifndef USE_RAY_QUERY
 						if (omni_lights.data[light_index].shadow_opacity > 0.001) {
 							//has shadow
 							vec4 uv_rect = omni_lights.data[light_index].atlas_rect;
@@ -522,7 +570,13 @@ void main() {
 
 							shadow_attenuation = mix(1.0 - omni_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / omni_lights.data[light_index].inv_radius * INV_FOG_FADE));
 						}
-						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
+#endif // !USE_RAY_QUERY
+						vec3 contrib = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
+#ifdef USE_RAY_QUERY
+						rq_accumulate(contrib, light_pos);
+#else
+						total_light += contrib;
+#endif
 					}
 				}
 			}
@@ -570,6 +624,7 @@ void main() {
 
 						vec3 light = spot_lights.data[light_index].color;
 
+#ifndef USE_RAY_QUERY
 						if (spot_lights.data[light_index].shadow_opacity > 0.001) {
 							//has shadow
 							vec4 uv_rect = spot_lights.data[light_index].atlas_rect;
@@ -587,7 +642,13 @@ void main() {
 
 							shadow_attenuation = mix(1.0 - spot_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / spot_lights.data[light_index].inv_radius * INV_FOG_FADE));
 						}
-						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
+#endif // !USE_RAY_QUERY
+						vec3 contrib = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
+#ifdef USE_RAY_QUERY
+						rq_accumulate(contrib, light_pos);
+#else
+						total_light += contrib;
+#endif
 					}
 				}
 			}
@@ -667,6 +728,7 @@ void main() {
 							attenuation *= ltc_diffuse * cutoff;
 							vec3 light_color = area_lights.data[light_index].color * texture_color;
 
+	#ifndef USE_RAY_QUERY
 							if (area_lights.data[light_index].shadow_opacity > 0.001) {
 								//has shadow
 								vec4 uv_rect = area_lights.data[light_index].atlas_rect;
@@ -688,16 +750,45 @@ void main() {
 
 								shadow_attenuation = mix(1.0 - area_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / inv_center_range * INV_FOG_FADE));
 							}
+#endif // !USE_RAY_QUERY
 							float cos_theta = 0.0;
 							if (dot(light_rel_vec, light_rel_vec) > EPSILON) {
 								cos_theta = dot(normalize(light_rel_vec), normalize(view_pos));
 							}
-							total_light += light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
+							vec3 contrib = light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
+#ifdef USE_RAY_QUERY
+							rq_accumulate(contrib, closest_point_on_light);
+#else
+							total_light += contrib;
+#endif
 						}
 					}
 				}
 			}
 		}
+
+#ifdef USE_RAY_QUERY
+		// Resolve the froxel's local light with one visibility ray toward the
+		// contribution-sampled light.
+		if (rq_weight_sum > 0.0) {
+			mat3 rq_rot = mat3(params.cam_rotation);
+			vec3 rq_world_origin = rq_rot * view_pos + params.cam_origin;
+			vec3 rq_world_target = rq_rot * rq_selected_pos + params.cam_origin;
+			vec3 rq_delta = rq_world_target - rq_world_origin;
+			float rq_dist = length(rq_delta);
+			if (rq_dist > 0.1) {
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, tlas,
+						gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+						0xFF, rq_world_origin, 0.05, rq_delta / rq_dist, rq_dist - 0.05);
+				rayQueryProceedEXT(rq);
+				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					rq_local_light = vec3(0.0);
+				}
+			}
+			total_light += rq_local_light;
+		}
+#endif // USE_RAY_QUERY
 
 		vec3 world_pos = mat3(params.cam_rotation) * view_pos;
 

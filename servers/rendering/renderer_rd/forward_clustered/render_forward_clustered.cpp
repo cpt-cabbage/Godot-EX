@@ -1404,6 +1404,10 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
 		settings.directional_shadow_depth = RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture();
 		settings.directional_light_buffer = RendererRD::LightStorage::get_singleton()->get_directional_light_buffer();
+		// Ray-traced fog shadows through the stochastic lighting TLAS (this is
+		// last frame's TLAS: fog updates before the pre-opaque TLAS rebuild,
+		// which is fine for a low-frequency volume).
+		settings.tlas = (use_stochastic_lighting && use_stochastic_fog_shadows && rt_shadows != nullptr) ? rt_shadows->get_tlas() : RID();
 
 		settings.vfog = fog;
 		settings.cluster_builder = rb_data->cluster_builder;
@@ -5413,6 +5417,7 @@ RenderForwardClustered::RenderForwardClustered() {
 	ss_effects = memnew(RendererRD::SSEffects);
 	use_stochastic_lighting = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/enabled");
 	use_stochastic_half_res = GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/half_resolution");
+	use_stochastic_fog_shadows = GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/volumetric_fog_shadows");
 	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && (use_stochastic_lighting || bool(GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")))) {
 		rt_shadows = memnew(RendererRD::RaytracedShadows);
 	}

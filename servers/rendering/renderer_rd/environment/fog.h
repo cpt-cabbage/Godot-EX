@@ -144,6 +144,10 @@ private:
 			VOLUMETRIC_FOG_PROCESS_SHADER_FILTER,
 			VOLUMETRIC_FOG_PROCESS_SHADER_FOG,
 			VOLUMETRIC_FOG_PROCESS_SHADER_COPY,
+			// Ray-query variants: local light scattering shadowed by tracing
+			// the stochastic direct lighting TLAS instead of shadow maps.
+			VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RQ,
+			VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI_RQ,
 			VOLUMETRIC_FOG_PROCESS_SHADER_MAX,
 		};
 
@@ -188,6 +192,9 @@ private:
 			float cam_rotation[12];
 			float to_prev_view[16];
 			float radiance_inverse_xform[12];
+
+			float cam_origin[3];
+			float pad_rq;
 		};
 
 		VolumetricFogProcessShaderRD process_shader;
@@ -361,6 +368,9 @@ public:
 		RID area_light_atlas;
 		RID directional_shadow_depth;
 		RID directional_light_buffer;
+		// Optional acceleration structure for ray-traced local light
+		// visibility in the fog (stochastic direct lighting's TLAS).
+		RID tlas;
 
 		// Objects related to our render buffer
 		Ref<VolumetricFog> vfog;
