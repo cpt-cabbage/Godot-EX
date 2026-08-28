@@ -121,6 +121,9 @@ void main() {
 	vec3 result_specular = current_specular;
 	vec4 moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	float frames = 1.0;
+	// Shading confidence from the sampling pass (share of energy carried by
+	// the strongest single light), carried in the specular history alpha.
+	float dominance = texelFetch(in_diffuse, pixel, 0).a;
 
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(params.screen_size);
 	vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, center_depth, 1.0);
@@ -146,11 +149,12 @@ void main() {
 			result_diffuse = mix(hist_d, current_diffuse, alpha);
 			result_specular = mix(hist_s, current_specular, alpha);
 			moments = mix(hist_moments, moments, alpha);
+			dominance = mix(hist_s4.a, dominance, alpha);
 		}
 	}
 
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, frames));
-	imageStore(out_specular, pixel, vec4(result_specular, frames));
+	imageStore(out_specular, pixel, vec4(result_specular, dominance));
 	imageStore(out_moments, pixel, moments);
 }
 
@@ -177,12 +181,16 @@ void main() {
 
 	// Only filter where the signal is actually noisy relative to its
 	// magnitude; elsewhere the temporal result is already converged and
-	// filtering would only cost sharpness.
+	// filtering would only cost sharpness. Also skip where a single light
+	// carried ~80%+ of the energy (shading confidence): its shadow signal is
+	// nearly binary, converges fast temporally, and spatial filtering would
+	// only soften the edge.
 	float rel_d = var_d / max(moments.x * moments.x, 1e-6);
 	float rel_s = var_s / max(moments.z * moments.z, 1e-6);
 	float frames = center_d4.a;
+	float dominance = center_s4.a;
 	bool newly_revealed = frames < 4.0;
-	if (!newly_revealed && max(rel_d, rel_s) < params.variance_threshold) {
+	if (!newly_revealed && (max(rel_d, rel_s) < params.variance_threshold || (dominance > 0.8 && frames >= 8.0))) {
 		imageStore(out_diffuse, pixel, center_d4);
 		imageStore(out_specular, pixel, center_s4);
 		return;
@@ -196,6 +204,12 @@ void main() {
 	// kernel and ignore the luminance stopping function for a few frames.
 	int stride = newly_revealed ? params.stride * 2 : params.stride;
 
+	// Rotate the sparse kernel per pixel so its footprint does not imprint a
+	// grid pattern on the result; the rotation is static (not per frame) to
+	// avoid shimmer after temporal accumulation.
+	float angle = fract(dot(vec2(pixel), vec2(0.7548776662, 0.5698402909))) * 6.2831853;
+	mat2 rot = mat2(vec2(cos(angle), -sin(angle)), vec2(sin(angle), cos(angle)));
+
 	vec3 sum_d = center_d4.rgb;
 	vec3 sum_s = center_s4.rgb;
 	float weight_d = 1.0;
@@ -206,7 +220,7 @@ void main() {
 			if (x == 0 && y == 0) {
 				continue;
 			}
-			ivec2 sp = clamp(pixel + ivec2(x, y) * stride, ivec2(0), params.screen_size - 1);
+			ivec2 sp = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride)))), ivec2(0), params.screen_size - 1);
 			float sd = texelFetch(depth_texture, sp, 0).r;
 			if (sd == 0.0) {
 				continue;
@@ -242,7 +256,7 @@ void main() {
 	}
 
 	imageStore(out_diffuse, pixel, vec4(sum_d / weight_d, frames));
-	imageStore(out_specular, pixel, vec4(sum_s / weight_s, frames));
+	imageStore(out_specular, pixel, vec4(sum_s / weight_s, dominance));
 }
 
 #endif

@@ -449,6 +449,12 @@ void main() {
 	float guided_weight_sum = 0.0;
 	// Total unshadowed luminance estimate, for the sample culling threshold.
 	float total_lum = 0.0;
+	// Analytic unshadowed light sum over the candidate set (with the stride
+	// multiplier this is an unbiased estimate of the whole cell's lighting).
+	// Shading is separable: this analytic factor carries the full-quality
+	// lighting detail, and the rays only estimate a visibility ratio.
+	vec3 analytic_diffuse = vec3(0.0);
+	vec3 analytic_specular = vec3(0.0);
 	for (uint i = 0u; i < visible_count && candidate_count < MAX_GUIDED_CANDIDATES; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
@@ -463,6 +469,8 @@ void main() {
 		candidate_lum[candidate_count] = lum;
 		guided_weight_sum += w;
 		total_lum += lum;
+		analytic_diffuse += f;
+		analytic_specular += s;
 		candidate_count++;
 	}
 	uint guided_count = candidate_count;
@@ -529,6 +537,8 @@ void main() {
 					candidate_weights[candidate_count] = w * stride_mult;
 					candidate_lum[candidate_count] = lum;
 					total_lum += lum * stride_mult;
+					analytic_diffuse += f * stride_mult;
+					analytic_specular += s * stride_mult;
 					candidate_count++;
 				}
 			}
@@ -581,8 +591,21 @@ void main() {
 	uint traced_quadrant[RESERVOIR_COUNT];
 	uint traced_count = 0u;
 
-	vec3 diffuse = vec3(0.0);
-	vec3 specular = vec3(0.0);
+	// Ratio estimator: the rays only measure what fraction of the (RIS
+	// estimated) unshadowed luminance survives occlusion; the analytic
+	// candidate sum carries the lighting itself. The estimator clamp appears
+	// in numerator and denominator alike, so its bias largely cancels, and
+	// culled samples simply drop out of the ratio instead of counting as
+	// shadowed.
+	float vis_num_d = 0.0;
+	float vis_den_d = 0.0;
+	float vis_num_s = 0.0;
+	float vis_den_s = 0.0;
+	// Per-unique-light visible energy, for the shading confidence heuristic.
+	float traced_energy[RESERVOIR_COUNT];
+	for (uint t = 0u; t < RESERVOIR_COUNT; t++) {
+		traced_energy[t] = 0.0;
+	}
 	uint chosen_visible_light = INVALID_LIGHT;
 	uint visible_found = 0u;
 	for (uint r = 0u; r < RESERVOIR_COUNT; r++) {
@@ -602,11 +625,13 @@ void main() {
 
 		bool visible = false;
 		uint quadrant = 0u;
+		uint slot = 0u;
 		bool found = false;
 		for (uint t = 0u; t < traced_count; t++) {
 			if (traced_candidates[t] == c) {
 				visible = traced_visible[t];
 				quadrant = traced_quadrant[t];
+				slot = t;
 				found = true;
 				break;
 			}
@@ -656,11 +681,23 @@ void main() {
 			traced_candidates[traced_count] = c;
 			traced_visible[traced_count] = visible;
 			traced_quadrant[traced_count] = quadrant;
+			slot = traced_count;
 			traced_count++;
 		}
+
+		// RIS estimator weight_sum / selected_weight, averaged over the
+		// reservoirs and clamped to bound variance.
+		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
+		float lum_d = luminance(f);
+		float lum_s = luminance(s);
+		vis_den_d += estimator * lum_d;
+		vis_den_s += estimator * lum_s;
 		if (!visible) {
 			continue;
 		}
+		vis_num_d += estimator * lum_d;
+		vis_num_s += estimator * lum_s;
+		traced_energy[slot] += estimator * (lum_d + lum_s);
 
 		// Pick one visible light uniformly to seed next frame's tile list;
 		// area lights record which rect quadrant the ray reached.
@@ -671,15 +708,27 @@ void main() {
 				chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
 			}
 		}
-
-		// RIS estimator f * (weight_sum / selected_weight), averaged over the
-		// reservoirs and clamped to bound variance.
-		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(RESERVOIR_COUNT);
-		diffuse += f * estimator;
-		specular += s * estimator;
 	}
 
-	imageStore(out_diffuse, pixel, vec4(diffuse, 1.0));
+	float ratio_d = vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0;
+	float ratio_s = vis_den_s > 0.0 ? vis_num_s / vis_den_s : 0.0;
+	vec3 diffuse = analytic_diffuse * ratio_d;
+	vec3 specular = analytic_specular * ratio_s;
+
+	// Shading confidence: the share of visible energy carried by the single
+	// strongest light. Where one light dominates, the shadow signal is nearly
+	// binary and converges fast temporally; the denoiser skips its spatial
+	// filter there to keep the edge (the paper's ~80% heuristic).
+	float visible_energy = vis_num_d + vis_num_s;
+	float dominance = 0.0;
+	if (visible_energy > 0.0) {
+		for (uint t = 0u; t < traced_count; t++) {
+			dominance = max(dominance, traced_energy[t]);
+		}
+		dominance /= visible_energy;
+	}
+
+	imageStore(out_diffuse, pixel, vec4(diffuse, dominance));
 	imageStore(out_specular, pixel, vec4(specular, 1.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 }
