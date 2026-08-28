@@ -1738,6 +1738,7 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 	use_raytraced_shadows = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
+	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/rays_per_pixel"));
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
@@ -2256,19 +2257,29 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		Vector3 to_sun;
 		float tan_half_angle = 0.0f;
 		bool has_sun = false;
+		uint32_t sun_caster_mask = 0xFF;
 		Vector3 area_pos;
 		Vector3 area_axis_u;
 		Vector3 area_axis_v;
 		bool has_area = false;
+		uint32_t area_caster_mask = 0xFF;
 		for (uint64_t i = 0; use_raytraced_shadows && i < p_render_data->lights->size(); i++) {
 			RID light_instance = (*p_render_data->lights)[i];
 			RID light = light_storage->light_instance_get_base_light(light_instance);
+			if (!light_storage->light_has_shadow(light)) {
+				continue; // Shadows disabled on the light: nothing to trace.
+			}
 			RSE::LightType type = light_storage->light_get_type(light);
+			// Caster mask remapped to the 8-bit instance mask hardware rays
+			// support (exact for render layers 1-8).
+			uint32_t caster = light_storage->light_get_shadow_caster_mask(light);
+			uint32_t caster_8 = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
 			if (type == RSE::LIGHT_DIRECTIONAL && !has_sun) {
 				to_sun = light_storage->light_instance_get_base_transform(light_instance).basis.get_column(2).normalized();
 				// LIGHT_PARAM_SIZE is the angular diameter in degrees for directional lights.
 				tan_half_angle = Math::tan(Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE)) * 0.5f);
 				has_sun = true;
+				sun_caster_mask = caster_8;
 			} else if (type == RSE::LIGHT_AREA && !has_area) {
 				Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
 				Vector2 area_size = light_storage->light_area_get_size(light);
@@ -2276,6 +2287,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				area_axis_u = light_transform.basis.get_column(0) * area_size.x;
 				area_axis_v = light_transform.basis.get_column(1) * area_size.y;
 				has_area = true;
+				area_caster_mask = caster_8;
 			}
 			if (has_sun && has_area) {
 				break;
@@ -2301,10 +2313,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				Projection world_from_ndc = world_from_view * view_from_ndc;
 				Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[v] * prev_view_from_world;
 				if (has_sun) {
-					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle);
+					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle, sun_caster_mask, rt_shadow_rays);
 				}
 				if (has_area) {
-					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v);
+					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v, area_caster_mask, rt_shadow_rays);
 				}
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,

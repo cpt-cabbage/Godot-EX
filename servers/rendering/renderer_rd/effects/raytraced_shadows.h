@@ -81,7 +81,7 @@ private:
 		float axis_v[4]; // Area: xyz rect V extent. w: max distance.
 		int32_t screen_size[2];
 		uint32_t frame_index;
-		uint32_t pad0;
+		uint32_t caster_mask_and_rays; // Bits 0..7 caster mask, 8..15 soft shadow rays.
 	};
 
 	enum ShaderVariant {
@@ -248,11 +248,11 @@ public:
 	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size,
 	// denoised spatially and accumulated temporally (p_reproject maps current
 	// NDC to the previous frame's NDC).
-	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle);
+	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays);
 
 	// Traces a shadow mask for one area light (its rect spans p_axis_u/p_axis_v
 	// around p_light_pos) into RB_RT_AREA_SHADOW_MASK, spatially denoised.
-	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v);
+	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays);
 
 	// Stochastic direct lighting (mini-MegaLights): samples omni/spot lights
 	// per pixel (guided by last frame's visible lights, discovering new ones

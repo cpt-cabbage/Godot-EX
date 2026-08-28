@@ -25,17 +25,21 @@ layout(push_constant, std430) uniform Params {
 #endif
 	ivec2 screen_size;
 	uint frame_index; // Varies the sampling pattern for temporal accumulation.
-	uint pad0;
+	uint caster_mask_and_rays; // Bits 0..7 caster mask, 8..15 soft shadow rays.
 }
 params;
 
-#define SOFT_SHADOW_SAMPLES 4u
+#define SOFT_SHADOW_SAMPLES max((params.caster_mask_and_rays >> 8) & 0xFFu, 1u)
 
 bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
+	uint caster_mask = params.caster_mask_and_rays & 0xFFu;
+	if (caster_mask == 0u) {
+		return false; // The light casts no shadows from any object.
+	}
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas,
 			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, p_origin, params.axis_u.w, p_dir, p_max_dist);
+			caster_mask, p_origin, params.axis_u.w, p_dir, p_max_dist);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }

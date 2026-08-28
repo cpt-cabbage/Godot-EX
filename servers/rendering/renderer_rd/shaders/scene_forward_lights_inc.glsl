@@ -1007,12 +1007,14 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 
 #ifdef RT_AREA_SHADOW_MASK_AVAILABLE
 	// Ray-traced area shadow mask (white when inactive). Currently only the
-	// first area light is traced; the mask is applied to all area lights.
+	// first area light is traced; the mask is applied to all area lights,
+	// scaled by each light's shadow opacity.
 #ifdef USE_MULTIVIEW
-	shadow = min(shadow, half(texture(sampler2DArray(rt_area_shadow_mask, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r));
+	half rt_area_mask = half(texture(sampler2DArray(rt_area_shadow_mask, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r);
 #else
-	shadow = min(shadow, half(texture(sampler2D(rt_area_shadow_mask, SAMPLER_LINEAR_CLAMP), screen_uv).r));
+	half rt_area_mask = half(texture(sampler2D(rt_area_shadow_mask, SAMPLER_LINEAR_CLAMP), screen_uv).r);
 #endif
+	shadow = min(shadow, mix(half(1.0), rt_area_mask, half(area_lights.data[idx].shadow_opacity)));
 #endif // RT_AREA_SHADOW_MASK_AVAILABLE
 
 #ifndef SHADOWS_DISABLED

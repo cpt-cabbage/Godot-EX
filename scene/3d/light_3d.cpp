@@ -354,7 +354,7 @@ void Light3D::_validate_property(PropertyInfo &p_property) const {
 	bool rt_sun = GLOBAL_GET_CACHED(bool, "rendering/ray_tracing/raytraced_shadows/enabled") && get_light_type() == RSE::LIGHT_DIRECTIONAL;
 	if (rt_local || rt_sun) {
 		if (p_property.name == "shadow_bias" || p_property.name == "shadow_normal_bias" || p_property.name == "shadow_transmittance_bias" ||
-				p_property.name == "shadow_blur" || p_property.name == "shadow_reverse_cull_face" || p_property.name == "shadow_caster_mask" ||
+				p_property.name == "shadow_blur" || p_property.name == "shadow_reverse_cull_face" || p_property.name == "omni_shadow_mode" ||
 				p_property.name.begins_with("directional_shadow_")) {
 			p_property.usage = PROPERTY_USAGE_NONE;
 		}

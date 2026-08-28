@@ -154,7 +154,10 @@ private:
 		float specular_amount;
 		float shadow_opacity;
 
-		float pad[2];
+		// Low 8 bits of the light's shadow caster mask, remapped for ray
+		// tracing (0 = light casts no shadows from any object).
+		uint32_t shadow_caster_mask;
+		float pad;
 		float atlas_rect[4]; // in omni, used for atlas uv, in spot, used for projector uv
 		float shadow_matrix[16];
 		float shadow_bias;

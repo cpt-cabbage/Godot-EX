@@ -98,6 +98,8 @@ layout(set = 0, binding = 10) uniform texture2D ltc_lut1;
 layout(set = 0, binding = 11) uniform texture2D ltc_lut2;
 layout(set = 0, binding = 12) uniform texture2D area_light_atlas;
 layout(set = 0, binding = 13) uniform sampler material_sampler;
+// Projector textures for omni/spot lights (same atlas as the scene shader).
+layout(set = 0, binding = 14) uniform texture2D decal_atlas_srgb;
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -226,9 +228,37 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 		float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
 		attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
 	}
+
+	// Projector texture, same mapping as the scene shader's analytic path
+	// (spot: perspective projection through the shadow matrix; omni: dual
+	// paraboloid). As there, the matrix is only valid while the light has
+	// shadows enabled.
+	vec3 color = ld.color;
+	if (ld.projector_rect != vec4(0.0)) {
+		if (is_spot) {
+			vec4 splane = ld.shadow_matrix * vec4(view_pos, 1.0);
+			splane /= splane.w;
+			vec2 proj_uv = splane.xy * ld.projector_rect.zw;
+			vec4 proj = textureLod(sampler2D(decal_atlas_srgb, material_sampler), proj_uv + ld.projector_rect.xy, 0.0);
+			color *= proj.rgb * proj.a;
+		} else {
+			vec3 local_v = normalize((ld.shadow_matrix * vec4(view_pos, 1.0)).xyz);
+			vec4 atlas_rect = ld.projector_rect;
+			if (local_v.z >= 0.0) {
+				atlas_rect.y += atlas_rect.w;
+			}
+			local_v.z = 1.0 + abs(local_v.z);
+			local_v.xy /= local_v.z;
+			local_v.xy = local_v.xy * 0.5 + 0.5;
+			vec2 proj_uv = local_v.xy * atlas_rect.zw;
+			vec4 proj = textureLod(sampler2D(decal_atlas_srgb, material_sampler), proj_uv + atlas_rect.xy, 0.0);
+			color *= proj.rgb * proj.a;
+		}
+	}
+
 	vec3 l = normalize(light_rel_vec);
 	float ndotl = max(dot(view_normal, l), 0.0);
-	diffuse = ld.color * (ndotl * (1.0 / M_PI) * attenuation);
+	diffuse = color * (ndotl * (1.0 / M_PI) * attenuation);
 
 	// Schlick-GGX, dielectric F0. The prepass has no albedo/metallic, so the
 	// specular is an approximation the composite cannot recover exactly.
@@ -246,7 +276,7 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	float G = (ndotl / (ndotl * (1.0 - k) + k)) * (ndotv / (ndotv * (1.0 - k) + k));
 	const float f0 = 0.04;
 	float F = f0 + (1.0 - f0) * pow(1.0 - ldoth, 5.0);
-	specular = ld.color * attenuation * ndotl * (D * G * F / max(4.0 * ndotv, 1e-4)) * ld.specular_amount;
+	specular = color * attenuation * ndotl * (D * G * F / max(4.0 * ndotv, 1e-4)) * ld.specular_amount;
 }
 
 // Unshadowed LTC diffuse and specular contribution of an area light, the
@@ -317,7 +347,7 @@ void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, ou
 	}
 }
 
-bool trace_visible(vec3 world_origin, vec3 world_target) {
+bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	vec3 delta = world_target - world_origin;
 	float dist = length(delta);
 	if (dist < 1e-4) {
@@ -326,7 +356,7 @@ bool trace_visible(vec3 world_origin, vec3 world_target) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas,
 			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, world_origin, params.ray_bias, delta / dist, dist - params.ray_bias);
+			caster_mask, world_origin, params.ray_bias, delta / dist, dist - params.ray_bias);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
 }
@@ -474,7 +504,7 @@ void main() {
 		uint entry = visible_list[i];
 		vec3 f, s;
 		entry_eval(entry, view_pos, view_normal, roughness, f, s);
-		float lum = luminance(f + s);
+		float lum = abs(luminance(f + s)); // abs: negative lights sample too.
 		float w = light_weight(lum);
 		if (w <= 0.0) {
 			continue;
@@ -543,7 +573,7 @@ void main() {
 					}
 					vec3 f, s;
 					entry_eval(entry, view_pos, view_normal, roughness, f, s);
-					float lum = luminance(f + s);
+					float lum = abs(luminance(f + s));
 					float w = light_weight(lum);
 					if (w <= 0.0) {
 						continue;
@@ -700,18 +730,34 @@ void main() {
 					view_target += (tangent * cos(ang) + bitangent * sin(ang)) * rad;
 				}
 			}
-			// The light's own shadow settings: shadows disabled skips the ray
-			// entirely, partial opacity blends toward unshadowed.
-			float shadow_opacity = ((entry & AREA_BIT) != 0u ? area_lights.data[entry & ENTRY_ID_MASK].shadow_opacity : ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].shadow_opacity : omni_lights.data[entry & ENTRY_ID_MASK].shadow_opacity));
-			if (shadow_opacity < 0.001) {
+			// The light's own shadow settings: shadows disabled (or a caster
+			// mask matching nothing) skips the ray entirely, partial opacity
+			// blends toward unshadowed, and the caster mask culls which
+			// objects can occlude this light's rays (render layers 1-8).
+			uint light_index = entry & ENTRY_ID_MASK;
+			float shadow_opacity;
+			uint caster_mask;
+			if ((entry & AREA_BIT) != 0u) {
+				shadow_opacity = area_lights.data[light_index].shadow_opacity;
+				caster_mask = area_lights.data[light_index].shadow_caster_mask;
+			} else if ((entry & SPOT_BIT) != 0u) {
+				shadow_opacity = spot_lights.data[light_index].shadow_opacity;
+				caster_mask = spot_lights.data[light_index].shadow_caster_mask;
+			} else {
+				shadow_opacity = omni_lights.data[light_index].shadow_opacity;
+				caster_mask = omni_lights.data[light_index].shadow_caster_mask;
+			}
+			if (shadow_opacity < 0.001 || caster_mask == 0u) {
 				visibility = 1.0;
 			} else {
 				bool occluded;
-				if ((params.flags & FLAG_SCREEN_TRACES) != 0u && screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
+				// Screen traces cannot honor caster masks; skip them when the
+				// light culls casters so the BVH ray decides alone.
+				if (caster_mask == 0xFFu && (params.flags & FLAG_SCREEN_TRACES) != 0u && screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
 					occluded = true;
 				} else {
 					vec3 world_light = world_pos + world_basis * (view_target - view_pos);
-					occluded = !trace_visible(world_pos, world_light);
+					occluded = !trace_visible(world_pos, world_light, caster_mask);
 				}
 				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			}
@@ -725,8 +771,8 @@ void main() {
 		// RIS estimator weight_sum / selected_weight, averaged over the
 		// reservoirs and clamped to bound variance.
 		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(params.reservoir_count);
-		float lum_d = luminance(f);
-		float lum_s = luminance(s);
+		float lum_d = abs(luminance(f));
+		float lum_s = abs(luminance(s));
 		vis_den_d += estimator * lum_d;
 		vis_den_s += estimator * lum_s;
 		if (visibility <= 0.0) {
@@ -747,8 +793,8 @@ void main() {
 		}
 	}
 
-	float ratio_d = vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0;
-	float ratio_s = vis_den_s > 0.0 ? vis_num_s / vis_den_s : 0.0;
+	float ratio_d = clamp(vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0, 0.0, 1.0);
+	float ratio_s = clamp(vis_den_s > 0.0 ? vis_num_s / vis_den_s : 0.0, 0.0, 1.0);
 	vec3 diffuse = analytic_diffuse * ratio_d;
 	vec3 specular = analytic_specular * ratio_s;
 

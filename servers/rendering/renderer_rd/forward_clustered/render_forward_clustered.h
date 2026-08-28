@@ -757,6 +757,7 @@ private:
 	RendererRD::SSEffects *ss_effects = nullptr;
 	RendererRD::RaytracedShadows *rt_shadows = nullptr;
 	bool use_raytraced_shadows = false;
+	uint32_t rt_shadow_rays = 4;
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
 	bool use_stochastic_fog_shadows = false;

@@ -1101,6 +1101,14 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		}
 		light_data.mask = light->cull_mask;
 
+		// Shadow caster mask for ray tracing, remapped to the 8-bit instance
+		// mask hardware rays support: works exactly for render layers 1-8;
+		// masks using only higher layers degrade to casting from everything.
+		{
+			uint32_t caster = light->shadow_caster_mask;
+			light_data.shadow_caster_mask = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
+		}
+
 		light_data.atlas_rect[0] = 0;
 		light_data.atlas_rect[1] = 0;
 		light_data.atlas_rect[2] = 0;

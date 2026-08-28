@@ -307,7 +307,11 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 
 		RD::AccelerationStructureInstance as_instance;
 		as_instance.transform = inst->transform;
-		as_instance.mask = 0xFF;
+		// Instance mask from the object's render layers so per-light shadow
+		// caster masks can cull rays (exact for layers 1-8; objects on only
+		// higher layers degrade to always casting).
+		uint32_t layers = inst->layer_mask & 0xFF;
+		as_instance.mask = layers != 0 ? layers : 0xFF;
 		// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
 		as_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 		as_instance.blas = entry->blas;
@@ -330,7 +334,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	return rd->tlas_build(tlas, as_instances) == OK;
 }
 
-void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle) {
+void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays) {
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -374,6 +378,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.frame_index = frame_index;
+	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
 
 	(void)view_count;
 
@@ -446,7 +451,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 }
 
-void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v) {
+void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays) {
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -483,6 +488,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.frame_index = frame_index;
+	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
 
 	RID area_shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_AREA);
 
@@ -670,6 +676,11 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	RD::Uniform u_atlas(RD::UNIFORM_TYPE_TEXTURE, 12, Vector<RID>({ area_atlas }));
 	RD::Uniform u_material_sampler(RD::UNIFORM_TYPE_SAMPLER, 13, Vector<RID>({ material_sampler }));
+	RID decal_atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
+	if (decal_atlas.is_null()) {
+		decal_atlas = ltc_lut1_texture; // Never sampled without a projector rect.
+	}
+	RD::Uniform u_decal_atlas(RD::UNIFORM_TYPE_TEXTURE, 14, Vector<RID>({ decal_atlas }));
 	RID visible_light = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, p_view, 0);
 	RID raw_meta = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_META, p_view, 0);
 	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VIEW_DEPTH, p_view, 0);
@@ -681,7 +692,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
