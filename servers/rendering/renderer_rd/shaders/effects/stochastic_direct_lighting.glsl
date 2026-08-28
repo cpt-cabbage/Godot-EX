@@ -371,14 +371,19 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 // fixed-step march is enough). The depth buffer is pixel-accurate where the
 // BVH only has render geometry with its own bias, so this adds the contact
 // occlusion that ray bias erases and fixes proxy/self-shadowing mismatches.
+//
+// Only the receiver-side half of the segment is marched: the depth buffer
+// contains geometry that does not cast shadows (lamp bulbs and shades around
+// the light being the classic case), which the BVH correctly ignores but a
+// screen march cannot tell apart. The far half is the BVH ray's job anyway.
 bool screen_trace_occluded(vec3 view_origin, vec3 view_target, float jitter) {
 	vec3 delta = view_target - view_origin;
 	float dist = length(delta);
-	if (dist < 1e-4) {
-		return false;
+	if (dist < 0.15) {
+		return false; // Too short for a meaningful march; the BVH ray decides.
 	}
 	vec3 dir = delta / dist;
-	float trace_dist = min(dist, SCREEN_TRACE_DISTANCE);
+	float trace_dist = min(dist * 0.5, SCREEN_TRACE_DISTANCE);
 	for (int i = 0; i < SCREEN_TRACE_STEPS; i++) {
 		float t = trace_dist * (float(i) + jitter + 0.5) / float(SCREEN_TRACE_STEPS);
 		vec3 p = view_origin + dir * t;
