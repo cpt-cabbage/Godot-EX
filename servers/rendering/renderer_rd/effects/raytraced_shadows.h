@@ -57,6 +57,8 @@
 #define RB_RT_STOCHASTIC_HIST_DIFFUSE_1 SNAME("stochastic_hist_diffuse_1")
 #define RB_RT_STOCHASTIC_HIST_SPECULAR_0 SNAME("stochastic_hist_specular_0")
 #define RB_RT_STOCHASTIC_HIST_SPECULAR_1 SNAME("stochastic_hist_specular_1")
+#define RB_RT_STOCHASTIC_MOMENTS_0 SNAME("stochastic_moments_0")
+#define RB_RT_STOCHASTIC_MOMENTS_1 SNAME("stochastic_moments_1")
 
 namespace RendererRD {
 
@@ -132,15 +134,25 @@ private:
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 
+	enum DenoiseVariant {
+		DENOISE_VARIANT_TEMPORAL,
+		DENOISE_VARIANT_SPATIAL,
+		DENOISE_VARIANT_MAX,
+	};
+
 	StochasticDenoiseShaderRD stochastic_denoise_shader;
 	RID stochastic_denoise_shader_version;
-	RID stochastic_denoise_pipeline;
+	RID stochastic_denoise_pipelines[DENOISE_VARIANT_MAX];
 
 	struct StochasticDenoisePushConstant {
 		float reproject[16];
 		int32_t screen_size[2];
 		float blend_alpha;
 		float depth_tolerance;
+		float variance_threshold;
+		int32_t stride;
+		float pad0;
+		float pad1;
 	};
 
 	struct DecodePushConstant {
