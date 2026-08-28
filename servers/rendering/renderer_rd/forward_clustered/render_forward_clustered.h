@@ -318,7 +318,7 @@ private:
 			uint32_t volumetric_fog_enabled;
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
-			uint32_t volumetric_fog_pad;
+			uint32_t stochastic_direct_lights;
 		};
 
 		struct PushConstantUbershader {
@@ -756,6 +756,7 @@ private:
 	RendererRD::FSR2Effect *fsr2_effect = nullptr;
 	RendererRD::SSEffects *ss_effects = nullptr;
 	RendererRD::RaytracedShadows *rt_shadows = nullptr;
+	bool use_stochastic_lighting = false;
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;

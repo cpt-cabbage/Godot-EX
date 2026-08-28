@@ -347,7 +347,7 @@ struct ImplementationData {
 	bool volumetric_fog_enabled;
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
-	uint volumetric_fog_pad;
+	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass.
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -494,9 +494,13 @@ layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 38) uniform texture2DArray rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2DArray rt_area_shadow_mask;
+layout(set = 1, binding = 40) uniform texture2DArray stochastic_diffuse_buffer;
+layout(set = 1, binding = 41) uniform texture2DArray stochastic_specular_buffer;
 #else
 layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2D rt_area_shadow_mask;
+layout(set = 1, binding = 40) uniform texture2D stochastic_diffuse_buffer;
+layout(set = 1, binding = 41) uniform texture2D stochastic_specular_buffer;
 #endif // USE_MULTIVIEW
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 

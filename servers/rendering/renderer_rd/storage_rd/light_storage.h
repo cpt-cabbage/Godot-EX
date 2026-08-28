@@ -834,6 +834,8 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_directional_light_buffer() { return directional_light_buffer; }
+	uint32_t get_omni_light_count() const { return omni_light_count; }
+	uint32_t get_spot_light_count() const { return spot_light_count; }
 	uint32_t get_max_directional_lights() { return max_directional_lights; }
 	uint32_t get_directional_light_blend_splits(uint32_t p_directional_light_count) const {
 		uint32_t blend_splits = 0;

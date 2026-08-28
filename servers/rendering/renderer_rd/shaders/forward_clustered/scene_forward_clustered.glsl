@@ -2786,7 +2786,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 
 #ifndef USE_VERTEX_LIGHTING
-	{ //omni lights
+	if (implementation_data.stochastic_direct_lights == 0u) { //omni lights
 
 		uint cluster_omni_offset = cluster_offset;
 
@@ -2847,7 +2847,7 @@ void fragment_shader(in SceneData scene_data) {
 		}
 	}
 
-	{ //spot lights
+	if (implementation_data.stochastic_direct_lights == 0u) { //spot lights
 
 		uint cluster_spot_offset = cluster_offset + implementation_data.cluster_type_size;
 
@@ -2969,6 +2969,19 @@ void fragment_shader(in SceneData scene_data) {
 		}
 	}
 #endif // !USE_VERTEX_LIGHTING
+
+	// Stochastic direct lighting (mini-MegaLights): omni/spot contribution
+	// computed by the ray-traced compute pass. Demodulated: albedo, AO and
+	// metallic are applied by the common composite below.
+	if (implementation_data.stochastic_direct_lights != 0u) {
+#ifdef USE_MULTIVIEW
+		diffuse_light += textureLod(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+		direct_specular_light += textureLod(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+#else
+		diffuse_light += textureLod(sampler2D(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+		direct_specular_light += textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+#endif
+	}
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
 #ifdef USE_SHADOW_TO_OPACITY

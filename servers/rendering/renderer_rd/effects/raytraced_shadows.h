@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -47,6 +48,8 @@
 #define RB_RT_SHADOW_HISTORY_1 SNAME("history_1")
 #define RB_RT_AREA_SHADOW_MASK SNAME("area_mask")
 #define RB_RT_AREA_SHADOW_RAW SNAME("area_raw")
+#define RB_RT_STOCHASTIC_DIFFUSE SNAME("stochastic_diffuse")
+#define RB_RT_STOCHASTIC_SPECULAR SNAME("stochastic_specular")
 
 namespace RendererRD {
 
@@ -106,6 +109,22 @@ private:
 	uint32_t frame_index = 0;
 	bool history_parity = false;
 
+	StochasticDirectLightingShaderRD stochastic_shader;
+	RID stochastic_shader_version;
+	RID stochastic_pipeline;
+
+	struct StochasticParamsUBO {
+		float view_from_ndc[16];
+		float world_from_view[16];
+		int32_t screen_size[2];
+		uint32_t omni_light_count;
+		uint32_t spot_light_count;
+		uint32_t frame_index;
+		float ray_bias;
+		uint32_t pad[2];
+	};
+	LocalVector<RID> stochastic_params_ubos; // Per view.
+
 	struct DecodePushConstant {
 		float aabb_position[4];
 		float aabb_size[4];
@@ -140,6 +159,11 @@ public:
 	// Traces a shadow mask for one area light (its rect spans p_axis_u/p_axis_v
 	// around p_light_pos) into RB_RT_AREA_SHADOW_MASK, spatially denoised.
 	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v);
+
+	// Stochastic direct lighting (mini-MegaLights phase A): samples omni/spot
+	// lights per pixel and shades ray-traced-visible samples into demodulated
+	// diffuse/specular buffers (RB_RT_STOCHASTIC_*).
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }

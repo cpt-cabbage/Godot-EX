@@ -127,6 +127,9 @@ public:
 		bool use_dynamic_gi = false;
 		bool cast_double_sided_shadows = false;
 		bool casts_shadows = true;
+		// True if any surface participates in the shadow pass. Alpha-blended
+		// surfaces that do not write depth are excluded, matching shadow maps.
+		bool has_shadow_casting_surface = true;
 		bool dirty_dependencies = false;
 
 		DependencyTracker dependency_tracker;

@@ -733,6 +733,8 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
+	// Only valid where the stochastic pass runs: opaque main-view rendering.
+	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? 1 : 0;
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1959,11 +1961,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					environment_get_ssao_enabled(p_render_data->environment) ||
 					using_ssil ||
 					ce_needs_normal_roughness ||
+					use_stochastic_lighting ||
 					get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER ||
 					scene_state.used_normal_texture) {
 				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 			}
-		} else if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
+		} else if (use_stochastic_lighting || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
 
@@ -2241,7 +2244,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		}
 
-		if ((has_sun || has_area) && rt_shadows->update_scene(*p_render_data->instances)) {
+		bool run_stochastic = use_stochastic_lighting && rb_data->has_normal_roughness() &&
+				(light_storage->get_omni_light_count() > 0 || light_storage->get_spot_light_count() > 0);
+
+		if ((has_sun || has_area || run_stochastic) && rt_shadows->update_scene(*p_render_data->instances)) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
 			rt_shadows->advance_frame();
@@ -2253,13 +2259,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			prev_correction.add_jitter_offset(scene_data->prev_taa_jitter);
 			Projection prev_view_from_world = Projection(scene_data->prev_cam_transform.affine_inverse());
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-				Projection world_from_ndc = world_from_view * scene_data->get_view_projection(v).inverse();
+				Projection view_from_ndc = scene_data->get_view_projection(v).inverse();
+				Projection world_from_ndc = world_from_view * view_from_ndc;
 				Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[v] * prev_view_from_world;
 				if (has_sun) {
 					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle);
 				}
 				if (has_area) {
 					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v);
+				}
+				if (run_stochastic) {
+					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(),
+							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count());
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -3877,6 +3888,18 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
+	for (uint32_t i = 0; i < 2; i++) {
+		RD::Uniform u;
+		u.binding = 40 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : RB_RT_STOCHASTIC_SPECULAR;
+		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
+		// Additive terms: black when inactive.
+		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.get_default_shader_rd(is_multiview), RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
@@ -4323,6 +4346,10 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 		flags |= GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW;
 	}
 
+	if (flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
+		ginstance->data->has_shadow_casting_surface = true;
+	}
+
 	if (p_material->shader_data->uses_particle_trails) {
 		flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS;
 	}
@@ -4484,6 +4511,9 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 	if (ginstance->data->dirty_dependencies) {
 		ginstance->data->dependency_tracker.update_begin();
 	}
+
+	// Recomputed below as surfaces are added.
+	ginstance->data->has_shadow_casting_surface = false;
 
 	//add geometry for drawing
 	switch (ginstance->data->base_type) {
@@ -5379,7 +5409,8 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
-	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")) {
+	use_stochastic_lighting = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && GLOBAL_GET("rendering/lighting/stochastic_direct_lighting/enabled");
+	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && (use_stochastic_lighting || bool(GLOBAL_GET("rendering/lights_and_shadows/raytraced_shadows/enabled")))) {
 		rt_shadows = memnew(RendererRD::RaytracedShadows);
 	}
 #ifdef METAL_MFXTEMPORAL_ENABLED

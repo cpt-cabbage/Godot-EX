@@ -30,6 +30,7 @@
 
 #include "raytraced_shadows.h"
 
+#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
@@ -64,6 +65,12 @@ RaytracedShadows::RaytracedShadows() {
 	temporal_shader_version = temporal_shader.version_create();
 	temporal_pipeline = RD::get_singleton()->compute_pipeline_create(temporal_shader.version_get_shader(temporal_shader_version, 0));
 
+	Vector<String> stochastic_modes;
+	stochastic_modes.push_back("");
+	stochastic_shader.initialize(stochastic_modes);
+	stochastic_shader_version = stochastic_shader.version_create();
+	stochastic_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 }
@@ -74,10 +81,14 @@ RaytracedShadows::~RaytracedShadows() {
 	// teardown typically runs before this destructor), so freeing here would
 	// double-free. Any still alive are reclaimed at device shutdown.
 	RD::get_singleton()->free_rid(sampler);
+	for (const RID &ubo : stochastic_params_ubos) {
+		RD::get_singleton()->free_rid(ubo);
+	}
 	shader.version_free(shader_version);
 	decode_shader.version_free(decode_shader_version);
 	blur_shader.version_free(blur_shader_version);
 	temporal_shader.version_free(temporal_shader_version);
+	stochastic_shader.version_free(stochastic_shader_version);
 }
 
 RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
@@ -194,6 +205,9 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		}
 		if (!inst->data->casts_shadows) {
 			continue; // Respects GeometryInstance3D's shadow casting setting (e.g. editor gizmos).
+		}
+		if (!inst->data->has_shadow_casting_surface) {
+			continue; // Alpha-blended geometry does not cast shadows, as with shadow maps.
 		}
 		RID mesh = inst->data->base;
 
@@ -427,5 +441,67 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 1, u_blur_dst), 1);
 	rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
 	rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
+	rd->compute_list_end();
+}
+
+void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count) {
+	ERR_FAIL_COND(tlas.is_null());
+	ERR_FAIL_COND(p_normal_roughness.is_null());
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+
+	Size2i size = p_render_buffers->get_internal_size();
+
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE)) {
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
+	}
+	RID diffuse_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE, p_view, 0);
+	RID specular_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR, p_view, 0);
+	RID depth = p_render_buffers->get_depth_texture(p_view);
+
+	while (stochastic_params_ubos.size() <= p_view) {
+		stochastic_params_ubos.push_back(rd->uniform_buffer_create(sizeof(StochasticParamsUBO)));
+	}
+
+	StochasticParamsUBO params = {};
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			params.view_from_ndc[col * 4 + row] = p_view_from_ndc.columns[col][row];
+		}
+	}
+	Projection world_from_view_proj = Projection(p_world_from_view);
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			params.world_from_view[col * 4 + row] = world_from_view_proj.columns[col][row];
+		}
+	}
+	params.screen_size[0] = size.x;
+	params.screen_size[1] = size.y;
+	params.omni_light_count = p_omni_light_count;
+	params.spot_light_count = p_spot_light_count;
+	params.frame_index = frame_index;
+	params.ray_bias = 0.08f;
+	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
+
+	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
+
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
+	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
+	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ light_storage->get_omni_light_buffer() }));
+	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ light_storage->get_spot_light_buffer() }));
+	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, Vector<RID>({ stochastic_params_ubos[p_view] }));
+	RD::Uniform u_diffuse(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ diffuse_slice }));
+	RD::Uniform u_specular(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ specular_slice }));
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_params), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular), 1);
+	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
 }
