@@ -137,10 +137,22 @@ RaytracedShadows::RaytracedShadows() {
 }
 
 RaytracedShadows::~RaytracedShadows() {
-	// BLASes and the TLAS are not freed here: the RenderingDevice frees them
-	// automatically when the mesh buffers they depend on are freed (scene
-	// teardown typically runs before this destructor), so freeing here would
-	// double-free. Any still alive are reclaimed at device shutdown.
+	// Scene teardown may already have cascade-freed acceleration structures
+	// through the mesh buffers they depend on, so validity is checked before
+	// freeing (freeing a dead RID would error). The decoded position buffers
+	// are ours alone and nothing else frees them. Order matters: TLAS first
+	// (it depends on every BLAS), then BLASes, then their input buffers.
+	if (tlas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(tlas)) {
+		RD::get_singleton()->free_rid(tlas);
+	}
+	for (const KeyValue<RID, MeshBlas> &E : blas_cache) {
+		if (E.value.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(E.value.blas)) {
+			RD::get_singleton()->free_rid(E.value.blas);
+		}
+		for (const RID &buffer : E.value.decoded_buffers) {
+			RD::get_singleton()->free_rid(buffer);
+		}
+	}
 	RD::get_singleton()->free_rid(sampler);
 	RD::get_singleton()->free_rid(stbn_texture);
 	RD::get_singleton()->free_rid(ltc_lut1_texture);
@@ -289,6 +301,11 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		if (entry != nullptr && entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas)) {
 			// The BLAS was freed behind our back (e.g. the mesh was reimported and its
 			// surface buffers were recreated, cascading the free). Rebuild it.
+			// The decoded position buffers are ours and did not cascade: free
+			// them here or they leak for the rest of the session.
+			for (const RID &buffer : entry->decoded_buffers) {
+				rd->free_rid(buffer);
+			}
 			blas_cache.erase(mesh);
 			entry = nullptr;
 		}
