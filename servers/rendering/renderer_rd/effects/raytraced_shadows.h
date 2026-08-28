@@ -123,6 +123,13 @@ private:
 	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.
 	RID stbn_texture;
 
+	// LTC lookup tables for area light shading in the stochastic pass (own
+	// copies; the scene renderer's are created lazily through the resource
+	// path and may not exist when the compute pass first runs).
+	RID ltc_lut1_texture;
+	RID ltc_lut2_texture;
+	RID material_sampler; // Linear, for LTC LUTs and the area light atlas.
+
 	StochasticDirectLightingShaderRD stochastic_shader;
 	RID stochastic_shader_version;
 	RID stochastic_pipeline;
@@ -143,7 +150,7 @@ private:
 		uint32_t max_cluster_element_count_div_32;
 		uint32_t cluster_type_size;
 		float z_far;
-		float pad0;
+		uint32_t area_light_count;
 		float pad1;
 		float pad2;
 	};
@@ -230,7 +237,7 @@ public:
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }

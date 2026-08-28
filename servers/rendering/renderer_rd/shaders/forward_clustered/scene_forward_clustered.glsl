@@ -2908,7 +2908,8 @@ void fragment_shader(in SceneData scene_data) {
 		}
 	}
 
-	if (sc_cluster_has_area_light()) { // area lights
+	// Area lights are owned by the stochastic pass when it is active.
+	if (sc_cluster_has_area_light() && implementation_data.stochastic_direct_lights == 0u) { // area lights
 
 		uint cluster_area_offset = cluster_offset + implementation_data.cluster_type_size * 2;
 
@@ -2970,9 +2971,9 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #endif // !USE_VERTEX_LIGHTING
 
-	// Stochastic direct lighting (mini-MegaLights): omni/spot contribution
-	// computed by the ray-traced compute pass. Demodulated: albedo, AO and
-	// metallic are applied by the common composite below.
+	// Stochastic direct lighting (mini-MegaLights): omni/spot/area
+	// contribution computed by the ray-traced compute pass. Demodulated:
+	// albedo, AO and metallic are applied by the common composite below.
 	if (implementation_data.stochastic_direct_lights != 0u) {
 #ifdef USE_MULTIVIEW
 		diffuse_light += textureLod(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;

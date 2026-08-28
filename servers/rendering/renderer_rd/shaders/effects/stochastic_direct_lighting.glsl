@@ -17,6 +17,12 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../light_data_inc.glsl"
 
+// Compute shaders cannot use implicit-LOD sampling; the LTC helpers only
+// sample mipless LUTs through texture(), so base level is exact.
+#define texture(s, uv) textureLod(s, uv, 0.0)
+#include "../area_lights_inc.glsl"
+#undef texture
+
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
@@ -51,7 +57,7 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint max_cluster_element_count_div_32;
 	uint cluster_type_size;
 	float z_far;
-	float pad0;
+	uint area_light_count;
 	float pad1;
 	float pad2;
 }
@@ -72,17 +78,36 @@ cluster_buffer;
 // faster under temporal accumulation than white noise would).
 layout(set = 0, binding = 8) uniform sampler2DArray stbn_texture;
 
+layout(set = 0, binding = 9, std430) restrict readonly buffer AreaLights {
+	LightData data[];
+}
+area_lights;
+
+// LTC lookup tables and the textured-area-light atlas, shared with the scene
+// shader's analytic area light path.
+layout(set = 0, binding = 10) uniform texture2D ltc_lut1;
+layout(set = 0, binding = 11) uniform texture2D ltc_lut2;
+layout(set = 0, binding = 12) uniform texture2D area_light_atlas;
+layout(set = 0, binding = 13) uniform sampler material_sampler;
+
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_specular;
 // One light this pixel found visible, gathered next frame into the tile lists.
 layout(set = 1, binding = 2, r32ui) uniform restrict writeonly uimage2D out_visible_light;
 
-#define M_PI 3.14159265359
 #define RESERVOIR_COUNT 4u
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
+// Entry encoding: bit 31 spot, bit 30 area, bits 26..29 payload (2x2 rect
+// visibility bitmask for area lights, quadrant order (-u,-v),(+u,-v),(-u,+v),
+// (+u,+v)), bits 0..25 the per-type light index.
 #define SPOT_BIT 0x80000000u
+#define AREA_BIT 0x40000000u
+#define QUAD_MASK_SHIFT 26u
+#define QUAD_MASK_BITS (0xFu << QUAD_MASK_SHIFT)
+#define ENTRY_ID_MASK 0x03FFFFFFu
+#define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | ENTRY_ID_MASK)
 // Bounds the RIS estimator. Rarely selected lights produce a huge
 // weight_sum/selected_weight ratio, which shows up as fireflies and, once
 // filtered, as blotches. Slightly biased, but far lower variance.
@@ -211,6 +236,74 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	specular = ld.color * attenuation * ndotl * (D * G * F / max(4.0 * ndotv, 1e-4)) * ld.specular_amount;
 }
 
+// Unshadowed LTC diffuse and specular contribution of an area light, the
+// analytic core of the scene shader's light_process_area (clearcoat,
+// transmittance and material-dependent terms cannot apply here: the prepass
+// carries only normal and roughness, so the specular assumes a dielectric).
+void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular) {
+	diffuse = vec3(0.0);
+	specular = vec3(0.0);
+	LightData ld = area_lights.data[idx];
+	vec3 area_width = ld.area_width;
+	vec3 area_height = ld.area_height;
+	if (dot(area_width, area_width) < 1e-7 || dot(area_height, area_height) < 1e-7) {
+		return;
+	}
+	if (dot(ld.direction, view_pos - ld.position) <= 0.0) {
+		return; // Point is behind the light.
+	}
+
+	// Attenuation from the closest point on the rect; the LTC integral already
+	// falls off with inverse-square solid angle, so that part is compensated.
+	vec3 light_to_vert = view_pos - ld.position;
+	vec3 a_dir = normalize(area_width);
+	vec3 b_dir = normalize(area_height);
+	float a_half = length(area_width) * 0.5;
+	float b_half = length(area_height) * 0.5;
+	vec3 pos_local = vec3(dot(light_to_vert, a_dir), dot(light_to_vert, b_dir), dot(light_to_vert, -ld.direction));
+	vec3 closest_local = vec3(clamp(pos_local.x, -a_half, a_half), clamp(pos_local.y, -b_half, b_half), 0.0);
+	float dist = length(closest_local - pos_local);
+	float att_raw = get_omni_attenuation(dist, ld.inv_radius, ld.attenuation);
+	float att_ltc = att_raw * dist * dist;
+	if (att_ltc <= 0.0) {
+		return;
+	}
+
+	vec3 points[4];
+	vec3 hw = area_width * 0.5;
+	vec3 hh = area_height * 0.5;
+	points[0] = ld.position - hw - hh - view_pos;
+	points[1] = ld.position + hw - hh - view_pos;
+	points[2] = ld.position + hw + hh - view_pos;
+	points[3] = ld.position - hw + hh - view_pos;
+
+	vec3 eye_vec = normalize(-view_pos);
+	float max_mipmap = ld.cone_angle;
+
+	float ltc_diffuse = 0.0;
+	vec3 diffuse_tex_color = vec3(1.0);
+	ltc_evaluate(view_normal, eye_vec, mat3(1.0), points, ld.projector_rect, max_mipmap, area_light_atlas, material_sampler, ltc_diffuse, diffuse_tex_color);
+	diffuse = ltc_diffuse * diffuse_tex_color * ld.color * att_ltc;
+
+	float ltc_specular = 0.0;
+	vec2 ltc_fresnel = vec2(0.0);
+	vec3 specular_tex_color = vec3(1.0);
+	ltc_evaluate_specular(view_normal, eye_vec, roughness, points, ld.projector_rect, max_mipmap, area_light_atlas, material_sampler, material_sampler, ltc_lut1, ltc_lut2, ltc_specular, ltc_fresnel, specular_tex_color);
+	const float f0 = 0.04;
+	float fresnel = f0 * max(ltc_fresnel.x, 0.0) + (1.0 - f0) * max(ltc_fresnel.y, 0.0);
+	specular = ltc_specular * fresnel * specular_tex_color * ld.color * att_ltc * ld.specular_amount;
+}
+
+// Unshadowed contribution of any encoded light entry.
+void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular) {
+	if ((entry & AREA_BIT) != 0u) {
+		area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular);
+	} else {
+		vec3 unused_rel;
+		light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, unused_rel);
+	}
+}
+
 bool trace_visible(vec3 world_origin, vec3 world_target) {
 	vec3 delta = world_target - world_origin;
 	float dist = length(delta);
@@ -294,8 +387,8 @@ void main() {
 						break;
 					}
 					// Drop stale entries from lights that no longer exist.
-					uint idx = entry & ~SPOT_BIT;
-					uint count = (entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count;
+					uint idx = entry & ENTRY_ID_MASK;
+					uint count = (entry & AREA_BIT) != 0u ? params.area_light_count : ((entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count);
 					if (idx < count) {
 						visible_list[visible_count++] = entry;
 					}
@@ -308,11 +401,10 @@ void main() {
 	float guided_weight_sum = 0.0;
 	// Total unshadowed luminance estimate, for the sample culling threshold.
 	float total_lum = 0.0;
-	vec3 unused;
 	for (uint i = 0u; i < visible_count && candidate_count < MAX_GUIDED_CANDIDATES; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
-		light_eval((entry & SPOT_BIT) != 0u, entry & ~SPOT_BIT, view_pos, view_normal, roughness, f, s, unused);
+		entry_eval(entry, view_pos, view_normal, roughness, f, s);
 		float lum = luminance(f + s);
 		float w = light_weight(lum);
 		if (w <= 0.0) {
@@ -336,9 +428,9 @@ void main() {
 		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
 		uint cluster_z = uint(clamp((-view_pos.z / params.z_far) * 32.0, 0.0, 31.0));
 
-		// First pass: count the candidates in the cell (omni then spot).
+		// First pass: count the candidates in the cell (omni, spot, area).
 		uint cell_count = 0u;
-		for (uint type = 0u; type < 2u; type++) {
+		for (uint type = 0u; type < 3u; type++) {
 			uint type_offset = cluster_offset + type * params.cluster_type_size;
 			uint item_min, item_max, item_from, item_to;
 			cluster_get_item_range(type_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
@@ -353,7 +445,7 @@ void main() {
 		float stride_mult = float(stride);
 
 		uint cell_index = 0u;
-		for (uint type = 0u; type < 2u; type++) {
+		for (uint type = 0u; type < 3u; type++) {
 			uint type_offset = cluster_offset + type * params.cluster_type_size;
 			uint item_min, item_max, item_from, item_to;
 			cluster_get_item_range(type_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
@@ -366,11 +458,11 @@ void main() {
 					if (take % stride != start) {
 						continue;
 					}
-					uint entry = (32u * i + bit) | (type == 1u ? SPOT_BIT : 0u);
+					uint entry = (32u * i + bit) | (type == 1u ? SPOT_BIT : (type == 2u ? AREA_BIT : 0u));
 					// Skip lights already on the guided list.
 					bool listed = false;
 					for (uint j = 0u; j < guided_count; j++) {
-						if (candidate_entries[j] == entry) {
+						if ((candidate_entries[j] & ENTRY_KEY_MASK) == entry) {
 							listed = true;
 							break;
 						}
@@ -379,7 +471,7 @@ void main() {
 						continue;
 					}
 					vec3 f, s;
-					light_eval((entry & SPOT_BIT) != 0u, entry & ~SPOT_BIT, view_pos, view_normal, roughness, f, s, unused);
+					entry_eval(entry, view_pos, view_normal, roughness, f, s);
 					float lum = luminance(f + s);
 					float w = light_weight(lum);
 					if (w <= 0.0) {
@@ -438,6 +530,7 @@ void main() {
 	// few lights dominate; duplicate rays would hit the same target).
 	uint traced_candidates[RESERVOIR_COUNT];
 	bool traced_visible[RESERVOIR_COUNT];
+	uint traced_quadrant[RESERVOIR_COUNT];
 	uint traced_count = 0u;
 
 	vec3 diffuse = vec3(0.0);
@@ -456,36 +549,75 @@ void main() {
 			continue;
 		}
 
-		bool is_spot = (entry & SPOT_BIT) != 0u;
-		uint idx = entry & ~SPOT_BIT;
-
-		vec3 f, s, light_rel_vec;
-		light_eval(is_spot, idx, view_pos, view_normal, roughness, f, s, light_rel_vec);
+		vec3 f, s;
+		entry_eval(entry, view_pos, view_normal, roughness, f, s);
 
 		bool visible = false;
+		uint quadrant = 0u;
 		bool found = false;
 		for (uint t = 0u; t < traced_count; t++) {
 			if (traced_candidates[t] == c) {
 				visible = traced_visible[t];
+				quadrant = traced_quadrant[t];
 				found = true;
 				break;
 			}
 		}
 		if (!found) {
-			vec3 world_light = world_pos + world_basis * light_rel_vec;
+			vec3 view_target;
+			if ((entry & AREA_BIT) != 0u) {
+				// Sample a point on the rect, warping the random variable
+				// toward the quadrants the tile saw unoccluded last frame (the
+				// paper's 2x2 visibility bitmask guiding). Hidden quadrants
+				// keep a reduced probability so reappearing ones are found.
+				LightData ld = area_lights.data[entry & ENTRY_ID_MASK];
+				uint qmask = (entry >> QUAD_MASK_SHIFT) & 0xFu;
+				if (qmask == 0u) {
+					qmask = 0xFu;
+				}
+				vec2 rnd = stbn_sample(pixel, 6u);
+				float qw[4];
+				float qtotal = 0.0;
+				for (uint q = 0u; q < 4u; q++) {
+					qw[q] = (qmask & (1u << q)) != 0u ? 1.0 : 0.25;
+					qtotal += qw[q];
+				}
+				float pick = rnd.x * qtotal;
+				quadrant = 3u;
+				for (uint q = 0u; q < 3u; q++) {
+					if (pick < qw[q]) {
+						quadrant = q;
+						break;
+					}
+					pick -= qw[q];
+				}
+				float u_in = clamp(pick / qw[quadrant], 0.0, 1.0);
+				float u = (float(quadrant & 1u) + u_in) * 0.5;
+				float v = (float(quadrant >> 1u) + rnd.y) * 0.5;
+				view_target = ld.position + ld.area_width * (u - 0.5) + ld.area_height * (v - 0.5);
+			} else {
+				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
+				view_target = ld.position;
+			}
+			vec3 world_light = world_pos + world_basis * (view_target - view_pos);
 			visible = trace_visible(world_pos, world_light);
 			traced_candidates[traced_count] = c;
 			traced_visible[traced_count] = visible;
+			traced_quadrant[traced_count] = quadrant;
 			traced_count++;
 		}
 		if (!visible) {
 			continue;
 		}
 
-		// Pick one visible light uniformly to seed next frame's tile list.
+		// Pick one visible light uniformly to seed next frame's tile list;
+		// area lights record which rect quadrant the ray reached.
 		visible_found++;
 		if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + visible_found)) < 1.0 / float(visible_found)) {
-			chosen_visible_light = entry;
+			chosen_visible_light = entry & ENTRY_KEY_MASK;
+			if ((entry & AREA_BIT) != 0u) {
+				chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
+			}
 		}
 
 		// RIS estimator f * (weight_sum / selected_weight), averaged over the

@@ -15,6 +15,11 @@
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
+// Entries carry a payload (2x2 area light visibility bitmask) in bits 26..29;
+// deduplication is by light identity only, with the payloads of duplicates
+// merged so the tile remembers every quadrant any of its pixels reached.
+#define QUAD_MASK_BITS (0xFu << 26u)
+#define ENTRY_KEY_MASK (~QUAD_MASK_BITS)
 
 layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE, local_size_z = 1) in;
 
@@ -52,20 +57,28 @@ void main() {
 	candidates[local_index] = light;
 	barrier();
 
-	// Keep only the first occurrence of each light in the group, then append
-	// survivors to the tile list until it is full.
+	// Keep only the first occurrence of each light in the group (merging the
+	// quadrant payloads of duplicates), then append survivors to the tile list
+	// until it is full.
 	if (light != INVALID_LIGHT) {
+		uint key = light & ENTRY_KEY_MASK;
 		bool duplicate = false;
 		for (uint i = 0u; i < local_index; i++) {
-			if (candidates[i] == light) {
+			if (candidates[i] != INVALID_LIGHT && (candidates[i] & ENTRY_KEY_MASK) == key) {
 				duplicate = true;
 				break;
 			}
 		}
 		if (!duplicate) {
+			uint merged = light;
+			for (uint i = local_index + 1u; i < uint(TILE_SIZE * TILE_SIZE); i++) {
+				if (candidates[i] != INVALID_LIGHT && (candidates[i] & ENTRY_KEY_MASK) == key) {
+					merged |= candidates[i] & QUAD_MASK_BITS;
+				}
+			}
 			uint slot = atomicAdd(list_count, 1u);
 			if (slot < uint(LIST_SIZE)) {
-				tile_list[slot] = light;
+				tile_list[slot] = merged;
 			}
 		}
 	}
