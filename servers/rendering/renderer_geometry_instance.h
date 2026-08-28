@@ -130,6 +130,10 @@ public:
 		// True if any surface participates in the shadow pass. Alpha-blended
 		// surfaces that do not write depth are excluded, matching shadow maps.
 		bool has_shadow_casting_surface = true;
+		// Bit per surface (first 32) that casts shadows; surfaces that do not
+		// (e.g. transparent glass) are excluded from ray tracing BLASes just
+		// as they are skipped by the shadow map passes.
+		uint32_t shadow_casting_surface_mask = 0xFFFFFFFF;
 		bool dirty_dependencies = false;
 
 		DependencyTracker dependency_tracker;

@@ -215,15 +215,19 @@ private:
 	struct MeshBlas {
 		RID blas; // Null if the mesh has no BLAS-eligible surfaces.
 		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
+		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
 		bool built = false;
 	};
-	HashMap<RID, MeshBlas> blas_cache;
+	// Variants per mesh: instances can exclude different surfaces from shadow
+	// casting (transparent glass being the classic case), and material
+	// overrides make that per instance, not per mesh.
+	HashMap<RID, LocalVector<MeshBlas>> blas_cache;
 
 	RID tlas;
 	uint32_t tlas_capacity = 0;
 
 	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb);
-	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry);
+	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask);
 
 public:
 	// Live quality settings for the stochastic pass, read from the project

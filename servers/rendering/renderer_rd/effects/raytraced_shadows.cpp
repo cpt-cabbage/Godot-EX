@@ -145,12 +145,14 @@ RaytracedShadows::~RaytracedShadows() {
 	if (tlas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(tlas)) {
 		RD::get_singleton()->free_rid(tlas);
 	}
-	for (const KeyValue<RID, MeshBlas> &E : blas_cache) {
-		if (E.value.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(E.value.blas)) {
-			RD::get_singleton()->free_rid(E.value.blas);
-		}
-		for (const RID &buffer : E.value.decoded_buffers) {
-			RD::get_singleton()->free_rid(buffer);
+	for (const KeyValue<RID, LocalVector<MeshBlas>> &E : blas_cache) {
+		for (const MeshBlas &variant : E.value) {
+			if (variant.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(variant.blas)) {
+				RD::get_singleton()->free_rid(variant.blas);
+			}
+			for (const RID &buffer : variant.decoded_buffers) {
+				RD::get_singleton()->free_rid(buffer);
+			}
 		}
 	}
 	RD::get_singleton()->free_rid(sampler);
@@ -208,8 +210,10 @@ RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t
 	return decoded;
 }
 
-void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
+void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask) {
 	MeshStorage *mesh_storage = MeshStorage::get_singleton();
+
+	r_entry.surface_mask = p_surface_mask;
 
 	uint32_t surface_count = 0;
 	mesh_storage->mesh_get_surface_count_and_materials(p_mesh, surface_count);
@@ -218,6 +222,9 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry) {
 	geometries.clear();
 
 	for (uint32_t i = 0; i < surface_count; i++) {
+		if (i < 32 && (p_surface_mask & (1u << i)) == 0) {
+			continue; // Surface does not cast shadows (e.g. transparent glass).
+		}
 		void *surface = mesh_storage->mesh_get_surface(p_mesh, i);
 		if (mesh_storage->mesh_surface_get_primitive(surface) != RSE::PRIMITIVE_TRIANGLES) {
 			continue;
@@ -292,27 +299,51 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		if (!inst->data->casts_shadows) {
 			continue; // Respects GeometryInstance3D's shadow casting setting (e.g. editor gizmos).
 		}
-		if (!inst->data->has_shadow_casting_surface) {
+		if (!inst->data->has_shadow_casting_surface || inst->data->shadow_casting_surface_mask == 0) {
 			continue; // Alpha-blended geometry does not cast shadows, as with shadow maps.
 		}
 		RID mesh = inst->data->base;
+		uint32_t surface_mask = inst->data->shadow_casting_surface_mask;
 
-		MeshBlas *entry = blas_cache.getptr(mesh);
-		if (entry != nullptr && entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas)) {
-			// The BLAS was freed behind our back (e.g. the mesh was reimported and its
-			// surface buffers were recreated, cascading the free). Rebuild it.
+		LocalVector<MeshBlas> *variants = blas_cache.getptr(mesh);
+		if (variants != nullptr) {
+			// The BLAS may have been freed behind our back (e.g. the mesh was
+			// reimported and its surface buffers were recreated, cascading the
+			// free); all variants share those buffers, so all die together.
 			// The decoded position buffers are ours and did not cascade: free
 			// them here or they leak for the rest of the session.
-			for (const RID &buffer : entry->decoded_buffers) {
-				rd->free_rid(buffer);
+			bool stale = false;
+			for (const MeshBlas &variant : *variants) {
+				if (variant.blas.is_valid() && !rd->acceleration_structure_is_valid(variant.blas)) {
+					stale = true;
+					break;
+				}
 			}
-			blas_cache.erase(mesh);
-			entry = nullptr;
+			if (stale) {
+				for (const MeshBlas &variant : *variants) {
+					for (const RID &buffer : variant.decoded_buffers) {
+						rd->free_rid(buffer);
+					}
+				}
+				blas_cache.erase(mesh);
+				variants = nullptr;
+			}
+		}
+		if (variants == nullptr) {
+			variants = &blas_cache.insert(mesh, LocalVector<MeshBlas>())->value;
+		}
+		MeshBlas *entry = nullptr;
+		for (MeshBlas &variant : *variants) {
+			if (variant.surface_mask == surface_mask) {
+				entry = &variant;
+				break;
+			}
 		}
 		if (entry == nullptr) {
 			MeshBlas new_entry;
-			_create_blas_for_mesh(mesh, new_entry);
-			entry = &blas_cache.insert(mesh, new_entry)->value;
+			_create_blas_for_mesh(mesh, new_entry, surface_mask);
+			variants->push_back(new_entry);
+			entry = &(*variants)[variants->size() - 1];
 		}
 		if (entry->blas.is_null()) {
 			continue;

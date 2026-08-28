@@ -4431,6 +4431,8 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 
 	if (flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
 		ginstance->data->has_shadow_casting_surface = true;
+		// Surfaces past the first 32 conservatively count as casting.
+		ginstance->data->shadow_casting_surface_mask |= p_surface < 32 ? (1u << p_surface) : 0xFFFFFFFFu;
 	}
 
 	if (p_material->shader_data->uses_particle_trails) {
@@ -4597,6 +4599,7 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 
 	// Recomputed below as surfaces are added.
 	ginstance->data->has_shadow_casting_surface = false;
+	ginstance->data->shadow_casting_surface_mask = 0;
 
 	//add geometry for drawing
 	switch (ginstance->data->base_type) {
