@@ -43,6 +43,7 @@ prev_light_list;
 
 layout(set = 0, binding = 6, std140) uniform Params {
 	mat4 view_from_ndc; // Inverse of the (depth-corrected) projection.
+	mat4 ndc_from_view; // The (depth-corrected) projection, for screen traces.
 	mat4 world_from_view; // Camera transform.
 	mat4 reproject; // Current NDC -> previous frame NDC, for the tile lookup.
 	ivec2 screen_size;
@@ -316,6 +317,53 @@ bool trace_visible(vec3 world_origin, vec3 world_target) {
 			0xFF, world_origin, params.ray_bias, delta / dist, dist - params.ray_bias);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+
+#define SCREEN_TRACE_STEPS 6
+#define SCREEN_TRACE_DISTANCE 0.4
+#define SCREEN_TRACE_THICKNESS 0.25
+#define SCREEN_TRACE_BIAS 0.02
+
+// Short screen-space trace against the depth buffer over the first stretch of
+// the shadow ray (MegaLights' screen traces, without the HZB: at this range a
+// fixed-step march is enough). The depth buffer is pixel-accurate where the
+// BVH only has render geometry with its own bias, so this adds the contact
+// occlusion that ray bias erases and fixes proxy/self-shadowing mismatches.
+bool screen_trace_occluded(vec3 view_origin, vec3 view_target, float jitter) {
+	vec3 delta = view_target - view_origin;
+	float dist = length(delta);
+	if (dist < 1e-4) {
+		return false;
+	}
+	vec3 dir = delta / dist;
+	float trace_dist = min(dist, SCREEN_TRACE_DISTANCE);
+	for (int i = 0; i < SCREEN_TRACE_STEPS; i++) {
+		float t = trace_dist * (float(i) + jitter + 0.5) / float(SCREEN_TRACE_STEPS);
+		vec3 p = view_origin + dir * t;
+		vec4 ndc = params.ndc_from_view * vec4(p, 1.0);
+		if (ndc.w <= 0.0) {
+			return false;
+		}
+		ndc.xyz /= ndc.w;
+		vec2 suv = ndc.xy * 0.5 + 0.5;
+		if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
+			return false;
+		}
+		float scene_depth = textureLod(depth_texture, suv, 0.0).r;
+		if (scene_depth == 0.0) {
+			continue; // Sky.
+		}
+		vec4 scene_view = params.view_from_ndc * vec4(ndc.xy, scene_depth, 1.0);
+		float scene_z = scene_view.z / scene_view.w;
+		// View looks down -Z: larger z is closer to the camera. Occluded when
+		// the depth buffer's surface lies between the sample point and the
+		// camera, within a finite thickness so distant foreground geometry
+		// does not shadow everything behind it.
+		if (scene_z > p.z + SCREEN_TRACE_BIAS && scene_z < p.z + SCREEN_TRACE_THICKNESS) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max, out uint item_from, out uint item_to) {
@@ -599,8 +647,12 @@ void main() {
 				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
 				view_target = ld.position;
 			}
-			vec3 world_light = world_pos + world_basis * (view_target - view_pos);
-			visible = trace_visible(world_pos, world_light);
+			if (screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
+				visible = false;
+			} else {
+				vec3 world_light = world_pos + world_basis * (view_target - view_pos);
+				visible = trace_visible(world_pos, world_light);
+			}
 			traced_candidates[traced_count] = c;
 			traced_visible[traced_count] = visible;
 			traced_quadrant[traced_count] = quadrant;

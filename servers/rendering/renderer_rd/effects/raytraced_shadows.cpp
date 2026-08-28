@@ -576,9 +576,11 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 
 	StochasticParamsUBO params = {};
+	Projection ndc_from_view = p_view_from_ndc.inverse();
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
 			params.view_from_ndc[col * 4 + row] = p_view_from_ndc.columns[col][row];
+			params.ndc_from_view[col * 4 + row] = ndc_from_view.columns[col][row];
 		}
 	}
 	Projection world_from_view_proj = Projection(p_world_from_view);

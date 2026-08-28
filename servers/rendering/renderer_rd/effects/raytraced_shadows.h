@@ -136,6 +136,7 @@ private:
 
 	struct StochasticParamsUBO {
 		float view_from_ndc[16];
+		float ndc_from_view[16];
 		float world_from_view[16];
 		float reproject[16];
 		int32_t screen_size[2];
