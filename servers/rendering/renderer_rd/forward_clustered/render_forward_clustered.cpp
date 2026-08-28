@@ -2244,7 +2244,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		}
 
-		bool run_stochastic = use_stochastic_lighting && rb_data->has_normal_roughness() &&
+		bool run_stochastic = use_stochastic_lighting && rb_data->has_normal_roughness() && current_cluster_builder != nullptr &&
 				(light_storage->get_omni_light_count() > 0 || light_storage->get_spot_light_count() > 0);
 
 		if ((has_sun || has_area || run_stochastic) && rt_shadows->update_scene(*p_render_data->instances)) {
@@ -2270,7 +2270,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
-							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count());
+							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(),
+							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();

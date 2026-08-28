@@ -468,9 +468,10 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->compute_list_end();
 }
 
-void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count) {
+void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far) {
 	ERR_FAIL_COND(tlas.is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
+	ERR_FAIL_COND(p_cluster_buffer.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
@@ -549,6 +550,15 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	params.ray_bias = 0.08f;
 	params.tiles_x = tiles.x;
 	params.tiles_y = tiles.y;
+	params.cluster_shift = Math::get_shift_from_power_of_2(p_cluster_size);
+	params.max_cluster_element_count_div_32 = p_max_cluster_elements / 32;
+	{
+		uint32_t cluster_screen_width = Math::division_round_up((uint32_t)size.x, p_cluster_size);
+		uint32_t cluster_screen_height = Math::division_round_up((uint32_t)size.y, p_cluster_size);
+		params.cluster_type_size = cluster_screen_width * cluster_screen_height * (params.max_cluster_element_count_div_32 + 32);
+		params.cluster_width = cluster_screen_width;
+	}
+	params.z_far = p_z_far;
 	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
@@ -560,6 +570,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ light_storage->get_spot_light_buffer() }));
 	RD::Uniform u_list(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ list_read }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ stochastic_params_ubos[p_view] }));
+	RD::Uniform u_cluster(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, Vector<RID>({ p_cluster_buffer }));
 	RID visible_light = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, p_view, 0);
 	RD::Uniform u_diffuse(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ diffuse_slice }));
 	RD::Uniform u_specular(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ specular_slice }));
@@ -567,7 +578,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

@@ -135,6 +135,14 @@ private:
 		float ray_bias;
 		int32_t tiles_x;
 		int32_t tiles_y;
+		uint32_t cluster_shift;
+		uint32_t cluster_width;
+		uint32_t max_cluster_element_count_div_32;
+		uint32_t cluster_type_size;
+		float z_far;
+		float pad0;
+		float pad1;
+		float pad2;
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 
@@ -214,10 +222,12 @@ public:
 	// around p_light_pos) into RB_RT_AREA_SHADOW_MASK, spatially denoised.
 	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v);
 
-	// Stochastic direct lighting (mini-MegaLights phase A): samples omni/spot
-	// lights per pixel and shades ray-traced-visible samples into demodulated
-	// diffuse/specular buffers (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count);
+	// Stochastic direct lighting (mini-MegaLights): samples omni/spot lights
+	// per pixel (guided by last frame's visible lights, discovering new ones
+	// through a strided subset of the clustered light grid cell) and shades
+	// ray-traced-visible samples into demodulated diffuse/specular buffers
+	// (RB_RT_STOCHASTIC_*).
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
