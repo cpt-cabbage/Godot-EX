@@ -2269,7 +2269,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v);
 				}
 				if (run_stochastic) {
-					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(),
+					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count());
 				}
 			}

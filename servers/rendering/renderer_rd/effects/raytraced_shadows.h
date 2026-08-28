@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -50,6 +51,12 @@
 #define RB_RT_AREA_SHADOW_RAW SNAME("area_raw")
 #define RB_RT_STOCHASTIC_DIFFUSE SNAME("stochastic_diffuse")
 #define RB_RT_STOCHASTIC_SPECULAR SNAME("stochastic_specular")
+#define RB_RT_STOCHASTIC_RAW_DIFFUSE SNAME("stochastic_raw_diffuse")
+#define RB_RT_STOCHASTIC_RAW_SPECULAR SNAME("stochastic_raw_specular")
+#define RB_RT_STOCHASTIC_HIST_DIFFUSE_0 SNAME("stochastic_hist_diffuse_0")
+#define RB_RT_STOCHASTIC_HIST_DIFFUSE_1 SNAME("stochastic_hist_diffuse_1")
+#define RB_RT_STOCHASTIC_HIST_SPECULAR_0 SNAME("stochastic_hist_specular_0")
+#define RB_RT_STOCHASTIC_HIST_SPECULAR_1 SNAME("stochastic_hist_specular_1")
 
 namespace RendererRD {
 
@@ -125,6 +132,17 @@ private:
 	};
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 
+	StochasticDenoiseShaderRD stochastic_denoise_shader;
+	RID stochastic_denoise_shader_version;
+	RID stochastic_denoise_pipeline;
+
+	struct StochasticDenoisePushConstant {
+		float reproject[16];
+		int32_t screen_size[2];
+		float blend_alpha;
+		float depth_tolerance;
+	};
+
 	struct DecodePushConstant {
 		float aabb_position[4];
 		float aabb_size[4];
@@ -163,7 +181,7 @@ public:
 	// Stochastic direct lighting (mini-MegaLights phase A): samples omni/spot
 	// lights per pixel and shades ray-traced-visible samples into demodulated
 	// diffuse/specular buffers (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
