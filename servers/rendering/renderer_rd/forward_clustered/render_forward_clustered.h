@@ -84,6 +84,11 @@ class RenderForwardClustered : public RendererSceneRenderRD {
 		RENDER_LIST_MAX
 	};
 
+	// Render layers exposed to games (VisualInstance3D shows 20). Instances only
+	// on higher layers are editor helpers (gizmos, icons, grid); in the editor
+	// they are drawn as a late overlay invisible to screen-space effects.
+	static constexpr uint32_t GAME_VISUAL_LAYERS_MASK = (1 << 20) - 1;
+
 	/* Scene Shader */
 
 	SceneShaderForwardClustered scene_shader;
@@ -752,6 +757,8 @@ private:
 	};
 
 	RenderList render_list[RENDER_LIST_MAX];
+
+	uint32_t _partition_editor_overlay_surfaces(RenderList &p_list);
 
 	virtual void _update_shader_quality_settings() override;
 

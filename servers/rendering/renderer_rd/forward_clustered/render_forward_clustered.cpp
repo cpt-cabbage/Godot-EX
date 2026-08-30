@@ -30,6 +30,7 @@
 
 #include "render_forward_clustered.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -942,6 +943,29 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
+uint32_t RenderForwardClustered::_partition_editor_overlay_surfaces(RenderList &p_list) {
+	// Stable partition: editor overlay surfaces (instances with no game-visible
+	// layer) go to the tail, preserving sort order within both halves.
+	if (!Engine::get_singleton()->is_editor_hint()) {
+		return p_list.elements.size();
+	}
+	thread_local LocalVector<GeometryInstanceSurfaceDataCache *> overlay;
+	overlay.clear();
+	uint32_t write = 0;
+	for (uint32_t i = 0; i < p_list.elements.size(); i++) {
+		GeometryInstanceSurfaceDataCache *surf = p_list.elements[i];
+		if ((surf->owner->layer_mask & GAME_VISUAL_LAYERS_MASK) == 0) {
+			overlay.push_back(surf);
+		} else {
+			p_list.elements[write++] = surf;
+		}
+	}
+	for (uint32_t i = 0; i < overlay.size(); i++) {
+		p_list.elements[write + i] = overlay[i];
+	}
+	return write;
+}
+
 void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t frame = RSG::rasterizer->get_frame_number();
@@ -962,6 +986,10 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	RenderList *rl = &render_list[p_render_list];
 	_update_dirty_geometry_instances();
+
+	// Only the editor places instances exclusively on the reserved layers; in a
+	// game every visible instance has at least one bit in the game range.
+	const bool editor_overlay_active = p_render_list == RENDER_LIST_OPAQUE && p_pass_mode == PASS_MODE_COLOR && Engine::get_singleton()->is_editor_hint();
 
 	if (!p_append) {
 		rl->clear();
@@ -1165,6 +1193,14 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 #endif
 
 				if (fade_alpha < FADE_ALPHA_PASS_THRESHOLD) {
+					force_alpha = true;
+				}
+
+				if (editor_overlay_active && (inst->layer_mask & GAME_VISUAL_LAYERS_MASK) == 0) {
+					// Editor-only helpers (gizmos, icons, grid) must stay out of the
+					// depth prepass and opaque pass so screen-space effects (SSR/SSIL
+					// history, ray traced screen traces) never see them; they are
+					// drawn as a late overlay after the SSR/SSIL frame copy.
 					force_alpha = true;
 				}
 
@@ -2007,6 +2043,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
 	render_list[RENDER_LIST_MOTION].sort_by_key();
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+	// Editor overlay surfaces move to the tail of the alpha list so they can be
+	// drawn after the SSR/SSIL frame copy (must happen before instance data fill).
+	uint32_t alpha_overlay_from = _partition_editor_overlay_surfaces(render_list[RENDER_LIST_ALPHA]);
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
@@ -2594,13 +2633,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
 
-	{
-		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
-		// Motion vectors should not be overwritten by transparent objects.
-		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
+	uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
+	// Motion vectors should not be overwritten by transparent objects.
+	transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
-		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
+	RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+
+	{
+		// Editor overlay surfaces at the tail of the list draw later, after the SSR/SSIL frame copy.
+		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), alpha_overlay_from, reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
 		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 	}
 
@@ -2630,6 +2671,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_copy_framebuffer_to_ss_effects(rb, using_ssil, using_ssr);
 	}
 	RD::get_singleton()->draw_command_end_label();
+
+	if (alpha_overlay_from < render_list[RENDER_LIST_ALPHA].elements.size()) {
+		// Editor overlay (gizmos, icons, grid): drawn after the SSR/SSIL frame
+		// copy so next frame's screen-space effects never reflect them.
+		RENDER_TIMESTAMP("Render 3D Editor Overlay Pass");
+		RD::get_singleton()->draw_command_begin_label("Render 3D Editor Overlay Pass");
+
+		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr() + alpha_overlay_from, render_list[RENDER_LIST_ALPHA].element_info.ptr() + alpha_overlay_from, render_list[RENDER_LIST_ALPHA].elements.size() - alpha_overlay_from, reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, alpha_overlay_from, base_specialization, !is_reflection_probe);
+		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+
+		if (rb_data.is_valid() && use_msaa) {
+			// The overlay landed in the MSAA targets after the main resolve; resolve again.
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			}
+		}
+
+		RD::get_singleton()->draw_command_end_label();
+	}
 
 	{
 		RENDER_TIMESTAMP("Process Post Transparent Compositor Effects");
