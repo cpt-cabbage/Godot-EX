@@ -350,7 +350,7 @@ struct ImplementationData {
 	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass.
 
 	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
-	uint pad3;
+	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers (1: full res, 2: half res).
 	uint pad4;
 	uint pad5;
 };
@@ -502,12 +502,18 @@ layout(set = 1, binding = 39) uniform texture2DArray rt_area_shadow_mask;
 layout(set = 1, binding = 40) uniform texture2DArray stochastic_diffuse_buffer;
 layout(set = 1, binding = 41) uniform texture2DArray stochastic_specular_buffer;
 layout(set = 1, binding = 42) uniform texture2DArray stochastic_depth_buffer;
+layout(set = 1, binding = 43) uniform texture2DArray rt_gi_ambient_buffer;
+layout(set = 1, binding = 44) uniform texture2DArray rt_gi_reflection_buffer;
+layout(set = 1, binding = 45) uniform texture2DArray rt_gi_depth_buffer;
 #else
 layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2D rt_area_shadow_mask;
 layout(set = 1, binding = 40) uniform texture2D stochastic_diffuse_buffer;
 layout(set = 1, binding = 41) uniform texture2D stochastic_specular_buffer;
 layout(set = 1, binding = 42) uniform texture2D stochastic_depth_buffer;
+layout(set = 1, binding = 43) uniform texture2D rt_gi_ambient_buffer;
+layout(set = 1, binding = 44) uniform texture2D rt_gi_reflection_buffer;
+layout(set = 1, binding = 45) uniform texture2D rt_gi_depth_buffer;
 #endif // USE_MULTIVIEW
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 

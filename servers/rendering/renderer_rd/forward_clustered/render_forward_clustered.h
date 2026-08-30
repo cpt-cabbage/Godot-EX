@@ -326,7 +326,7 @@ private:
 			uint32_t stochastic_direct_lights;
 
 			uint32_t rt_sun_shadow;
-			uint32_t pad3;
+			uint32_t rt_gi;
 			uint32_t pad4;
 			uint32_t pad5;
 		};
@@ -773,6 +773,16 @@ private:
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
 	bool use_stochastic_fog_shadows = false;
+	bool use_rt_sdfgi_probes = false;
+	bool use_rt_gi = false;
+	bool use_rt_gi_half_res = true;
+	uint32_t rt_gi_rays = 1;
+	bool use_rt_gi_screen_radiance = true;
+	bool use_rt_gi_specular = true;
+	uint32_t rt_gi_temporal_frames = 32;
+	// Whether the last main-view frame rendered SDFGI (drives whether the TLAS
+	// must be built when only the SDFGI probe integrator consumes it).
+	bool sdfgi_used_last_frame = false;
 	RendererRD::RaytracedShadows::StochasticQuality stochastic_quality;
 
 	// Reads the live ray tracing project settings (called once per frame) and
@@ -790,6 +800,7 @@ private:
 public:
 	virtual bool needs_ray_tracing_instances() override;
 	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) override;
+	virtual RID get_ray_tracing_tlas() const override;
 
 private:
 

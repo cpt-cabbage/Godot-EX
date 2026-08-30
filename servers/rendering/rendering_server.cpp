@@ -3699,6 +3699,18 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/ray_bias", PROPERTY_HINT_RANGE, "0.001,1.0,0.001,or_greater"), 0.08);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows"), true);
+	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
+	// available, i.e. any other ray tracing feature is on or SDFGI is active).
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);
+	// Ray-traced indirect lighting: a per-pixel final gather that traces
+	// hardware rays and shades hits from the SDFGI cascades (sky-only when no
+	// SDFGI is active). Replaces the SDFGI/VoxelGI screen resolve and SSIL.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/half_resolution"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

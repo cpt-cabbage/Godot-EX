@@ -24,6 +24,9 @@ layout(set = 0, binding = 5) uniform sampler2D history_moments;
 layout(set = 0, binding = 6) uniform sampler2D raw_meta;
 // r: accumulated frames / 64, g: shading confidence.
 layout(set = 0, binding = 7) uniform sampler2D history_meta;
+// Motion vectors from the previous frame's color pass (uv_prev = uv + velocity).
+// Bound to a default black texture when motion vectors are not rendered.
+layout(set = 0, binding = 8) uniform sampler2D velocity_texture;
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -47,7 +50,13 @@ layout(push_constant, std430) uniform Params {
 	float variance_threshold; // Relative variance below which filtering is skipped.
 	int stride; // Spatial kernel stride.
 	int depth_scale; // 2 when the lighting buffers are half resolution.
-	float pad1;
+	// Neighborhood clamp width in standard deviations; <= 0 disables history
+	// clipping entirely. Dense signals (the direct lighting ratio) use ~1.5;
+	// sparse Monte Carlo signals (the GI gather) must not clamp: a 5x5
+	// neighborhood that catches no bright sample this frame would clip a
+	// perfectly converged history to black every frame (the same failure the
+	// STB lighting talk hits with TAA color clamping on noisy input).
+	float clamp_gamma;
 }
 params;
 
@@ -135,21 +144,37 @@ void main() {
 	vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, center_depth, 1.0);
 	if (prev_ndc.w > 0.0) {
 		vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
+		// The camera reprojection is exact for static geometry; where the
+		// velocity buffer (one frame stale, written by the previous color pass)
+		// disagrees by more than a pixel, the pixel belongs to a moving object
+		// and its velocity is the better predictor of where the history lives.
+		vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
+		if (velocity != vec2(0.0)) {
+			vec2 residual = (uv + velocity) - prev_uv;
+			if (any(greaterThan(abs(residual) * vec2(params.screen_size), vec2(1.0)))) {
+				prev_uv = uv + velocity;
+			}
+		}
 		if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
 			vec4 hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
 			vec4 hist_s4 = textureLod(history_specular, prev_uv, 0.0);
 			vec4 hist_moments = textureLod(history_moments, prev_uv, 0.0);
 			vec2 hist_meta = textureLod(history_meta, prev_uv, 0.0).rg;
 
-			const float gamma = 1.5;
-			float outside_d;
-			float outside_s;
-			vec3 hist_d = clip_to_aabb(hist_d4.rgb, mean_d, stddev_d * gamma, outside_d);
-			vec3 hist_s = clip_to_aabb(hist_s4.rgb, mean_s, stddev_s * gamma, outside_s);
+			vec3 hist_d = hist_d4.rgb;
+			vec3 hist_s = hist_s4.rgb;
+			float confidence = 1.0;
+			if (params.clamp_gamma > 0.0) {
+				float outside_d;
+				float outside_s;
+				hist_d = clip_to_aabb(hist_d4.rgb, mean_d, stddev_d * params.clamp_gamma, outside_d);
+				hist_s = clip_to_aabb(hist_s4.rgb, mean_s, stddev_s * params.clamp_gamma, outside_s);
 
-			// History confidence: the further the history was from the current
-			// neighborhood, the faster it is discarded (reduces ghosting).
-			float confidence = clamp(1.0 - max(outside_d, outside_s), 0.0, 1.0);
+				// History confidence: the further the history was from the
+				// current neighborhood, the faster it is discarded (reduces
+				// ghosting).
+				confidence = clamp(1.0 - max(outside_d, outside_s), 0.0, 1.0);
+			}
 			frames = min(hist_meta.r * 64.0 * confidence + 1.0, 1.0 / max(params.blend_alpha, 1e-3));
 			float alpha = max(1.0 / frames, params.blend_alpha);
 

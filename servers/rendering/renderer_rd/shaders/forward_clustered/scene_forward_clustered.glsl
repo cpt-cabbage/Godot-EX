@@ -2091,6 +2091,69 @@ void fragment_shader(in SceneData scene_data) {
 		ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
 		indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
 	}
+
+	// Ray-traced indirect lighting: the gather's rays already carry sky
+	// visibility and SDFGI bounce, so its demodulated irradiance replaces the
+	// ambient estimate outright; the traced reflection feeds only the rough
+	// specular band (sharp reflections stay with probes / SSR, whose
+	// sharpness the blurry radiance cache cannot match). Reflection probes
+	// later still override inside their volumes, as with SDFGI.
+	if (implementation_data.rt_gi != 0u) {
+		vec3 rt_gi_ambient = vec3(0.0);
+		vec3 rt_gi_reflection = vec3(0.0);
+		bool rt_gi_valid = false;
+		if ((implementation_data.rt_gi & 3u) == 1u) {
+#ifdef USE_MULTIVIEW
+			rt_gi_ambient = textureLod(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+			rt_gi_reflection = textureLod(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+#else
+			rt_gi_ambient = textureLod(sampler2D(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+			rt_gi_reflection = textureLod(sampler2D(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+#endif
+			rt_gi_valid = true;
+		} else {
+			// Half resolution: the same depth-aware upsample the stochastic
+			// direct lighting uses, so GI does not bleed across silhouettes.
+			uvec2 rtgi_full_size = uvec2(1.0 / scene_data.screen_pixel_size);
+			ivec2 rtgi_half_size = ivec2((rtgi_full_size + uvec2(1)) >> 1);
+			vec2 rtgi_pos = screen_uv * vec2(rtgi_half_size) - 0.5;
+			ivec2 rtgi_base = ivec2(floor(rtgi_pos));
+			vec2 rtgi_fr = rtgi_pos - vec2(rtgi_base);
+			float rtgi_own_depth = -vertex.z;
+			float rtgi_weight = 0.0;
+			for (int i = 0; i < 4; i++) {
+				ivec2 off = ivec2(i & 1, i >> 1);
+				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
+#ifdef USE_MULTIVIEW
+				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
+#else
+				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
+#endif
+				float w = (1.0 - abs(float(off.x) - rtgi_fr.x)) * (1.0 - abs(float(off.y) - rtgi_fr.y));
+				w *= exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
+#ifdef USE_MULTIVIEW
+				rt_gi_ambient += texelFetch(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
+				rt_gi_reflection += texelFetch(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
+#else
+				rt_gi_ambient += texelFetch(sampler2D(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
+				rt_gi_reflection += texelFetch(sampler2D(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
+#endif
+				rtgi_weight += w;
+			}
+			if (rtgi_weight > 1e-6) {
+				rt_gi_ambient /= rtgi_weight;
+				rt_gi_reflection /= rtgi_weight;
+				rt_gi_valid = true;
+			}
+		}
+		if (rt_gi_valid) {
+			ambient_light = rt_gi_ambient;
+			if (bool(implementation_data.rt_gi & 4u)) {
+				float rt_gi_spec_blend = smoothstep(0.2, 0.35, roughness);
+				indirect_specular_light = mix(indirect_specular_light, rt_gi_reflection, rt_gi_spec_blend);
+			}
+		}
+	}
 #endif // !USE_LIGHTMAP
 
 	if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSAO)) {

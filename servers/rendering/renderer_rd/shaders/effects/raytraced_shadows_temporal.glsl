@@ -13,6 +13,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform sampler2D current_mask;
 layout(set = 0, binding = 1) uniform sampler2D history_mask;
 layout(set = 0, binding = 2) uniform sampler2D depth_texture;
+// Motion vectors from the previous frame's color pass (uv_prev = uv + velocity).
+// Bound to a default black texture when motion vectors are not rendered.
+layout(set = 0, binding = 3) uniform sampler2D velocity_texture;
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
 layout(set = 1, binding = 1, r8) uniform restrict writeonly image2D dest_history;
 
@@ -56,6 +59,17 @@ void main() {
 	float result = current;
 	if (prev_ndc.w > 0.0) {
 		vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
+		// The camera reprojection is exact for static geometry; where the
+		// velocity buffer (one frame stale, written by the previous color pass)
+		// disagrees by more than a pixel, the pixel belongs to a moving object
+		// and its velocity is the better predictor of where the history lives.
+		vec2 velocity = texelFetch(velocity_texture, pixel, 0).xy;
+		if (velocity != vec2(0.0)) {
+			vec2 residual = (uv + velocity) - prev_uv;
+			if (any(greaterThan(abs(residual) * vec2(params.screen_size), vec2(1.0)))) {
+				prev_uv = uv + velocity;
+			}
+		}
 		if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
 			float history = textureLod(history_mask, prev_uv, 0.0).r;
 			// Widen the clamp window slightly to reduce flicker in stable regions.

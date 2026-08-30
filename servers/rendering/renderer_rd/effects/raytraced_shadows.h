@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -65,6 +66,23 @@
 #define RB_RT_STOCHASTIC_VIEW_DEPTH SNAME("stochastic_view_depth")
 #define RB_RT_STOCHASTIC_META_0 SNAME("stochastic_meta_0")
 #define RB_RT_STOCHASTIC_META_1 SNAME("stochastic_meta_1")
+
+// Ray-traced indirect lighting (own scope so toggling it doesn't drop the
+// direct lighting buffers and vice versa).
+#define RB_SCOPE_RT_GI SNAME("rb_rt_gi")
+#define RB_RT_GI_AMBIENT SNAME("ambient")
+#define RB_RT_GI_REFLECTION SNAME("reflection")
+#define RB_RT_GI_RAW_AMBIENT SNAME("raw_ambient")
+#define RB_RT_GI_RAW_REFLECTION SNAME("raw_reflection")
+#define RB_RT_GI_HIST_AMBIENT_0 SNAME("hist_ambient_0")
+#define RB_RT_GI_HIST_AMBIENT_1 SNAME("hist_ambient_1")
+#define RB_RT_GI_HIST_REFLECTION_0 SNAME("hist_reflection_0")
+#define RB_RT_GI_HIST_REFLECTION_1 SNAME("hist_reflection_1")
+#define RB_RT_GI_MOMENTS_0 SNAME("moments_0")
+#define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
+#define RB_RT_GI_META_0 SNAME("meta_0")
+#define RB_RT_GI_META_1 SNAME("meta_1")
+#define RB_RT_GI_VIEW_DEPTH SNAME("view_depth")
 
 namespace RendererRD {
 
@@ -184,6 +202,34 @@ private:
 		int32_t pad0;
 	};
 
+	// Ray-traced indirect lighting gather ("Lumen-lite" final gather).
+	bool sky_uses_octmap_array = false;
+	StochasticIndirectGiShaderRD rt_gi_shader;
+	RID rt_gi_shader_version;
+	RID rt_gi_pipeline;
+
+	struct RtGiParamsUBO {
+		float view_from_ndc[16];
+		float ndc_from_view[16];
+		float world_from_view[16];
+		float reproject[16];
+		int32_t screen_size[2];
+		int32_t full_screen_size[2];
+		uint32_t depth_scale;
+		uint32_t frame_index;
+		uint32_t ray_count;
+		uint32_t flags;
+		float sky_quat_or_color[4];
+		float sky_energy;
+		float ray_bias;
+		float sky_border[2];
+		float z_far;
+		float pad0;
+		float pad1;
+		float pad2;
+	};
+	LocalVector<RID> rt_gi_params_ubos; // Per view.
+
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
 		DENOISE_VARIANT_SPATIAL,
@@ -202,7 +248,7 @@ private:
 		float variance_threshold;
 		int32_t stride;
 		int32_t depth_scale;
-		float pad1;
+		float clamp_gamma; // Neighborhood clamp width in stddevs; <= 0 disables clipping.
 	};
 
 	struct DecodePushConstant {
@@ -252,18 +298,64 @@ public:
 	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size,
 	// denoised spatially and accumulated temporally (p_reproject maps current
 	// NDC to the previous frame's NDC).
-	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays);
+	// p_velocity is the previous frame's motion vector buffer (may be null);
+	// the temporal filter uses it to reproject moving objects.
+	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity);
 
 	// Traces a shadow mask for one area light (its rect spans p_axis_u/p_axis_v
 	// around p_light_pos) into RB_RT_AREA_SHADOW_MASK, spatially denoised.
 	void process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays);
+
+	// Quality settings for the ray-traced indirect lighting gather, read from
+	// the live project settings every frame.
+	struct GiQuality {
+		uint32_t rays_per_pixel = 1;
+		bool half_resolution = true;
+		bool screen_radiance = true;
+		bool specular = true;
+		bool screen_traces = true;
+		float ray_bias = 0.08f;
+		uint32_t temporal_frames = 32;
+		bool denoise = true;
+		int32_t spatial_stride = 2;
+		float variance_threshold = 0.02f;
+	};
+
+	// The SDFGI radiance cache handed to the gather (all null / inactive when
+	// the scene has no SDFGI: the gather then runs in sky-visibility mode).
+	struct GiCascades {
+		LocalVector<RID> sdf;
+		LocalVector<RID> light;
+		LocalVector<RID> aniso0;
+		LocalVector<RID> aniso1;
+		RID sdfgi_ubo; // GI::SDFGIData, required even when inactive.
+		bool active = false;
+	};
+
+	// Sky fallback for rays that leave the scene, mirroring the SDFGI probe
+	// integrator's sky handling.
+	struct GiSky {
+		RID radiance; // Octmap radiance texture (mode 2), may be null.
+		Quaternion orientation;
+		Color color; // Flat color (mode 1).
+		float energy = 1.0f;
+		float border_size = 0.0f;
+		uint32_t mode = 0; // 0: black, 1: color, 2: sky texture.
+	};
+
+	// Ray-traced indirect lighting: a per-pixel final gather tracing cosine
+	// hemisphere rays (plus an optional GGX ray for rough specular), shading
+	// hits from the SDFGI cascades and last frame's screen, denoised into
+	// demodulated ambient/reflection buffers (RB_SCOPE_RT_GI) the scene
+	// shader merges at the GI buffer merge point.
+	void process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_far, const GiQuality &p_quality);
 
 	// Stochastic direct lighting (mini-MegaLights): samples omni/spot lights
 	// per pixel (guided by last frame's visible lights, discovering new ones
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
@@ -271,7 +363,9 @@ public:
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return tlas; }
 
-	RaytracedShadows();
+	// p_sky_use_octmap_array selects the sky radiance octmap layout the GI
+	// gather shader compiles against (must match the sky renderer's).
+	RaytracedShadows(bool p_sky_use_octmap_array);
 	~RaytracedShadows();
 };
 

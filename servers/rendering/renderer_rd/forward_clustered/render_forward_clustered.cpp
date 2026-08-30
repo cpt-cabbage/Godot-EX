@@ -737,6 +737,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Only valid where the stochastic pass runs: opaque main-view rendering.
 	// 1: full resolution buffers, 2: half resolution (depth-aware upsample).
 	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? 2 : 1) : 0;
+	// Same validity rule for the ray-traced GI buffers. Bits 0-1: resolution
+	// mode (1 full, 2 half with the depth-aware upsample); bit 2: the traced
+	// reflection buffer is populated (otherwise the composite must not blend
+	// rough specular toward its black fallback).
+	scene_state.ubo.rt_gi = (use_rt_gi && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u)) : 0;
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
 	scene_state.ubo.rt_sun_shadow = (p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && _get_rt_sun_base(p_render_data).is_valid()) ? 1 : 0;
@@ -774,7 +779,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 		uint32_t ss_flags = 0;
 		if (p_opaque_render_buffers) {
 			ss_flags |= environment_get_ssao_enabled(p_render_data->environment) ? (1 << 0) : 0;
-			ss_flags |= environment_get_ssil_enabled(p_render_data->environment) ? (1 << 1) : 0;
+			// Ray-traced GI replaces SSIL (its rays already carry the on-screen
+			// bounce SSIL approximates; keeping both would double count).
+			ss_flags |= (environment_get_ssil_enabled(p_render_data->environment) && !use_rt_gi) ? (1 << 1) : 0;
 			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
 
 			if (rd.is_valid()) {
@@ -1680,7 +1687,10 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 		_render_shadow_process();
 	}
 
-	if (render_gi) {
+	if (render_gi && !use_rt_gi) {
+		// With ray-traced GI on, the SDFGI/VoxelGI volumes still update (they
+		// are the gather's radiance cache) but this screen resolve is replaced
+		// by the traced gather in the ray tracing block.
 		gi.process_gi(rb, p_normal_roughness_slices, p_voxel_gi_buffer, p_render_data->environment, p_render_data->scene_data->view_count, p_render_data->scene_data->view_projection, p_render_data->scene_data->view_eye_offset, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances);
 	}
 
@@ -1695,6 +1705,9 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 		if (p_use_ssil || p_use_ssr) {
 			ss_effects->allocate_last_frame_buffer(rb, p_use_ssil, p_use_ssr);
+		} else if (use_rt_gi && use_rt_gi_screen_radiance) {
+			// The GI gather reads last frame's scene at on-screen ray hits.
+			ss_effects->allocate_last_frame_buffer(rb, false, false);
 		}
 
 		if (p_use_ssao || p_use_ssil) {
@@ -1780,11 +1793,18 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 
 bool RenderForwardClustered::needs_ray_tracing_instances() {
 	_update_ray_tracing_settings();
-	return use_raytraced_shadows || use_stochastic_lighting;
+	return use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || (use_rt_sdfgi_probes && sdfgi_used_last_frame);
 }
 
 void RenderForwardClustered::update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
 	rt_scene_ready = rt_shadows != nullptr && rt_shadows->update_scene(p_instances);
+}
+
+RID RenderForwardClustered::get_ray_tracing_tlas() const {
+	if (rt_shadows == nullptr || !rt_scene_ready || !use_rt_sdfgi_probes) {
+		return RID();
+	}
+	return rt_shadows->get_tlas();
 }
 
 RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) const {
@@ -1810,6 +1830,13 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
+	use_rt_sdfgi_probes = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/sdfgi/ray_query"));
+	use_rt_gi = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
+	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/half_resolution");
+	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/rays_per_pixel"));
+	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance");
+	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
+	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/temporal_frames"));
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
@@ -1822,8 +1849,9 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	stochastic_quality.variance_threshold = GLOBAL_GET("rendering/ray_tracing/denoiser/variance_threshold");
 
 	// Lazily create the ray tracing backend the first frame anything needs it.
-	if ((use_raytraced_shadows || use_stochastic_lighting) && rt_shadows == nullptr) {
-		rt_shadows = memnew(RendererRD::RaytracedShadows);
+	// SDFGI probe rays alone only warrant it once SDFGI is actually rendering.
+	if ((use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || (use_rt_sdfgi_probes && sdfgi_used_last_frame)) && rt_shadows == nullptr) {
+		rt_shadows = memnew(RendererRD::RaytracedShadows(sky.sky_use_octmap_array));
 	}
 }
 
@@ -1880,6 +1908,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		p_render_data->voxel_gi_count = 0;
 
+		sdfgi_used_last_frame = rb->has_custom_data(RB_SCOPE_SDFGI);
 		if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
 			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
 			if (sdfgi.is_valid()) {
@@ -1942,6 +1971,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		motion_vectors_required = true;
 	} else if (!is_reflection_probe && using_upscaling) {
 		motion_vectors_required = true;
+	} else if (!is_reflection_probe && rb_data.is_valid() && (use_raytraced_shadows || use_stochastic_lighting)) {
+		// The ray-traced denoisers reproject history with last frame's motion
+		// vectors, so moving objects don't smear their accumulated lighting.
+		motion_vectors_required = true;
 	} else {
 		motion_vectors_required = false;
 	}
@@ -1965,7 +1998,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool using_sdfgi = false;
 	bool using_voxelgi = false;
 	bool reverse_cull = p_render_data->scene_data->cam_transform.basis.determinant() < 0;
-	bool using_ssil = !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
+	// Ray-traced GI replaces SSIL entirely (see _setup_environment).
+	bool using_ssil = !is_reflection_probe && !use_rt_gi && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
 	bool using_motion_pass = rb_data.is_valid() && using_upscaling;
 
 	if (is_reflection_probe) {
@@ -2064,11 +2098,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					using_ssil ||
 					ce_needs_normal_roughness ||
 					use_stochastic_lighting ||
+					use_rt_gi ||
 					get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER ||
 					scene_state.used_normal_texture) {
 				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 			}
-		} else if (use_stochastic_lighting || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
+		} else if (use_stochastic_lighting || use_rt_gi || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
 
@@ -2321,8 +2356,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	} else if (rb_data.is_valid() && !is_reflection_probe && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE) && !use_stochastic_lighting) {
 		rb->clear_context(RB_SCOPE_RT_SHADOWS);
 	}
+	if (rb_data.is_valid() && !is_reflection_probe && rb->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT) && !use_rt_gi) {
+		// Ray-traced GI toggled off: drop its buffers so the scene shader
+		// falls back to the default black textures.
+		rb->clear_context(RB_SCOPE_RT_GI);
+	}
 
-	if (rt_shadows != nullptr && (use_raytraced_shadows || use_stochastic_lighting) && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
+	if (rt_shadows != nullptr && (use_raytraced_shadows || use_stochastic_lighting || use_rt_gi) && depth_pre_pass && rb_data.is_valid() && !is_reflection_probe) {
 		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 		// Find the first directional and first area light to trace shadows for.
 		Vector3 to_sun;
@@ -2367,11 +2407,68 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		bool run_stochastic = use_stochastic_lighting && rb_data->has_normal_roughness() && current_cluster_builder != nullptr &&
 				(light_storage->get_omni_light_count() > 0 || light_storage->get_spot_light_count() > 0 || light_storage->get_area_light_count() > 0);
+		bool run_rt_gi = use_rt_gi && rb_data->has_normal_roughness();
 
-		if ((has_sun || has_area || run_stochastic) && rt_scene_ready) {
+		if ((has_sun || has_area || run_stochastic || run_rt_gi) && rt_scene_ready) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
 			rt_shadows->advance_frame();
+
+			// The GI gather's radiance cache and sky fallback.
+			RendererRD::RaytracedShadows::GiCascades gi_cascades;
+			RendererRD::RaytracedShadows::GiSky gi_sky;
+			RendererRD::RaytracedShadows::GiQuality gi_quality;
+			RID gi_screen_radiance_base;
+			if (run_rt_gi) {
+				gi_cascades.sdfgi_ubo = gi.get_sdfgi_ubo();
+				if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
+					Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+					if (sdfgi.is_valid() && sdfgi->cascades.size() > 0) {
+						gi_cascades.active = true;
+						for (uint32_t c = 0; c < sdfgi->cascades.size(); c++) {
+							gi_cascades.sdf.push_back(sdfgi->cascades[c].sdf_tex);
+							gi_cascades.light.push_back(sdfgi->cascades[c].light_tex);
+							gi_cascades.aniso0.push_back(sdfgi->cascades[c].light_aniso_0_tex);
+							gi_cascades.aniso1.push_back(sdfgi->cascades[c].light_aniso_1_tex);
+						}
+					}
+				}
+				if (is_environment(p_render_data->environment)) {
+					RID env = p_render_data->environment;
+					gi_sky.energy = environment_get_bg_energy_multiplier(env);
+					if (p_render_data->camera_attributes.is_valid()) {
+						gi_sky.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+					}
+					RSE::EnvironmentBG bg = environment_get_background(env);
+					if (bg == RSE::ENV_BG_CLEAR_COLOR) {
+						gi_sky.mode = 1;
+						gi_sky.color = p_default_bg_color.srgb_to_linear();
+					} else if (bg == RSE::ENV_BG_COLOR) {
+						gi_sky.mode = 1;
+						gi_sky.color = environment_get_bg_color(env).srgb_to_linear();
+					} else if (bg == RSE::ENV_BG_SKY && radiance_texture.is_valid()) {
+						gi_sky.mode = 2;
+						gi_sky.radiance = radiance_texture;
+						gi_sky.orientation = environment_get_sky_orientation(env).get_quaternion().inverse();
+						RendererRD::SkyRD::Sky *sky_object = sky.sky_owner.get_or_null(environment_get_sky(env));
+						gi_sky.border_size = sky_object != nullptr ? sky_object->uv_border_size : 0.0f;
+					}
+				}
+				if (use_rt_gi_screen_radiance && rb->has_texture(RB_SCOPE_SSLF, RB_LAST_FRAME)) {
+					gi_screen_radiance_base = rb->get_texture(RB_SCOPE_SSLF, RB_LAST_FRAME);
+				}
+				gi_quality.rays_per_pixel = rt_gi_rays;
+				gi_quality.half_resolution = use_rt_gi_half_res;
+				gi_quality.screen_radiance = use_rt_gi_screen_radiance;
+				gi_quality.specular = use_rt_gi_specular;
+				gi_quality.screen_traces = stochastic_quality.screen_traces;
+				gi_quality.ray_bias = stochastic_quality.ray_bias;
+				gi_quality.temporal_frames = rt_gi_temporal_frames;
+				gi_quality.denoise = stochastic_quality.denoise;
+				gi_quality.spatial_stride = stochastic_quality.spatial_stride;
+				gi_quality.variance_threshold = stochastic_quality.variance_threshold;
+			}
+
 			// get_view_projection() applies the NDC depth correction the depth buffer was rendered with.
 			RenderSceneDataRD *scene_data = p_render_data->scene_data;
 			Projection world_from_view = Projection(scene_data->get_cam_transform());
@@ -2383,8 +2480,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				Projection view_from_ndc = scene_data->get_view_projection(v).inverse();
 				Projection world_from_ndc = world_from_view * view_from_ndc;
 				Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[v] * prev_view_from_world;
+				// Last frame's motion vectors (this frame's are rendered later,
+				// in the opaque pass); helps the temporal filters follow moving
+				// objects. Null on the first frame the buffer exists.
+				RID velocity = rb->has_velocity_buffer(false) ? rb->get_velocity_buffer(false, v) : RID();
 				if (has_sun) {
-					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle, sun_caster_mask, rt_shadow_rays);
+					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle, sun_caster_mask, rt_shadow_rays, velocity);
 				}
 				if (has_area) {
 					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v, area_caster_mask, rt_shadow_rays);
@@ -2392,7 +2493,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
-							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, stochastic_quality);
+							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, stochastic_quality, velocity);
+				}
+				if (run_rt_gi) {
+					RID screen_radiance;
+					if (gi_screen_radiance_base.is_valid()) {
+						screen_radiance = rb->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
+					}
+					rt_shadows->process_rt_gi(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
+							rb_data->get_normal_roughness(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_far, gi_quality);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -2666,7 +2775,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RD::get_singleton()->draw_command_end_label();
 
 	RD::get_singleton()->draw_command_begin_label("Copy Framebuffer for SSIL/SSR");
-	if (using_ssil || using_ssr) {
+	if (using_ssil || using_ssr || (use_rt_gi && use_rt_gi_screen_radiance && rb_data.is_valid())) {
 		RENDER_TIMESTAMP("Copy Final Framebuffer (SSIL/SSR)");
 		_copy_framebuffer_to_ss_effects(rb, using_ssil, using_ssr);
 	}
@@ -4039,6 +4148,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_SPECULAR : RB_RT_STOCHASTIC_VIEW_DEPTH);
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		// Additive terms: black when inactive.
+		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	for (uint32_t i = 0; i < 3; i++) {
+		RD::Uniform u;
+		u.binding = 43 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : RB_RT_GI_VIEW_DEPTH);
+		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_GI, name) ? rb->get_texture(RB_SCOPE_RT_GI, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);
