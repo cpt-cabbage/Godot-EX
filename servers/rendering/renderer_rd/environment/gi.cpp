@@ -1310,7 +1310,7 @@ void GI::SDFGI::update_light() {
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky) {
+void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky, RID p_tlas) {
 	RD::get_singleton()->draw_command_begin_label("SDFGI Update Probes");
 
 	SDFGIShader::IntegratePushConstant push_constant;
@@ -1392,8 +1392,21 @@ void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky) {
 
 	render_pass++;
 
+	// Trace the probe rays against the scene BVH when one is available: the
+	// hardware rays see the actual render geometry (thin walls, small
+	// occluders) the voxelized SDF misses; hits still shade from the cascades.
+	const bool use_ray_query = p_tlas.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	const int process_mode = use_ray_query ? SDFGIShader::INTEGRATE_MODE_PROCESS_RQ : SDFGIShader::INTEGRATE_MODE_PROCESS;
+
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
-	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, gi->sdfgi_shader.integrate_pipeline[SDFGIShader::INTEGRATE_MODE_PROCESS].get_rid());
+	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, gi->sdfgi_shader.integrate_pipeline[process_mode].get_rid());
+
+	RID tlas_uniform_set;
+	if (use_ray_query) {
+		RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ p_tlas }));
+		RID rq_shader = gi->sdfgi_shader.integrate.version_get_shader(gi->sdfgi_shader.integrate_shader, SDFGIShader::INTEGRATE_MODE_PROCESS_RQ);
+		tlas_uniform_set = UniformSetCacheRD::get_singleton()->get_cache(rq_shader, 2, u_tlas);
+	}
 
 	int32_t probe_divisor = cascade_size / SDFGI::PROBE_DIVISOR;
 	for (uint32_t i = 0; i < cascades.size(); i++) {
@@ -1404,6 +1417,9 @@ void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky) {
 
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, cascades[i].integrate_uniform_set, 0);
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, sky_uniform_set, 1);
+		if (use_ray_query) {
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, tlas_uniform_set, 2);
+		}
 
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SDFGIShader::IntegratePushConstant));
 		RD::get_singleton()->compute_list_dispatch_threads(compute_list, probe_axis_count * probe_axis_count, probe_axis_count, 1);
@@ -3677,10 +3693,20 @@ void GI::init(SkyRD *p_sky) {
 		integrate_modes.push_back("\n#define MODE_STORE\n");
 		integrate_modes.push_back("\n#define MODE_SCROLL\n");
 		integrate_modes.push_back("\n#define MODE_SCROLL_STORE\n");
+		integrate_modes.push_back("\n#define MODE_PROCESS\n#define USE_RAY_QUERY\n");
 		sdfgi_shader.integrate.initialize(integrate_modes, defines);
+
+		const bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+		if (!supports_ray_query) {
+			sdfgi_shader.integrate.set_variant_enabled(SDFGIShader::INTEGRATE_MODE_PROCESS_RQ, false);
+		}
+
 		sdfgi_shader.integrate_shader = sdfgi_shader.integrate.version_create();
 
 		for (int i = 0; i < SDFGIShader::INTEGRATE_MODE_MAX; i++) {
+			if (i == SDFGIShader::INTEGRATE_MODE_PROCESS_RQ && !supports_ray_query) {
+				continue;
+			}
 			sdfgi_shader.integrate_pipeline[i].create_compute_pipeline(sdfgi_shader.integrate.version_get_shader(sdfgi_shader.integrate_shader, i));
 		}
 

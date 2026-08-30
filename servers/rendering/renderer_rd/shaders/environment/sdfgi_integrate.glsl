@@ -1,8 +1,12 @@
 #[compute]
 
-#version 450
+#version 460
 
 #VERSION_DEFINES
+
+#ifdef USE_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 #include "../oct_inc.glsl"
 
@@ -48,6 +52,14 @@ layout(set = 1, binding = 0) uniform texture2DArray sky_irradiance;
 layout(set = 1, binding = 0) uniform texture2D sky_irradiance;
 #endif
 layout(set = 1, binding = 1) uniform sampler linear_sampler_mipmaps;
+
+#ifdef USE_RAY_QUERY
+// Probe rays traced against the scene's acceleration structure instead of
+// marching the cascade SDFs: the BVH has the actual render geometry, so thin
+// walls and small occluders the voxelized SDF misses stop light correctly.
+// The hit is still shaded from the cascades' light volumes.
+layout(set = 2, binding = 0) uniform accelerationStructureEXT tlas;
+#endif
 
 #define HISTORY_BITS 10
 
@@ -196,13 +208,63 @@ void main() {
 		vec3 inv_dir = 1.0 / ray_dir;
 
 		bool hit = false;
+		bool blocked = false; // Hit geometry the cascades cannot shade (RQ only).
 		uint hit_cascade;
+		vec3 uvw;
 
+#ifndef USE_RAY_QUERY
+		// The cell-scaled bias frees probes embedded in the dilated voxel
+		// representation. Hardware rays trace the real (thin) geometry, where
+		// this bias would push the origin straight through a wall; they use a
+		// small fixed t_min instead.
 		float bias = params.ray_bias;
 		vec3 abs_ray_dir = abs(ray_dir);
 		ray_pos += ray_dir * 1.0 / max(abs_ray_dir.x, max(abs_ray_dir.y, abs_ray_dir.z)) * bias / cascades.data[params.cascade].to_cell;
-		vec3 uvw;
+#endif
 
+#ifdef USE_RAY_QUERY
+		// Trace the probe ray against the scene BVH instead of marching the
+		// cascade SDFs. The SDFGI volume is the world with Y compressed by
+		// y_mult, so origin and direction convert to true world space for the
+		// trace and the hit converts back for cascade shading.
+		vec3 world_origin = vec3(ray_pos.x, ray_pos.y / params.y_mult, ray_pos.z);
+		vec3 world_dir_unnorm = vec3(ray_dir.x, ray_dir.y / params.y_mult, ray_dir.z);
+		float world_len = length(world_dir_unnorm);
+		vec3 world_dir = world_dir_unnorm / world_len;
+
+		// Limit the ray to where the outermost cascade ends, like the march.
+		uint last_cascade = params.max_cascades - 1;
+		vec3 bounds_min = cascades.data[last_cascade].offset;
+		vec3 bounds_max = bounds_min + params.grid_size / cascades.data[last_cascade].to_cell;
+		vec3 bt0 = (bounds_min - ray_pos) * inv_dir;
+		vec3 bt1 = (bounds_max - ray_pos) * inv_dir;
+		vec3 btmax = max(bt0, bt1);
+		float t_exit = max(min(btmax.x, min(btmax.y, btmax.z)), 0.0);
+
+		rayQueryEXT rq;
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, world_origin, 0.02, world_dir, t_exit * world_len);
+		while (rayQueryProceedEXT(rq)) {
+		}
+		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+			blocked = true;
+			float t_hit = rayQueryGetIntersectionTEXT(rq, true);
+			vec3 world_hit = world_origin + world_dir * t_hit;
+			vec3 hit_pos = vec3(world_hit.x, world_hit.y * params.y_mult, world_hit.z);
+			// Shade from the smallest cascade containing the hit, sampling half
+			// a cell back along the ray where the SDF march would have stopped.
+			for (uint j = params.cascade; j < params.max_cascades; j++) {
+				vec3 sample_pos = hit_pos - ray_dir * 0.5 / cascades.data[j].to_cell;
+				vec3 lpos = (sample_pos - cascades.data[j].offset) * cascades.data[j].to_cell;
+				if (any(lessThan(lpos, vec3(0.0))) || any(greaterThanEqual(lpos, params.grid_size))) {
+					continue;
+				}
+				hit = true;
+				hit_cascade = j;
+				uvw = lpos * pos_to_uvw;
+				break;
+			}
+		}
+#else
 		for (uint j = params.cascade; j < params.max_cascades; j++) {
 			//convert to local bounds
 			vec3 pos = ray_pos - cascades.data[j].offset;
@@ -245,6 +307,7 @@ void main() {
 			pos += cascades.data[j].offset;
 			ray_pos = pos;
 		}
+#endif // !USE_RAY_QUERY
 
 		vec4 light;
 		if (hit) {
@@ -268,6 +331,10 @@ void main() {
 				}
 			}
 
+		} else if (blocked) {
+			// Geometry outside every cascade blocked the ray: keep it dark
+			// rather than letting sky light leak through the wall.
+			light = vec4(0.0, 0.0, 0.0, 1.0);
 		} else if (bool(params.sky_flags & SKY_FLAGS_MODE_SKY)) {
 			// Reconstruct sky orientation as quaternion and rotate ray_dir before sampling.
 			float sky_sign = bool(params.sky_flags & SKY_FLAGS_ORIENTATION_SIGN) ? 1.0 : -1.0;

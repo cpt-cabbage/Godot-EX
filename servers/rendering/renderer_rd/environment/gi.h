@@ -397,6 +397,7 @@ private:
 			INTEGRATE_MODE_STORE,
 			INTEGRATE_MODE_SCROLL,
 			INTEGRATE_MODE_SCROLL_STORE,
+			INTEGRATE_MODE_PROCESS_RQ, // MODE_PROCESS tracing hardware ray queries against the scene TLAS.
 			INTEGRATE_MODE_MAX
 		};
 		struct IntegratePushConstant {
@@ -692,7 +693,9 @@ public:
 		void create(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size, GI *p_gi);
 		void update(RID p_env, const Vector3 &p_world_position);
 		void update_light();
-		void update_probes(RID p_env, RendererRD::SkyRD::Sky *p_sky);
+		// p_tlas (optional): scene acceleration structure; when valid, probe
+		// rays are traced against it instead of marching the cascade SDFs.
+		void update_probes(RID p_env, RendererRD::SkyRD::Sky *p_sky, RID p_tlas);
 		void store_probes();
 		int get_pending_region_data(int p_region, Vector3i &r_local_offset, Vector3i &r_local_size, AABB &r_bounds) const;
 		void update_cascades();
@@ -798,6 +801,11 @@ public:
 	};
 
 	RID sdfgi_ubo;
+
+	// The SDFGIData uniform buffer the deferred GI resolve and the ray-traced
+	// GI gather bind (always valid once init() ran; contents only meaningful
+	// while an SDFGI instance is updating it).
+	RID get_sdfgi_ubo() const { return sdfgi_ubo; }
 
 	enum Group {
 		GROUP_NORMAL,

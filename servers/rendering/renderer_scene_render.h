@@ -280,6 +280,9 @@ public:
 	// subset: off-screen occluders must still block rays.
 	virtual bool needs_ray_tracing_instances() { return false; }
 	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {}
+	// The frame's scene acceleration structure (null when unavailable), for
+	// consumers like the SDFGI probe integrator.
+	virtual RID get_ray_tracing_tlas() const { return RID(); }
 
 	virtual void voxel_gi_update(RID p_probe, bool p_update_light_instances, const Vector<RID> &p_light_instances, const PagedArray<RenderGeometryInstance *> &p_dynamic_objects) = 0;
 
