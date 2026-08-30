@@ -274,6 +274,9 @@ private:
 
 	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb);
 	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask);
+	// Finds (or creates) the cached BLAS variant for a mesh + surface mask,
+	// healing stale cache entries whose buffers were freed behind our back.
+	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
 
 public:
 	// Live quality settings for the stochastic pass, read from the project

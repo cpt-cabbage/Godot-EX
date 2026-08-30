@@ -286,6 +286,47 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint
 	r_entry.blas = RD::get_singleton()->blas_create(geometries, 0);
 }
 
+RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask) {
+	RD *rd = RD::get_singleton();
+
+	LocalVector<MeshBlas> *variants = blas_cache.getptr(p_mesh);
+	if (variants != nullptr) {
+		// The BLAS may have been freed behind our back (e.g. the mesh was
+		// reimported and its surface buffers were recreated, cascading the
+		// free); all variants share those buffers, so all die together.
+		// The decoded position buffers are ours and did not cascade: free
+		// them here or they leak for the rest of the session.
+		bool stale = false;
+		for (const MeshBlas &variant : *variants) {
+			if (variant.blas.is_valid() && !rd->acceleration_structure_is_valid(variant.blas)) {
+				stale = true;
+				break;
+			}
+		}
+		if (stale) {
+			for (const MeshBlas &variant : *variants) {
+				for (const RID &buffer : variant.decoded_buffers) {
+					rd->free_rid(buffer);
+				}
+			}
+			blas_cache.erase(p_mesh);
+			variants = nullptr;
+		}
+	}
+	if (variants == nullptr) {
+		variants = &blas_cache.insert(p_mesh, LocalVector<MeshBlas>())->value;
+	}
+	for (MeshBlas &variant : *variants) {
+		if (variant.surface_mask == p_surface_mask) {
+			return &variant;
+		}
+	}
+	MeshBlas new_entry;
+	_create_blas_for_mesh(p_mesh, new_entry, p_surface_mask);
+	variants->push_back(new_entry);
+	return &(*variants)[variants->size() - 1];
+}
+
 bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
 	RD *rd = RD::get_singleton();
 
@@ -299,12 +340,15 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	thread_local LocalVector<RD::AccelerationStructureInstance> as_instances;
 	as_instances.clear();
 
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+
 	for (uint64_t i = 0; i < p_instances.size(); i++) {
 		RenderGeometryInstanceBase *inst = static_cast<RenderGeometryInstanceBase *>(p_instances[i]);
-		if (inst->data->base_type != RSE::INSTANCE_MESH) {
-			continue; // Multimesh and particles are not supported yet.
+		const bool is_multimesh = inst->data->base_type == RSE::INSTANCE_MULTIMESH;
+		if (inst->data->base_type != RSE::INSTANCE_MESH && !is_multimesh) {
+			continue; // Particles are not supported yet.
 		}
-		if (inst->mesh_instance.is_valid()) {
+		if (!is_multimesh && inst->mesh_instance.is_valid()) {
 			continue; // Skinned or blend-shaped: base geometry would be wrong; skip.
 		}
 		if (!inst->data->casts_shadows) {
@@ -314,49 +358,16 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 			continue; // Alpha-blended geometry does not cast shadows, as with shadow maps.
 		}
 		RID mesh = inst->data->base;
+		if (is_multimesh) {
+			mesh = mesh_storage->multimesh_get_mesh(inst->data->base);
+			if (mesh.is_null() || mesh_storage->multimesh_get_transform_format(inst->data->base) != RSE::MULTIMESH_TRANSFORM_3D) {
+				continue;
+			}
+		}
 		uint32_t surface_mask = inst->data->shadow_casting_surface_mask;
 
-		LocalVector<MeshBlas> *variants = blas_cache.getptr(mesh);
-		if (variants != nullptr) {
-			// The BLAS may have been freed behind our back (e.g. the mesh was
-			// reimported and its surface buffers were recreated, cascading the
-			// free); all variants share those buffers, so all die together.
-			// The decoded position buffers are ours and did not cascade: free
-			// them here or they leak for the rest of the session.
-			bool stale = false;
-			for (const MeshBlas &variant : *variants) {
-				if (variant.blas.is_valid() && !rd->acceleration_structure_is_valid(variant.blas)) {
-					stale = true;
-					break;
-				}
-			}
-			if (stale) {
-				for (const MeshBlas &variant : *variants) {
-					for (const RID &buffer : variant.decoded_buffers) {
-						rd->free_rid(buffer);
-					}
-				}
-				blas_cache.erase(mesh);
-				variants = nullptr;
-			}
-		}
-		if (variants == nullptr) {
-			variants = &blas_cache.insert(mesh, LocalVector<MeshBlas>())->value;
-		}
-		MeshBlas *entry = nullptr;
-		for (MeshBlas &variant : *variants) {
-			if (variant.surface_mask == surface_mask) {
-				entry = &variant;
-				break;
-			}
-		}
-		if (entry == nullptr) {
-			MeshBlas new_entry;
-			_create_blas_for_mesh(mesh, new_entry, surface_mask);
-			variants->push_back(new_entry);
-			entry = &(*variants)[variants->size() - 1];
-		}
-		if (entry->blas.is_null()) {
+		MeshBlas *entry = _resolve_mesh_blas(mesh, surface_mask);
+		if (entry == nullptr || entry->blas.is_null()) {
 			continue;
 		}
 		if (!entry->built) {
@@ -373,7 +384,29 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
 		as_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 		as_instance.blas = entry->blas;
-		as_instances.push_back(as_instance);
+
+		if (is_multimesh) {
+			// One TLAS instance per multimesh instance, sharing the BLAS. The
+			// per-instance transforms come from the multimesh data cache
+			// (reading it makes GPU-set buffers CPU-local once, then stays
+			// cheap). Capped so pathological instance counts (grass fields)
+			// cannot explode the TLAS; instances past the cap just don't
+			// occlude, matching how they'd LOD out of shadow maps anyway.
+			const int MAX_MULTIMESH_TLAS_INSTANCES = 16384;
+			int instance_count = mesh_storage->multimesh_get_instance_count(inst->data->base);
+			int visible = mesh_storage->multimesh_get_visible_instances(inst->data->base);
+			if (visible >= 0) {
+				instance_count = MIN(instance_count, visible);
+			}
+			instance_count = MIN(instance_count, MAX_MULTIMESH_TLAS_INSTANCES);
+			for (int mm = 0; mm < instance_count; mm++) {
+				as_instance.transform = inst->transform * mesh_storage->multimesh_instance_get_transform(inst->data->base, mm);
+				as_instances.push_back(as_instance);
+			}
+		} else {
+			as_instance.transform = inst->transform;
+			as_instances.push_back(as_instance);
+		}
 	}
 
 	if (as_instances.is_empty()) {
