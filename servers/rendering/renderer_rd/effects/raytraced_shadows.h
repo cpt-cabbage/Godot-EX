@@ -264,9 +264,18 @@ private:
 		uint32_t pad[3];
 	};
 
+	// A compressed-position decode that must re-run when its source deforms.
+	struct DecodeJob {
+		RID source;
+		RID dest;
+		uint32_t vertex_count = 0;
+		AABB aabb;
+	};
+
 	struct MeshBlas {
 		RID blas; // Null if the mesh has no BLAS-eligible surfaces.
 		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
+		LocalVector<DecodeJob> decode_jobs; // Re-run per frame for deforming geometry.
 		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
 		bool built = false;
 	};
@@ -275,14 +284,20 @@ private:
 	// overrides make that per instance, not per mesh.
 	HashMap<RID, LocalVector<MeshBlas>> blas_cache;
 
+	// Skinned / blend-shaped instances: one BLAS per mesh instance over its
+	// deformed vertex buffers, rebuilt every frame.
+	HashMap<RID, MeshBlas> skinned_blas_cache;
+
 	RID tlas;
 	uint32_t tlas_capacity = 0;
 
-	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb);
-	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask);
+	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer = RID());
+	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance = RID());
 	// Finds (or creates) the cached BLAS variant for a mesh + surface mask,
 	// healing stale cache entries whose buffers were freed behind our back.
 	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
+	// Same for a deforming instance's per-frame BLAS.
+	MeshBlas *_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask);
 
 public:
 	// Live quality settings for the stochastic pass, read from the project

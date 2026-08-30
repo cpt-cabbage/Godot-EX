@@ -163,6 +163,14 @@ RaytracedShadows::~RaytracedShadows() {
 			}
 		}
 	}
+	for (const KeyValue<RID, MeshBlas> &E : skinned_blas_cache) {
+		if (E.value.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(E.value.blas)) {
+			RD::get_singleton()->free_rid(E.value.blas);
+		}
+		for (const RID &buffer : E.value.decoded_buffers) {
+			RD::get_singleton()->free_rid(buffer);
+		}
+	}
 	RD::get_singleton()->free_rid(sampler);
 	RD::get_singleton()->free_rid(stbn_texture);
 	RD::get_singleton()->free_rid(ltc_lut1_texture);
@@ -191,12 +199,15 @@ RaytracedShadows::~RaytracedShadows() {
 	light_list_shader.version_free(light_list_shader_version);
 }
 
-RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb) {
+RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer) {
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 
-	RID decoded = rd->vertex_buffer_create(p_vertex_count * sizeof(float) * 3, Vector<uint8_t>(),
-			BitField<RD::BufferCreationBits>(uint32_t(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) | uint32_t(RD::BUFFER_CREATION_AS_STORAGE_BIT)));
+	RID decoded = p_reuse_buffer;
+	if (decoded.is_null()) {
+		decoded = rd->vertex_buffer_create(p_vertex_count * sizeof(float) * 3, Vector<uint8_t>(),
+				BitField<RD::BufferCreationBits>(uint32_t(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) | uint32_t(RD::BUFFER_CREATION_AS_STORAGE_BIT)));
+	}
 	ERR_FAIL_COND_V(decoded.is_null(), RID());
 
 	DecodePushConstant push_constant = {};
@@ -222,7 +233,7 @@ RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t
 	return decoded;
 }
 
-void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask) {
+void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance) {
 	MeshStorage *mesh_storage = MeshStorage::get_singleton();
 
 	r_entry.surface_mask = p_surface_mask;
@@ -251,6 +262,15 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint
 			continue;
 		}
 		RID vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, i);
+		if (p_mesh_instance.is_valid()) {
+			// Deformed surfaces read the skinned/blend-shaped output instead
+			// of the base geometry; rigid surfaces of the same mesh have no
+			// per-instance buffer and keep the base one.
+			RID skinned_buffer = mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(p_mesh_instance, i);
+			if (skinned_buffer.is_valid()) {
+				vertex_buffer = skinned_buffer;
+			}
+		}
 		if (vertex_buffer.is_null()) {
 			continue;
 		}
@@ -265,6 +285,13 @@ void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint
 				continue;
 			}
 			r_entry.decoded_buffers.push_back(decoded);
+			// Deforming geometry re-decodes every frame; remember the job.
+			DecodeJob job;
+			job.source = vertex_buffer;
+			job.dest = decoded;
+			job.vertex_count = vertex_count;
+			job.aabb = mesh_storage->mesh_surface_get_aabb(surface);
+			r_entry.decode_jobs.push_back(job);
 			geometry.vertex_buffer = decoded;
 		} else {
 			// Uncompressed 3D positions are tightly packed floats at the start of the buffer.
@@ -328,6 +355,33 @@ RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_mesh_blas(RID p_mesh, uin
 	return &(*variants)[variants->size() - 1];
 }
 
+RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask) {
+	RD *rd = RD::get_singleton();
+
+	MeshBlas *entry = skinned_blas_cache.getptr(p_mesh_instance);
+	if (entry != nullptr) {
+		// Same self-heal as the mesh cache: the BLAS cascade-frees with the
+		// instance's (or mesh's) buffers; our decoded buffers do not.
+		bool stale = entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas);
+		if (stale || entry->surface_mask != p_surface_mask) {
+			if (entry->blas.is_valid() && rd->acceleration_structure_is_valid(entry->blas)) {
+				rd->free_rid(entry->blas);
+			}
+			for (const RID &buffer : entry->decoded_buffers) {
+				rd->free_rid(buffer);
+			}
+			skinned_blas_cache.erase(p_mesh_instance);
+			entry = nullptr;
+		}
+	}
+	if (entry == nullptr) {
+		MeshBlas new_entry;
+		_create_blas_for_mesh(p_mesh, new_entry, p_surface_mask, p_mesh_instance);
+		entry = &skinned_blas_cache.insert(p_mesh_instance, new_entry)->value;
+	}
+	return entry;
+}
+
 bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
 	RD *rd = RD::get_singleton();
 
@@ -346,11 +400,9 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	for (uint64_t i = 0; i < p_instances.size(); i++) {
 		RenderGeometryInstanceBase *inst = static_cast<RenderGeometryInstanceBase *>(p_instances[i]);
 		const bool is_multimesh = inst->data->base_type == RSE::INSTANCE_MULTIMESH;
+		const bool is_skinned = !is_multimesh && inst->mesh_instance.is_valid();
 		if (inst->data->base_type != RSE::INSTANCE_MESH && !is_multimesh) {
 			continue; // Particles are not supported yet.
-		}
-		if (!is_multimesh && inst->mesh_instance.is_valid()) {
-			continue; // Skinned or blend-shaped: base geometry would be wrong; skip.
 		}
 		if (!inst->data->casts_shadows) {
 			continue; // Respects GeometryInstance3D's shadow casting setting (e.g. editor gizmos).
@@ -367,11 +419,25 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		}
 		uint32_t surface_mask = inst->data->shadow_casting_surface_mask;
 
-		MeshBlas *entry = _resolve_mesh_blas(mesh, surface_mask);
+		MeshBlas *entry;
+		if (is_skinned) {
+			// Deformed geometry: its own BLAS over the skinned vertex buffers,
+			// rebuilt every frame (the skinning dispatch is recorded earlier in
+			// the cull, so the build reads this frame's positions).
+			entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
+		} else {
+			entry = _resolve_mesh_blas(mesh, surface_mask);
+		}
 		if (entry == nullptr || entry->blas.is_null()) {
 			continue;
 		}
-		if (!entry->built) {
+		if (is_skinned) {
+			for (const DecodeJob &job : entry->decode_jobs) {
+				_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
+			}
+			rd->blas_build(entry->blas);
+			entry->built = true;
+		} else if (!entry->built) {
 			rd->blas_build(entry->blas);
 			entry->built = true;
 		}

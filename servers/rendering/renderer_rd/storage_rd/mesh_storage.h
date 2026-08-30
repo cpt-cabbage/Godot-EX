@@ -393,6 +393,9 @@ public:
 	virtual RenderingServerTypes::SurfaceData mesh_get_surface(RID p_mesh, int p_surface) const override;
 
 	virtual RID mesh_surface_get_vertex_buffer_rd_rid(RID p_mesh, int p_surface) const override;
+	// The deformed (skinned / blend-shaped) vertex buffer of a mesh instance
+	// surface, null when the surface has no per-instance buffer.
+	RID mesh_instance_surface_get_vertex_buffer_rd_rid(RID p_mesh_instance, uint32_t p_surface) const;
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const override;

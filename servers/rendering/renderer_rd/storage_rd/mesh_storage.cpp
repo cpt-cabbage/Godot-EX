@@ -639,6 +639,21 @@ RID MeshStorage::mesh_surface_get_vertex_buffer_rd_rid(RID p_mesh, int p_surface
 	return mesh->surfaces[p_surface]->vertex_buffer;
 }
 
+RID MeshStorage::mesh_instance_surface_get_vertex_buffer_rd_rid(RID p_mesh_instance, uint32_t p_surface) const {
+	MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
+	ERR_FAIL_NULL_V(mi, RID());
+	ERR_FAIL_UNSIGNED_INDEX_V(p_surface, mi->surfaces.size(), RID());
+	const MeshInstance::Surface &s = mi->surfaces[p_surface];
+	// Only deformed surfaces (bones or blend shapes) have per-instance
+	// buffers; rigid surfaces of the same mesh return null and callers fall
+	// back to the base surface buffer. The current buffer holds this frame's
+	// skinned positions (the other slot only exists for motion vectors).
+	if (s.vertex_buffer[s.current_buffer].is_valid()) {
+		return s.vertex_buffer[s.current_buffer];
+	}
+	return s.vertex_buffer[0];
+}
+
 RID MeshStorage::mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL_V(mesh, RID());
@@ -1101,7 +1116,14 @@ void MeshStorage::_mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint3
 }
 
 void MeshStorage::_mesh_instance_add_surface_buffer(MeshInstance *mi, Mesh *mesh, MeshInstance::Surface *s, uint32_t p_surface, uint32_t p_buffer_index) {
-	s->vertex_buffer[p_buffer_index] = RD::get_singleton()->vertex_buffer_create(mesh->surfaces[p_surface]->vertex_buffer_size, Vector<uint8_t>(), RD::BUFFER_CREATION_AS_STORAGE_BIT);
+	// Like the base surface buffers, skinned/blend-shaped output buffers can
+	// feed acceleration structure builds (deformed geometry in the ray-traced
+	// scene); compressed surfaces additionally get decoded in compute.
+	BitField<RD::BufferCreationBits> creation_bits = RD::BUFFER_CREATION_AS_STORAGE_BIT;
+	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+		creation_bits = BitField<RD::BufferCreationBits>(uint32_t(creation_bits) | uint32_t(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT));
+	}
+	s->vertex_buffer[p_buffer_index] = RD::get_singleton()->vertex_buffer_create(mesh->surfaces[p_surface]->vertex_buffer_size, Vector<uint8_t>(), creation_bits);
 
 	Vector<RD::Uniform> uniforms;
 	{
