@@ -242,6 +242,11 @@ void Light3DGizmoPlugin::commit_handle(const EditorNode3DGizmo *p_gizmo, int p_i
 	}
 }
 
+// Toggled from the inspector via the eye button next to the range property.
+static bool _is_light_range_visible(const Light3D *p_light) {
+	return p_light->get_meta("_edit_range_visible_", true);
+}
+
 void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 	Light3D *light = Object::cast_to<Light3D>(p_gizmo->get_node_3d());
 
@@ -293,7 +298,7 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 	}
 
 	if (Object::cast_to<OmniLight3D>(light)) {
-		if (p_gizmo->is_selected()) {
+		if (p_gizmo->is_selected() && _is_light_range_visible(light)) {
 			// Use both a billboard circle and 3 non-billboard circles for a better sphere-like representation
 			const Ref<Material> lines_material = get_material("lines_secondary", p_gizmo);
 			const Ref<Material> lines_billboard_material = get_material("lines_billboard", p_gizmo);
@@ -336,7 +341,7 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 	}
 
 	if (Object::cast_to<SpotLight3D>(light)) {
-		if (p_gizmo->is_selected()) {
+		if (p_gizmo->is_selected() && _is_light_range_visible(light)) {
 			const Ref<Material> material_primary = get_material("lines_primary", p_gizmo);
 			const Ref<Material> material_secondary = get_material("lines_secondary", p_gizmo);
 
@@ -404,6 +409,36 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 			points.push_back(Vector3(-a / 2, b / 2, 0));
 
 			p_gizmo->add_lines(points, material, false, color);
+
+			if (_is_light_range_visible(cl)) {
+				// Attenuation range sphere, drawn like the omni light's.
+				const Ref<Material> lines_material = get_material("lines_secondary", p_gizmo);
+				const Ref<Material> lines_billboard_material = get_material("lines_billboard", p_gizmo);
+
+				const float r = cl->get_param(Light3D::PARAM_RANGE);
+				Vector<Vector3> range_points;
+				Vector<Vector3> range_points_billboard;
+
+				for (int i = 0; i < 120; i++) {
+					const float ra = Math::deg_to_rad((float)(i * 3));
+					const float rb = Math::deg_to_rad((float)((i + 1) * 3));
+					const Point2 ca = Vector2(Math::sin(ra), Math::cos(ra)) * r;
+					const Point2 cb = Vector2(Math::sin(rb), Math::cos(rb)) * r;
+
+					range_points.push_back(Vector3(ca.x, 0, ca.y));
+					range_points.push_back(Vector3(cb.x, 0, cb.y));
+					range_points.push_back(Vector3(0, ca.x, ca.y));
+					range_points.push_back(Vector3(0, cb.x, cb.y));
+					range_points.push_back(Vector3(ca.x, ca.y, 0));
+					range_points.push_back(Vector3(cb.x, cb.y, 0));
+
+					range_points_billboard.push_back(Vector3(ca.x, ca.y, 0));
+					range_points_billboard.push_back(Vector3(cb.x, cb.y, 0));
+				}
+
+				p_gizmo->add_lines(range_points, lines_material, true, color);
+				p_gizmo->add_lines(range_points_billboard, lines_billboard_material, true, color);
+			}
 
 			Vector<Vector3> handles = {
 				Vector3(a / 2, 0, 0),

@@ -59,6 +59,7 @@
 #include "scene/3d/audio_stream_player_3d.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/decal.h"
+#include "scene/3d/light_3d.h"
 #include "scene/3d/mesh_instance_3d.h"
 #include "scene/3d/physics/collision_object_3d.h"
 #include "scene/3d/physics/collision_shape_3d.h"
@@ -5543,7 +5544,9 @@ AABB Node3DEditorViewport::_calculate_spatial_bounds(const Node3D *p_parent, boo
 	}
 
 	const VisualInstance3D *visual_instance = Object::cast_to<VisualInstance3D>(p_parent);
-	if (visual_instance) {
+	if (visual_instance && !Object::cast_to<Light3D>(p_parent)) {
+		// A light's AABB spans its whole attenuation range; using it would wrap
+		// the light in a huge selection box. Its gizmo already shows the range.
 		bounds = visual_instance->get_aabb();
 	} else {
 		bounds = AABB();
