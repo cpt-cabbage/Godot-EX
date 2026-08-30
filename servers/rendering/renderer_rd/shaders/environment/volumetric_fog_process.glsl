@@ -241,6 +241,7 @@ vec3 rq_local_light = vec3(0.0);
 float rq_weight_sum = 0.0;
 vec3 rq_selected_pos = vec3(0.0);
 float rq_rng = 0.0;
+vec2 rq_rnd = vec2(0.0);
 
 uint rq_pcg_hash(uint v) {
 	uint state = v * 747796405u + 2891336453u;
@@ -260,6 +261,25 @@ void rq_accumulate(vec3 contrib, vec3 light_pos) {
 		rq_rng = (rq_rng - p) / (1.0 - p);
 	}
 	rq_rng = clamp(rq_rng, 0.0, 0.9999999);
+}
+
+// Jitter the shadow-ray target across a disk of the light's size,
+// perpendicular to the ray, so the fog's temporal accumulation resolves a
+// penumbra that scales with the light's physical extent (the sphere
+// approximation the surface pass uses).
+vec3 rq_jitter_target(vec3 light_pos, vec3 from_pos, float size) {
+	vec3 rel = light_pos - from_pos;
+	float len = length(rel);
+	if (size <= 0.0 || len < 1e-4) {
+		return light_pos;
+	}
+	vec3 dir = rel / len;
+	vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tangent = normalize(cross(up, dir));
+	vec3 bitangent = cross(dir, tangent);
+	float ang = rq_rnd.x * 6.2831853;
+	float rad = sqrt(rq_rnd.y) * size;
+	return light_pos + (tangent * cos(ang) + bitangent * sin(ang)) * rad;
 }
 #endif // USE_RAY_QUERY
 
@@ -410,6 +430,8 @@ void main() {
 #ifdef USE_RAY_QUERY
 	uint rq_seed = rq_pcg_hash(uint(pos.x) + rq_pcg_hash(uint(pos.y) + rq_pcg_hash(uint(pos.z) + rq_pcg_hash(params.temporal_frame))));
 	rq_rng = float(rq_seed & 0x00FFFFFFu) / float(0x01000000u);
+	rq_rnd.x = float(rq_pcg_hash(rq_seed) & 0x00FFFFFFu) / float(0x01000000u);
+	rq_rnd.y = float(rq_pcg_hash(rq_seed + 0x9E3779B9u) & 0x00FFFFFFu) / float(0x01000000u);
 #endif
 
 	float total_density = params.base_density;
@@ -539,7 +561,9 @@ void main() {
 					float shadow_attenuation = 1.0;
 
 					if (omni_lights.data[light_index].volumetric_fog_energy > 0.001 && d * omni_lights.data[light_index].inv_radius < 1.0) {
-						float attenuation = get_omni_attenuation(d, omni_lights.data[light_index].inv_radius, omni_lights.data[light_index].attenuation);
+						// A sized light is a sphere, not a point: inside its
+						// radius the in-scatter saturates instead of spiking.
+						float attenuation = get_omni_attenuation(max(d, omni_lights.data[light_index].size), omni_lights.data[light_index].inv_radius, omni_lights.data[light_index].attenuation);
 
 						vec3 light = omni_lights.data[light_index].color;
 
@@ -573,7 +597,7 @@ void main() {
 #endif // !USE_RAY_QUERY
 						vec3 contrib = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
 #ifdef USE_RAY_QUERY
-						rq_accumulate(contrib, light_pos);
+						rq_accumulate(contrib, rq_jitter_target(light_pos, view_pos, omni_lights.data[light_index].size));
 #else
 						total_light += contrib;
 #endif
@@ -614,7 +638,9 @@ void main() {
 					float shadow_attenuation = 1.0;
 
 					if (spot_lights.data[light_index].volumetric_fog_energy > 0.001 && d * spot_lights.data[light_index].inv_radius < 1.0) {
-						float attenuation = get_omni_attenuation(d, spot_lights.data[light_index].inv_radius, spot_lights.data[light_index].attenuation);
+						// A sized light is a sphere, not a point: inside its
+						// radius the in-scatter saturates instead of spiking.
+						float attenuation = get_omni_attenuation(max(d, spot_lights.data[light_index].size), spot_lights.data[light_index].inv_radius, spot_lights.data[light_index].attenuation);
 
 						vec3 spot_dir = spot_lights.data[light_index].direction;
 						float cone_angle = spot_lights.data[light_index].cone_angle;
@@ -645,7 +671,7 @@ void main() {
 #endif // !USE_RAY_QUERY
 						vec3 contrib = light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
 #ifdef USE_RAY_QUERY
-						rq_accumulate(contrib, light_pos);
+						rq_accumulate(contrib, rq_jitter_target(light_pos, view_pos, spot_lights.data[light_index].size));
 #else
 						total_light += contrib;
 #endif
@@ -757,7 +783,11 @@ void main() {
 							}
 							vec3 contrib = light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
 #ifdef USE_RAY_QUERY
-							rq_accumulate(contrib, closest_point_on_light);
+							// Sample the whole rect rather than the closest
+							// point: the temporally averaged visibility then
+							// forms a penumbra matching the light's extent.
+							vec3 rq_rect_target = light_center + area_width * (rq_rnd.x - 0.5) + area_height * (rq_rnd.y - 0.5);
+							rq_accumulate(contrib, rq_rect_target);
 #else
 							total_light += contrib;
 #endif

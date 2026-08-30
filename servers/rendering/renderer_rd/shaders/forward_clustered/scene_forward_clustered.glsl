@@ -2755,7 +2755,10 @@ void fragment_shader(in SceneData scene_data) {
 			shadow = 1.0;
 #endif
 
-			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
+			// The sun's angular size broadens the lobe whether or not the
+			// PCSS soft-shadow gate is on (ray-traced sun shadows leave it
+			// off; size is stored as 1-cos(angle), zero for sizeless lights).
+			float size_A = directional_lights.data[i].size;
 
 			light_compute(normal, directional_lights.data[i].direction, normalize(view), size_A,
 #ifndef DEBUG_DRAW_PSSM_SPLITS

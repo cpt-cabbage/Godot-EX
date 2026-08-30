@@ -257,7 +257,17 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	}
 
 	vec3 l = normalize(light_rel_vec);
-	float ndotl = max(dot(view_normal, l), 0.0);
+
+	// Light size turns the point into a spherical area light: the same size_A
+	// offset the analytic light_compute applies widens the diffuse terminator
+	// and broadens the specular lobe.
+	float size_A = 0.0;
+	if (ld.size > 0.0) {
+		float t = ld.size / max(0.001, light_length);
+		size_A = max(0.0, 1.0 - 1.0 / sqrt(1.0 + t * t));
+	}
+
+	float ndotl = clamp(size_A + dot(view_normal, l), 0.0, 1.0);
 	diffuse = color * (ndotl * (1.0 / M_PI) * attenuation);
 
 	// Schlick-GGX, dielectric F0. The prepass has no albedo/metallic, so the
@@ -265,8 +275,8 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	vec3 v = normalize(-view_pos);
 	vec3 h = normalize(v + l);
 	float ndotv = max(dot(view_normal, v), 1e-4);
-	float ndoth = max(dot(view_normal, h), 0.0);
-	float ldoth = max(dot(l, h), 0.0);
+	float ndoth = clamp(size_A + dot(view_normal, h), 0.0, 1.0);
+	float ldoth = clamp(size_A + dot(l, h), 0.0, 1.0);
 
 	float alpha = max(roughness * roughness, 1e-3);
 	float alpha2 = alpha * alpha;
