@@ -90,6 +90,7 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	Vector<String> stochastic_denoise_modes;
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n");
+	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n#define VALIDATE_DEPTH\n");
 	stochastic_denoise_shader.initialize(stochastic_denoise_modes);
 	stochastic_denoise_shader_version = stochastic_denoise_shader.version_create();
 	for (int i = 0; i < DENOISE_VARIANT_MAX; i++) {
@@ -893,10 +894,11 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
-void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_far, const GiQuality &p_quality) {
+void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality) {
 	ERR_FAIL_COND(tlas.is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cascades.sdfgi_ubo.is_null());
+	ERR_FAIL_COND(p_cascades.voxel_gi_ubo.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -934,13 +936,19 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R8G8_UNORM,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
-		p_render_buffers->create_texture(RB_SCOPE_RT_GI, RB_RT_GI_VIEW_DEPTH, RD::DATA_FORMAT_R16_SFLOAT,
-				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
+		const StringName depth_names[] = { RB_RT_GI_VIEW_DEPTH_0, RB_RT_GI_VIEW_DEPTH_1 };
+		for (const StringName &name : depth_names) {
+			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16_SFLOAT,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
+		}
 	}
 
 	RID raw_ambient = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT, p_view, 0);
 	RID raw_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION, p_view, 0);
-	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_VIEW_DEPTH, p_view, 0);
+	// The gather writes this frame's parity; the temporal pass validates its
+	// history against the other one (last frame's).
+	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
+	RID prev_view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_VIEW_DEPTH_1 : RB_RT_GI_VIEW_DEPTH_0, p_view, 0);
 	RID depth = p_render_buffers->get_depth_texture(p_view);
 
 	while (rt_gi_params_ubos.size() <= p_view) {
@@ -991,11 +999,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	if (p_quality.screen_traces) {
 		params.flags |= 32; // FLAG_SCREEN_TRACES
 	}
+	if (p_cascades.voxel_gi_count > 0) {
+		params.flags |= 64; // FLAG_VOXEL_GI
+	}
 	params.sky_energy = p_sky.energy;
 	params.ray_bias = p_quality.ray_bias;
 	params.sky_border[0] = p_sky.border_size;
 	params.sky_border[1] = 1.0f - p_sky.border_size * 2.0f;
 	params.z_far = p_z_far;
+	params.voxel_gi_count = MIN(p_cascades.voxel_gi_count, 8u);
 	rd->buffer_update(rt_gi_params_ubos[p_view], 0, sizeof(RtGiParamsUBO), &params);
 
 	RID shader_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 0);
@@ -1029,13 +1041,20 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_sky(RD::UNIFORM_TYPE_TEXTURE, 10, Vector<RID>({ sky_radiance }));
 	RD::Uniform u_mip_sampler(RD::UNIFORM_TYPE_SAMPLER, 11, Vector<RID>({ material_sampler }));
 	RD::Uniform u_screen(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ material_sampler, screen_radiance }));
+	RD::Uniform u_voxel_ubo(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 13, Vector<RID>({ p_cascades.voxel_gi_ubo }));
+	Vector<RID> voxel_ids;
+	for (uint32_t v = 0; v < 8; v++) {
+		RID tex = v < p_cascades.voxel_gi_textures.size() ? p_cascades.voxel_gi_textures[v] : RID();
+		voxel_ids.push_back(tex.is_valid() ? tex : default_3d);
+	}
+	RD::Uniform u_voxel_tex(RD::UNIFORM_TYPE_TEXTURE, 14, voxel_ids);
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1070,12 +1089,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	denoise_push_constant.depth_scale = (int32_t)depth_scale;
 	// Sparse Monte Carlo input: history clipping would reject converged
 	// history wherever this frame's neighborhood misses the bright samples.
+	// Disocclusion is caught by validating the reprojected depth instead.
 	denoise_push_constant.clamp_gamma = -1.0f;
+	denoise_push_constant.z_near = p_z_near;
+	denoise_push_constant.z_far = p_z_far;
 
 	RID velocity = p_velocity.is_valid() ? p_velocity : default_black;
 
 	{
-		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL);
+		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL_VALIDATE);
 		RD::Uniform u_raw_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_ambient }));
 		RD::Uniform u_raw_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_reflection }));
 		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
@@ -1085,14 +1107,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_raw_meta_in(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, default_black }));
 		RD::Uniform u_hist_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler, meta_read }));
 		RD::Uniform u_velocity(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, velocity }));
+		RD::Uniform u_prev_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, prev_view_depth }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ hist_write_a }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ hist_write_r }));
 		RD::Uniform u_out_m(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ moments_write }));
 		RD::Uniform u_out_meta(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ meta_write }));
 
 		RD::ComputeListID list = rd->compute_list_begin();
-		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity), 0);
+		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL_VALIDATE]);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_m, u_out_meta), 1);
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);

@@ -82,7 +82,9 @@
 #define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
 #define RB_RT_GI_META_0 SNAME("meta_0")
 #define RB_RT_GI_META_1 SNAME("meta_1")
-#define RB_RT_GI_VIEW_DEPTH SNAME("view_depth")
+// Ping-ponged: the previous frame's copy validates history reprojection.
+#define RB_RT_GI_VIEW_DEPTH_0 SNAME("view_depth_0")
+#define RB_RT_GI_VIEW_DEPTH_1 SNAME("view_depth_1")
 
 namespace RendererRD {
 
@@ -224,7 +226,7 @@ private:
 		float ray_bias;
 		float sky_border[2];
 		float z_far;
-		float pad0;
+		uint32_t voxel_gi_count;
 		float pad1;
 		float pad2;
 	};
@@ -233,6 +235,7 @@ private:
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
 		DENOISE_VARIANT_SPATIAL,
+		DENOISE_VARIANT_TEMPORAL_VALIDATE, // Temporal with depth-validated history (the GI signal).
 		DENOISE_VARIANT_MAX,
 	};
 
@@ -249,6 +252,9 @@ private:
 		int32_t stride;
 		int32_t depth_scale;
 		float clamp_gamma; // Neighborhood clamp width in stddevs; <= 0 disables clipping.
+		float z_near; // Camera planes for depth-validated history (VALIDATE_DEPTH).
+		float z_far;
+		float pad2[2];
 	};
 
 	struct DecodePushConstant {
@@ -324,8 +330,8 @@ public:
 		float variance_threshold = 0.02f;
 	};
 
-	// The SDFGI radiance cache handed to the gather (all null / inactive when
-	// the scene has no SDFGI: the gather then runs in sky-visibility mode).
+	// The radiance caches handed to the gather: SDFGI cascades preferred,
+	// VoxelGI volumes as fallback, sky-visibility-only when neither is active.
 	struct GiCascades {
 		LocalVector<RID> sdf;
 		LocalVector<RID> light;
@@ -333,6 +339,9 @@ public:
 		LocalVector<RID> aniso1;
 		RID sdfgi_ubo; // GI::SDFGIData, required even when inactive.
 		bool active = false;
+		RID voxel_gi_ubo; // GI::VoxelGIData array, required even when unused.
+		LocalVector<RID> voxel_gi_textures;
+		uint32_t voxel_gi_count = 0;
 	};
 
 	// Sky fallback for rays that leave the scene, mirroring the SDFGI probe
@@ -351,7 +360,7 @@ public:
 	// hits from the SDFGI cascades and last frame's screen, denoised into
 	// demodulated ambient/reflection buffers (RB_SCOPE_RT_GI) the scene
 	// shader merges at the GI buffer merge point.
-	void process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_far, const GiQuality &p_quality);
+	void process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality);
 
 	// Stochastic direct lighting (mini-MegaLights): samples omni/spot lights
 	// per pixel (guided by last frame's visible lights, discovering new ones
@@ -362,6 +371,10 @@ public:
 
 	// Call once per frame before the per-view process() calls.
 	void advance_frame() { frame_index++; history_parity = !history_parity; }
+
+	// Which ping-pong slot the current frame writes (for bindings that must
+	// pick the freshly written texture, like the GI view depth).
+	bool get_history_parity() const { return history_parity; }
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return tlas; }

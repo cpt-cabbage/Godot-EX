@@ -27,6 +27,11 @@ layout(set = 0, binding = 7) uniform sampler2D history_meta;
 // Motion vectors from the previous frame's color pass (uv_prev = uv + velocity).
 // Bound to a default black texture when motion vectors are not rendered.
 layout(set = 0, binding = 8) uniform sampler2D velocity_texture;
+#ifdef VALIDATE_DEPTH
+// The signal's own view depth from the previous frame (at the signal's
+// resolution), for disocclusion rejection when history clipping is off.
+layout(set = 0, binding = 9) uniform sampler2D prev_view_depth_texture;
+#endif
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -57,6 +62,10 @@ layout(push_constant, std430) uniform Params {
 	// perfectly converged history to black every frame (the same failure the
 	// STB lighting talk hits with TAA color clamping on noisy input).
 	float clamp_gamma;
+	// Camera planes, for linearizing the reprojected depth (VALIDATE_DEPTH).
+	float z_near;
+	float z_far;
+	vec2 pad2;
 }
 params;
 
@@ -155,7 +164,22 @@ void main() {
 				prev_uv = uv + velocity;
 			}
 		}
-		if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+#ifdef VALIDATE_DEPTH
+		if (history_usable) {
+			// Disocclusion check: without history clipping, a revealed pixel
+			// would otherwise inherit whatever surface used to be there. The
+			// signal recorded its own view depth last frame; compare it to
+			// where this surface reprojects to.
+			float prev_depth = texelFetch(prev_view_depth_texture, ivec2(prev_uv * vec2(params.screen_size)), 0).r;
+			float prev_ndc_z = clamp(prev_ndc.z / prev_ndc.w, 0.0, 1.0) * 2.0 - 1.0;
+			float predicted_depth = 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near + prev_ndc_z * (params.z_far - params.z_near));
+			if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
+				history_usable = false;
+			}
+		}
+#endif
+		if (history_usable) {
 			vec4 hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
 			vec4 hist_s4 = textureLod(history_specular, prev_uv, 0.0);
 			vec4 hist_moments = textureLod(history_moments, prev_uv, 0.0);

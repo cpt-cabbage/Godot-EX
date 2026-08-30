@@ -2421,6 +2421,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RID gi_screen_radiance_base;
 			if (run_rt_gi) {
 				gi_cascades.sdfgi_ubo = gi.get_sdfgi_ubo();
+				{
+					// VoxelGI volumes as the fallback radiance cache; the
+					// GI render-buffer data always exists for main buffers.
+					Ref<RendererRD::GI::RenderBuffersGI> rbgi = rb->get_custom_data(RB_SCOPE_GI);
+					if (rbgi.is_valid()) {
+						gi_cascades.voxel_gi_ubo = rbgi->get_voxel_gi_buffer();
+						gi_cascades.voxel_gi_count = p_render_data->voxel_gi_count;
+						for (uint32_t c = 0; c < RendererRD::GI::MAX_VOXEL_GI_INSTANCES; c++) {
+							gi_cascades.voxel_gi_textures.push_back(rbgi->voxel_gi_textures[c]);
+						}
+					}
+				}
 				if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
 					Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
 					if (sdfgi.is_valid() && sdfgi->cascades.size() > 0) {
@@ -2495,13 +2507,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
 							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, stochastic_quality, velocity);
 				}
-				if (run_rt_gi) {
+				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;
 					if (gi_screen_radiance_base.is_valid()) {
 						screen_radiance = rb->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
 					}
 					rt_shadows->process_rt_gi(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
-							rb_data->get_normal_roughness(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_far, gi_quality);
+							rb_data->get_normal_roughness(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_near, scene_data->z_far, gi_quality);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -4157,7 +4169,10 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		RD::Uniform u;
 		u.binding = 43 + i;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : RB_RT_GI_VIEW_DEPTH);
+		// The GI view depth ping-pongs (the old parity validates history);
+		// the upsample wants the one the gather wrote this frame.
+		const StringName &gi_depth_name = (rt_shadows != nullptr && rt_shadows->get_history_parity()) ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1;
+		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : gi_depth_name);
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_GI, name) ? rb->get_texture(RB_SCOPE_RT_GI, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);

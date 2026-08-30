@@ -40,7 +40,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float ray_bias;
 	vec2 sky_border; // x: octmap border size, y: 1 - 2 * border.
 	float z_far;
-	float pad0;
+	uint voxel_gi_count;
 	float pad1;
 	float pad2;
 }
@@ -52,6 +52,7 @@ params;
 #define FLAG_SKY_MODE_SKY 8u
 #define FLAG_SKY_MODE_COLOR 16u
 #define FLAG_SCREEN_TRACES 32u
+#define FLAG_VOXEL_GI 64u
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -112,6 +113,33 @@ layout(set = 0, binding = 11) uniform sampler linear_sampler_mipmaps;
 // emissive surfaces the cache lacks). Default black when disabled.
 layout(set = 0, binding = 12) uniform sampler2D screen_radiance_texture;
 
+// VoxelGI volumes as a fallback radiance cache for scenes without SDFGI
+// (same data the cone-traced resolve uses; the xform expects camera-relative
+// world positions).
+#define MAX_VOXEL_GI_INSTANCES 8
+
+struct VoxelGIData {
+	mat4 xform; // World (camera-relative) to probe cell space.
+
+	vec3 bounds;
+	float dynamic_range;
+
+	float bias;
+	float normal_bias;
+	bool blend_ambient;
+	uint mipmaps;
+
+	vec3 pad;
+	float exposure_normalization;
+};
+
+layout(set = 0, binding = 13, std140) uniform VoxelGIs {
+	VoxelGIData data[MAX_VOXEL_GI_INSTANCES];
+}
+voxel_gi_instances;
+
+layout(set = 0, binding = 14) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_INSTANCES];
+
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_ambient;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_reflection;
 // View depth of the shaded texel, for the half-resolution upsample.
@@ -159,12 +187,34 @@ vec3 sky_eval(vec3 world_dir) {
 	return vec3(0.0);
 }
 
+// Lit-voxel radiance from a VoxelGI volume containing the hit, used as the
+// cache when no SDFGI is active. Samples the voxel the hit surface occupies
+// (stepped slightly off along the reversed ray so the lookup lands on the
+// solid cell's lit side).
+vec3 voxel_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
+	for (uint i = 0u; i < params.voxel_gi_count; i++) {
+		vec3 pos = (voxel_gi_instances.data[i].xform * vec4(rel_pos, 1.0)).xyz;
+		if (any(lessThan(pos, vec3(0.0))) || any(greaterThan(pos, voxel_gi_instances.data[i].bounds))) {
+			continue;
+		}
+		vec3 n = normalize((voxel_gi_instances.data[i].xform * vec4(-ray_dir, 0.0)).xyz);
+		pos += n * (voxel_gi_instances.data[i].normal_bias + 1.0);
+		vec3 uvw = pos / voxel_gi_instances.data[i].bounds;
+		vec4 light = textureLod(sampler3D(voxel_gi_textures[i], linear_sampler_mipmaps), uvw, 1.0);
+		return light.rgb * voxel_gi_instances.data[i].dynamic_range * voxel_gi_instances.data[i].exposure_normalization;
+	}
+	return vec3(0.0);
+}
+
 // Direct light stored in the SDFGI cascades at a camera-relative world
 // position, shaded with the local SDF gradient normal (the same evaluation
 // the probe integrator uses at its ray hits). p_backup_dir provides the
 // half-cell pull-back direction (the incoming ray).
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	if (!bool(params.flags & FLAG_SDFGI)) {
+		if (bool(params.flags & FLAG_VOXEL_GI)) {
+			return voxel_cache_radiance(rel_pos, ray_dir);
+		}
 		return vec3(0.0);
 	}
 	vec3 p = vec3(rel_pos.x, rel_pos.y * sdfgi.y_mult, rel_pos.z);
