@@ -114,9 +114,12 @@ layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_d
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
-// Entry encoding: bit 31 spot, bit 30 area, bits 26..29 payload (2x2 rect
-// visibility bitmask for area lights, quadrant order (-u,-v),(+u,-v),(-u,+v),
-// (+u,+v)), bits 0..25 the per-type light index.
+// Entry encoding: bit 31 spot, bit 30 area, bits 26..29 payload, bits 0..25
+// the per-type light index. The payload is a 2x2 rect visibility bitmask for
+// area lights (quadrant order (-u,-v),(+u,-v),(-u,+v),(+u,+v)) and a 4-bit
+// quantized visibility ratio for omni/spot lights, so guiding can down-weight
+// lights the tile found mostly shadowed (STB lighting's shadow-in-PDF idea,
+// evaluated one frame late for free).
 #define SPOT_BIT 0x80000000u
 #define AREA_BIT 0x40000000u
 #define QUAD_MASK_SHIFT 26u
@@ -521,6 +524,17 @@ void main() {
 		entry_eval(entry, view_pos, view_normal, roughness, f, s);
 		float lum = abs(luminance(f + s)); // abs: negative lights sample too.
 		float w = light_weight(lum);
+		// Down-weight lights the tile found mostly shadowed last frame; the
+		// epsilon floor keeps every guided light discoverable, so one that
+		// becomes unoccluded is re-found within a few frames (the sampling
+		// stays unbiased: the ratio estimator divides the same weight out).
+		float vis_guide;
+		if ((entry & AREA_BIT) != 0u) {
+			vis_guide = float(bitCount((entry >> QUAD_MASK_SHIFT) & 0xFu)) * 0.25;
+		} else {
+			vis_guide = float((entry >> QUAD_MASK_SHIFT) & 0xFu) * (1.0 / 15.0);
+		}
+		w *= max(vis_guide, 0.125);
 		if (w <= 0.0) {
 			continue;
 		}
@@ -667,7 +681,7 @@ void main() {
 		traced_energy[t] = 0.0;
 	}
 	uint chosen_visible_light = INVALID_LIGHT;
-	uint visible_found = 0u;
+	uint traced_found = 0u;
 	for (uint r = 0u; r < params.reservoir_count; r++) {
 		uint c = reservoirs[r].candidate;
 		if (c == INVALID_LIGHT) {
@@ -790,22 +804,29 @@ void main() {
 		float lum_s = abs(luminance(s));
 		vis_den_d += estimator * lum_d;
 		vis_den_s += estimator * lum_s;
+
+		// Pick one traced light uniformly to seed next frame's tile list,
+		// carrying how visible its ray found it (area lights record which rect
+		// quadrant the ray reached instead), so guiding can down-weight
+		// shadowed lights without dropping them from the list.
+		traced_found++;
+		if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + traced_found)) < 1.0 / float(traced_found)) {
+			chosen_visible_light = entry & ENTRY_KEY_MASK;
+			if ((entry & AREA_BIT) != 0u) {
+				if (visibility > 0.0) {
+					chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
+				}
+			} else {
+				chosen_visible_light |= uint(clamp(visibility, 0.0, 1.0) * 15.0 + 0.5) << QUAD_MASK_SHIFT;
+			}
+		}
+
 		if (visibility <= 0.0) {
 			continue;
 		}
 		vis_num_d += estimator * lum_d * visibility;
 		vis_num_s += estimator * lum_s * visibility;
 		traced_energy[slot] += estimator * (lum_d + lum_s) * visibility;
-
-		// Pick one visible light uniformly to seed next frame's tile list;
-		// area lights record which rect quadrant the ray reached.
-		visible_found++;
-		if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + visible_found)) < 1.0 / float(visible_found)) {
-			chosen_visible_light = entry & ENTRY_KEY_MASK;
-			if ((entry & AREA_BIT) != 0u) {
-				chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
-			}
-		}
 	}
 
 	float ratio_d = clamp(vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0, 0.0, 1.0);

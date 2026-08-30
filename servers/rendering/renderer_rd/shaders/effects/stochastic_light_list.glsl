@@ -15,9 +15,12 @@
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
-// Entries carry a payload (2x2 area light visibility bitmask) in bits 26..29;
-// deduplication is by light identity only, with the payloads of duplicates
-// merged so the tile remembers every quadrant any of its pixels reached.
+// Entries carry a payload in bits 26..29: a 2x2 rect visibility bitmask for
+// area lights, a 4-bit quantized visibility ratio for omni/spot lights.
+// Deduplication is by light identity only, with the payloads of duplicates
+// merged: quadrant masks are OR-ed so the tile remembers every quadrant any
+// pixel reached, visibility ratios take the maximum any pixel measured.
+#define AREA_BIT 0x40000000u
 #define QUAD_MASK_BITS (0xFu << 26u)
 #define ENTRY_KEY_MASK (~QUAD_MASK_BITS)
 
@@ -73,7 +76,12 @@ void main() {
 			uint merged = light;
 			for (uint i = local_index + 1u; i < uint(TILE_SIZE * TILE_SIZE); i++) {
 				if (candidates[i] != INVALID_LIGHT && (candidates[i] & ENTRY_KEY_MASK) == key) {
-					merged |= candidates[i] & QUAD_MASK_BITS;
+					uint payload = candidates[i] & QUAD_MASK_BITS;
+					if ((key & AREA_BIT) != 0u) {
+						merged |= payload;
+					} else if (payload > (merged & QUAD_MASK_BITS)) {
+						merged = key | payload;
+					}
 				}
 			}
 			uint slot = atomicAdd(list_count, 1u);
