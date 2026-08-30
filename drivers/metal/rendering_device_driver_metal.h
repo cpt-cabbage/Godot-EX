@@ -494,6 +494,11 @@ private:
 public:
 	const HashSet<MTL::AccelerationStructure *> &get_blas_registry() const { return blas_registry; }
 
+	// When barriers (and with them residency sets) are in use, every BLAS is
+	// already resident through the frame residency set (_track_resource on
+	// create), so encoders can skip the O(live BLASes) useResource loops.
+	bool blas_residency_is_implicit() const { return use_barriers; }
+
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;

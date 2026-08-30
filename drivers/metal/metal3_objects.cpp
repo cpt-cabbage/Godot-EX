@@ -375,9 +375,12 @@ void MDCommandBuffer::build_tlas(RDD::AccelerationStructureID p_accel, RDD::Buff
 
 	MTL::AccelerationStructureCommandEncoder *enc = _ensure_accel_encoder();
 	// Instances reference BLASes indirectly by MTL::ResourceID, so the encoder cannot infer
-	// residency from the descriptor; mark every live BLAS resident.
-	for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
-		enc->useResource(blas, MTL::ResourceUsageRead);
+	// residency from the descriptor; mark every live BLAS resident (unless the frame residency
+	// set already holds them, which makes this O(live BLASes) loop redundant).
+	if (!device_driver->blas_residency_is_implicit()) {
+		for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
+			enc->useResource(blas, MTL::ResourceUsageRead);
+		}
 	}
 	enc->buildAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), scratch->buffer.get(), 0);
 }
@@ -1866,8 +1869,9 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				const RDM::AccelerationStructureInfo *as_info = (const RDM::AccelerationStructureInfo *)uniform.ids[0].id;
 				p_enc.set(as_info->accel.get(), indexes.buffer);
 				// The TLAS dereferences its BLASes by MTL::ResourceID, which direct binding
-				// cannot make resident; mark every live BLAS resident on the encoder.
-				if (p_enc.mode == DirectEncoder::COMPUTE) {
+				// cannot make resident; mark every live BLAS resident on the encoder (skipped
+				// when the frame residency set already holds them).
+				if (p_enc.mode == DirectEncoder::COMPUTE && !device_driver->blas_residency_is_implicit()) {
 					MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(p_enc.encoder);
 					for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
 						enc->useResource(blas, MTL::ResourceUsageRead);
@@ -1888,10 +1892,11 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
 	compute.resource_tracker.merge_from(p_set->usage_to_resources);
 
-	if (p_set->uses_acceleration_structure) {
+	if (p_set->uses_acceleration_structure && !device_driver->blas_residency_is_implicit()) {
 		// TLAS traversal dereferences BLASes by MTL::ResourceID; make every
 		// currently live BLAS resident (the set must not cache BLAS pointers,
-		// as they can be freed while the set is still alive).
+		// as they can be freed while the set is still alive). Redundant when
+		// the frame residency set already holds every BLAS.
 		for (MTL::AccelerationStructure *blas : device_driver->get_blas_registry()) {
 			enc->useResource(blas, MTL::ResourceUsageRead);
 		}
