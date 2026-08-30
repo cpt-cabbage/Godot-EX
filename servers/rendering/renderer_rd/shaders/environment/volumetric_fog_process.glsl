@@ -237,10 +237,17 @@ layout(set = 0, binding = 21) uniform texture2D area_light_atlas;
 // averages it over frames).
 layout(set = 2, binding = 0) uniform accelerationStructureEXT tlas;
 
-vec3 rq_local_light = vec3(0.0);
-float rq_weight_sum = 0.0;
-vec3 rq_selected_pos = vec3(0.0);
-float rq_rng = 0.0;
+// Two stratified reservoir streams (the STB lighting "resampling without
+// replacement" idea scaled down): lights are dealt to the streams round-robin
+// so the two shadow rays cannot pick the same light, halving the variance of
+// the one-sample ratio estimate for the same temporal convergence.
+#define RQ_STREAMS 2u
+
+vec3 rq_local_light[RQ_STREAMS] = vec3[](vec3(0.0), vec3(0.0));
+float rq_weight_sum[RQ_STREAMS] = float[](0.0, 0.0);
+vec3 rq_selected_pos[RQ_STREAMS] = vec3[](vec3(0.0), vec3(0.0));
+float rq_rng[RQ_STREAMS] = float[](0.0, 0.0);
+uint rq_light_count = 0u;
 vec2 rq_rnd = vec2(0.0);
 
 uint rq_pcg_hash(uint v) {
@@ -250,17 +257,18 @@ uint rq_pcg_hash(uint v) {
 }
 
 void rq_accumulate(vec3 contrib, vec3 light_pos) {
-	rq_local_light += contrib;
+	uint s = (rq_light_count++) % RQ_STREAMS;
+	rq_local_light[s] += contrib;
 	float w = max(dot(contrib, vec3(0.2126, 0.7152, 0.0722)), 1e-8);
-	rq_weight_sum += w;
-	float p = w / rq_weight_sum;
-	if (rq_rng < p) {
-		rq_selected_pos = light_pos;
-		rq_rng = rq_rng / p;
+	rq_weight_sum[s] += w;
+	float p = w / rq_weight_sum[s];
+	if (rq_rng[s] < p) {
+		rq_selected_pos[s] = light_pos;
+		rq_rng[s] = rq_rng[s] / p;
 	} else {
-		rq_rng = (rq_rng - p) / (1.0 - p);
+		rq_rng[s] = (rq_rng[s] - p) / (1.0 - p);
 	}
-	rq_rng = clamp(rq_rng, 0.0, 0.9999999);
+	rq_rng[s] = clamp(rq_rng[s], 0.0, 0.9999999);
 }
 
 // Jitter the shadow-ray target across a disk of the light's size,
@@ -429,7 +437,8 @@ void main() {
 
 #ifdef USE_RAY_QUERY
 	uint rq_seed = rq_pcg_hash(uint(pos.x) + rq_pcg_hash(uint(pos.y) + rq_pcg_hash(uint(pos.z) + rq_pcg_hash(params.temporal_frame))));
-	rq_rng = float(rq_seed & 0x00FFFFFFu) / float(0x01000000u);
+	rq_rng[0] = float(rq_seed & 0x00FFFFFFu) / float(0x01000000u);
+	rq_rng[1] = float(rq_pcg_hash(rq_seed + 0x68E31DA4u) & 0x00FFFFFFu) / float(0x01000000u);
 	rq_rnd.x = float(rq_pcg_hash(rq_seed) & 0x00FFFFFFu) / float(0x01000000u);
 	rq_rnd.y = float(rq_pcg_hash(rq_seed + 0x9E3779B9u) & 0x00FFFFFFu) / float(0x01000000u);
 #endif
@@ -798,25 +807,30 @@ void main() {
 		}
 
 #ifdef USE_RAY_QUERY
-		// Resolve the froxel's local light with one visibility ray toward the
+		// Resolve each stream's local light with one visibility ray toward its
 		// contribution-sampled light.
-		if (rq_weight_sum > 0.0) {
+		{
 			mat3 rq_rot = mat3(params.cam_rotation);
 			vec3 rq_world_origin = rq_rot * view_pos + params.cam_origin;
-			vec3 rq_world_target = rq_rot * rq_selected_pos + params.cam_origin;
-			vec3 rq_delta = rq_world_target - rq_world_origin;
-			float rq_dist = length(rq_delta);
-			if (rq_dist > 0.1) {
-				rayQueryEXT rq;
-				rayQueryInitializeEXT(rq, tlas,
-						gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-						0xFF, rq_world_origin, 0.05, rq_delta / rq_dist, rq_dist - 0.05);
-				rayQueryProceedEXT(rq);
-				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-					rq_local_light = vec3(0.0);
+			for (uint s = 0u; s < RQ_STREAMS; s++) {
+				if (rq_weight_sum[s] <= 0.0) {
+					continue;
 				}
+				vec3 rq_world_target = rq_rot * rq_selected_pos[s] + params.cam_origin;
+				vec3 rq_delta = rq_world_target - rq_world_origin;
+				float rq_dist = length(rq_delta);
+				if (rq_dist > 0.1) {
+					rayQueryEXT rq;
+					rayQueryInitializeEXT(rq, tlas,
+							gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+							0xFF, rq_world_origin, 0.05, rq_delta / rq_dist, rq_dist - 0.05);
+					rayQueryProceedEXT(rq);
+					if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+						rq_local_light[s] = vec3(0.0);
+					}
+				}
+				total_light += rq_local_light[s];
 			}
-			total_light += rq_local_light;
 		}
 #endif // USE_RAY_QUERY
 
