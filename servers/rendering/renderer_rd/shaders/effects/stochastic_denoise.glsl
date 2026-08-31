@@ -188,6 +188,31 @@ vec3 ycocg_to_rgb(vec3 c) {
 // Variance clipping in YCoCg (Salvi 2016, Karis 2014): clips history to an
 // ellipsoid around the local mean, which avoids the color shifts that a
 // per-channel RGB min/max clamp introduces.
+// The direct lighting signals are one visibility ratio replicated across all
+// three channels, so they carry no chroma of their own. What YCoCg then reads
+// as Co and Cg is the r11f_g11f_b10f rounding -- B keeps five mantissa bits
+// where R and G keep six, so a grey value does not survive the round trip grey.
+// The neighborhood's chroma extent is the spread of that rounding, microscopic
+// and floored at 1e-5, while the history's chroma differs from the mean's by a
+// comparable amount, so the normalized distance_outside comes back large for a
+// pixel that is not drifting at all.
+//
+// That number is not just a clip: it feeds confidence, confidence multiplies
+// the accumulated frame count, and frames = frames * confidence + 1 has fixed
+// point 1 / (1 - confidence). A confidence permanently short of 1 pins the
+// history to a handful of frames, alpha stays near its ceiling, and the result
+// boils at close to the raw sampling noise -- with temporal_frames inert,
+// because the cap is never the binding constraint. Clip the scalar the signal
+// actually is, and the chroma axis stops voting.
+vec3 clip_ratio(vec3 history, vec3 mean, vec3 extent, out float distance_outside) {
+	float h = luminance(history);
+	float m = luminance(mean);
+	float e = max(luminance(extent), 1e-5);
+	float clipped = clamp(h, m - e, m + e);
+	distance_outside = abs(clipped - h) / e;
+	return vec3(clipped);
+}
+
 vec3 clip_to_aabb(vec3 history, vec3 mean, vec3 extent, out float distance_outside) {
 	vec3 h = rgb_to_ycocg(history);
 	vec3 m = rgb_to_ycocg(mean);
@@ -328,8 +353,15 @@ void main() {
 			if (params.clamp_gamma > 0.0) {
 				float outside_d;
 				float outside_s;
+#ifdef HAS_DIRECTIONAL
+				// GI carries real colour, so its chroma is signal and the
+				// ellipsoid clip is the right one.
 				hist_d = clip_to_aabb(hist_d4.rgb, mean_d, stddev_d * params.clamp_gamma, outside_d);
 				hist_s = clip_to_aabb(hist_s4.rgb, mean_s, stddev_s * params.clamp_gamma, outside_s);
+#else
+				hist_d = clip_ratio(hist_d4.rgb, mean_d, stddev_d * params.clamp_gamma, outside_d);
+				hist_s = clip_ratio(hist_s4.rgb, mean_s, stddev_s * params.clamp_gamma, outside_s);
+#endif
 
 				// History confidence: the further the history was from the
 				// current neighborhood, the faster it is discarded (reduces

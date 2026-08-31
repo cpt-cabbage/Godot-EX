@@ -992,7 +992,23 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
 	denoise_push_constant.blend_alpha = p_quality.denoise ? denoise_push_constant.blend_alpha : 1.0f;
 	denoise_push_constant.depth_scale = (int32_t)depth_scale;
-	denoise_push_constant.clamp_gamma = 1.5f;
+	// Neighborhood clamp width. This was 1.5 while the clamp was measuring the
+	// wrong axis: it read a scalar ratio's packed-format rounding as chroma, so
+	// its confidence output collapsed and pinned the accumulated frame count
+	// near one. Clipping a history that never accumulated costs nothing, and
+	// the width was never really tested.
+	//
+	// With the clamp on the luminance the signal actually carries, history does
+	// accumulate, and the width starts to matter in the direction the GI path
+	// already warns about: a heavily occluded light is sparse Monte Carlo,
+	// mostly zero with rare bright samples, and a history sitting at the true
+	// mean is above most of its all-zero neighborhoods. A tight clip pulls it
+	// down far more often than up and the mean walks toward black. Measured on
+	// the game project with only its (shadowed) area light visible: 1.5 gives
+	// 0.19x the reference's energy, 4.0 gives 0.55x, against 0.47x for the
+	// clamp that was never accumulating. The frame's temporal noise pays for it
+	// -- 0.52 to 0.63 RMS -- and is still a third of what it was.
+	denoise_push_constant.clamp_gamma = 4.0f;
 	// Camera planes for the depth-validated history (DIRECT_DEPTH_VALIDATION).
 	denoise_push_constant.z_near = p_z_near;
 	denoise_push_constant.z_far = p_z_far;
