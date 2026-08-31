@@ -87,6 +87,11 @@
 // Ping-ponged: the previous frame's copy validates history reprojection.
 #define RB_RT_GI_VIEW_DEPTH_0 SNAME("view_depth_0")
 #define RB_RT_GI_VIEW_DEPTH_1 SNAME("view_depth_1")
+// xyz: luminance-weighted mean incoming direction, w: short-range visibility.
+#define RB_RT_GI_DIRECTIONAL SNAME("directional")
+#define RB_RT_GI_RAW_DIRECTIONAL SNAME("raw_directional")
+#define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
+#define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
 namespace RendererRD {
 
@@ -148,6 +153,8 @@ private:
 		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
 		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
+		DENOISE_FLAG_HAS_DIRECTIONAL = 8, // The GI directional buffer travels with the diffuse signal.
+		DENOISE_FLAG_HAS_HIT_DISTANCE = 16, // Spatial: hit distance joins the edge-stopping weights.
 	};
 
 	uint32_t frame_index = 0;
@@ -249,8 +256,8 @@ private:
 		float sky_border[2];
 		float z_far;
 		uint32_t voxel_gi_count;
-		float pad1;
-		float pad2;
+		float ao_range; // Hit distances are normalized and clamped against this.
+		float inv_ao_range;
 	};
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
 
@@ -258,6 +265,7 @@ private:
 		DENOISE_VARIANT_TEMPORAL,
 		DENOISE_VARIANT_SPATIAL,
 		DENOISE_VARIANT_TEMPORAL_VALIDATE, // Temporal with depth-validated history (the GI signal).
+		DENOISE_VARIANT_SPATIAL_DIRECTIONAL, // Spatial carrying the GI directional buffer along.
 		DENOISE_VARIANT_MAX,
 	};
 
@@ -366,6 +374,7 @@ public:
 		bool denoise = true;
 		int32_t spatial_stride = 2;
 		float variance_threshold = 0.02f;
+		float ao_range = 3.0f; // Distance the near-field visibility term saturates at.
 	};
 
 	// The radiance caches handed to the gather: SDFGI cascades preferred,

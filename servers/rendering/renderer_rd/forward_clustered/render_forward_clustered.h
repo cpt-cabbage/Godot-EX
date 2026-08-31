@@ -327,7 +327,7 @@ private:
 
 			uint32_t rt_sun_shadow;
 			uint32_t rt_gi;
-			uint32_t pad4;
+			float rt_gi_directionality;
 			uint32_t pad5;
 		};
 
@@ -780,6 +780,11 @@ private:
 	bool use_rt_gi_screen_radiance = true;
 	bool use_rt_gi_specular = true;
 	uint32_t rt_gi_temporal_frames = 32;
+	bool use_rt_gi_directional = true;
+	bool use_rt_gi_specular_occlusion = true;
+	bool use_rt_gi_probe_refit = true;
+	float rt_gi_ao_range = 3.0f;
+	float rt_gi_directionality = 1.0f;
 	// Whether the last main-view frame rendered SDFGI (drives whether the TLAS
 	// must be built when only the SDFGI probe integrator consumes it).
 	bool sdfgi_used_last_frame = false;

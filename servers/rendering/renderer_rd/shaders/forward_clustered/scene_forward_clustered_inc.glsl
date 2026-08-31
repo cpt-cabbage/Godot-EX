@@ -154,6 +154,13 @@ bool sc_material_feedback() {
 	return ((sc_packed_1() >> 7) & 1U) != 0;
 }
 
+// Set on the transparent color pass. The screen-space effects keyed on the
+// opaque depth prepass (ray-traced GI in particular) are meaningless for a
+// fragment that is not the one the prepass recorded.
+bool sc_is_transparent_pass() {
+	return ((sc_packed_1() >> 8) & 1U) != 0;
+}
+
 float sc_luminance_multiplier() {
 	// Not used in clustered renderer but we share some code with the mobile renderer that requires this.
 	return 1.0;
@@ -351,7 +358,7 @@ struct ImplementationData {
 
 	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
 	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers (1: full res, 2: half res).
-	uint pad4;
+	float rt_gi_directionality; // Scales how far the directional term re-bases irradiance onto the fragment normal.
 	uint pad5;
 };
 
@@ -505,6 +512,7 @@ layout(set = 1, binding = 42) uniform texture2DArray stochastic_depth_buffer;
 layout(set = 1, binding = 43) uniform texture2DArray rt_gi_ambient_buffer;
 layout(set = 1, binding = 44) uniform texture2DArray rt_gi_reflection_buffer;
 layout(set = 1, binding = 45) uniform texture2DArray rt_gi_depth_buffer;
+layout(set = 1, binding = 46) uniform texture2DArray rt_gi_directional_buffer;
 #else
 layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2D rt_area_shadow_mask;
@@ -514,6 +522,7 @@ layout(set = 1, binding = 42) uniform texture2D stochastic_depth_buffer;
 layout(set = 1, binding = 43) uniform texture2D rt_gi_ambient_buffer;
 layout(set = 1, binding = 44) uniform texture2D rt_gi_reflection_buffer;
 layout(set = 1, binding = 45) uniform texture2D rt_gi_depth_buffer;
+layout(set = 1, binding = 46) uniform texture2D rt_gi_directional_buffer;
 #endif // USE_MULTIVIEW
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 

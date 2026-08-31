@@ -3711,6 +3711,15 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
+	// The gather also records which direction its light came from and how far
+	// its rays got, which re-bases the irradiance onto normal-mapped detail,
+	// occludes indirect specular, and re-fits reflection probes captured under
+	// different lighting.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular_occlusion"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/reflection_probe_refit"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/occlusion_range", PROPERTY_HINT_RANGE, "0.1,20.0,0.1,or_greater"), 3.0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/directionality", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

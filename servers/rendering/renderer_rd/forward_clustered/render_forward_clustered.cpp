@@ -460,6 +460,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_TRANSPARENT) != 0) {
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_TRANSPARENT;
+					// The screen-space GI buffers describe the opaque surface
+					// behind this fragment, not this fragment.
+					pipeline_specialization.is_transparent_pass = 1;
 				}
 
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_MULTIVIEW) != 0) {
@@ -742,8 +745,12 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Same validity rule for the ray-traced GI buffers. Bits 0-1: resolution
 	// mode (1 full, 2 half with the depth-aware upsample); bit 2: the traced
 	// reflection buffer is populated (otherwise the composite must not blend
-	// rough specular toward its black fallback).
-	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u)) : 0;
+	// rough specular toward its black fallback); bit 3: re-base the gathered
+	// irradiance onto the fragment normal; bit 4: take specular occlusion from
+	// the traced bent normal; bit 5: re-fit reflection probes to the frame's
+	// irradiance.
+	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u)) : 0;
+	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
 	scene_state.ubo.rt_sun_shadow = (p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && _get_rt_sun_base(p_render_data).is_valid()) ? 1 : 0;
@@ -1839,6 +1846,11 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance");
 	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
 	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/temporal_frames"));
+	use_rt_gi_directional = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional");
+	use_rt_gi_specular_occlusion = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular_occlusion");
+	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/reflection_probe_refit");
+	rt_gi_ao_range = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/occlusion_range");
+	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directionality");
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
@@ -2480,6 +2492,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.screen_traces = stochastic_quality.screen_traces;
 				gi_quality.ray_bias = stochastic_quality.ray_bias;
 				gi_quality.temporal_frames = rt_gi_temporal_frames;
+			gi_quality.ao_range = rt_gi_ao_range;
 				gi_quality.denoise = stochastic_quality.denoise;
 				gi_quality.spatial_stride = stochastic_quality.spatial_stride;
 				gi_quality.variance_threshold = stochastic_quality.variance_threshold;
@@ -4172,14 +4185,14 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
-	for (uint32_t i = 0; i < 3; i++) {
+	for (uint32_t i = 0; i < 4; i++) {
 		RD::Uniform u;
 		u.binding = 43 + i;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		// The GI view depth ping-pongs (the old parity validates history);
 		// the upsample wants the one the gather wrote this frame.
 		const StringName &gi_depth_name = (rt_shadows != nullptr && rt_shadows->get_history_parity()) ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1;
-		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : gi_depth_name);
+		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : (i == 2 ? gi_depth_name : RB_RT_GI_DIRECTIONAL));
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_GI, name) ? rb->get_texture(RB_SCOPE_RT_GI, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);

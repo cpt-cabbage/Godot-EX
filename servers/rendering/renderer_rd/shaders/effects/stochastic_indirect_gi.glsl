@@ -41,8 +41,8 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	vec2 sky_border; // x: octmap border size, y: 1 - 2 * border.
 	float z_far;
 	uint voxel_gi_count;
-	float pad1;
-	float pad2;
+	float ao_range; // Hit distances are normalized and clamped against this.
+	float inv_ao_range;
 }
 params;
 
@@ -140,10 +140,20 @@ voxel_gi_instances;
 
 layout(set = 0, binding = 14) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_INSTANCES];
 
-layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_ambient;
-layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_reflection;
+layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_ambient;
+layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_reflection;
 // View depth of the shaded texel, for the half-resolution upsample.
 layout(set = 1, binding = 2, r16f) uniform restrict writeonly image2D out_view_depth;
+// xyz: the first spherical-harmonic moment of the incoming radiance,
+// luminance weighted, in world space. Deliberately left unnormalized: because
+// |sum(lum_i * dir_i)| <= sum(lum_i) = luminance(irradiance) * ray_count, the
+// ratio |xyz| / luminance(irradiance) is bounded by 1, and that bound is what
+// keeps the reconstruction stable. It also survives any non-negative weighted
+// average, so both denoiser passes preserve it.
+// w: mean hit distance normalized against ao_range (0 = contact, 1 = far or
+// sky). Serves as both the ambient visibility term and the denoiser's
+// hit-distance edge stop.
+layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_directional;
 
 #define M_PI 3.14159265359
 
@@ -333,12 +343,16 @@ bool screen_trace_hit(vec3 view_origin, vec3 view_dir, float jitter, out vec3 hi
 
 // One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
 // miss. Positions are camera-relative world space (the cascade convention).
-vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter) {
+// r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
+// escaped), which the denoiser uses to keep contact GI away from far-field GI.
+vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
+	r_hit_distance = params.ao_range; // Nothing hit within range.
 	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
 		vec3 hit_view;
 		if (screen_trace_hit(view_origin, view_dir, jitter, hit_view)) {
 			mat3 world_basis = mat3(params.world_from_view);
 			vec3 rel_hit = world_basis * hit_view;
+			r_hit_distance = length(hit_view - view_origin);
 			return screen_radiance_boost(hit_view, sdfgi_cache_radiance(rel_hit, world_dir));
 		}
 	}
@@ -373,6 +387,7 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 vie
 	}
 	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
 		float t_hit = rayQueryGetIntersectionTEXT(rq, true);
+		r_hit_distance = t_hit;
 		vec3 rel_hit = origin + world_dir * t_hit;
 		mat3 view_basis = transpose(mat3(params.world_from_view));
 		vec3 view_hit = view_basis * rel_hit;
@@ -393,6 +408,8 @@ void main() {
 		imageStore(out_ambient, pixel, vec4(0.0));
 		imageStore(out_reflection, pixel, vec4(0.0));
 		imageStore(out_view_depth, pixel, vec4(0.0));
+		// Sky: unoccluded, no directional bias.
+		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
 		return;
 	}
 
@@ -416,13 +433,30 @@ void main() {
 	vec3 world_normal = normalize(world_basis * view_normal);
 
 	vec3 irradiance = vec3(0.0);
+	// First moment of the incoming radiance and the near-field visibility,
+	// both free from the rays we already trace.
+	vec3 moment = vec3(0.0);
+	float visibility = 0.0;
 	for (uint r = 0u; r < params.ray_count; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
 		vec3 dir = cosine_hemisphere(world_normal, rnd);
 		vec3 view_dir = transpose(world_basis) * dir;
-		irradiance += trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r);
+		float t_hit;
+		// Clamped non-negative: half-float caches and the screen radiance
+		// boost can return a small negative, and the |moment| <= luminance
+		// bound the reconstruction relies on only holds for positive radiance.
+		vec3 radiance = max(trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
+		irradiance += radiance;
+		moment += luminance(radiance) * dir;
+		// Only nearby geometry occludes: in an open scene nearly every ray
+		// hits something eventually, and counting those would report near
+		// total occlusion everywhere.
+		visibility += clamp(t_hit * params.inv_ao_range, 0.0, 1.0);
 	}
-	irradiance /= float(params.ray_count);
+	float inv_rays = 1.0 / float(params.ray_count);
+	irradiance *= inv_rays;
+	moment *= inv_rays;
+	visibility *= inv_rays;
 
 	vec3 reflection = vec3(0.0);
 	if (bool(params.flags & FLAG_SPECULAR) && roughness > 0.2) {
@@ -441,10 +475,12 @@ void main() {
 			dir = reflect(-v, world_normal);
 		}
 		vec3 view_dir = transpose(world_basis) * dir;
-		reflection = trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r);
+		float spec_t_hit;
+		reflection = trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
 	}
 
 	imageStore(out_ambient, pixel, vec4(irradiance, 0.0));
 	imageStore(out_reflection, pixel, vec4(reflection, 0.0));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
+	imageStore(out_directional, pixel, vec4(moment, visibility));
 }

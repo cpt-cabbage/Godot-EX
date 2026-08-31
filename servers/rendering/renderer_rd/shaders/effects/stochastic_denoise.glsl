@@ -19,6 +19,24 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
 #define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
 
+// The GI signal carries a directional companion buffer (first radiance moment
+// + near-field visibility) that must be blended and filtered with exactly the
+// diffuse weights. It rides on the GI-only variants (VALIDATE_DEPTH for the
+// temporal pass, FILTER_DIRECTIONAL for the spatial one) rather than a runtime
+// flag, so the direct lighting variants keep their existing set layouts.
+#ifdef VALIDATE_DEPTH
+#define HAS_DIRECTIONAL
+// The GI accumulates unbounded HDR radiance through a 32-frame feedback loop,
+// where the packed format's rounding compounds; direct lighting accumulates
+// bounded [0;1] visibility ratios and stays packed.
+#define LIGHTING_FORMAT rgba16f
+#else
+#define LIGHTING_FORMAT r11f_g11f_b10f
+#endif
+#ifdef FILTER_DIRECTIONAL
+#define HAS_DIRECTIONAL
+#endif
+
 layout(set = 0, binding = 0) uniform sampler2D in_diffuse;
 layout(set = 0, binding = 1) uniform sampler2D in_specular;
 layout(set = 0, binding = 2) uniform sampler2D depth_texture;
@@ -39,10 +57,13 @@ layout(set = 0, binding = 8) uniform sampler2D velocity_texture;
 // The signal's own view depth from the previous frame (at the signal's
 // resolution), for disocclusion rejection when history clipping is off.
 layout(set = 0, binding = 9) uniform sampler2D prev_view_depth_texture;
+// This frame's directional term and its history.
+layout(set = 0, binding = 10) uniform sampler2D in_directional;
+layout(set = 0, binding = 11) uniform sampler2D history_directional;
 #endif
 
-layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
+layout(set = 1, binding = 0, LIGHTING_FORMAT) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, LIGHTING_FORMAT) uniform restrict writeonly image2D out_specular;
 // xy: diffuse luminance 1st/2nd moment, zw: specular.
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_moments;
 // r: diffuse frames / 64, g: specular frames / 64, b: shading confidence,
@@ -56,6 +77,9 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	mat4 prev_reproject;
 }
 reprojection;
+#ifdef HAS_DIRECTIONAL
+layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_directional;
+#endif
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
 layout(set = 0, binding = 4) uniform sampler2D normal_roughness_texture;
@@ -64,9 +88,18 @@ layout(set = 0, binding = 5) uniform sampler2D meta_texture;
 // FLAG_MODULATE_ANALYTIC is set (dummy bindings otherwise, never fetched).
 layout(set = 0, binding = 6) uniform sampler2D analytic_diffuse;
 layout(set = 0, binding = 7) uniform sampler2D analytic_specular;
+#ifdef FILTER_DIRECTIONAL
+layout(set = 0, binding = 8) uniform sampler2D in_directional;
+#endif
 
+// The spatial pass writes the final buffers, which stay packed on both paths:
+// they are written once and read four times per fragment by the upsample, so
+// the rounding never compounds.
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
+#ifdef FILTER_DIRECTIONAL
+layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
+#endif
 #endif
 
 layout(push_constant, std430) uniform Params {
@@ -132,11 +165,18 @@ void main() {
 		imageStore(out_specular, pixel, vec4(0.0));
 		imageStore(out_moments, pixel, vec4(0.0));
 		imageStore(out_meta, pixel, vec4(0.0));
+#ifdef HAS_DIRECTIONAL
+		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+#endif
 		return;
 	}
 
 	vec3 current_diffuse = texelFetch(in_diffuse, pixel, 0).rgb;
 	vec3 current_specular = texelFetch(in_specular, pixel, 0).rgb;
+#ifdef HAS_DIRECTIONAL
+	vec4 current_directional = texelFetch(in_directional, pixel, 0);
+	vec4 result_directional = current_directional;
+#endif
 
 	// 5x5 neighborhood statistics for history rectification.
 	vec3 mean_d = vec3(0.0);
@@ -267,6 +307,15 @@ void main() {
 			float lum_s = luminance(current_specular);
 			result_diffuse = mix(hist_d, current_diffuse, alpha_d);
 			result_specular = mix(hist_s, current_specular, alpha_s);
+#ifdef HAS_DIRECTIONAL
+			// The moment is stored unnormalized precisely so this blend is a
+			// linear average: with one ray per pixel a single frame's moment
+			// is a delta and useless on its own, but its running mean over
+			// frames_d frames is the estimate we want. It must use the same
+			// alpha as the diffuse signal it is paired with, or the ratio
+			// between them stops being bounded.
+			result_directional = mix(textureLod(history_directional, prev_uv, 0.0), current_directional, alpha_d);
+#endif
 			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_d),
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
 			dominance = mix(hist_meta.b, dominance, alpha_d);
@@ -284,19 +333,41 @@ void main() {
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
 	imageStore(out_moments, pixel, moments);
 	imageStore(out_meta, pixel, vec4(frames_d / 64.0, frames_s / 64.0, dominance, reveal));
+#ifdef HAS_DIRECTIONAL
+	// Stored unscaled: the spatial pass applies the convergence ramp, so the
+	// history this feeds back stays an honest running mean.
+	imageStore(out_directional, pixel, result_directional);
+#endif
 }
 
 #else // MODE_SPATIAL
 
 // Multiplies the analytic lighting back into the filtered visibility ratios
 // (direct lighting only; GI filters radiance directly).
-void store_result(ivec2 pixel, vec3 d, vec3 s) {
+//
+// p_confidence fades the directional term in as the temporal accumulation
+// converges. With one ray per pixel the instantaneous moment is a delta -- its
+// length always equals the luminance, reading as "all light comes from exactly
+// one direction" on every pixel of every frame. Only the running mean over
+// many frames is meaningful, so a young pixel is pulled back toward the
+// isotropic ratio (2/3, the value a uniform hemisphere produces under
+// cosine-weighted sampling) and the consumer sees a flat irradiance instead of
+// a wild reconstruction. Scaling the moment by a positive scalar is safe: it
+// scales the ratio by the same factor and cannot break its bound.
+void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
 	if ((params.flags & FLAG_MODULATE_ANALYTIC) != 0u) {
 		d *= texelFetch(analytic_diffuse, pixel, 0).rgb;
 		s *= texelFetch(analytic_specular, pixel, 0).rgb;
 	}
 	imageStore(out_diffuse, pixel, vec4(d, 0.0));
 	imageStore(out_specular, pixel, vec4(s, 0.0));
+#ifdef FILTER_DIRECTIONAL
+	float l0 = max(luminance(d), 1e-6);
+	float len = length(dir.xyz);
+	float ratio = mix(2.0 / 3.0, len / l0, p_confidence);
+	dir.xyz = len > 1e-9 ? dir.xyz * (ratio * l0 / len) : vec3(0.0);
+	imageStore(out_directional, pixel, vec4(dir.xyz, mix(1.0, dir.w, p_confidence)));
+#endif
 }
 
 void main() {
@@ -308,15 +379,23 @@ void main() {
 	float center_depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
 	vec4 center_d4 = texelFetch(in_diffuse, pixel, 0);
 	vec4 center_s4 = texelFetch(in_specular, pixel, 0);
+#ifdef FILTER_DIRECTIONAL
+	vec4 center_dir = texelFetch(in_directional, pixel, 0);
+#else
+	vec4 center_dir = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
 	if (center_depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
 		imageStore(out_specular, pixel, vec4(0.0));
+#ifdef FILTER_DIRECTIONAL
+		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+#endif
 		return;
 	}
 
 	// Denoiser disabled (sentinel threshold): pass the input through.
 	if (params.variance_threshold >= 1e5) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0);
 		return;
 	}
 
@@ -349,8 +428,10 @@ void main() {
 	bool young_s = frames_s < 4.0;
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
 	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
+	// Ramp the directional term in over the first frames of accumulation.
+	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	if (!filter_d && !filter_s) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
 		return;
 	}
 
@@ -362,6 +443,14 @@ void main() {
 	// kernel and ignore the luminance stopping function for a few frames.
 	int stride = newly_revealed ? params.stride * 2 : params.stride;
 
+#ifdef FILTER_DIRECTIONAL
+	// Where the gather's rays hit close by, the irradiance varies over the same
+	// short scale (the contact darkening under and beside objects), so a wide
+	// kernel would average that detail away. Tighten the footprint in
+	// proportion to how far the rays actually got.
+	stride = max(1, int(round(float(stride) * max(center_dir.w, 0.25))));
+#endif
+
 	// Rotate the sparse kernel per pixel so its footprint does not imprint a
 	// grid pattern on the result; the rotation is static (not per frame) to
 	// avoid shimmer after temporal accumulation.
@@ -370,6 +459,7 @@ void main() {
 
 	vec3 sum_d = center_d4.rgb;
 	vec3 sum_s = center_s4.rgb;
+	vec4 sum_dir = center_dir;
 	float weight_d = 1.0;
 	float weight_s = 1.0;
 
@@ -407,15 +497,29 @@ void main() {
 			if (!newly_revealed && !young_s) {
 				ws *= exp(-abs(luminance(s) - moments.z) / sigma_s);
 			}
+#ifdef FILTER_DIRECTIONAL
+			// Neighbors whose rays travelled a very different distance are
+			// looking at a different part of the scene even where depth and
+			// normal agree, so they must not average together.
+			vec4 sdir = texelFetch(in_directional, sp, 0);
+			wd *= exp(-abs(sdir.w - center_dir.w) * 4.0);
+#endif
 
 			sum_d += d * wd;
 			sum_s += s * ws;
 			weight_d += wd;
 			weight_s += ws;
+#ifdef FILTER_DIRECTIONAL
+			// Same weight as the diffuse signal, deliberately: the pair only
+			// stays consistent while both are averaged identically.
+			sum_dir += sdir * wd;
+#endif
 		}
 	}
 
-	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb, filter_s ? sum_s / weight_s : center_s4.rgb);
+	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb,
+			filter_s ? sum_s / weight_s : center_s4.rgb,
+			filter_d ? sum_dir / weight_d : center_dir, dir_confidence);
 }
 
 #endif

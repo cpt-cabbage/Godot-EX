@@ -1805,6 +1805,12 @@ void fragment_shader(in SceneData scene_data) {
 
 /// GI ///
 #if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+	// Directional occlusion measured by the ray-traced gather, consumed by the
+	// specular occlusion term further down. Defaults describe an unoccluded
+	// surface, which is what every path that does not trace leaves in place.
+	vec3 rt_gi_bent_normal = normal;
+	float rt_gi_visibility = 1.0;
+	bool rt_gi_occlusion_valid = false;
 #ifndef AMBIENT_LIGHT_DISABLED
 #ifdef USE_LIGHTMAP
 
@@ -2098,17 +2104,24 @@ void fragment_shader(in SceneData scene_data) {
 	// specular band (sharp reflections stay with probes / SSR, whose
 	// sharpness the blurry radiance cache cannot match). Reflection probes
 	// later still override inside their volumes, as with SDFGI.
-	if (implementation_data.rt_gi != 0u) {
+	if (implementation_data.rt_gi != 0u && !sc_is_transparent_pass()) {
 		vec3 rt_gi_ambient = vec3(0.0);
 		vec3 rt_gi_reflection = vec3(0.0);
+		// xyz: first radiance moment (world space), w: near-field visibility.
+		vec4 rt_gi_directional = vec4(0.0, 0.0, 0.0, 1.0);
+		// The normal the gather actually sampled around, which the directional
+		// reconstruction re-bases onto this fragment's normal.
+		vec3 rt_gi_gather_normal = indirect_normal;
 		bool rt_gi_valid = false;
 		if ((implementation_data.rt_gi & 3u) == 1u) {
 #ifdef USE_MULTIVIEW
 			rt_gi_ambient = textureLod(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
 			rt_gi_reflection = textureLod(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+			rt_gi_directional = textureLod(sampler2DArray(rt_gi_directional_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
 			rt_gi_ambient = textureLod(sampler2D(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
 			rt_gi_reflection = textureLod(sampler2D(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+			rt_gi_directional = textureLod(sampler2D(rt_gi_directional_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
 			rt_gi_valid = true;
 		} else {
@@ -2121,33 +2134,98 @@ void fragment_shader(in SceneData scene_data) {
 			vec2 rtgi_fr = rtgi_pos - vec2(rtgi_base);
 			float rtgi_own_depth = -vertex.z;
 			float rtgi_weight = 0.0;
+			rt_gi_directional = vec4(0.0);
 			for (int i = 0; i < 4; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
 				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
+				vec3 sn = normalize(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp * 2, int(ViewIndex)), 0).xyz * 2.0 - 1.0);
 #else
 				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
+				vec3 sn = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), hp * 2, 0).xyz * 2.0 - 1.0);
 #endif
 				float w = (1.0 - abs(float(off.x) - rtgi_fr.x)) * (1.0 - abs(float(off.y) - rtgi_fr.y));
 				w *= exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
+				// Depth alone lets GI bleed across a silhouette where two
+				// surfaces meet at similar depth but face different ways -- a
+				// box edge being the everyday case. A gentler exponent than
+				// the denoiser's, since half-res taps are legitimately a
+				// little further apart in normal.
+				w *= pow(max(dot(indirect_normal, sn), 0.0), 8.0);
 #ifdef USE_MULTIVIEW
 				rt_gi_ambient += texelFetch(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
 				rt_gi_reflection += texelFetch(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
+				rt_gi_directional += texelFetch(sampler2DArray(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0) * w;
 #else
 				rt_gi_ambient += texelFetch(sampler2D(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
 				rt_gi_reflection += texelFetch(sampler2D(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
+				rt_gi_directional += texelFetch(sampler2D(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), hp, 0) * w;
 #endif
+				// The nearest tap is the one whose gather most likely covered
+				// this fragment, so its normal is the basis the irradiance was
+				// integrated around. Taken unweighted on purpose: the weighted
+				// mean would converge on this fragment's own normal and the
+				// reconstruction below would collapse to a no-op.
+				if (i == 0) {
+					rt_gi_gather_normal = sn;
+				}
 				rtgi_weight += w;
 			}
 			if (rtgi_weight > 1e-6) {
+				// One weight set for all three, so the bound relating the
+				// moment to the irradiance survives the upsample.
 				rt_gi_ambient /= rtgi_weight;
 				rt_gi_reflection /= rtgi_weight;
+				rt_gi_directional /= rtgi_weight;
 				rt_gi_valid = true;
 			}
 		}
 		if (rt_gi_valid) {
 			ambient_light = rt_gi_ambient;
+			if (bool(implementation_data.rt_gi & 8u)) {
+				// Re-base the gathered irradiance onto this fragment's own
+				// normal. The gather integrates a cosine lobe around the
+				// half-resolution normal, so a normal-mapped surface gets one
+				// flat value across every bump. The stored first moment says
+				// where the light came from, and its length relative to the
+				// irradiance says how directional it was: 2/3 for a uniform
+				// hemisphere (what cosine-weighted sampling yields), rising
+				// toward 1 as the light concentrates in one direction.
+				// The moment is stored in world space (a view-space history
+				// would lag by the camera's own rotation); rotate it here,
+				// where the normals live.
+				vec3 gi_l1 = transpose(mat3(scene_data.inv_view_matrix)) * rt_gi_directional.xyz;
+				float gi_l0 = max(dot(rt_gi_ambient, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+				float gi_len = length(gi_l1);
+				if (gi_len > 1e-6 * gi_l0) {
+					vec3 gi_dir = gi_l1 / gi_len;
+					// The same rays give a real bent normal and a
+					// range-limited visibility, which the specular occlusion
+					// below uses in place of its luminance heuristic.
+					rt_gi_bent_normal = gi_dir;
+					rt_gi_visibility = clamp(rt_gi_directional.w, 0.0, 1.0);
+					rt_gi_occlusion_valid = bool(implementation_data.rt_gi & 16u);
+					float gi_q = clamp(gi_len / gi_l0, 0.0, 1.0);
+					// The useful range of this ratio is narrow and it is worth
+					// being exact about it. Under cosine-weighted sampling a
+					// uniform hemisphere yields 2/3, and a pure cosine lobe --
+					// the most directional field a single moment can describe
+					// -- yields 3/4 (its moment is B/2 against an irradiance of
+					// 2B/3). So 1/12 of range separates "no direction at all"
+					// from "as directional as this representation goes", and
+					// mapping it against 1 instead would leave the term an
+					// invisible few percent.
+					float gi_s = clamp((gi_q - 2.0 / 3.0) * 12.0, 0.0, 1.0) * implementation_data.rt_gi_directionality;
+					gi_s = min(gi_s, 0.75); // Keeps the denominator away from zero.
+					float gi_num = (1.0 - gi_s) + gi_s * max(dot(gi_dir, indirect_normal), 0.0);
+					float gi_den = (1.0 - gi_s) + gi_s * max(dot(gi_dir, rt_gi_gather_normal), 0.0);
+					// Exactly 1 when the two normals agree, so flat surfaces
+					// and every pixel of a scene without normal maps are
+					// unchanged.
+					ambient_light *= clamp(gi_num / max(gi_den, 0.15), 0.0, 3.0);
+				}
+			}
 			if (bool(implementation_data.rt_gi & 4u)) {
 				float rt_gi_spec_blend = smoothstep(0.2, 0.35, roughness);
 				indirect_specular_light = mix(indirect_specular_light, rt_gi_reflection, rt_gi_spec_blend);
@@ -2284,47 +2362,64 @@ void fragment_shader(in SceneData scene_data) {
 		ambient_light *= ao;
 #endif // MULTI_BOUNCE_OCCLUSION_ENABLED
 #ifndef SPECULAR_OCCLUSION_DISABLED
+		// A bent normal plus a visibility cone gives a real answer here; a
+		// bent normal map is one source of them, and the ray-traced gather is
+		// another, measured rather than authored. Its visibility is range
+		// limited, which is what makes it usable: raw ray occlusion would
+		// count a wall a hundred metres away as an occluder.
+		vec3 so_bent_normal;
+		float so_visibility;
+		bool so_use_cone;
 #ifdef BENT_NORMAL_MAP_USED
-		// Apply cone to cone intersection with cosine weighted assumption:
-		// https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf
-		float cos_a_v = sqrt(1.0 - ao);
-		float limited_roughness = max(roughness, 0.01); // Avoid artifacts at really low roughness.
-		float cos_a_s = exp2((-log(10.0) / log(2.0)) * limited_roughness * limited_roughness);
-		float cos_b = dot(bent_normal_vector, reflect(-view, normal));
-
-		// Intersection between the spherical caps of the visibility and specular cone.
-		// Based on Christopher Oat and Pedro V. Sander's "Ambient aperture lighting":
-		// https://advances.realtimerendering.com/s2006/Chapter8-Ambient_Aperture_Lighting.pdf
-		float r1 = acos(cos_a_v);
-		float r2 = acos(cos_a_s);
-		float d = acos(cos_b);
-		float area = 0.0;
-
-		if (d <= max(r1, r2) - min(r1, r2)) {
-			// One cap is enclosed in the other.
-			area = M_TAU - M_TAU * max(cos_a_v, cos_a_s);
-		} else if (d >= r1 + r2) {
-			// No intersection.
-			area = 0.0;
-		} else {
-			float delta = abs(r1 - r2);
-			float x = 1.0 - clamp((d - delta) / (r1 + r2 - delta), 0.0, 1.0);
-			area = smoothstep(0.0, 1.0, x);
-			area *= M_TAU - M_TAU * max(cos_a_v, cos_a_s);
-		}
-
-		float specular_occlusion = area / (M_TAU * (1.0 - cos_a_s));
-		indirect_specular_light *= specular_occlusion;
-#else // BENT_NORMAL_MAP_USED
-		float specular_occlusion = (ambient_light.r * 0.3 + ambient_light.g * 0.59 + ambient_light.b * 0.11) * 2.0; // Luminance of ambient light.
-		specular_occlusion = min(specular_occlusion * 4.0, 1.0); // This multiplication preserves speculars on bright areas.
-
-		float reflective_f = (1.0 - roughness) * metallic;
-		// 10.0 is a magic number, it gives the intended effect in most scenarios.
-		// Low enough for occlusion, high enough for reaction to lights and shadows.
-		specular_occlusion = max(min(reflective_f * specular_occlusion * 10.0, 1.0), specular_occlusion);
-		indirect_specular_light *= specular_occlusion;
+		so_bent_normal = bent_normal_vector;
+		so_visibility = ao;
+		so_use_cone = true;
+#else
+		so_bent_normal = rt_gi_bent_normal;
+		so_visibility = rt_gi_visibility;
+		so_use_cone = rt_gi_occlusion_valid;
 #endif // BENT_NORMAL_MAP_USED
+		float specular_occlusion;
+		if (so_use_cone) {
+			// Apply cone to cone intersection with cosine weighted assumption:
+			// https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf
+			float cos_a_v = sqrt(1.0 - so_visibility);
+			float limited_roughness = max(roughness, 0.01); // Avoid artifacts at really low roughness.
+			float cos_a_s = exp2((-log(10.0) / log(2.0)) * limited_roughness * limited_roughness);
+			float cos_b = dot(so_bent_normal, reflect(-view, normal));
+
+			// Intersection between the spherical caps of the visibility and specular cone.
+			// Based on Christopher Oat and Pedro V. Sander's "Ambient aperture lighting":
+			// https://advances.realtimerendering.com/s2006/Chapter8-Ambient_Aperture_Lighting.pdf
+			float r1 = acos(cos_a_v);
+			float r2 = acos(cos_a_s);
+			float d = acos(cos_b);
+			float area = 0.0;
+
+			if (d <= max(r1, r2) - min(r1, r2)) {
+				// One cap is enclosed in the other.
+				area = M_TAU - M_TAU * max(cos_a_v, cos_a_s);
+			} else if (d >= r1 + r2) {
+				// No intersection.
+				area = 0.0;
+			} else {
+				float delta = abs(r1 - r2);
+				float x = 1.0 - clamp((d - delta) / (r1 + r2 - delta), 0.0, 1.0);
+				area = smoothstep(0.0, 1.0, x);
+				area *= M_TAU - M_TAU * max(cos_a_v, cos_a_s);
+			}
+
+			specular_occlusion = area / (M_TAU * (1.0 - cos_a_s));
+		} else {
+			specular_occlusion = (ambient_light.r * 0.3 + ambient_light.g * 0.59 + ambient_light.b * 0.11) * 2.0; // Luminance of ambient light.
+			specular_occlusion = min(specular_occlusion * 4.0, 1.0); // This multiplication preserves speculars on bright areas.
+
+			float reflective_f = (1.0 - roughness) * metallic;
+			// 10.0 is a magic number, it gives the intended effect in most scenarios.
+			// Low enough for occlusion, high enough for reaction to lights and shadows.
+			specular_occlusion = max(min(reflective_f * specular_occlusion * 10.0, 1.0), specular_occlusion);
+		}
+		indirect_specular_light *= specular_occlusion;
 #endif // SPECULAR_OCCLUSION_DISABLED
 		ambient_light *= albedo.rgb;
 
