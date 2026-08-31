@@ -146,6 +146,37 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 #define MAX_DISCOVERY_CANDIDATES 12u
 #define MAX_CANDIDATES 20u
 
+// The analytic (unshadowed) term bypasses the denoiser entirely -- it is the
+// factor the filtered visibility ratio is multiplied back into, and the whole
+// demodulation only holds if it is exact. It used to be built from the same
+// strided subset that feeds the candidate set, scaled by the stride: unbiased
+// in expectation, but every non-guided light was then a Bernoulli(1/stride)
+// sample, all of them sharing one per-pixel phase, so a pixel's analytic value
+// was one of only `stride` discrete levels. Unfiltered and re-rolled every
+// frame, that read as grain on the floor, hard splotches on the walls, and
+// boiling under camera motion, and no amount of denoising could touch it
+// because the denoiser never sees this buffer.
+//
+// So the stride now selects candidates only. Up to this many lights the cell
+// is summed exactly; the evaluations are shared with the candidate set, so a
+// cell at the cap costs its own size in entry_eval calls rather than the ~17
+// the candidate budget already pays. That is ALU, not registers, which is what
+// this pass is actually bound by. Past the cap the strided estimate returns,
+// stratified per light so the levels break up into grain.
+#define MAX_ANALYTIC_LIGHTS 32u
+
+// r11f_g11f_b10f saturates near 65024, and an over-range value stores as +Inf.
+// The denoiser multiplies this buffer into the ratio, so a fully shadowed
+// pixel next to an over-range one becomes 0 * Inf = NaN: a black hole inside a
+// blown highlight. Bound well inside the format instead.
+#define ANALYTIC_MAX 32768.0
+
+// GGX D peaks at 1/(pi * alpha^2), which the alpha floor below puts at ~3.2e5
+// before the light color is even applied. Upstream's own D_GGX ends in
+// saturateHalf() for exactly this reason (scene_forward_lights_inc.glsl); this
+// copy had dropped the bound.
+#define D_GGX_MAX 65504.0
+
 // On a guiding miss (the pixel's history reprojected off screen or behind the
 // camera) the tile list is borrowed from elsewhere on screen and is only a
 // guess, so the paper shifts the sample budget from exploiting it to
@@ -154,10 +185,12 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 // samples in order to speedup new visible light discovery".
 //
 // The split moves but the total does not. Candidate evaluation, not tracing,
-// dominates this pass (entry_eval runs ~17x/pixel) and it is register-bound,
-// so raising MAX_CANDIDATES to widen discovery would cost occupancy on every
-// pixel to fix a band at the frame edge. Re-splitting the same 20 slots is
-// free: the miss path evaluates exactly as many lights as the hit path.
+// dominates this pass (~17 of the 20 slots are filled on a typical pixel) and
+// it is register-bound, so raising MAX_CANDIDATES to widen discovery would
+// cost occupancy on every pixel to fix a band at the frame edge. Re-splitting
+// the same 20 slots is free: the miss path fills exactly as many slots as the
+// hit path. (MAX_ANALYTIC_LIGHTS can push the number of entry_eval calls above
+// the slot count, but it adds no candidate slots and so no registers.)
 #define MISS_GUIDED_CANDIDATES 4u
 #define MISS_DISCOVERY_CANDIDATES 16u
 
@@ -243,6 +276,20 @@ float light_weight(float lum) {
 	return log2(lum + 1.0);
 }
 
+// Bounds an analytic buffer to what its storage format can hold. Scales by the
+// max channel rather than clipping each one, so bounding a spike desaturates
+// it toward the format ceiling instead of shifting its hue toward white. Also
+// the last place a non-finite value can be stopped before it reaches the
+// denoiser, where it would latch into the history permanently.
+vec3 bound_analytic(vec3 c) {
+	c = max(c, vec3(0.0));
+	float l = max(max(c.r, c.g), c.b);
+	if (!(l < 1e30)) { // False for NaN as well as Inf.
+		return vec3(0.0);
+	}
+	return l > ANALYTIC_MAX ? c * (ANALYTIC_MAX / l) : c;
+}
+
 // Unshadowed diffuse (radiance, no albedo) and specular contribution of a
 // light at a view-space point. Zero when out of range or facing away.
 void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec3 light_rel_vec) {
@@ -286,8 +333,7 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	vec3 l = normalize(light_rel_vec);
 
 	// Light size turns the point into a spherical area light: the same size_A
-	// offset the analytic light_compute applies widens the diffuse terminator
-	// and broadens the specular lobe.
+	// offset the analytic light_compute applies widens the diffuse terminator.
 	float size_A = 0.0;
 	if (ld.size > 0.0) {
 		float t = ld.size / max(0.001, light_length);
@@ -302,13 +348,24 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	vec3 v = normalize(-view_pos);
 	vec3 h = normalize(v + l);
 	float ndotv = max(dot(view_normal, v), 1e-4);
-	float ndoth = clamp(size_A + dot(view_normal, h), 0.0, 1.0);
-	float ldoth = clamp(size_A + dot(l, h), 0.0, 1.0);
+	float ndoth = clamp(dot(view_normal, h), 0.0, 1.0);
+	float ldoth = clamp(dot(l, h), 0.0, 1.0);
 
 	float alpha = max(roughness * roughness, 1e-3);
-	float alpha2 = alpha * alpha;
+	// Sphere light specular: widen the lobe by the light's subtended angle and
+	// renormalize so the wider lobe carries the same energy (Karis' normalized
+	// representative point). Folding size_A into ndoth instead, as the diffuse
+	// terminator does, pins ndoth to 1 across a whole cone, which holds D at
+	// its peak over a disc rather than falling off -- that is what turned close
+	// sized lights into flat-topped blown-out discs.
+	float alpha_prime = alpha;
+	if (ld.size > 0.0) {
+		alpha_prime = clamp(alpha + ld.size / (2.0 * max(light_length, 1e-3)), alpha, 1.0);
+	}
+	float sphere_norm = (alpha / alpha_prime) * (alpha / alpha_prime);
+	float alpha2 = alpha_prime * alpha_prime;
 	float d = ndoth * ndoth * (alpha2 - 1.0) + 1.0;
-	float D = alpha2 / (M_PI * d * d);
+	float D = min(alpha2 / (M_PI * d * d), D_GGX_MAX) * sphere_norm;
 	float k = alpha * 0.5;
 	float G = (ndotl / (ndotl * (1.0 - k) + k)) * (ndotv / (ndotv * (1.0 - k) + k));
 	const float f0 = 0.04;
@@ -559,10 +616,13 @@ void main() {
 	float guided_weight_sum = 0.0;
 	// Total unshadowed luminance estimate, for the sample culling threshold.
 	float total_lum = 0.0;
-	// Analytic unshadowed light sum over the candidate set (with the stride
-	// multiplier this is an unbiased estimate of the whole cell's lighting).
-	// Shading is separable: this analytic factor carries the full-quality
-	// lighting detail, and the rays only estimate a visibility ratio.
+	// Analytic unshadowed light sum. Shading is separable: this factor carries
+	// the full-quality lighting detail and the rays only estimate a visibility
+	// ratio, so it must describe one well-defined population of lights. That
+	// population is the pixel's cluster cell, accumulated by the discovery
+	// block below -- the guided list is a sampling hint, not a light set, and
+	// contributes nothing here. (A guided entry outside the cell evaluates to
+	// zero radiance anyway and is dropped by the w <= 0.0 test.)
 	vec3 analytic_diffuse = vec3(0.0);
 	vec3 analytic_specular = vec3(0.0);
 	uint guided_budget = guide_miss ? MISS_GUIDED_CANDIDATES : MAX_GUIDED_CANDIDATES;
@@ -591,8 +651,6 @@ void main() {
 		candidate_lum[candidate_count] = lum;
 		guided_weight_sum += w;
 		total_lum += lum;
-		analytic_diffuse += f;
-		analytic_specular += s;
 		candidate_count++;
 	}
 	uint guided_count = candidate_count;
@@ -601,6 +659,11 @@ void main() {
 	// newly visible lights are still found. The stride multiplier on the weight
 	// keeps the subset an unbiased stand-in for the cell's full light list, and
 	// bounds the per-pixel cost regardless of how many lights the scene has.
+	//
+	// The same walk accumulates the analytic term, but on its own terms: up to
+	// MAX_ANALYTIC_LIGHTS the cell is summed exactly, sharing its entry_eval
+	// results with whichever lights the stride also picks as candidates. The
+	// stride governs sampling; it no longer governs the analytic sum.
 	{
 		uvec2 cluster_pos = uvec2(full_pixel) >> params.cluster_shift;
 		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
@@ -626,6 +689,10 @@ void main() {
 		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
 		float stride_mult = float(stride);
 
+		// Small enough to sum the analytic term exactly, so it stops being an
+		// estimate at all.
+		bool analytic_exact = cell_count <= MAX_ANALYTIC_LIGHTS;
+
 		uint cell_index = 0u;
 		for (uint type = 0u; type < 3u; type++) {
 			uint type_offset = cluster_offset + type * params.cluster_type_size;
@@ -637,10 +704,36 @@ void main() {
 					uint bit = findLSB(mask);
 					mask &= ~(1u << bit);
 					uint take = cell_index++;
-					if (take % stride != start) {
+					uint entry = (32u * i + bit) | (type == 1u ? SPOT_BIT : (type == 2u ? AREA_BIT : 0u));
+
+					// Which lights this pixel samples. Past the exact cap each
+					// light draws its own phase instead of sharing one across
+					// the cell: a shared phase makes every light present or
+					// absent together, so the analytic sum lands on one of only
+					// `stride` levels and reads as hard banding. Independent
+					// phases decorrelate them, and the relative variance falls
+					// off as 1/sqrt(cell_count) instead of staying at
+					// sqrt(stride - 1).
+					uint phase = analytic_exact ? start : (pcg_hash(pixel_seed ^ entry) % stride);
+					bool sampled = (take % stride) == phase;
+					if (!analytic_exact && !sampled) {
 						continue;
 					}
-					uint entry = (32u * i + bit) | (type == 1u ? SPOT_BIT : (type == 2u ? AREA_BIT : 0u));
+
+					vec3 f, s;
+					entry_eval(entry, view_pos, view_normal, roughness, f, s);
+					// One evaluation serves both the analytic sum and, below,
+					// the candidate set. The analytic sum takes every cell light
+					// unscaled when exact, and the stride-scaled sampled subset
+					// otherwise -- unconditionally either way, so a full
+					// candidate array cannot darken the lighting.
+					float analytic_scale = analytic_exact ? 1.0 : stride_mult;
+					analytic_diffuse += f * analytic_scale;
+					analytic_specular += s * analytic_scale;
+					if (!sampled) {
+						continue;
+					}
+
 					// Skip lights already on the guided list.
 					bool listed = false;
 					for (uint j = 0u; j < guided_count; j++) {
@@ -652,8 +745,6 @@ void main() {
 					if (listed || candidate_count >= MAX_CANDIDATES) {
 						continue;
 					}
-					vec3 f, s;
-					entry_eval(entry, view_pos, view_normal, roughness, f, s);
 					float lum = abs(luminance(f + s));
 					float w = light_weight(lum);
 					if (w <= 0.0) {
@@ -663,8 +754,6 @@ void main() {
 					candidate_weights[candidate_count] = w * stride_mult;
 					candidate_lum[candidate_count] = lum;
 					total_lum += lum * stride_mult;
-					analytic_diffuse += f * stride_mult;
-					analytic_specular += s * stride_mult;
 					candidate_count++;
 				}
 			}
@@ -917,13 +1006,15 @@ void main() {
 	}
 
 	// The ratios are the denoiser's input (replicated to the shared vec3
-	// filter path); the analytic terms bypass the filter entirely. The
+	// filter path); the analytic terms bypass the filter entirely, which is
+	// why bound_analytic has to be the one place they are made safe -- nothing
+	// downstream inspects them again before they are multiplied back in. The
 	// unsigned buffer format drops negative-light energy, as the modulated
 	// signal always did.
 	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
 	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
-	imageStore(out_analytic_diffuse, pixel, vec4(max(analytic_diffuse, vec3(0.0)), 0.0));
-	imageStore(out_analytic_specular, pixel, vec4(max(analytic_specular, vec3(0.0)), 0.0));
+	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
+	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_specular), 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 	imageStore(out_meta, pixel, vec4(dominance));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z));
