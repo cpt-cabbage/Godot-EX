@@ -3164,37 +3164,70 @@ void fragment_shader(in SceneData scene_data) {
 		// stores the view depth it was lit at; weight the four nearest by
 		// bilinear distance and how well that depth matches ours, so lighting
 		// does not bleed across silhouettes.
-		uvec2 full_size = uvec2(1.0 / scene_data.screen_pixel_size);
-		ivec2 half_size = ivec2((full_size + uvec2(1)) >> 1);
-		vec2 pos = screen_uv * vec2(half_size) - 0.5;
+		//
+		// Round rather than truncate: screen_pixel_size is 1/size, and its
+		// reciprocal lands just under the integer for sizes whose inverse is
+		// not exactly representable. One pixel short here misaligns the whole
+		// grid.
+		ivec2 full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
+		ivec2 half_size = (full_size + ivec2(1)) >> 1;
+		// The sampling pass lit full-res pixel 2 * p for half-res texel p, so
+		// its result describes continuous full-res coordinate 2p + 0.5 -- the
+		// centre of that one pixel, not the centre of the 2x2 block. Placing
+		// the taps at block centres instead (screen_uv * half_size - 0.5) put
+		// every weight half a full pixel off. Solve 2p + 0.5 <= f + 0.5 for the
+		// tap index. The denoised signal is smooth enough that correcting this
+		// is not visible in the scenes measured so far; it is fixed because the
+		// reconstruction should stand on the sampling grid that exists.
+		vec2 pos = (screen_uv * vec2(full_size) - 0.5) * 0.5;
 		ivec2 base = ivec2(floor(pos));
 		vec2 fr = pos - vec2(base);
 		float own_depth = -vertex.z;
 		vec3 up_diffuse = vec3(0.0);
 		vec3 up_specular = vec3(0.0);
 		float up_weight = 0.0;
+		// Best depth match, kept for when no tap agrees well enough to trust
+		// the blend.
+		vec3 near_diffuse = vec3(0.0);
+		vec3 near_specular = vec3(0.0);
+		float near_depth_weight = -1.0;
 		for (int i = 0; i < 4; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
 #ifdef USE_MULTIVIEW
 			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
+			vec3 tap_diffuse = texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+			vec3 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 #else
 			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
+			vec3 tap_diffuse = texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+			vec3 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 #endif
-			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y));
-			w *= exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
-#ifdef USE_MULTIVIEW
-			up_diffuse += texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
-			up_specular += texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
-#else
-			up_diffuse += texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
-			up_specular += texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
-#endif
+			float depth_weight = exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
+			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y)) * depth_weight;
+			up_diffuse += tap_diffuse * w;
+			up_specular += tap_specular * w;
 			up_weight += w;
+			// Ranked on depth alone: where the taps disagree it is the one at
+			// our own depth that is right, however far it sits on screen.
+			if (depth_weight > near_depth_weight) {
+				near_depth_weight = depth_weight;
+				near_diffuse = tap_diffuse;
+				near_specular = tap_specular;
+			}
 		}
+		// Any positive sum normalizes correctly, however small -- this only has
+		// to catch the case where every tap was rejected to nothing.
 		if (up_weight > 1e-6) {
 			diffuse_light += up_diffuse / up_weight;
 			direct_specular_light += up_specular / up_weight;
+		} else {
+			// Every tap disagreed on depth. Adding nothing, as this did, leaves
+			// the pixel with no direct lighting whatsoever -- a black speckle
+			// that crawls along silhouettes as the camera moves. A single
+			// mismatched sample is far closer to the truth than darkness.
+			diffuse_light += near_diffuse;
+			direct_specular_light += near_specular;
 		}
 	}
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
