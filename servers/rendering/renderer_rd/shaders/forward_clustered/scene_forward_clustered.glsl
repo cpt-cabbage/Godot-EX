@@ -1045,6 +1045,12 @@ layout(location = 2) out vec2 motion_vector;
 #endif
 
 #include "../scene_forward_gi_inc.glsl"
+
+// Local shadow maps are skipped on the frames the stochastic pass ray traces
+// their shadows instead. The mobile renderer shares the light include but has
+// no implementation data block, so the condition is a macro with a default.
+#define LOCAL_SHADOW_MAPS_RENDERED (implementation_data.local_shadow_maps != 0u)
+
 #include "../scene_forward_lights_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)

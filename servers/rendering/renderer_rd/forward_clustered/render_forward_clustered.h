@@ -332,7 +332,7 @@ private:
 			uint32_t rt_sun_shadow;
 			uint32_t rt_gi;
 			float rt_gi_directionality;
-			uint32_t pad5;
+			uint32_t local_shadow_maps; // Zero: no local shadow map was rendered this frame, so the analytic paths must treat omni/spot/area lights as unshadowed instead of sampling a stale atlas rect.
 		};
 
 		struct PushConstantUbershader {
@@ -777,6 +777,7 @@ private:
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
 	bool use_stochastic_fog_shadows = false;
+	bool use_stochastic_skip_local_shadow_maps = true;
 	bool use_rt_sdfgi_probes = false;
 	bool use_rt_gi = false;
 	bool use_rt_gi_half_res = true;
@@ -818,6 +819,13 @@ private:
 	// opaque _setup_environment that follows it.
 	bool stochastic_traced_this_frame = false;
 	bool rt_gi_traced_this_frame = false;
+
+	// Whether the stochastic pass owns every local light's shadow this frame, so
+	// no omni/spot/area shadow map has to be rendered at all (the paper's point:
+	// shadow maps survive only as a fallback). Decided before _pre_opaque_render,
+	// which queues the shadow passes, so it repeats the conditions the tracing
+	// block below checks rather than reading its result.
+	bool stochastic_owns_local_shadows = false;
 
 public:
 	virtual bool needs_ray_tracing_instances() override;

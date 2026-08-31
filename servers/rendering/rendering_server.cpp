@@ -3697,11 +3697,16 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), false);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,8,1"), 4);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/light_guiding"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/ray_bias", PROPERTY_HINT_RANGE, "0.001,1.0,0.001,or_greater"), 0.08);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows"), true);
+	// The stochastic pass ray traces every local light's shadow, so the opaque
+	// pass never samples their shadow maps. Rendering them anyway is the single
+	// largest cost this path can avoid. Turn this off to keep them for the
+	// transparent pass, which still shades local lights analytically.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps"), true);
 	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
 	// available, i.e. any other ray tracing feature is on or SDFGI is active).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);

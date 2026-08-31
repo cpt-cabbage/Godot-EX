@@ -751,6 +751,12 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
 	scene_state.ubo.rt_sun_shadow = (p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && _get_rt_sun_base(p_render_data).is_valid()) ? 1 : 0;
+	// Local shadow maps skipped this frame: the atlas rects still point at
+	// whatever was last rendered into them, so the passes that shade local
+	// lights analytically (the transparent pass above all) have to treat them as
+	// unshadowed rather than sample stale depth. Reflection probes render into
+	// their own pass with their own atlas and are never skipped.
+	scene_state.ubo.local_shadow_maps = (stochastic_owns_local_shadows && p_render_data->reflection_probe.is_null()) ? 0 : 1;
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1641,6 +1647,19 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 					continue; // Ray traced this frame: skip its shadow map entirely.
 				}
 				p_render_data->directional_shadows.push_back(i);
+			} else if (stochastic_owns_local_shadows) {
+				// The stochastic pass ray traces this light's visibility, and the
+				// opaque pass reads its result instead of the atlas, so the
+				// shadow map would be rendered for nothing. Local lights are
+				// never partially covered: the pass samples the whole cluster, so
+				// one flag covers every omni, spot and area light.
+				// The atlas has already recorded this version as drawn, so drop
+				// that record: otherwise a frame that stops skipping (the setting
+				// toggled, the TLAS gone, fog turned on) would find the light
+				// unchanged, never redraw it, and sample depth left over from
+				// whenever the skipping began.
+				light_storage->shadow_atlas_invalidate_light_instance(p_render_data->shadow_atlas, li);
+				continue;
 			} else if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI && light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
 				p_render_data->cube_shadows.push_back(i);
 			} else {
@@ -1836,6 +1855,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
+	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps");
 	use_rt_sdfgi_probes = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/sdfgi/ray_query"));
 	if (rt_shadows != nullptr) {
 		rt_shadows->shadow_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/temporal_frames"));
@@ -2399,6 +2419,23 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			normal_roughness_views[v] = rb_data->get_normal_roughness(v);
 		}
 	}
+	// Decide before the shadow passes are queued whether the stochastic pass will
+	// own every local light's shadow this frame. The conditions repeat the ones
+	// guarding run_stochastic below, which is evaluated too late to be used here;
+	// all of them are already settled at this point (the cluster builder and
+	// rt_scene_ready come from the cull, the normal/roughness buffer from the
+	// depth pre-pass). Being wrong in the permissive direction would leave local
+	// lights unshadowed, so every condition is repeated rather than approximated.
+	{
+		bool fog_needs_shadow_maps = p_render_data->environment.is_valid() &&
+				environment_get_volumetric_fog_enabled(p_render_data->environment) && !use_stochastic_fog_shadows;
+		stochastic_owns_local_shadows = use_stochastic_skip_local_shadow_maps &&
+				use_stochastic_lighting && rt_shadows != nullptr && rt_scene_ready &&
+				depth_pre_pass && rb_data.is_valid() && !is_reflection_probe &&
+				rb_data->has_normal_roughness() && current_cluster_builder != nullptr &&
+				!fog_needs_shadow_maps;
+	}
+
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
 	if (rb_data.is_valid() && !is_reflection_probe && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) && !use_raytraced_shadows) {
@@ -2557,7 +2594,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (has_sun) {
 					rt_shadows->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle, sun_caster_mask, rt_shadow_rays, velocity);
 				}
-				if (has_area) {
+				// The mask this traces is only read by the analytic area light
+				// path, which the stochastic pass replaces; on those frames the
+				// stochastic rays already carry the area light's shadow, so
+				// tracing it a second time is pure duplicate work.
+				if (has_area && !stochastic_owns_local_shadows) {
 					rt_shadows->process_area(rb, v, world_from_ndc, area_pos, area_axis_u, area_axis_v, area_caster_mask, rt_shadow_rays);
 				}
 				if (run_stochastic) {

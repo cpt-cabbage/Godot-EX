@@ -856,7 +856,10 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	params.full_screen_size[0] = full_size.x;
 	params.full_screen_size[1] = full_size.y;
 	params.depth_scale = depth_scale;
-	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 8u);
+	// MAX_RESERVOIRS in the shader bounds this: the per-reservoir arrays are
+	// registers, and sizing them past the rays actually requested costs
+	// occupancy on every pixel.
+	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0);
 	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 

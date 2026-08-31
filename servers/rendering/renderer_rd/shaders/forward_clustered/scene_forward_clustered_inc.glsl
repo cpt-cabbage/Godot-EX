@@ -357,7 +357,7 @@ struct ImplementationData {
 	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
 	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers (1: full res, 2: half res).
 	float rt_gi_directionality; // Scales how far the directional term re-bases irradiance onto the fragment normal.
-	uint pad5;
+	uint local_shadow_maps; // Zero: no omni/spot/area shadow map was rendered this frame (the stochastic pass owns those shadows), so the analytic paths must not sample the atlas.
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {

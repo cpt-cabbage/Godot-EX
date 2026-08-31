@@ -1137,6 +1137,25 @@ public:
 		return atlas->shadow_owners[p_light_instance];
 	}
 
+	// Forget that this light's shadow was ever drawn into the atlas, so the next
+	// shadow_atlas_update_light() reports it as needing a redraw. A caller that
+	// drops a queued shadow pass has to do this: update_light() records the
+	// version as drawn whether or not the pass then runs, and without this the
+	// slot would keep stale depth the next time something samples it.
+	_FORCE_INLINE_ void shadow_atlas_invalidate_light_instance(RID p_atlas, RID p_light_instance) {
+		ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_atlas);
+		if (atlas == nullptr) {
+			return;
+		}
+		HashMap<RID, uint32_t>::Iterator E = atlas->shadow_owners.find(p_light_instance);
+		if (!E) {
+			return;
+		}
+		uint32_t quadrant = (E->value >> QUADRANT_SHIFT) & 0x3;
+		uint32_t shadow = E->value & SHADOW_INDEX_MASK;
+		atlas->quadrants[quadrant].shadows.write[shadow].version = 0;
+	}
+
 	_FORCE_INLINE_ RID shadow_atlas_get_texture(RID p_atlas) {
 		ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_atlas);
 		ERR_FAIL_NULL_V(atlas, RID());

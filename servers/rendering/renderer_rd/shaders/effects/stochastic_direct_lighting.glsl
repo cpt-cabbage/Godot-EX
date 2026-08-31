@@ -117,7 +117,7 @@ layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_d
 layout(set = 1, binding = 5, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_diffuse;
 layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_specular;
 
-#define MAX_RESERVOIRS 8u
+#define MAX_RESERVOIRS 4u
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
