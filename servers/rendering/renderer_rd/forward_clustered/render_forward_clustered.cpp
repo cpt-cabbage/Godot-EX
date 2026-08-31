@@ -47,6 +47,7 @@
 
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
 #include "modules/texture_streaming/texture_streaming.h"
+#include "servers/rendering/color_management.h"
 #endif
 
 using namespace RendererSceneRenderImplementation;
@@ -2276,7 +2277,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					RendererRD::MaterialStorage::get_singleton()->material_set_param(sky.sky_scene_state.fog_material, "clear_color", Variant(clear_color));
 				}
 
-				clear_color = clear_color.srgb_to_linear();
+				clear_color = ColorManagement::authored_to_working(clear_color);
 				clear_color.r *= bg_energy_multiplier;
 				clear_color.g *= bg_energy_multiplier;
 				clear_color.b *= bg_energy_multiplier;
@@ -2329,10 +2330,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 
 		if (bg_mode != RSE::ENV_BG_CLEAR_COLOR && bg_mode != RSE::ENV_BG_COLOR) {
-			clear_color = clear_color.srgb_to_linear();
+			clear_color = ColorManagement::authored_to_working(clear_color);
 		}
 	} else {
-		clear_color = p_default_bg_color.srgb_to_linear();
+		clear_color = ColorManagement::authored_to_working(p_default_bg_color);
 	}
 
 	// After this point clear_color has linear encoding.
@@ -2546,10 +2547,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					RSE::EnvironmentBG bg = environment_get_background(env);
 					if (bg == RSE::ENV_BG_CLEAR_COLOR) {
 						gi_sky.mode = 1;
-						gi_sky.color = p_default_bg_color.srgb_to_linear();
+						gi_sky.color = ColorManagement::authored_to_working(p_default_bg_color);
 					} else if (bg == RSE::ENV_BG_COLOR) {
 						gi_sky.mode = 1;
-						gi_sky.color = environment_get_bg_color(env).srgb_to_linear();
+						gi_sky.color = ColorManagement::authored_to_working(environment_get_bg_color(env));
 					} else if (bg == RSE::ENV_BG_SKY && radiance_texture.is_valid()) {
 						gi_sky.mode = 2;
 						gi_sky.radiance = radiance_texture;

@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -1341,7 +1342,7 @@ void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky, RID p_tlas) {
 
 		if (RendererSceneRenderRD::get_singleton()->environment_get_background(p_env) == RSE::ENV_BG_CLEAR_COLOR) {
 			push_constant.sky_flags |= SDFGIShader::IntegratePushConstant::SKY_FLAGS_MODE_COLOR;
-			Color c = RSG::texture_storage->get_default_clear_color().srgb_to_linear();
+			Color c = ColorManagement::authored_to_working(RSG::texture_storage->get_default_clear_color());
 			push_constant.sky_color_or_orientation[0] = c.r;
 			push_constant.sky_color_or_orientation[1] = c.g;
 			push_constant.sky_color_or_orientation[2] = c.b;
@@ -1951,7 +1952,7 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 			lights[idx].direction[1] = dir.y;
 			lights[idx].direction[2] = dir.z;
 			Color color = RSG::light_storage->light_get_color(light);
-			color = color.srgb_to_linear();
+			color = ColorManagement::authored_to_working(color);
 			lights[idx].color[0] = color.r;
 			lights[idx].color[1] = color.g;
 			lights[idx].color[2] = color.b;
@@ -2009,7 +2010,7 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 			lights[idx].position[1] = pos.y;
 			lights[idx].position[2] = pos.z;
 			Color color = RSG::light_storage->light_get_color(light);
-			color = color.srgb_to_linear();
+			color = ColorManagement::authored_to_working(color);
 			lights[idx].color[0] = color.r;
 			lights[idx].color[1] = color.g;
 			lights[idx].color[2] = color.b;
@@ -2501,7 +2502,7 @@ void GI::SDFGI::render_static_lights(RenderDataRD *p_render_data, Ref<RenderScen
 				lights[idx].position[1] = pos.y;
 				lights[idx].position[2] = pos.z;
 				Color color = RSG::light_storage->light_get_color(light);
-				color = color.srgb_to_linear();
+				color = ColorManagement::authored_to_working(color);
 				lights[idx].color[0] = color.r;
 				lights[idx].color[1] = color.g;
 				lights[idx].color[2] = color.b;
@@ -3026,7 +3027,7 @@ void GI::VoxelGIInstance::update(bool p_update_light_instances, const Vector<RID
 				}
 
 				l.radius = to_cell.basis.xform(Vector3(RSG::light_storage->light_get_param(light, RSE::LIGHT_PARAM_RANGE), 0, 0)).length();
-				Color color = RSG::light_storage->light_get_color(light).srgb_to_linear();
+				Color color = ColorManagement::authored_to_working(RSG::light_storage->light_get_color(light));
 				l.color[0] = color.r;
 				l.color[1] = color.g;
 				l.color[2] = color.b;

@@ -36,6 +36,7 @@
 
 #include <initializer_list>
 #include <type_traits>
+#include "servers/rendering/color_management.h"
 
 template <typename T>
 struct VariantConverterStd140 {
@@ -208,7 +209,7 @@ T convert_to_vector(const Variant &p_variant, bool p_linear_color = false) {
 	} else if (type == Variant::COLOR) {
 		Color c = p_variant;
 		if (p_linear_color) {
-			c = c.srgb_to_linear();
+			c = ColorManagement::authored_to_working(c);
 		}
 		return construct_vector<T>({ c.r, c.g, c.b, c.a });
 	} else if (p_variant.is_array()) {

@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -765,7 +766,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 					light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 				}
 
-				Color linear_col = light->color.srgb_to_linear();
+				Color linear_col = ColorManagement::authored_to_working(light->color);
 				light_data.color[0] = linear_col.r;
 				light_data.color[1] = linear_col.g;
 				light_data.color[2] = linear_col.b;
@@ -1001,7 +1002,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		Transform3D light_transform = light_instance->transform;
 
 		float sign = light->negative ? -1 : 1;
-		Color linear_col = light->color.srgb_to_linear();
+		Color linear_col = ColorManagement::authored_to_working(light->color);
 
 		light_data.attenuation = light->param[RSE::LIGHT_PARAM_ATTENUATION];
 
@@ -2036,7 +2037,7 @@ void LightStorage::update_reflection_probe_buffer(RenderDataRD *p_render_data, c
 		// lighting, so the shader must not re-fit it to that lighting again.
 		reflection_ubo.refit_strength = probe->update_mode == RSE::REFLECTION_PROBE_UPDATE_ALWAYS ? 0.0f : 1.0f;
 
-		Color ambient_linear = probe->ambient_color.srgb_to_linear();
+		Color ambient_linear = ColorManagement::authored_to_working(probe->ambient_color);
 		float interior_ambient_energy = probe->ambient_color_energy;
 		reflection_ubo.ambient[0] = ambient_linear.r * interior_ambient_energy;
 		reflection_ubo.ambient[1] = ambient_linear.g * interior_ambient_energy;

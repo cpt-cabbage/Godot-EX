@@ -44,6 +44,7 @@
 
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
 #include "modules/texture_streaming/texture_streaming.h"
+#include "servers/rendering/color_management.h"
 #endif
 
 using namespace RendererRD;
@@ -452,7 +453,7 @@ _FORCE_INLINE_ static void _fill_std140_ubo_value(ShaderLanguage::DataType type,
 		case ShaderLanguage::TYPE_VEC3: {
 			Color c = Color(value[0].real, value[1].real, value[2].real);
 			if (p_use_linear_color) {
-				c = c.srgb_to_linear();
+				c = ColorManagement::authored_to_working(c);
 			}
 
 			float *gui = reinterpret_cast<float *>(data);
@@ -465,7 +466,7 @@ _FORCE_INLINE_ static void _fill_std140_ubo_value(ShaderLanguage::DataType type,
 		case ShaderLanguage::TYPE_VEC4: {
 			Color c = Color(value[0].real, value[1].real, value[2].real, value[3].real);
 			if (p_use_linear_color) {
-				c = c.srgb_to_linear();
+				c = ColorManagement::authored_to_working(c);
 			}
 
 			float *gui = reinterpret_cast<float *>(data);
@@ -1746,7 +1747,7 @@ void MaterialStorage::_global_shader_uniform_store_in_buffer(int32_t p_index, RS
 			bv.w = v.a;
 
 			GlobalShaderUniforms::Value &bv_linear = global_shader_uniforms.buffer_values[p_index + 1];
-			v = v.srgb_to_linear();
+			v = ColorManagement::authored_to_working(v);
 			bv_linear.x = v.r;
 			bv_linear.y = v.g;
 			bv_linear.z = v.b;

@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_default.h"
+#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -1106,7 +1107,7 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 
 	params.fog_frustum_end = fog_end;
 
-	Color ambient_color = RendererSceneRenderRD::get_singleton()->environment_get_ambient_light(p_settings.env).srgb_to_linear();
+	Color ambient_color = ColorManagement::authored_to_working(RendererSceneRenderRD::get_singleton()->environment_get_ambient_light(p_settings.env));
 	params.ambient_color[0] = ambient_color.r;
 	params.ambient_color[1] = ambient_color.g;
 	params.ambient_color[2] = ambient_color.b;
@@ -1118,13 +1119,13 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 
 	params.directional_light_count = p_directional_light_count;
 
-	Color emission = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_emission(p_settings.env).srgb_to_linear();
+	Color emission = ColorManagement::authored_to_working(RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_emission(p_settings.env));
 	params.base_emission[0] = emission.r * RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_emission_energy(p_settings.env);
 	params.base_emission[1] = emission.g * RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_emission_energy(p_settings.env);
 	params.base_emission[2] = emission.b * RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_emission_energy(p_settings.env);
 	params.base_density = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_density(p_settings.env);
 
-	Color base_scattering = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_scattering(p_settings.env).srgb_to_linear();
+	Color base_scattering = ColorManagement::authored_to_working(RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_scattering(p_settings.env));
 	params.base_scattering[0] = base_scattering.r;
 	params.base_scattering[1] = base_scattering.g;
 	params.base_scattering[2] = base_scattering.b;

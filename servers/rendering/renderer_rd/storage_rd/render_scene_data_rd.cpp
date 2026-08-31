@@ -34,6 +34,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/color_management.h"
 
 Transform3D RenderSceneDataRD::get_cam_transform() const {
 	return cam_transform;
@@ -175,7 +176,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		//ambient
 		if (ambient_src == RSE::ENV_AMBIENT_SOURCE_BG && (env_bg == RSE::ENV_BG_CLEAR_COLOR || env_bg == RSE::ENV_BG_COLOR)) {
 			Color color = env_bg == RSE::ENV_BG_CLEAR_COLOR ? p_default_bg_color : render_scene_render->environment_get_bg_color(p_env);
-			color = color.srgb_to_linear();
+			color = ColorManagement::authored_to_working(color);
 
 			ubo.ambient_light_color_energy[0] = color.r * bg_energy_multiplier;
 			ubo.ambient_light_color_energy[1] = color.g * bg_energy_multiplier;
@@ -184,7 +185,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		} else {
 			float energy = render_scene_render->environment_get_ambient_light_energy(p_env);
 			Color color = render_scene_render->environment_get_ambient_light(p_env);
-			color = color.srgb_to_linear();
+			color = ColorManagement::authored_to_working(color);
 			ubo.ambient_light_color_energy[0] = color.r * energy;
 			ubo.ambient_light_color_energy[1] = color.g * energy;
 			ubo.ambient_light_color_energy[2] = color.b * energy;
@@ -217,7 +218,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		ubo.fog_depth_end = render_scene_render->environment_get_fog_depth_end(p_env) > 0.0 ? render_scene_render->environment_get_fog_depth_end(p_env) : ubo.z_far;
 		ubo.fog_depth_begin = MIN(render_scene_render->environment_get_fog_depth_begin(p_env), ubo.fog_depth_end - 0.001);
 
-		Color fog_color = render_scene_render->environment_get_fog_light_color(p_env).srgb_to_linear();
+		Color fog_color = ColorManagement::authored_to_working(render_scene_render->environment_get_fog_light_color(p_env));
 		float fog_energy = render_scene_render->environment_get_fog_light_energy(p_env);
 
 		ubo.fog_light_color[0] = fog_color.r * fog_energy;
@@ -229,7 +230,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		if (!(p_reflection_probe_instance.is_valid() && RendererRD::LightStorage::get_singleton()->reflection_probe_is_interior(p_reflection_probe_instance))) {
 			ubo.flags |= SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT;
 			Color clear_color = p_default_bg_color;
-			clear_color = clear_color.srgb_to_linear();
+			clear_color = ColorManagement::authored_to_working(clear_color);
 			ubo.ambient_light_color_energy[0] = clear_color.r;
 			ubo.ambient_light_color_energy[1] = clear_color.g;
 			ubo.ambient_light_color_energy[2] = clear_color.b;
