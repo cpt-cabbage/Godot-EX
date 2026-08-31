@@ -179,13 +179,13 @@ def include_file_in_rd_header(filename: str, header_data: RDHeaderStruct, depth:
 def build_rd_header_lines_for_raytracing_stage(lines, stage: str):
     if lines:
         return f"""\
-		static const char _{stage}_code[] = {{
+	static inline const char _{stage}_code[] = {{
 {to_raw_cstring(lines)}
-		}};
+	}};
 """
     else:
         return f"""\
-		static const char *_{stage}_code = nullptr;
+	static inline const char *_{stage}_code = nullptr;
 """
 
 
@@ -193,54 +193,87 @@ def build_rd_header(filename: str, shader: str) -> None:
     include_file_in_rd_header(shader, header_data := RDHeaderStruct(), 0)
     class_name = os.path.basename(shader).replace(".glsl", "").title().replace("_", "").replace(".", "") + "ShaderRD"
 
+    is_raytracing = bool(
+        header_data.raygen_lines
+        or header_data.any_hit_lines
+        or header_data.closest_hit_lines
+        or header_data.miss_lines
+        or header_data.intersection_lines
+    )
+
     with generated_wrapper(filename) as file:
         file.write(f"""\
 #include "servers/rendering/renderer_rd/shader_rd.h"
 
 class {class_name} : public ShaderRD {{
-public:
-	{class_name}() {{
 """)
 
-        if (
-            header_data.raygen_lines
-            or header_data.any_hit_lines
-            or header_data.closest_hit_lines
-            or header_data.miss_lines
-            or header_data.intersection_lines
-        ):
+        # The source is held in static members rather than constructor locals so
+        # that callers can read it, patch it and hand the result to their own
+        # ShaderRD. That is how the OpenColorIO display transform is spliced into
+        # the tonemapper: OCIO generates GLSL at runtime, and ShaderRD compiles
+        # from source and hashes it into the shader cache key, so a patched copy
+        # is a first-class shader with correct cache invalidation.
+        if is_raytracing:
+            file.write("private:\n")
             file.write(build_rd_header_lines_for_raytracing_stage(header_data.raygen_lines, "raygen"))
             file.write(build_rd_header_lines_for_raytracing_stage(header_data.any_hit_lines, "any_hit"))
             file.write(build_rd_header_lines_for_raytracing_stage(header_data.closest_hit_lines, "closest_hit"))
             file.write(build_rd_header_lines_for_raytracing_stage(header_data.miss_lines, "miss"))
             file.write(build_rd_header_lines_for_raytracing_stage(header_data.intersection_lines, "intersection"))
             file.write(f"""\
+
+public:
+	static const char *get_raygen_code() {{ return _raygen_code; }}
+	static const char *get_any_hit_code() {{ return _any_hit_code; }}
+	static const char *get_closest_hit_code() {{ return _closest_hit_code; }}
+	static const char *get_miss_code() {{ return _miss_code; }}
+	static const char *get_intersection_code() {{ return _intersection_code; }}
+
+	{class_name}() {{
 		setup_raytracing(_raygen_code, _any_hit_code, _closest_hit_code, _miss_code, _intersection_code, "{class_name}");
+	}}
+}};
 """)
         elif header_data.compute_lines:
             file.write(f"""\
-		static const char *_vertex_code = nullptr;
-		static const char *_fragment_code = nullptr;
-		static const char _compute_code[] = {{
+private:
+	static inline const char *_vertex_code = nullptr;
+	static inline const char *_fragment_code = nullptr;
+	static inline const char _compute_code[] = {{
 {to_raw_cstring(header_data.compute_lines)}
-		}};
+	}};
+
+public:
+	static const char *get_vertex_code() {{ return _vertex_code; }}
+	static const char *get_fragment_code() {{ return _fragment_code; }}
+	static const char *get_compute_code() {{ return _compute_code; }}
+
+	{class_name}() {{
 		setup(_vertex_code, _fragment_code, _compute_code, "{class_name}");
+	}}
+}};
 """)
         else:
             file.write(f"""\
-		static const char _vertex_code[] = {{
+private:
+	static inline const char _vertex_code[] = {{
 {to_raw_cstring(header_data.vertex_lines)}
-		}};
-		static const char _fragment_code[] = {{
+	}};
+	static inline const char _fragment_code[] = {{
 {to_raw_cstring(header_data.fragment_lines)}
-		}};
-		static const char *_compute_code = nullptr;
-		setup(_vertex_code, _fragment_code, _compute_code, "{class_name}");
-""")
+	}};
+	static inline const char *_compute_code = nullptr;
 
-        file.write("""\
-	}
-};
+public:
+	static const char *get_vertex_code() {{ return _vertex_code; }}
+	static const char *get_fragment_code() {{ return _fragment_code; }}
+	static const char *get_compute_code() {{ return _compute_code; }}
+
+	{class_name}() {{
+		setup(_vertex_code, _fragment_code, _compute_code, "{class_name}");
+	}}
+}};
 """)
 
 

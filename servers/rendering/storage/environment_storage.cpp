@@ -239,7 +239,11 @@ float RendererEnvironmentStorage::environment_get_white(RID p_env, bool p_limit_
 		// Filmic and ACES only support SDR; their white is stable regardless
 		// of output_max_value.
 		return MAX(1.0, env->white);
-	} else if (env->tone_mapper == RSE::ENV_TONE_MAPPER_AGX) {
+	} else if (env->tone_mapper == RSE::ENV_TONE_MAPPER_AGX || env->tone_mapper == RSE::ENV_TONE_MAPPER_OCIO) {
+		// OpenColorIO shares AgX's white derivation: its views map a wide
+		// scene-referred range into the display much as AgX does, so this is the
+		// right normalization for glow blending, and it means the AgX fallback
+		// taken when no OCIO transform can be built gets correct parameters.
 		// AgX works best with a high white. 2.0 is the minimum required for
 		// good behavior with Mobile rendering method.
 		if (p_limit_agx_white) {
@@ -265,6 +269,32 @@ void RendererEnvironmentStorage::environment_set_tonemap_agx_contrast(RID p_env,
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 	env->tonemap_agx_contrast = p_agx_contrast;
+}
+
+void RendererEnvironmentStorage::environment_set_tonemap_ocio(RID p_env, const String &p_display, const String &p_view, const String &p_look) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->ocio_display = p_display;
+	env->ocio_view = p_view;
+	env->ocio_look = p_look;
+}
+
+String RendererEnvironmentStorage::environment_get_ocio_display(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, String());
+	return env->ocio_display;
+}
+
+String RendererEnvironmentStorage::environment_get_ocio_view(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, String());
+	return env->ocio_view;
+}
+
+String RendererEnvironmentStorage::environment_get_ocio_look(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, String());
+	return env->ocio_look;
 }
 
 float RendererEnvironmentStorage::environment_get_tonemap_agx_contrast(RID p_env) const {
@@ -310,7 +340,7 @@ RendererEnvironmentStorage::TonemapParameters RendererEnvironmentStorage::enviro
 		white *= exposure_bias;
 		float white_tonemapped = (white * (white + A) - B) / (white * (C * white + D) + E);
 		tonemap_parameters.white_tonemapped = white_tonemapped;
-	} else if (env->tone_mapper == RSE::ENV_TONE_MAPPER_AGX) {
+	} else if (env->tone_mapper == RSE::ENV_TONE_MAPPER_AGX || env->tone_mapper == RSE::ENV_TONE_MAPPER_OCIO) {
 		// Calculate allenwp tonemapping curve parameters on the CPU to improve shader performance.
 		// Source and details: https://allenwp.com/blog/2025/05/29/allenwp-tonemapping-curve/
 

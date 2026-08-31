@@ -901,6 +901,7 @@ public:
 
 	FUNC4(environment_set_tonemap, RID, RSE::EnvironmentToneMapper, float, float)
 	FUNC2(environment_set_tonemap_agx_contrast, RID, float)
+	FUNC4(environment_set_tonemap_ocio, RID, const String &, const String &, const String &)
 
 	FUNC7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)
 

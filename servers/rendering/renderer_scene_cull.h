@@ -1245,6 +1245,7 @@ public:
 	// Tonemap
 	PASS4(environment_set_tonemap, RID, RSE::EnvironmentToneMapper, float, float)
 	PASS2(environment_set_tonemap_agx_contrast, RID, float)
+	PASS4(environment_set_tonemap_ocio, RID, const String &, const String &, const String &)
 	PASS1RC(RSE::EnvironmentToneMapper, environment_get_tone_mapper, RID)
 	PASS1RC(float, environment_get_exposure, RID)
 	PASS3RC(float, environment_get_white, RID, bool, float)

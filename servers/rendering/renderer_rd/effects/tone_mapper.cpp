@@ -34,7 +34,18 @@
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
+#include "modules/modules_enabled.gen.h" // For ocio.
+#ifdef MODULE_OCIO_ENABLED
+#include "modules/ocio/ocio_server.h"
+#endif
+
 using namespace RendererRD;
+
+// The line in tonemap.glsl that the generated OpenColorIO code replaces, and the
+// descriptor set its LUT samplers are bound to. Set 4 is used so that the
+// existing colour-correction LUT on set 3 keeps working on top.
+#define OCIO_CODE_MARKER "#OCIO_CODE"
+static constexpr int OCIO_LUT_UNIFORM_SET = 4;
 
 ToneMapper::ToneMapper(bool p_use_mobile_version) {
 	using_mobile_version = p_use_mobile_version;
@@ -107,11 +118,146 @@ ToneMapper::ToneMapper(bool p_use_mobile_version) {
 }
 
 ToneMapper::~ToneMapper() {
+	_free_ocio_shader();
 	if (using_mobile_version) {
 		tonemap_mobile.shader.version_free(tonemap_mobile.shader_version);
 	} else {
 		tonemap.shader.version_free(tonemap.shader_version);
 	}
+}
+
+// ShaderRD::setup() is protected, so building a shader from source that was not
+// produced at build time needs a subclass. This is the whole mechanism behind
+// the OpenColorIO tonemapper: the generated tonemap source is patched and handed
+// straight to ShaderRD, which compiles it and keys its disk cache on the text.
+namespace {
+class PatchedShaderRD : public ShaderRD {
+public:
+	PatchedShaderRD(const char *p_vertex_code, const char *p_fragment_code, const char *p_name) {
+		setup(p_vertex_code, p_fragment_code, nullptr, p_name);
+	}
+};
+} // namespace
+
+void ToneMapper::_free_ocio_shader() {
+	if (tonemap_ocio.shader) {
+		if (tonemap_ocio.shader_version.is_valid()) {
+			tonemap_ocio.shader->version_free(tonemap_ocio.shader_version);
+			tonemap_ocio.shader_version = RID();
+		}
+		memdelete(tonemap_ocio.shader);
+		tonemap_ocio.shader = nullptr;
+	}
+	for (const RID &texture : tonemap_ocio.lut_textures) {
+		RD::get_singleton()->free_rid(texture);
+	}
+	tonemap_ocio.lut_textures.clear();
+	tonemap_ocio.key = String();
+	tonemap_ocio.valid = false;
+}
+
+bool ToneMapper::_update_ocio_shader(const TonemapSettings &p_settings) {
+#ifdef MODULE_OCIO_ENABLED
+	OCIOServer *ocio = OCIOServer::get_singleton();
+	if (!ocio || !ocio->is_enabled()) {
+		return false;
+	}
+
+	OCIOBackend::GPUShader generated;
+	if (!ocio->get_display_shader(p_settings.ocio_display, p_settings.ocio_view, p_settings.ocio_look,
+				OCIO_LUT_UNIFORM_SET, &generated)) {
+		return false;
+	}
+
+	// The processor cache ID changes exactly when the generated code would, so it
+	// is the right thing to compare against; rebuilding is expensive enough that
+	// doing it per frame would be visible.
+	if (tonemap_ocio.valid && tonemap_ocio.key == generated.cache_id) {
+		return true;
+	}
+
+	_free_ocio_shader();
+
+	const String tonemap_source = String::utf8(TonemapShaderRD::get_fragment_code());
+	ERR_FAIL_COND_V_MSG(!tonemap_source.contains(OCIO_CODE_MARKER), false,
+			"tonemap.glsl no longer contains the '" OCIO_CODE_MARKER "' marker that the OpenColorIO transform is spliced into.");
+
+	const CharString fragment_utf8 = tonemap_source.replace(OCIO_CODE_MARKER, generated.source).utf8();
+	tonemap_ocio.shader = memnew(PatchedShaderRD(TonemapShaderRD::get_vertex_code(), fragment_utf8.get_data(), "TonemapOCIOShaderRD"));
+
+	Vector<String> tonemap_modes;
+	tonemap_modes.push_back("\n#define USE_OCIO\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_GLOW_FILTER_BICUBIC\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_1D_LUT\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_GLOW_FILTER_BICUBIC\n#define USE_1D_LUT\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_MULTIVIEW\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_MULTIVIEW\n#define USE_GLOW_FILTER_BICUBIC\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_MULTIVIEW\n#define USE_1D_LUT\n");
+	tonemap_modes.push_back("\n#define USE_OCIO\n#define USE_MULTIVIEW\n#define USE_GLOW_FILTER_BICUBIC\n#define USE_1D_LUT\n");
+	tonemap_ocio.shader->initialize(tonemap_modes);
+
+	if (!RendererCompositorRD::get_singleton()->is_xr_enabled()) {
+		tonemap_ocio.shader->set_variant_enabled(TONEMAP_MODE_NORMAL_MULTIVIEW, false);
+		tonemap_ocio.shader->set_variant_enabled(TONEMAP_MODE_BICUBIC_GLOW_FILTER_MULTIVIEW, false);
+		tonemap_ocio.shader->set_variant_enabled(TONEMAP_MODE_1D_LUT_MULTIVIEW, false);
+		tonemap_ocio.shader->set_variant_enabled(TONEMAP_MODE_BICUBIC_GLOW_FILTER_1D_LUT_MULTIVIEW, false);
+	}
+
+	tonemap_ocio.shader_version = tonemap_ocio.shader->version_create();
+	for (int i = 0; i < TONEMAP_MODE_MAX; i++) {
+		if (tonemap_ocio.shader->is_variant_enabled(i)) {
+			tonemap_ocio.pipelines[i].setup(tonemap_ocio.shader->version_get_shader(tonemap_ocio.shader_version, i), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(), 0);
+		} else {
+			tonemap_ocio.pipelines[i].clear();
+		}
+	}
+
+	// Upload the LUTs the generated code samples. OCIO hands over tightly packed
+	// floats with 1 or 3 channels; RenderingDevice has no 3-channel float format
+	// that is guaranteed to be sampleable, so pad RGB to RGBA.
+	for (const OCIOBackend::GPUTexture &lut : generated.textures) {
+		RD::TextureFormat format;
+		format.format = lut.channels == 1 ? RD::DATA_FORMAT_R32_SFLOAT : RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+		format.width = lut.width;
+		format.height = lut.height;
+		format.depth = lut.depth;
+		format.texture_type = lut.is_3d() ? RD::TEXTURE_TYPE_3D : RD::TEXTURE_TYPE_2D;
+		format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+
+		const int64_t texel_count = int64_t(lut.width) * lut.height * lut.depth;
+		Vector<uint8_t> data;
+		if (lut.channels == 1) {
+			data.resize(texel_count * sizeof(float));
+			memcpy(data.ptrw(), lut.values.ptr(), data.size());
+		} else {
+			data.resize(texel_count * 4 * sizeof(float));
+			float *dst = reinterpret_cast<float *>(data.ptrw());
+			const float *src = lut.values.ptr();
+			for (int64_t i = 0; i < texel_count; i++) {
+				dst[i * 4 + 0] = src[i * 3 + 0];
+				dst[i * 4 + 1] = src[i * 3 + 1];
+				dst[i * 4 + 2] = src[i * 3 + 2];
+				dst[i * 4 + 3] = 1.0f;
+			}
+		}
+
+		Vector<Vector<uint8_t>> slices;
+		slices.push_back(data);
+		const RID texture = RD::get_singleton()->texture_create(format, RD::TextureView(), slices);
+		if (texture.is_null()) {
+			ERR_PRINT(vformat("Could not upload the OpenColorIO LUT '%s'; falling back to a built-in tonemapper.", lut.sampler_name));
+			_free_ocio_shader();
+			return false;
+		}
+		tonemap_ocio.lut_textures.push_back(texture);
+	}
+
+	tonemap_ocio.key = generated.cache_id;
+	tonemap_ocio.valid = true;
+	return true;
+#else
+	return false;
+#endif // MODULE_OCIO_ENABLED
 }
 
 void ToneMapper::tonemapper(RID p_source_color, RID p_dst_framebuffer, const TonemapSettings &p_settings) {
@@ -168,6 +314,12 @@ void ToneMapper::tonemapper(RID p_source_color, RID p_dst_framebuffer, const Ton
 	tonemap.push_constant.pixel_size[0] = 1.0 / p_settings.texture_size.x;
 	tonemap.push_constant.pixel_size[1] = 1.0 / p_settings.texture_size.y;
 
+	// _update_ocio_shader() decides whether the OCIO path is actually available;
+	// if it is not, this falls straight back to the built-in tonemapper the
+	// settings already carry. The flag keeps its meaning either way: it says
+	// whether whatever reads this buffer wants display-encoded values, which the
+	// OCIO variant uses to decide whether to undo the view's own encoding.
+	const bool use_ocio = p_settings.tonemap_mode == RSE::ENV_TONE_MAPPER_OCIO && _update_ocio_shader(p_settings);
 	tonemap.push_constant.flags |= p_settings.convert_to_srgb ? TONEMAP_FLAG_CONVERT_TO_SRGB : 0;
 
 	if (p_settings.view_count > 1) {
@@ -205,15 +357,35 @@ void ToneMapper::tonemapper(RID p_source_color, RID p_dst_framebuffer, const Ton
 	u_color_correction_texture.append_id(default_sampler);
 	u_color_correction_texture.append_id(p_settings.color_correction_texture);
 
-	RID shader = tonemap.shader.version_get_shader(tonemap.shader_version, mode);
+	ShaderRD *shader_rd = use_ocio ? tonemap_ocio.shader : &tonemap.shader;
+	const RID shader_version = use_ocio ? tonemap_ocio.shader_version : tonemap.shader_version;
+	PipelineCacheRD *pipelines = use_ocio ? tonemap_ocio.pipelines : tonemap.pipelines;
+
+	RID shader = shader_rd->version_get_shader(shader_version, mode);
 	ERR_FAIL_COND(shader.is_null());
 
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_dst_framebuffer);
-	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, tonemap.pipelines[mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(p_dst_framebuffer), false, RD::get_singleton()->draw_list_get_current_pass()));
+	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipelines[mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(p_dst_framebuffer), false, RD::get_singleton()->draw_list_get_current_pass()));
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 0, u_source_color), 0);
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 1, u_exposure_texture), 1);
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 2, u_glow_texture, u_glow_map), 2);
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 3, u_color_correction_texture), 3);
+
+	if (use_ocio && !tonemap_ocio.lut_textures.is_empty()) {
+		// Bindings run 0..n-1 in the same order the LUTs were reported, which is
+		// the order the generated GLSL declares its samplers in.
+		LocalVector<RD::Uniform> lut_uniforms;
+		for (int i = 0; i < tonemap_ocio.lut_textures.size(); i++) {
+			RD::Uniform uniform;
+			uniform.uniform_type = RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE;
+			uniform.binding = i;
+			uniform.append_id(default_sampler);
+			uniform.append_id(tonemap_ocio.lut_textures[i]);
+			lut_uniforms.push_back(uniform);
+		}
+		RD::get_singleton()->draw_list_bind_uniform_set(draw_list,
+				uniform_set_cache->get_cache_vec(shader, OCIO_LUT_UNIFORM_SET, lut_uniforms), OCIO_LUT_UNIFORM_SET);
+	}
 
 	RD::get_singleton()->draw_list_set_push_constant(draw_list, &tonemap.push_constant, sizeof(TonemapPushConstant));
 	RD::get_singleton()->draw_list_draw(draw_list, false, 1u, 3u);

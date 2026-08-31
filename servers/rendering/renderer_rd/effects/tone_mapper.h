@@ -37,6 +37,9 @@
 namespace RendererRD {
 
 class ToneMapper {
+public:
+	struct TonemapSettings;
+
 private:
 	bool using_mobile_version = false;
 	enum TonemapMode {
@@ -159,6 +162,31 @@ private:
 		PipelineCacheRD pipelines[TONEMAP_MOBILE_MODE_MAX];
 	} tonemap_mobile;
 
+	// A copy of the tonemap shader with an OpenColorIO display transform spliced
+	// into it. OCIO generates its GLSL at runtime, so this cannot be one of the
+	// build-time variants above; it is rebuilt whenever the display, view or look
+	// changes and left alone otherwise. ShaderRD hashes the source into the
+	// shader cache key, so a rebuild that produces the same code reuses the
+	// cached SPIR-V rather than recompiling.
+	struct TonemapOCIO {
+		String key;
+		ShaderRD *shader = nullptr;
+		RID shader_version;
+		PipelineCacheRD pipelines[TONEMAP_MODE_MAX];
+
+		// The LUTs the generated code samples, bound as descriptor set 4. Often
+		// empty: the ACES views are analytic and need no textures at all.
+		Vector<RID> lut_textures;
+
+		bool valid = false;
+	} tonemap_ocio;
+
+	// Rebuilds tonemap_ocio for the given display/view/look if it is not already
+	// current. Returns false if no OpenColorIO transform is available, in which
+	// case the caller must fall back to a built-in tonemapper.
+	bool _update_ocio_shader(const TonemapSettings &p_settings);
+	void _free_ocio_shader();
+
 public:
 	ToneMapper(bool p_use_mobile_version);
 	~ToneMapper();
@@ -207,6 +235,12 @@ public:
 		bool bilinear_filtering = true;
 
 		bool convert_to_srgb = false;
+
+		// Only read when tonemap_mode is ENV_TONE_MAPPER_OCIO. Empty strings mean
+		// "use whatever the project's colour-management settings select".
+		String ocio_display;
+		String ocio_view;
+		String ocio_look;
 	};
 
 	void tonemapper(RID p_source_color, RID p_dst_framebuffer, const TonemapSettings &p_settings);

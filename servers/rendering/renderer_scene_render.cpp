@@ -381,6 +381,22 @@ void RendererSceneRender::environment_set_tonemap_agx_contrast(RID p_env, float 
 	environment_storage.environment_set_tonemap_agx_contrast(p_env, p_agx_contrast);
 }
 
+void RendererSceneRender::environment_set_tonemap_ocio(RID p_env, const String &p_display, const String &p_view, const String &p_look) {
+	environment_storage.environment_set_tonemap_ocio(p_env, p_display, p_view, p_look);
+}
+
+String RendererSceneRender::environment_get_ocio_display(RID p_env) const {
+	return environment_storage.environment_get_ocio_display(p_env);
+}
+
+String RendererSceneRender::environment_get_ocio_view(RID p_env) const {
+	return environment_storage.environment_get_ocio_view(p_env);
+}
+
+String RendererSceneRender::environment_get_ocio_look(RID p_env) const {
+	return environment_storage.environment_get_ocio_look(p_env);
+}
+
 float RendererSceneRender::environment_get_tonemap_agx_contrast(RID p_env) const {
 	return environment_storage.environment_get_tonemap_agx_contrast(p_env);
 }

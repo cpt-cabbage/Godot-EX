@@ -243,7 +243,29 @@ vec3 srgb_to_linear(vec3 color) {
 #define TONEMAPPER_ACES 3
 #define TONEMAPPER_AGX 4
 
+#ifdef USE_OCIO
+// OpenColorIO generates the display transform as GLSL at runtime, and
+// RendererRD::ToneMapper splices it in here before handing the patched source to
+// ShaderRD. The marker below is replaced with that generated code, which defines
+// `vec4 ocio_display_transform(vec4)` along with any LUT samplers it needs
+// (bound as descriptor set 4). Do not remove or reformat the marker line.
+#OCIO_CODE
+#endif // USE_OCIO
+
 vec3 apply_tonemapping(vec3 color) { // inputs are LINEAR
+#ifdef USE_OCIO
+	// The OCIO view replaces the curve: it maps scene-referred values in the
+	// working space through the display transform and hands back linear Rec. 709,
+	// so everything downstream — brightness, the sRGB encode, debanding, HDR
+	// compositing — is exactly the same as for a built-in tonemapper. An HDR view
+	// simply returns values above 1.0.
+	//
+	// Negative components are not clamped away first. Unlike the analytic curves
+	// below, an OCIO view is defined over them, and gamut-mapping looks such as
+	// the ACES reference gamut compression exist precisely to bring out-of-gamut
+	// colour back rather than have it truncated.
+	return ocio_display_transform(vec4(color, 1.0)).rgb;
+#else
 	if (params.tonemapper == TONEMAPPER_LINEAR) {
 		return color;
 	}
@@ -261,6 +283,7 @@ vec3 apply_tonemapping(vec3 color) { // inputs are LINEAR
 	} else { // TONEMAPPER_AGX
 		return tonemap_agx(color);
 	}
+#endif // !USE_OCIO
 }
 
 #ifdef USE_GLOW_FILTER_BICUBIC

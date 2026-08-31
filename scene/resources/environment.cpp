@@ -39,6 +39,11 @@
 #include "scene/resources/sky.h"
 #include "servers/rendering/rendering_server.h"
 
+#include "modules/modules_enabled.gen.h" // For ocio.
+#ifdef MODULE_OCIO_ENABLED
+#include "modules/ocio/ocio_server.h"
+#endif
+
 RID Environment::get_rid() const {
 	return environment;
 }
@@ -248,6 +253,38 @@ void Environment::set_tonemap_agx_contrast(float p_agx_contrast) {
 
 float Environment::get_tonemap_agx_contrast() const {
 	return tonemap_agx_contrast;
+}
+
+void Environment::set_ocio_display(const String &p_display) {
+	ocio_display = p_display;
+	_update_tonemap_ocio();
+	notify_property_list_changed(); // The list of views depends on the display.
+}
+
+String Environment::get_ocio_display() const {
+	return ocio_display;
+}
+
+void Environment::set_ocio_view(const String &p_view) {
+	ocio_view = p_view;
+	_update_tonemap_ocio();
+}
+
+String Environment::get_ocio_view() const {
+	return ocio_view;
+}
+
+void Environment::set_ocio_look(const String &p_look) {
+	ocio_look = p_look;
+	_update_tonemap_ocio();
+}
+
+String Environment::get_ocio_look() const {
+	return ocio_look;
+}
+
+void Environment::_update_tonemap_ocio() {
+	RS::get_singleton()->environment_set_tonemap_ocio(environment, ocio_display, ocio_view, ocio_look);
 }
 
 void Environment::_update_tonemap() {
@@ -1164,6 +1201,32 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 		return;
 	}
 
+	if (p_property.name.begins_with("ocio_")) {
+		if (tone_mapper != TONE_MAPPER_OCIO) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+			return;
+		}
+#ifdef MODULE_OCIO_ENABLED
+		// Offer the names the active config actually defines, so the inspector
+		// shows real choices instead of a free-text field. Leaving them as
+		// suggestions rather than a closed enum means a project can still name a
+		// display or view that only exists in another artist's config.
+		const OCIOServer *ocio = OCIOServer::get_singleton();
+		if (ocio && ocio->is_enabled()) {
+			PackedStringArray names;
+			if (p_property.name == "ocio_display") {
+				names = ocio->get_displays();
+			} else if (p_property.name == "ocio_view") {
+				names = ocio->get_views(ocio_display);
+			} else if (p_property.name == "ocio_look") {
+				names = ocio->get_looks();
+			}
+			p_property.hint_string = String(",").join(names);
+		}
+#endif
+		return;
+	}
+
 	if (p_property.name == "glow_intensity") {
 		if (glow_blend_mode == GLOW_BLEND_MODE_MIX && OS::get_singleton()->get_current_rendering_method() != "gl_compatibility") {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
@@ -1309,13 +1372,22 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_tonemap_agx_white"), &Environment::get_tonemap_agx_white);
 	ClassDB::bind_method(D_METHOD("set_tonemap_agx_contrast", "contrast"), &Environment::set_tonemap_agx_contrast);
 	ClassDB::bind_method(D_METHOD("get_tonemap_agx_contrast"), &Environment::get_tonemap_agx_contrast);
+	ClassDB::bind_method(D_METHOD("set_ocio_display", "display"), &Environment::set_ocio_display);
+	ClassDB::bind_method(D_METHOD("get_ocio_display"), &Environment::get_ocio_display);
+	ClassDB::bind_method(D_METHOD("set_ocio_view", "view"), &Environment::set_ocio_view);
+	ClassDB::bind_method(D_METHOD("get_ocio_view"), &Environment::get_ocio_view);
+	ClassDB::bind_method(D_METHOD("set_ocio_look", "look"), &Environment::set_ocio_look);
+	ClassDB::bind_method(D_METHOD("get_ocio_look"), &Environment::get_ocio_look);
 
 	ADD_GROUP("Tonemap", "tonemap_");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "tonemap_mode", PROPERTY_HINT_ENUM, "Linear,Reinhard,Filmic,ACES,AgX"), "set_tonemapper", "get_tonemapper");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "tonemap_mode", PROPERTY_HINT_ENUM, "Linear,Reinhard,Filmic,ACES,AgX,OpenColorIO"), "set_tonemapper", "get_tonemapper");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tonemap_exposure", PROPERTY_HINT_RANGE, "0,4,0.01,or_greater"), "set_tonemap_exposure", "get_tonemap_exposure");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tonemap_white", PROPERTY_HINT_RANGE, "1,16,0.01,or_greater"), "set_tonemap_white", "get_tonemap_white");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tonemap_agx_white", PROPERTY_HINT_RANGE, "2,16.5,0.01,or_greater"), "set_tonemap_agx_white", "get_tonemap_agx_white");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tonemap_agx_contrast", PROPERTY_HINT_RANGE, "1.0,2.0,0.01,or_greater"), "set_tonemap_agx_contrast", "get_tonemap_agx_contrast");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "ocio_display", PROPERTY_HINT_ENUM_SUGGESTION, ""), "set_ocio_display", "get_ocio_display");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "ocio_view", PROPERTY_HINT_ENUM_SUGGESTION, ""), "set_ocio_view", "get_ocio_view");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "ocio_look", PROPERTY_HINT_ENUM_SUGGESTION, ""), "set_ocio_look", "get_ocio_look");
 
 	// SSR
 
@@ -1619,6 +1691,7 @@ void Environment::_bind_methods() {
 	BIND_ENUM_CONSTANT(TONE_MAPPER_FILMIC);
 	BIND_ENUM_CONSTANT(TONE_MAPPER_ACES);
 	BIND_ENUM_CONSTANT(TONE_MAPPER_AGX);
+	BIND_ENUM_CONSTANT(TONE_MAPPER_OCIO);
 
 	BIND_ENUM_CONSTANT(GLOW_BLEND_MODE_ADDITIVE);
 	BIND_ENUM_CONSTANT(GLOW_BLEND_MODE_SCREEN);

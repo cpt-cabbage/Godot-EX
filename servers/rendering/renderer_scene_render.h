@@ -144,6 +144,10 @@ public:
 	float environment_get_white(RID p_env, bool p_limit_agx_white, float p_output_max_value) const;
 	void environment_set_tonemap_agx_contrast(RID p_env, float p_agx_contrast);
 	float environment_get_tonemap_agx_contrast(RID p_env) const;
+	void environment_set_tonemap_ocio(RID p_env, const String &p_display, const String &p_view, const String &p_look);
+	String environment_get_ocio_display(RID p_env) const;
+	String environment_get_ocio_view(RID p_env) const;
+	String environment_get_ocio_look(RID p_env) const;
 	RendererEnvironmentStorage::TonemapParameters environment_get_tonemap_parameters(RID p_env, bool p_limit_agx_white, float p_output_max_value) const;
 
 	// Fog

@@ -43,6 +43,7 @@
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/shader_include_db.h"
 #include "servers/rendering/storage/camera_attributes_storage.h"
+#include "servers/rendering/color_management.h"
 
 void get_vogel_disk(float *r_kernel, int p_sample_count) {
 	const float golden_angle = 2.4;
@@ -130,7 +131,7 @@ Ref<Image> RendererSceneRenderRD::environment_bake_panorama(RID p_env, bool p_ba
 		ambient_color_sky_mix = environment_get_ambient_sky_contribution(p_env);
 		const float ambient_energy = environment_get_ambient_light_energy(p_env);
 		ambient_color = environment_get_ambient_light(p_env);
-		ambient_color = ambient_color.srgb_to_linear();
+		ambient_color = ColorManagement::authored_to_working(ambient_color);
 		ambient_color.r *= ambient_energy;
 		ambient_color.g *= ambient_energy;
 		ambient_color.b *= ambient_energy;
@@ -149,7 +150,7 @@ Ref<Image> RendererSceneRenderRD::environment_bake_panorama(RID p_env, bool p_ba
 	} else {
 		const float bg_energy_multiplier = environment_get_bg_energy_multiplier(p_env);
 		Color panorama_color = ((environment_background == RSE::ENV_BG_CLEAR_COLOR) ? RSG::texture_storage->get_default_clear_color() : environment_get_bg_color(p_env));
-		panorama_color = panorama_color.srgb_to_linear();
+		panorama_color = ColorManagement::authored_to_working(panorama_color);
 		panorama_color.r *= bg_energy_multiplier;
 		panorama_color.g *= bg_energy_multiplier;
 		panorama_color.b *= bg_energy_multiplier;
@@ -744,6 +745,13 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 			tonemap.white = environment_get_white(p_render_data->environment, limit_agx_white, max_value);
 			tonemap.exposure = environment_get_exposure(p_render_data->environment);
 			tonemap.max_value = max_value;
+
+			if (tonemap.tonemap_mode == RSE::ENV_TONE_MAPPER_OCIO) {
+				tonemap.ocio_display = environment_get_ocio_display(p_render_data->environment);
+				tonemap.ocio_view = environment_get_ocio_view(p_render_data->environment);
+				tonemap.ocio_look = environment_get_ocio_look(p_render_data->environment);
+
+			}
 		}
 
 		tonemap.use_color_correction = false;

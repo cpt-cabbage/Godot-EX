@@ -68,6 +68,7 @@ public:
 		TONE_MAPPER_FILMIC,
 		TONE_MAPPER_ACES,
 		TONE_MAPPER_AGX,
+		TONE_MAPPER_OCIO,
 	};
 
 	enum SDFGIYScale {
@@ -118,7 +119,12 @@ private:
 	float tonemap_white = 1.0;
 	float tonemap_agx_white = 16.29; // Default to Blender's AgX white.
 	float tonemap_agx_contrast = 1.25; // Default to approximately Blender's AgX contrast.
+	// Empty means "use the project's colour-management settings".
+	String ocio_display;
+	String ocio_view;
+	String ocio_look;
 	void _update_tonemap();
+	void _update_tonemap_ocio();
 
 	// SSR
 	bool ssr_enabled = false;
@@ -278,6 +284,12 @@ public:
 	float get_tonemap_agx_white() const;
 	void set_tonemap_agx_contrast(float p_agx_contrast);
 	float get_tonemap_agx_contrast() const;
+	void set_ocio_display(const String &p_display);
+	String get_ocio_display() const;
+	void set_ocio_view(const String &p_view);
+	String get_ocio_view() const;
+	void set_ocio_look(const String &p_look);
+	String get_ocio_look() const;
 
 	// SSR
 	void set_ssr_enabled(bool p_enabled);

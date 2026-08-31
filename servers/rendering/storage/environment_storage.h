@@ -89,6 +89,12 @@ private:
 		float tonemap_agx_contrast = 1.25; // Default to approximately Blender's AgX contrast
 		float max_value = 1.0;
 
+		// OpenColorIO display transform, used when tone_mapper is ENV_TONE_MAPPER_OCIO.
+		// Empty strings mean "whatever the project settings select".
+		String ocio_display;
+		String ocio_view;
+		String ocio_look;
+
 		// Fog
 		bool fog_enabled = false;
 		RSE::EnvironmentFogMode fog_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL;
@@ -231,6 +237,10 @@ public:
 	float environment_get_white(RID p_env, bool p_limit_agx_white, float p_output_max_value) const;
 	void environment_set_tonemap_agx_contrast(RID p_env, float p_agx_contrast);
 	float environment_get_tonemap_agx_contrast(RID p_env) const;
+	void environment_set_tonemap_ocio(RID p_env, const String &p_display, const String &p_view, const String &p_look);
+	String environment_get_ocio_display(RID p_env) const;
+	String environment_get_ocio_view(RID p_env) const;
+	String environment_get_ocio_look(RID p_env) const;
 	TonemapParameters environment_get_tonemap_parameters(RID p_env, bool p_limit_agx_white, float p_output_max_value) const;
 
 	// Fog
