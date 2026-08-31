@@ -146,6 +146,8 @@ private:
 		int32_t screen_size[2];
 		float blend_alpha;
 		uint32_t flags;
+		float frames_max;
+		float pad[3];
 	};
 
 	// Flag bits shared by the temporal/denoise shaders.
@@ -344,6 +346,10 @@ public:
 		int32_t spatial_stride = 2;
 		float variance_threshold = 0.02f;
 	};
+
+	// Accumulation cap for the sun/area shadow mask's temporal filter, read
+	// from the live project settings every frame.
+	uint32_t shadow_temporal_frames = 16;
 
 	// Rebuilds the TLAS from the frame's instances.
 	// Returns false if there is no geometry to trace against.

@@ -543,9 +543,10 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_BLURRED, RD::DATA_FORMAT_R8_UNORM,
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
-		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_0, RD::DATA_FORMAT_R8_UNORM,
+		// Two channels: the accumulated mask and how many frames are behind it.
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_0, RD::DATA_FORMAT_R8G8_UNORM,
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
-		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_1, RD::DATA_FORMAT_R8_UNORM,
+		p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_HISTORY_1, RD::DATA_FORMAT_R8G8_UNORM,
 				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT);
 	}
 	RID mask_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK, p_view, 0);
@@ -622,7 +623,12 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		}
 		temporal_push_constant.screen_size[0] = size.x;
 		temporal_push_constant.screen_size[1] = size.y;
-		temporal_push_constant.blend_alpha = 0.15f;
+		// The convergence counter carries the early frames, so the steady
+		// state can accumulate far longer than the fixed 0.15 this used to
+		// blend at without the slow start that would otherwise cost.
+		float shadow_frames = float(MAX(shadow_temporal_frames, 1u));
+		temporal_push_constant.blend_alpha = 1.0f / shadow_frames;
+		temporal_push_constant.frames_max = shadow_frames;
 		temporal_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
 
 		// The dummy is never fetched (DENOISE_FLAG_HAS_VELOCITY unset).

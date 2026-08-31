@@ -1840,6 +1840,9 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
 	use_rt_sdfgi_probes = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/sdfgi/ray_query"));
+	if (rt_shadows != nullptr) {
+		rt_shadows->shadow_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/temporal_frames"));
+	}
 	use_rt_gi = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
 	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/half_resolution");
 	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/rays_per_pixel"));

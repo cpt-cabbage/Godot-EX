@@ -3692,6 +3692,9 @@ void RenderingServer::init() {
 	// project settings updates the running viewport without a restart.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_shadows/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/rays_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), 4);
+	// Accumulation cap for the sun/area shadow mask. A per-pixel convergence
+	// counter carries the first frames, so this can be long without a slow start.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,8,1"), 4);

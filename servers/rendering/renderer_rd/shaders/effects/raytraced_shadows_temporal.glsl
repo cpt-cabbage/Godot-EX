@@ -23,15 +23,20 @@ layout(set = 0, binding = 4, std140) uniform ReprojectUBO {
 }
 reprojection;
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
-layout(set = 1, binding = 1, r8) uniform restrict writeonly image2D dest_history;
+// r: accumulated mask, g: frames accumulated / 255.
+layout(set = 1, binding = 1, rg8) uniform restrict writeonly image2D dest_history;
 
 #define FLAG_HAS_VELOCITY 1u
 
 layout(push_constant, std430) uniform Params {
 	mat4 reproject; // Current NDC -> previous frame NDC.
 	ivec2 screen_size;
-	float blend_alpha;
+	float blend_alpha; // Steady-state weight of the current frame.
 	uint flags;
+	float frames_max; // Accumulation cap.
+	float pad0;
+	float pad1;
+	float pad2;
 }
 params;
 
@@ -46,7 +51,7 @@ void main() {
 
 	if (depth == 0.0) {
 		imageStore(dest_mask, pixel, vec4(1.0));
-		imageStore(dest_history, pixel, vec4(1.0));
+		imageStore(dest_history, pixel, vec4(1.0, 0.0, 0.0, 1.0));
 		return;
 	}
 
@@ -65,6 +70,12 @@ void main() {
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(params.screen_size);
 	vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	float result = current;
+	// Frames of history behind this pixel. A running count lets the first
+	// frames after a reveal average exactly (1/n) and only then settle to the
+	// steady-state weight, so the accumulation can be made long -- which is
+	// where the noise reduction comes from -- without the slow convergence a
+	// long fixed blend would otherwise cost.
+	float frames = 1.0;
 	if (prev_ndc.w > 0.0) {
 		vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 		// The camera reprojection is exact for static geometry, but a nonzero
@@ -88,13 +99,24 @@ void main() {
 			}
 		}
 		if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
-			float history = textureLod(history_mask, prev_uv, 0.0).r;
-			// Widen the clamp window slightly to reduce flicker in stable regions.
-			history = clamp(history, mn - 0.05, mx + 0.05);
-			result = mix(history, current, params.blend_alpha);
+			vec2 hist = textureLod(history_mask, prev_uv, 0.0).rg;
+			float frames_prev = hist.g * 255.0;
+			// A young pixel's neighborhood is itself noisy, so clamping it
+			// tightly would reject good history; the window closes as the
+			// estimate settles.
+			float widen = mix(0.25, 0.05, clamp(frames_prev / 8.0, 0.0, 1.0));
+			float clamped = clamp(hist.r, mn - widen, mx + widen);
+			if (abs(clamped - hist.r) > 0.35) {
+				// Far outside the current neighborhood: this is stale history
+				// from another surface, not a noisy sample. Start over.
+				result = current;
+			} else {
+				frames = min(frames_prev + 1.0, params.frames_max);
+				result = mix(clamped, current, max(1.0 / frames, params.blend_alpha));
+			}
 		}
 	}
 
 	imageStore(dest_mask, pixel, vec4(result));
-	imageStore(dest_history, pixel, vec4(result));
+	imageStore(dest_history, pixel, vec4(result, frames / 255.0, 0.0, 1.0));
 }
