@@ -163,7 +163,7 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 // the candidate budget already pays. That is ALU, not registers, which is what
 // this pass is actually bound by. Past the cap the strided estimate returns,
 // stratified per light so the levels break up into grain.
-#define MAX_ANALYTIC_LIGHTS 32u
+#define MAX_ANALYTIC_LIGHTS 64u
 
 // r11f_g11f_b10f saturates near 65024, and an over-range value stores as +Inf.
 // The denoiser multiplies this buffer into the ratio, so a fully shadowed
@@ -866,7 +866,10 @@ void main() {
 		// when few lights dominate, the reservoirs all agree, and deduplicating
 		// them would collapse the pixel to a single binary penumbra sample per
 		// frame no matter the rays_per_pixel setting. Zero-extent lights keep
-		// the dedupe (their duplicate rays would be identical).
+		// the dedupe (their duplicate rays would be identical, and a duplicate
+		// double-counts in both the ratio numerator and denominator, so it
+		// cancels there -- tracing a replacement instead was measured to add
+		// variance on both the rt_lab and game-project scenes and reverted).
 		bool has_extent = (entry & AREA_BIT) != 0u;
 		if (!has_extent) {
 			has_extent = ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].size : omni_lights.data[entry & ENTRY_ID_MASK].size) > 0.0;
