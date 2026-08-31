@@ -883,35 +883,27 @@ void main() {
 			}
 			vec3 view_target;
 			if ((entry & AREA_BIT) != 0u) {
-				// Sample a point on the rect, warping the random variable
-				// toward the quadrants the tile saw unoccluded last frame (the
-				// paper's 2x2 visibility bitmask guiding). Hidden quadrants
-				// keep a reduced probability so reappearing ones are found.
+				// Sample the rect uniformly, recording which quadrant the sample
+				// landed in so the tile mask still says where the light was
+				// reachable.
+				//
+				// This used to warp the sample toward the quadrants the tile saw
+				// unoccluded, which is a place a ratio estimator cannot follow.
+				// The importance weight that would undo the warp cancels: a light
+				// contributes one sample per frame, so the frame's ratio is that
+				// sample's visibility whatever weight it carries, and the temporal
+				// average then converges to the visibility of the quadrants we
+				// chose to look at rather than of the light. Measured against a
+				// converged uniformly-sampled reference on stochastic_area_demo,
+				// the warp sat 62% further from the truth (0.00112 vs 0.00069) for
+				// 3% less noise: it read penumbrae as brighter than they are. The
+				// 2x2 mask keeps its other job, down-weighting mostly-shadowed
+				// lights in the candidate weights, where the estimator does divide
+				// the same weight back out.
 				LightData ld = area_lights.data[entry & ENTRY_ID_MASK];
-				uint qmask = (entry >> QUAD_MASK_SHIFT) & 0xFu;
-				if (qmask == 0u) {
-					qmask = 0xFu;
-				}
 				vec2 rnd = sample_rnd;
-				float qw[4];
-				float qtotal = 0.0;
-				for (uint q = 0u; q < 4u; q++) {
-					qw[q] = (qmask & (1u << q)) != 0u ? 1.0 : 0.25;
-					qtotal += qw[q];
-				}
-				float pick = rnd.x * qtotal;
-				quadrant = 3u;
-				for (uint q = 0u; q < 3u; q++) {
-					if (pick < qw[q]) {
-						quadrant = q;
-						break;
-					}
-					pick -= qw[q];
-				}
-				float u_in = clamp(pick / qw[quadrant], 0.0, 1.0);
-				float u = (float(quadrant & 1u) + u_in) * 0.5;
-				float v = (float(quadrant >> 1u) + rnd.y) * 0.5;
-				view_target = ld.position + ld.area_width * (u - 0.5) + ld.area_height * (v - 0.5);
+				quadrant = (rnd.x < 0.5 ? 0u : 1u) | (rnd.y < 0.5 ? 0u : 2u);
+				view_target = ld.position + ld.area_width * (rnd.x - 0.5) + ld.area_height * (rnd.y - 0.5);
 			} else {
 				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
 				view_target = ld.position;
