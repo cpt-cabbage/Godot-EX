@@ -767,6 +767,17 @@
 			Draws the atlas used by [AreaLight3D] nodes in the upper left quadrant of the [Viewport].
 			[b]Note:[/b] Only supported when using the Forward+ or Mobile rendering method.
 		</constant>
+		<constant name="DEBUG_DRAW_STOCHASTIC_LIGHT" value="29" enum="DebugDraw">
+			Draws only the direct lighting the ray-traced stochastic pass produced for local lights, without material colour: diffuse in the image, specular added on top.
+			Direct light from local lights is the one signal in the frame whose noise, its lag behind moving lights, and which lights the sampler chose to spend its budget on can only be judged on its own. In the composited image it is mixed with the sun, with indirect light and with albedo, and each of those hides it.
+			Requires [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/enabled] to have anything to show.
+			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
+		</constant>
+		<constant name="DEBUG_DRAW_STOCHASTIC_VISIBILITY" value="30" enum="DebugDraw">
+			Draws the shadow ratio the stochastic sampler traced, before the denoiser filters it: white is fully lit, black fully shadowed. This is the pass's input rather than its output, and a different quantity from [constant DEBUG_DRAW_STOCHASTIC_LIGHT] — the lighting is divided out of it, so no light's colour or brightness is in the image.
+			That is what makes it the view to judge the ray budget by. Every speckle here was produced by tracing too few rays at that pixel, with nothing else in the frame able to mask it; raising [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel] is what removes it, while the denoiser settings only decide how well the rest of the pipeline hides what is left.
+			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
+		</constant>
 		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_NEAREST" value="0" enum="DefaultCanvasItemTextureFilter">
 			The texture filter reads from the nearest pixel only. This makes the texture look pixelated from up close, and grainy from a distance (due to mipmaps not being sampled).
 		</constant>

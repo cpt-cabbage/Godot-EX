@@ -1852,16 +1852,22 @@ RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) 
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
-	// Every ray traced feature is silently dropped on a device without ray
-	// queries, which from the outside is indistinguishable from having left the
-	// setting off. Say so once, naming the settings that were asked for, so the
-	// answer to "why does this look the same as before" is in the log.
-	if (!supports_ray_query) {
-		const bool wanted = bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled")) ||
-				bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled")) ||
-				bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
-		if (wanted) {
+	// Every ray traced feature can be dropped for reasons that leave no trace in
+	// the image: from the outside, a device without ray queries and a project
+	// with the settings turned off look exactly alike. Say so once, so the answer
+	// to "why does this look the same as before" is in the log rather than in
+	// this function.
+	const bool wanted = bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled")) ||
+			bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled")) ||
+			bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
+	if (wanted) {
+		if (!supports_ray_query) {
 			WARN_PRINT_ONCE("Ray tracing is enabled in the project settings, but this device's rendering driver reports no ray query support. Every 'rendering/ray_tracing' feature is rendering as if it were off.");
+		} else if (!scene_shader.depth_prepass_enabled) {
+			// The traced passes shade from the depth pre-pass's depth and
+			// normal/roughness buffers. Without it there is nothing to trace
+			// from, and the whole category silently does nothing.
+			WARN_PRINT_ONCE("Ray tracing is enabled in the project settings, but 'rendering/driver/depth_prepass/enable' is off. Every 'rendering/ray_tracing' feature needs the depth pre-pass's depth and normal buffers, so all of them are rendering as if they were off.");
 		}
 	}
 
@@ -3076,6 +3082,37 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 		RID ambient_texture = rb->get_texture(RB_SCOPE_GI, RB_TEX_AMBIENT);
 		RID reflection_texture = rb->get_texture(RB_SCOPE_GI, RB_TEX_REFLECTION);
 		copy_effects->copy_to_fb_rect(ambient_texture, texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, false, false, true, reflection_texture, rb->get_view_count() > 1);
+	}
+
+	// The stochastic pass's own output, before it is multiplied back into albedo
+	// and added to everything else. Direct lighting from local lights is the one
+	// signal in the frame whose noise, lag and light selection can only be judged
+	// on its own: in the composited image it is mixed with the sun, with indirect
+	// light and with material colour, and every one of those hides it.
+	//
+	// The two modes show the two ends of the pass, and they are not the same
+	// quantity. STOCHASTIC_LIGHT is what the pass hands the scene shader:
+	// filtered visibility already multiplied back by the analytic lighting, so
+	// it is radiance, in colour, with the specular lobe added on top.
+	// STOCHASTIC_VISIBILITY is the demodulated ratio the sampler traced, before
+	// any filtering -- a plain 0..1 shadow signal with no light colour in it,
+	// which is where the ray budget's noise is actually visible. Adding the
+	// specular ratio to the diffuse one there would only push both toward white,
+	// so that mode shows the diffuse ratio alone.
+	{
+		const bool debug_light = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_LIGHT;
+		const bool debug_visibility = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_VISIBILITY;
+		const StringName source = debug_visibility ? RB_RT_STOCHASTIC_RAW_DIFFUSE : RB_RT_STOCHASTIC_DIFFUSE;
+		if ((debug_light || debug_visibility) && rb->has_texture(RB_SCOPE_RT_SHADOWS, source)) {
+			Size2i rtsize = texture_storage->render_target_get_size(render_target);
+			// Half resolution when the pass runs at half resolution; the blit
+			// filters it up, which is what the reconstruction does anyway.
+			copy_effects->copy_to_fb_rect(rb->get_texture(RB_SCOPE_RT_SHADOWS, source),
+					texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize),
+					false, false, false, true,
+					debug_light ? rb->get_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR) : RID(),
+					rb->get_view_count() > 1);
+		}
 	}
 }
 

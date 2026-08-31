@@ -98,6 +98,7 @@
 			The simulated size of the light in Godot units, affecting shading and shadows. For [OmniLight3D]s and [SpotLight3D]s, increasing this value simulates a spherical area light, expanding the size of specular highlights. If shadows are enabled, a penumbra is rendered, making shadows appear blurrier. For [AreaLight3D]s, only the shadows are affected. Penumbras are simulated with percentage-closer soft shadows, or PCSS, which has a noticeable performance cost for values above [code]0.0[/code].
 			[b]Note:[/b] [member light_size] is not affected by [member Node3D.scale] (the light's scale or its parent's scale).
 			[b]Note:[/b] PCSS for positional lights is only supported in the Forward+ and Mobile rendering methods, not Compatibility.
+			[b]Note:[/b] With [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/enabled], this is the radius the shadow rays are aimed within, so the penumbra it produces is traced rather than approximated by PCSS, and it costs no more than a hard shadow does. A larger size then needs more rays to stay clean rather than more filtering; see [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel].
 		</member>
 		<member name="light_specular" type="float" setter="set_param" getter="get_param" default="1.0">
 			The intensity of the specular blob in objects affected by the light. At [code]0[/code], the light becomes a pure diffuse light. When not baking emission, this can be used to avoid unrealistic reflections when placing lights above an emissive surface.
@@ -112,12 +113,14 @@
 		</member>
 		<member name="shadow_bias" type="float" setter="set_param" getter="get_param" default="0.1">
 			Used to adjust shadow appearance. Too small a value results in self-shadowing ("shadow acne"), while too large a value causes shadows to separate from casters ("peter-panning"). Adjust as needed.
+			[b]Note:[/b] This tunes the shadow map, so it does nothing once this light's shadows are ray traced, and the inspector hides it there along with the other shadow-map-only properties. The equivalent for a traced shadow is set once for the whole project: [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/ray_bias].
 		</member>
 		<member name="shadow_blur" type="float" setter="set_param" getter="get_param" default="1.0">
 			Blurs the edges of the shadow. Can be used to hide pixel artifacts in low-resolution shadow maps. A high value can impact performance, make shadows appear grainy and can cause other unwanted artifacts. Try to keep as near default as possible.
 		</member>
 		<member name="shadow_caster_mask" type="int" setter="set_shadow_caster_mask" getter="get_shadow_caster_mask" default="4294967295">
 			The light will only cast shadows using objects in the selected layers.
+			[b]Note:[/b] When this light's shadows are ray traced — see [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/enabled] and [member ProjectSettings.rendering/ray_tracing/raytraced_shadows/enabled] — only render layers 1 to 8 are honoured, because a hardware ray carries an 8-bit instance mask. A caster mask selecting only layers 9 to 32 cannot be expressed at all; it is treated as every layer rather than as none, so such a light casts shadows from everything instead of silently casting none.
 		</member>
 		<member name="shadow_enabled" type="bool" setter="set_shadow" getter="has_shadow" default="false">
 			If [code]true[/code], the light will cast real-time shadows. This has a significant performance cost. Only enable shadow rendering when it makes a noticeable difference in the scene's appearance, and consider using [member distance_fade_enabled] to hide the light when far away from the [Camera3D].

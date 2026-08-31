@@ -379,7 +379,7 @@ public:
 	// Live quality settings for the stochastic pass, read from the project
 	// settings every frame so changes apply without a restart.
 	struct StochasticQuality {
-		uint32_t rays_per_pixel = 4; // Reservoir count, 1..8.
+		uint32_t rays_per_pixel = 4; // Reservoir count, 1..MAX_RESERVOIRS (4).
 		bool half_resolution = false;
 		bool light_guiding = true; // Visible light list sample guiding.
 		bool screen_traces = true; // Screen-space contact traces.

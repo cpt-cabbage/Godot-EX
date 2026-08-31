@@ -5676,6 +5676,22 @@
 			Internal buffer is drawn instead of regular scene so you can see the per-pixel output that will be used by post-processing effects.
 			[b]Note:[/b] Only supported when using the Forward+ or Mobile rendering methods.
 		</constant>
+		<constant name="VIEWPORT_DEBUG_DRAW_CLUSTER_AREA_LIGHTS" value="27" enum="ViewportDebugDraw">
+			Draws the cluster used by [AreaLight3D] nodes to optimize light rendering.
+			[b]Note:[/b] Only supported when using the Forward+ rendering method.
+		</constant>
+		<constant name="VIEWPORT_DEBUG_DRAW_AREA_LIGHT_ATLAS" value="28" enum="ViewportDebugDraw">
+			Draws the atlas used by [AreaLight3D] nodes in the upper left quadrant of the viewport.
+			[b]Note:[/b] Only supported when using the Forward+ or Mobile rendering methods.
+		</constant>
+		<constant name="VIEWPORT_DEBUG_DRAW_STOCHASTIC_LIGHT" value="29" enum="ViewportDebugDraw">
+			Draws only the direct lighting the ray-traced stochastic pass produced for local lights, without material colour. See [constant Viewport.DEBUG_DRAW_STOCHASTIC_LIGHT].
+			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
+		</constant>
+		<constant name="VIEWPORT_DEBUG_DRAW_STOCHASTIC_VISIBILITY" value="30" enum="ViewportDebugDraw">
+			Draws the unfiltered shadow ratio the stochastic sampler traced, with the lighting divided out: white is fully lit, black fully shadowed. See [constant Viewport.DEBUG_DRAW_STOCHASTIC_VISIBILITY].
+			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
+		</constant>
 		<constant name="VIEWPORT_VRS_DISABLED" value="0" enum="ViewportVRSMode">
 			Variable rate shading is disabled.
 		</constant>
