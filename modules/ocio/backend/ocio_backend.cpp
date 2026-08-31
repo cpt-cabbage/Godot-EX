@@ -161,9 +161,15 @@ OCIO::ConstProcessorRcPtr make_display_processor(const OCIO::ConstConfigRcPtr &p
 		// the inverse of the encode it just applied, which OpenColorIO collapses;
 		// for a PQ one it recovers absolute luminance expressed relative to the
 		// config's reference white.
+		// A pair the config does not define comes back as an empty string rather
+		// than as null, so checking for null alone lets "" through to
+		// ColorSpaceTransform::setSrc(), which rejects it with a message naming
+		// neither the display nor the view. Views belong to displays and the two
+		// are chosen separately, so an undefined pair is a thing a project can
+		// ask for by accident; it has to fail saying which pair.
 		const char *view_color_space = p_config->getDisplayViewColorSpaceName(display.get_data(), view.get_data());
-		ERR_FAIL_NULL_V_MSG(view_color_space, OCIO::ConstProcessorRcPtr(),
-				vformat("OpenColorIO: no output colour space for display '%s' view '%s'.", p_display, p_view));
+		ERR_FAIL_COND_V_MSG(view_color_space == nullptr || view_color_space[0] == '\0', OCIO::ConstProcessorRcPtr(),
+				vformat("OpenColorIO: display '%s' defines no view named '%s', so there is no output colour space to convert back from.", p_display, p_view));
 
 		// A shared view — one defined once and offered on several displays —
 		// names its output space with the <USE_DISPLAY_NAME> token, meaning "the
@@ -402,6 +408,10 @@ Error build_display_shader(ConfigID p_config,
 	OCIO_GUARD(r_error, {
 		OCIO::ConstProcessorRcPtr processor =
 				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear);
+		// make_display_processor() returns null when it rejected the request; it
+		// has already said why, and dereferencing it here would take the process
+		// with it rather than raise something the guard could catch.
+		ERR_FAIL_COND_V(!processor, ERR_INVALID_PARAMETER);
 		OCIO::ConstGPUProcessorRcPtr gpu = processor->getDefaultGPUProcessor();
 
 		OCIO::GpuShaderDescRcPtr desc = OCIO::GpuShaderDesc::CreateShaderDesc();
@@ -521,6 +531,7 @@ Error apply_display_transform(ConfigID p_config,
 	OCIO_GUARD(r_error, {
 		OCIO::ConstProcessorRcPtr processor =
 				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear);
+		ERR_FAIL_COND_V(!processor, ERR_INVALID_PARAMETER);
 		OCIO::ConstCPUProcessorRcPtr cpu = processor->getDefaultCPUProcessor();
 
 		OCIO::PackedImageDesc image(&r_colors[0].r, p_count, 1, OCIO::CHANNEL_ORDERING_RGBA);

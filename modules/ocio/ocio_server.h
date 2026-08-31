@@ -35,6 +35,7 @@
 #include "core/object/class_db.h"
 #include "core/object/object.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 
 // Owns the project's active OpenColorIO config and the working space that goes
 // with it, and is the one place the rest of the engine asks about colour
@@ -83,6 +84,14 @@ private:
 	// LUTs, which is far too slow to redo per frame. Keyed by
 	// display/view/look/descriptor set, and dropped whenever the config reloads.
 	HashMap<String, OCIOBackend::GPUShader> shader_cache;
+
+	// Requests OpenColorIO refused, so that a combination it cannot satisfy is
+	// not retried -- and its error not reprinted -- once per frame. Keyed the
+	// same way as shader_cache, and dropped with it when the config reloads.
+	HashSet<String> failed_shaders;
+	// Display/view pairs already reported as mismatched, so the warning is one
+	// per pair rather than one per frame.
+	HashSet<String> reported_view_mismatches;
 
 	void _load_config();
 	void _resolve_defaults();

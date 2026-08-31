@@ -202,8 +202,12 @@ void OCIOServer::_resolve_defaults() {
 }
 
 void OCIOServer::reload() {
-	// Every cached shader belongs to the config that is about to be replaced.
+	// Every cached shader belongs to the config that is about to be replaced, and
+	// so does every conclusion drawn about what it could not build: a request the
+	// old config refused may be one the new one satisfies.
 	shader_cache.clear();
+	failed_shaders.clear();
+	reported_view_mismatches.clear();
 
 	enabled = GLOBAL_GET(SETTING_ENABLED);
 	working_space = GLOBAL_GET(SETTING_WORKING_SPACE);
@@ -384,23 +388,82 @@ bool OCIOServer::get_display_shader(const String &p_display, const String &p_vie
 		return false;
 	}
 
-	const String use_display = p_display.is_empty() ? display : p_display;
-	const String use_view = p_view.is_empty() ? view : p_view;
+	String use_display = p_display.is_empty() ? display : p_display;
+	String use_view = p_view.is_empty() ? view : p_view;
+	String use_look = p_look;
 	if (use_display.is_empty() || use_view.is_empty()) {
 		return false;
 	}
 
-	const String key = vformat("%s|%s|%s|%d", use_display, use_view, p_look, p_descriptor_set);
+	// The project settings are validated against the config when it loads, but an
+	// Environment's overrides are free text and are not: a scene authored against
+	// a different config, or a name typed by hand, arrives here unchecked. Each
+	// of the three is checked against the config, reported once, and replaced
+	// with the answer that keeps the scene rendering -- because the alternative
+	// is the whole view transform silently reverting to the built-in tonemapper.
+	if (!OCIOBackend::get_displays(config).has(use_display)) {
+		if (!reported_view_mismatches.has("display|" + use_display)) {
+			reported_view_mismatches.insert("display|" + use_display);
+			WARN_PRINT(vformat("OpenColorIO: the config defines no display named '%s'; rendering through the project's display ('%s') instead.",
+					use_display, display));
+		}
+		use_display = display;
+		if (use_display.is_empty()) {
+			return false;
+		}
+	}
+
+	if (!use_look.is_empty() && !OCIOBackend::get_looks(config).has(use_look)) {
+		if (!reported_view_mismatches.has("look|" + use_look)) {
+			reported_view_mismatches.insert("look|" + use_look);
+			WARN_PRINT(vformat("OpenColorIO: the config defines no look named '%s'; rendering with the view's own looks instead.", use_look));
+		}
+		use_look = String();
+	}
+
+	// A view belongs to a display, but the two are chosen separately and can come
+	// from different places: the project settings pick a pair, and an Environment
+	// may override either half. Overriding only the display -- which is the
+	// natural thing to do once the inspector offers a list of them -- leaves the
+	// project's view attached to a display that need not define it. The ACES HDR
+	// displays carry entirely different views from the SDR ones, so this is the
+	// ordinary case rather than a corner: asking OpenColorIO for such a pair
+	// fails, and it fails on every frame that draws.
+	//
+	// Pair them here instead. The display is what the user just chose, so it wins,
+	// and its own default view is the answer that keeps the scene rendering.
+	if (!OCIOBackend::get_views(config, use_display).has(use_view)) {
+		const String paired = OCIOBackend::get_default_view(config, use_display);
+		const String pair_key = use_display + "|" + use_view;
+		if (!reported_view_mismatches.has(pair_key)) {
+			reported_view_mismatches.insert(pair_key);
+			WARN_PRINT(vformat("OpenColorIO: display '%s' defines no view named '%s', so it is being rendered through its default view ('%s'). Set the view alongside the display to choose a different one.",
+					use_display, use_view, paired));
+		}
+		use_view = paired;
+		if (use_view.is_empty()) {
+			return false;
+		}
+	}
+
+	const String key = vformat("%s|%s|%s|%d", use_display, use_view, use_look, p_descriptor_set);
 	if (const OCIOBackend::GPUShader *cached = shader_cache.getptr(key)) {
 		*r_shader = *cached;
 		return true;
+	}
+	if (failed_shaders.has(key)) {
+		// Already tried and rejected. The renderer asks once a frame, so without
+		// this a request OpenColorIO cannot satisfy prints its error at the frame
+		// rate and buries whatever else the log had to say.
+		return false;
 	}
 
 	OCIOBackend::GPUShader shader;
 	// Always linear: the renderer treats the view like any other tonemapper and
 	// applies whatever encoding the target needs itself.
-	if (OCIOBackend::build_display_shader(config, working_space, use_display, use_view, p_look,
+	if (OCIOBackend::build_display_shader(config, working_space, use_display, use_view, use_look,
 				DISPLAY_FUNCTION_NAME, p_descriptor_set, /* output_linear = */ true, &shader) != OK) {
+		failed_shaders.insert(key);
 		return false;
 	}
 
