@@ -161,12 +161,22 @@ float luminance(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
-// STBN lookup, one stream per random decision (see stochastic_direct_lighting).
+// STBN lookup, one stream per random decision (see stochastic_direct_lighting;
+// this copy carries the same per-64x64-tile hashed offset so the pattern does
+// not repeat across the screen).
+uint pcg_hash(uint v) {
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
 vec2 stbn_sample(ivec2 pixel, uint stream) {
 	uint epoch = params.frame_index >> 4;
 	uint k = stream + epoch * 8u;
 	ivec2 shift = ivec2(fract(vec2(k) * vec2(0.7548776662, 0.5698402909)) * 64.0);
-	ivec2 p = (pixel + shift) & 63;
+	uint tile_hash = pcg_hash(uint(pixel.x >> 6) ^ (uint(pixel.y >> 6) * 0x9E3779B9u));
+	ivec2 tile_shift = ivec2(tile_hash & 63u, (tile_hash >> 6) & 63u);
+	ivec2 p = (pixel + shift + tile_shift) & 63;
 	return texelFetch(stbn_texture, ivec3(p, int(params.frame_index & 15u)), 0).rg;
 }
 

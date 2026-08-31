@@ -225,12 +225,21 @@ float hash_to_float(uint h) {
 // tile jitter) use toroidal shifts of the same slice: a shifted blue noise
 // pattern stays blue, while staying decorrelated from the other streams. The
 // 16 frame cycle is decorrelated across epochs the same way.
+//
+// The 64x64 pattern would otherwise repeat across the screen (a 1080p frame
+// tiles it 17x30 times), making distant pixels with the same phase take the
+// same decisions -- a faint repeating structure that also correlates the
+// spatial filter's inputs. Each 64x64 screen tile therefore offsets the
+// lookup by its own hashed amount; a constant offset preserves the blue
+// spectrum within the tile.
 vec2 stbn_sample(ivec2 pixel, uint stream) {
 	uint epoch = params.frame_index >> 4;
 	uint k = stream + epoch * 8u;
 	// R2 low-discrepancy sequence for the shift.
 	ivec2 shift = ivec2(fract(vec2(k) * vec2(0.7548776662, 0.5698402909)) * 64.0);
-	ivec2 p = (pixel + shift) & 63;
+	uint tile_hash = pcg_hash(uint(pixel.x >> 6) ^ (uint(pixel.y >> 6) * 0x9E3779B9u));
+	ivec2 tile_shift = ivec2(tile_hash & 63u, (tile_hash >> 6) & 63u);
+	ivec2 p = (pixel + shift + tile_shift) & 63;
 	return texelFetch(stbn_texture, ivec3(p, int(params.frame_index & 15u)), 0).rg;
 }
 
