@@ -34,7 +34,7 @@
 //
 // This header deliberately mentions no OCIO type. Everything below is
 // implemented in ocio_backend.cpp, which is compiled with exceptions enabled
-// (see modules/ocio/SCsub and backend/ocio_firewall.h) and is the only place
+// (see modules/ocio/SCsub and backend/ocio_error_macros.h) and is the only place
 // allowed to touch the library. Callers get Error codes and Godot types.
 
 #include "core/io/image.h"

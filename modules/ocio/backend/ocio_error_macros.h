@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  ocio_firewall.h                                                       */
+/*  ocio_error_macros.h                                                   */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,17 +30,17 @@
 
 #pragma once
 
-// The exception firewall between OpenColorIO and the rest of Godot.
+// Turns OpenColorIO's exceptions into Godot Error codes.
 //
 // OCIO reports every error by throwing OCIO::Exception, but Godot is built with
 // -fno-exceptions. An exception must never unwind through a frame compiled
-// without exception support, so the boundary cannot be a single wrapper
-// function called from ordinary Godot code: it has to be the translation unit.
-// Everything under modules/ocio/backend/ is compiled with exceptions enabled
-// (see the SCsub) and is the only code permitted to include an OCIO header or
-// to write `try` / `catch`. Those files wrap each entry point in OCIO_GUARD and
-// return plain Error codes, so callers outside this directory stay
-// exception-free and never see an OCIO type.
+// without exception support, so the boundary between the two cannot be a single
+// wrapper function called from ordinary Godot code: it has to be the whole
+// translation unit. Everything under modules/ocio/backend/ is compiled with
+// exceptions enabled (see the SCsub) and is the only code permitted to include
+// an OCIO header or to write `try` / `catch`. Those files wrap each entry point
+// in one of the macros below and return plain Error codes, so callers outside
+// this directory stay exception-free and never see an OCIO type.
 
 #include "core/error/error_list.h"
 #include "core/error/error_macros.h"

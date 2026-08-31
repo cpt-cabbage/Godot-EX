@@ -30,7 +30,7 @@
 
 #include "ocio_backend.h"
 
-#include "ocio_firewall.h"
+#include "ocio_error_macros.h"
 
 #include "core/config/project_settings.h"
 #include "core/os/mutex.h"

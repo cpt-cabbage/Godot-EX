@@ -118,10 +118,10 @@ module_obj = []
 # enabled. OCIO reports all errors by throwing, and an exception must never
 # unwind through a frame compiled with -fno-exceptions, so the boundary has to
 # be a whole translation unit rather than a single wrapper function: nothing
-# outside backend/ may call into the library. Those files catch via the
-# OCIO_GUARD macro in backend/ocio_firewall.h and hand back plain Error codes
-# and Godot types, so the rest of the module — and the rest of the engine —
-# never sees an OCIO type or an exception.
+# outside backend/ may call into the library. Those files catch through the
+# macros in backend/ocio_error_macros.h and hand back plain Error codes and
+# Godot types, so the rest of the module — and the rest of the engine — never
+# sees an OCIO type or an exception.
 env_backend = enable_exceptions(env_ocio.Clone())
 env_backend.add_source_files(module_obj, "backend/*.cpp")
 
