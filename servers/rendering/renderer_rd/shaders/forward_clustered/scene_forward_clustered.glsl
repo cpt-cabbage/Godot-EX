@@ -2209,10 +2209,24 @@ void fragment_shader(in SceneData scene_data) {
 					// The same rays give a real bent normal and a
 					// range-limited visibility, which the specular occlusion
 					// below uses in place of its luminance heuristic.
+					float gi_q = clamp(gi_len / gi_l0, 0.0, 1.0);
 					rt_gi_bent_normal = gi_dir;
 					rt_gi_visibility = clamp(rt_gi_directional.w, 0.0, 1.0);
-					rt_gi_occlusion_valid = bool(implementation_data.rt_gi & 16u);
-					float gi_q = clamp(gi_len / gi_l0, 0.0, 1.0);
+					// The guard above only asks that the moment be longer than
+					// nothing at all, which is much weaker than asking it to
+					// point somewhere. The bent normal IS that moment's
+					// direction, and by the reading below 2/3 is where the
+					// field stops being uniform: under it there is no direction
+					// to recover and gi_dir is the direction of rounding. The
+					// cone it aims then swings frame to frame, and the cone's
+					// own normalisation multiplies that swing.
+					//
+					// Blending toward the luminance heuristic instead of
+					// switching was tried and is worse: the heuristic reads the
+					// ambient buffer, so mixing it in spreads that noise onto
+					// the pixels whose cone was fine (664 hot pixels a frame
+					// against 596 for the switch, on the game project).
+					rt_gi_occlusion_valid = bool(implementation_data.rt_gi & 16u) && gi_q > 2.0 / 3.0;
 					// The useful range of this ratio is narrow and it is worth
 					// being exact about it. Under cosine-weighted sampling a
 					// uniform hemisphere yields 2/3, and a pure cosine lobe --
