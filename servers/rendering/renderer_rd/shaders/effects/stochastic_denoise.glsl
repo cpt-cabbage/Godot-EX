@@ -8,9 +8,16 @@
 // MegaLights / SVGF structure: temporal accumulation of lighting and its
 // luminance moments (giving a per-pixel variance estimate), then a single
 // variance-driven spatial pass using depth, normal and variance edge-stopping.
-// Diffuse and specular are filtered as separate demodulated signals.
+// The two filtered signals are demodulated: for direct lighting they are
+// bounded [0;1] visibility ratios (the analytic lighting is multiplied back
+// in at the end of the spatial pass), for GI they are radiance.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Params.flags bits.
+#define FLAG_HAS_VELOCITY 1u // A real velocity buffer is bound (else the binding is a dummy and must not be fetched).
+#define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
+#define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
 
 layout(set = 0, binding = 0) uniform sampler2D in_diffuse;
 layout(set = 0, binding = 1) uniform sampler2D in_specular;
@@ -20,12 +27,13 @@ layout(set = 0, binding = 2) uniform sampler2D depth_texture;
 layout(set = 0, binding = 3) uniform sampler2D history_diffuse;
 layout(set = 0, binding = 4) uniform sampler2D history_specular;
 layout(set = 0, binding = 5) uniform sampler2D history_moments;
-// r: shading confidence from the sampling pass.
+// r: shading confidence from the sampling pass (FLAG_HAS_META).
 layout(set = 0, binding = 6) uniform sampler2D raw_meta;
-// r: accumulated frames / 64, g: shading confidence.
+// r: diffuse frames / 64, g: specular frames / 64, b: shading confidence,
+// a: disocclusion mark.
 layout(set = 0, binding = 7) uniform sampler2D history_meta;
 // Motion vectors from the previous frame's color pass (uv_prev = uv + velocity).
-// Bound to a default black texture when motion vectors are not rendered.
+// A dummy binding when motion vectors are not rendered (FLAG_HAS_VELOCITY unset).
 layout(set = 0, binding = 8) uniform sampler2D velocity_texture;
 #ifdef VALIDATE_DEPTH
 // The signal's own view depth from the previous frame (at the signal's
@@ -37,11 +45,25 @@ layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D 
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
 // xy: diffuse luminance 1st/2nd moment, zw: specular.
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_moments;
-layout(set = 1, binding = 3, rg8) uniform restrict writeonly image2D out_meta;
+// r: diffuse frames / 64, g: specular frames / 64, b: shading confidence,
+// a: disocclusion mark (decays over a few frames).
+layout(set = 1, binding = 3, rgba8) uniform restrict writeonly image2D out_meta;
+// The previous frame pair's reprojection (previous NDC -> the frame before).
+// The velocity buffer is one frame stale (written by the previous color pass),
+// so this is the camera-only motion it was rendered with: static pixels match
+// it and only genuinely moving objects deviate.
+layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
+	mat4 prev_reproject;
+}
+reprojection;
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
 layout(set = 0, binding = 4) uniform sampler2D normal_roughness_texture;
 layout(set = 0, binding = 5) uniform sampler2D meta_texture;
+// Unshadowed analytic lighting, multiplied back into the filtered ratios when
+// FLAG_MODULATE_ANALYTIC is set (dummy bindings otherwise, never fetched).
+layout(set = 0, binding = 6) uniform sampler2D analytic_diffuse;
+layout(set = 0, binding = 7) uniform sampler2D analytic_specular;
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -65,7 +87,8 @@ layout(push_constant, std430) uniform Params {
 	// Camera planes, for linearizing the reprojected depth (VALIDATE_DEPTH).
 	float z_near;
 	float z_far;
-	vec2 pad2;
+	uint flags;
+	uint pad2;
 }
 params;
 
@@ -138,30 +161,56 @@ void main() {
 	vec3 stddev_d = sqrt(max(m2_d / count - mean_d * mean_d, vec3(0.0)));
 	vec3 stddev_s = sqrt(max(m2_s / count - mean_s * mean_s, vec3(0.0)));
 
-	float lum_d = luminance(current_diffuse);
-	float lum_s = luminance(current_specular);
+	// Dense bounded signals (the visibility ratios) also clamp the CURRENT
+	// sample into the neighborhood ellipsoid: a pixel whose reservoirs keep
+	// selecting an occluded light can otherwise stay a stuck outlier forever
+	// (its history converges to the outlier, so nothing ever rejects it). At
+	// real shadow edges the 5x5 spans both populations, so the ellipsoid is
+	// wide and detail survives. Sparse Monte Carlo signals must not do this:
+	// it would reject the rare bright samples that carry all the energy.
+	if (params.clamp_gamma > 0.0) {
+		float unused_d;
+		float unused_s;
+		current_diffuse = clip_to_aabb(current_diffuse, mean_d, stddev_d * params.clamp_gamma, unused_d);
+		current_specular = clip_to_aabb(current_specular, mean_s, stddev_s * params.clamp_gamma, unused_s);
+	}
 
 	vec3 result_diffuse = current_diffuse;
 	vec3 result_specular = current_specular;
-	vec4 moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
-	float frames = 1.0;
+	vec4 moments = vec4(0.0);
+	float frames_d = 1.0;
+	float frames_s = 1.0;
+	// Disocclusion mark for the spatial pass; set until a usable history
+	// proves the pixel is not freshly revealed.
+	float reveal = 1.0;
 	// Shading confidence from the sampling pass (share of energy carried by
 	// the strongest single light).
-	float dominance = texelFetch(raw_meta, pixel, 0).r;
+	float dominance = (params.flags & FLAG_HAS_META) != 0u ? texelFetch(raw_meta, pixel, 0).r : 0.0;
 
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(params.screen_size);
 	vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, center_depth, 1.0);
 	if (prev_ndc.w > 0.0) {
 		vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
-		// The camera reprojection is exact for static geometry; where the
-		// velocity buffer (one frame stale, written by the previous color pass)
-		// disagrees by more than a pixel, the pixel belongs to a moving object
-		// and its velocity is the better predictor of where the history lives.
-		vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
-		if (velocity != vec2(0.0)) {
-			vec2 residual = (uv + velocity) - prev_uv;
-			if (any(greaterThan(abs(residual) * vec2(params.screen_size), vec2(1.0)))) {
-				prev_uv = uv + velocity;
+		// The camera reprojection is exact for static geometry, but a nonzero
+		// velocity does not mean a moving object: Godot velocity buffers carry
+		// camera motion for static geometry too, and this buffer is one frame
+		// stale (written by the previous color pass). Classify by comparing
+		// against the camera-only motion of the frame pair the buffer was
+		// rendered with: only where the two disagree is the pixel a moving
+		// object, and the stale velocity is then the best predictor available
+		// of where its history lives.
+		if ((params.flags & FLAG_HAS_VELOCITY) != 0u) {
+			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
+			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
+			if (velocity != vec2(0.0) && prevprev_ndc.w > 0.0) {
+				vec2 static_motion = (prevprev_ndc.xy / prevprev_ndc.w) * 0.5 + 0.5 - prev_uv;
+				// Threshold of 2 full-resolution pixels: the velocity buffer is
+				// unjittered while the reprojection matrices carry the TAA
+				// jitter of both frames.
+				vec2 object_pixels = (velocity - static_motion) * vec2(params.screen_size * params.depth_scale);
+				if (any(greaterThan(abs(object_pixels), vec2(2.0)))) {
+					prev_uv = uv + velocity;
+				}
 			}
 		}
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
@@ -171,7 +220,8 @@ void main() {
 			// would otherwise inherit whatever surface used to be there. The
 			// signal recorded its own view depth last frame; compare it to
 			// where this surface reprojects to.
-			float prev_depth = texelFetch(prev_view_depth_texture, ivec2(prev_uv * vec2(params.screen_size)), 0).r;
+			ivec2 prev_pixel = clamp(ivec2(prev_uv * vec2(params.screen_size)), ivec2(0), params.screen_size - 1);
+			float prev_depth = texelFetch(prev_view_depth_texture, prev_pixel, 0).r;
 			float prev_ndc_z = clamp(prev_ndc.z / prev_ndc.w, 0.0, 1.0) * 2.0 - 1.0;
 			float predicted_depth = 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near + prev_ndc_z * (params.z_far - params.z_near));
 			if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
@@ -183,11 +233,12 @@ void main() {
 			vec4 hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
 			vec4 hist_s4 = textureLod(history_specular, prev_uv, 0.0);
 			vec4 hist_moments = textureLod(history_moments, prev_uv, 0.0);
-			vec2 hist_meta = textureLod(history_meta, prev_uv, 0.0).rg;
+			vec4 hist_meta = textureLod(history_meta, prev_uv, 0.0);
 
 			vec3 hist_d = hist_d4.rgb;
 			vec3 hist_s = hist_s4.rgb;
-			float confidence = 1.0;
+			float confidence_d = 1.0;
+			float confidence_s = 1.0;
 			if (params.clamp_gamma > 0.0) {
 				float outside_d;
 				float outside_s;
@@ -196,26 +247,57 @@ void main() {
 
 				// History confidence: the further the history was from the
 				// current neighborhood, the faster it is discarded (reduces
-				// ghosting).
-				confidence = clamp(1.0 - max(outside_d, outside_s), 0.0, 1.0);
+				// ghosting). Per signal: a noisy specular neighborhood must
+				// not throw away the converged diffuse history (or vice
+				// versa), and a clipping reset is not a disocclusion.
+				confidence_d = clamp(1.0 - outside_d, 0.0, 1.0);
+				confidence_s = clamp(1.0 - outside_s, 0.0, 1.0);
 			}
-			frames = min(hist_meta.r * 64.0 * confidence + 1.0, 1.0 / max(params.blend_alpha, 1e-3));
-			float alpha = max(1.0 / frames, params.blend_alpha);
+			// No clamping of any kind on the sparse Monte Carlo path (see the
+			// clamp_gamma comment): the rare bright samples carry all the
+			// energy, and even a generous mean-relative firefly limit feeds
+			// back into a progressively darker mean.
+			float frames_cap = 1.0 / max(params.blend_alpha, 1e-3);
+			frames_d = min(hist_meta.r * 64.0 * confidence_d + 1.0, frames_cap);
+			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
+			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
+			float alpha_s = max(1.0 / frames_s, params.blend_alpha);
 
-			result_diffuse = mix(hist_d, current_diffuse, alpha);
-			result_specular = mix(hist_s, current_specular, alpha);
-			moments = mix(hist_moments, moments, alpha);
-			dominance = mix(hist_meta.g, dominance, alpha);
+			float lum_d = luminance(current_diffuse);
+			float lum_s = luminance(current_specular);
+			result_diffuse = mix(hist_d, current_diffuse, alpha_d);
+			result_specular = mix(hist_s, current_specular, alpha_s);
+			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_d),
+					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
+			dominance = mix(hist_meta.b, dominance, alpha_d);
+			// A usable history clears the disocclusion mark over a few frames.
+			reveal = max(hist_meta.a - 0.25, 0.0);
 		}
+	}
+	if (reveal == 1.0) {
+		float lum_d = luminance(current_diffuse);
+		float lum_s = luminance(current_specular);
+		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	}
 
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
 	imageStore(out_moments, pixel, moments);
-	imageStore(out_meta, pixel, vec4(frames / 64.0, dominance, 0.0, 0.0));
+	imageStore(out_meta, pixel, vec4(frames_d / 64.0, frames_s / 64.0, dominance, reveal));
 }
 
 #else // MODE_SPATIAL
+
+// Multiplies the analytic lighting back into the filtered visibility ratios
+// (direct lighting only; GI filters radiance directly).
+void store_result(ivec2 pixel, vec3 d, vec3 s) {
+	if ((params.flags & FLAG_MODULATE_ANALYTIC) != 0u) {
+		d *= texelFetch(analytic_diffuse, pixel, 0).rgb;
+		s *= texelFetch(analytic_specular, pixel, 0).rgb;
+	}
+	imageStore(out_diffuse, pixel, vec4(d, 0.0));
+	imageStore(out_specular, pixel, vec4(s, 0.0));
+}
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -234,8 +316,7 @@ void main() {
 
 	// Denoiser disabled (sentinel threshold): pass the input through.
 	if (params.variance_threshold >= 1e5) {
-		imageStore(out_diffuse, pixel, center_d4);
-		imageStore(out_specular, pixel, center_s4);
+		store_result(pixel, center_d4.rgb, center_s4.rgb);
 		return;
 	}
 
@@ -251,13 +332,22 @@ void main() {
 	// only soften the edge.
 	float rel_d = var_d / max(moments.x * moments.x, 1e-6);
 	float rel_s = var_s / max(moments.z * moments.z, 1e-6);
-	vec2 meta = texelFetch(meta_texture, pixel, 0).rg;
-	float frames = meta.r * 64.0;
-	float dominance = meta.g;
-	bool newly_revealed = frames < 4.0;
-	if (!newly_revealed && (max(rel_d, rel_s) < params.variance_threshold || (dominance > 0.8 && frames >= 8.0))) {
-		imageStore(out_diffuse, pixel, center_d4);
-		imageStore(out_specular, pixel, center_s4);
+	vec4 meta = texelFetch(meta_texture, pixel, 0);
+	float frames_d = meta.r * 64.0;
+	float frames_s = meta.g * 64.0;
+	float dominance = meta.b;
+	// Only a true disocclusion (history rejected, not merely clipped) widens
+	// the kernel and drops the luminance stop below; the variance estimate is
+	// meaningless there. A signal whose accumulation is still young (reset by
+	// history clipping) also has no usable variance yet, so it filters
+	// unconditionally at normal stride until a few frames have accumulated.
+	bool newly_revealed = meta.a > 0.25;
+	bool young_d = frames_d < 4.0;
+	bool young_s = frames_s < 4.0;
+	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0));
+	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0));
+	if (!filter_d && !filter_s) {
+		store_result(pixel, center_d4.rgb, center_s4.rgb);
 		return;
 	}
 
@@ -308,8 +398,10 @@ void main() {
 
 			float wd = w_spatial;
 			float ws = w_spatial;
-			if (!newly_revealed) {
+			if (!newly_revealed && !young_d) {
 				wd *= exp(-abs(luminance(d) - moments.x) / sigma_d);
+			}
+			if (!newly_revealed && !young_s) {
 				ws *= exp(-abs(luminance(s) - moments.z) / sigma_s);
 			}
 
@@ -320,8 +412,7 @@ void main() {
 		}
 	}
 
-	imageStore(out_diffuse, pixel, vec4(sum_d / weight_d, 0.0));
-	imageStore(out_specular, pixel, vec4(sum_s / weight_s, 0.0));
+	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb, filter_s ? sum_s / weight_s : center_s4.rgb);
 }
 
 #endif

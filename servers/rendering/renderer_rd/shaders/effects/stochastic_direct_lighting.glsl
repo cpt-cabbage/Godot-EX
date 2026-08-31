@@ -10,8 +10,11 @@
 // Per pixel: weighted reservoir sampling over a candidate set built from the
 // previous frame's visible light list (guided) and a strided subset of the
 // clustered light grid cell (discovery), one ray-query visibility ray per
-// unique selected sample, shading of visible samples into demodulated diffuse
-// (irradiance, no albedo) and specular buffers.
+// unique selected sample. The outputs are fully demodulated: the noisy part
+// of the shading is a bounded [0;1] visibility ratio per signal (what the
+// denoiser filters), while the analytic unshadowed lighting (diffuse without
+// albedo, full specular) goes into its own buffers and is multiplied back in
+// after denoising, so lighting detail never passes through the filter.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -109,6 +112,10 @@ layout(set = 1, binding = 2, r32ui) uniform restrict writeonly uimage2D out_visi
 layout(set = 1, binding = 3, r8) uniform restrict writeonly image2D out_meta;
 // View depth of the lit texel, for the half-resolution upsample.
 layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_depth;
+// Unshadowed analytic lighting, multiplied back into the denoised visibility
+// ratios at the end of the denoiser's spatial pass.
+layout(set = 1, binding = 5, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_diffuse;
+layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_specular;
 
 #define MAX_RESERVOIRS 8u
 #define TILE_SIZE 8
@@ -460,6 +467,8 @@ void main() {
 		imageStore(out_visible_light, pixel, uvec4(INVALID_LIGHT));
 		imageStore(out_meta, pixel, vec4(0.0));
 		imageStore(out_view_depth, pixel, vec4(0.0));
+		imageStore(out_analytic_diffuse, pixel, vec4(0.0));
+		imageStore(out_analytic_specular, pixel, vec4(0.0));
 		return;
 	}
 
@@ -831,8 +840,6 @@ void main() {
 
 	float ratio_d = clamp(vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0, 0.0, 1.0);
 	float ratio_s = clamp(vis_den_s > 0.0 ? vis_num_s / vis_den_s : 0.0, 0.0, 1.0);
-	vec3 diffuse = analytic_diffuse * ratio_d;
-	vec3 specular = analytic_specular * ratio_s;
 
 	// Shading confidence: the share of visible energy carried by the single
 	// strongest light. Where one light dominates, the shadow signal is nearly
@@ -847,8 +854,14 @@ void main() {
 		dominance /= visible_energy;
 	}
 
-	imageStore(out_diffuse, pixel, vec4(diffuse, 0.0));
-	imageStore(out_specular, pixel, vec4(specular, 0.0));
+	// The ratios are the denoiser's input (replicated to the shared vec3
+	// filter path); the analytic terms bypass the filter entirely. The
+	// unsigned buffer format drops negative-light energy, as the modulated
+	// signal always did.
+	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
+	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
+	imageStore(out_analytic_diffuse, pixel, vec4(max(analytic_diffuse, vec3(0.0)), 0.0));
+	imageStore(out_analytic_specular, pixel, vec4(max(analytic_specular, vec3(0.0)), 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 	imageStore(out_meta, pixel, vec4(dominance));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z));

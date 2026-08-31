@@ -64,6 +64,8 @@
 #define RB_RT_STOCHASTIC_VISIBLE_LIGHT SNAME("stochastic_visible_light")
 #define RB_RT_STOCHASTIC_RAW_META SNAME("stochastic_raw_meta")
 #define RB_RT_STOCHASTIC_VIEW_DEPTH SNAME("stochastic_view_depth")
+#define RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE SNAME("stochastic_analytic_diffuse")
+#define RB_RT_STOCHASTIC_ANALYTIC_SPECULAR SNAME("stochastic_analytic_specular")
 #define RB_RT_STOCHASTIC_META_0 SNAME("stochastic_meta_0")
 #define RB_RT_STOCHASTIC_META_1 SNAME("stochastic_meta_1")
 
@@ -138,11 +140,31 @@ private:
 		float reproject[16];
 		int32_t screen_size[2];
 		float blend_alpha;
-		float pad;
+		uint32_t flags;
+	};
+
+	// Flag bits shared by the temporal/denoise shaders.
+	enum DenoiseFlags {
+		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
+		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
+		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
 	};
 
 	uint32_t frame_index = 0;
 	bool history_parity = false;
+
+	// Per view: this frame's and the previous frame's reprojection matrices.
+	// The previous one classifies moving objects in the one-frame-stale
+	// velocity buffer; it is uploaded once per frame into a small UBO shared
+	// by every temporal pass of that view.
+	struct ReprojectHistory {
+		Projection current;
+		Projection previous;
+		uint32_t frame = UINT32_MAX;
+		RID ubo;
+	};
+	LocalVector<ReprojectHistory> reproject_history;
+	RID _update_reproject_ubo(uint32_t p_view, const Projection &p_reproject);
 
 	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.
 	RID stbn_texture;
@@ -254,7 +276,8 @@ private:
 		float clamp_gamma; // Neighborhood clamp width in stddevs; <= 0 disables clipping.
 		float z_near; // Camera planes for depth-validated history (VALIDATE_DEPTH).
 		float z_far;
-		float pad2[2];
+		uint32_t flags; // DenoiseFlags.
+		uint32_t pad2;
 	};
 
 	struct DecodePushConstant {
