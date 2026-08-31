@@ -1042,6 +1042,7 @@ bool RendererSceneRenderRD::_debug_draw_can_use_effects(RSE::ViewportDebugDraw p
 		case RSE::VIEWPORT_DEBUG_DRAW_GI_BUFFER:
 		case RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_LIGHT:
 		case RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_VISIBILITY:
+		case RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_ANALYTIC:
 		case RSE::VIEWPORT_DEBUG_DRAW_OCCLUDERS:
 			can_use_effects = true;
 			break;

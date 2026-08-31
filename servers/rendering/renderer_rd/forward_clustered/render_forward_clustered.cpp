@@ -3090,8 +3090,8 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 	// on its own: in the composited image it is mixed with the sun, with indirect
 	// light and with material colour, and every one of those hides it.
 	//
-	// The two modes show the two ends of the pass, and they are not the same
-	// quantity. STOCHASTIC_LIGHT is what the pass hands the scene shader:
+	// The three modes show three points along the pass, and they are not the
+	// same quantity. STOCHASTIC_LIGHT is what the pass hands the scene shader:
 	// filtered visibility already multiplied back by the analytic lighting, so
 	// it is radiance, in colour, with the specular lobe added on top.
 	// STOCHASTIC_VISIBILITY is the demodulated ratio the sampler traced, before
@@ -3099,11 +3099,26 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 	// which is where the ray budget's noise is actually visible. Adding the
 	// specular ratio to the diffuse one there would only push both toward white,
 	// so that mode shows the diffuse ratio alone.
+	//
+	// STOCHASTIC_ANALYTIC is the other factor of that product: the unshadowed
+	// lighting the pass computed for the cell, which never passes through the
+	// denoiser and is simply multiplied back in at the end. Splitting the two
+	// factors is the only way to tell a sampling problem from a shading one --
+	// if a light comes out too dim, either its rays found it more occluded than
+	// they should have (visibility) or it was never evaluated at full strength
+	// in the first place (analytic), and the composited image cannot say which.
+	// Diffuse alone, matching the visibility mode, so the two are comparable.
 	{
 		const bool debug_light = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_LIGHT;
 		const bool debug_visibility = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_VISIBILITY;
-		const StringName source = debug_visibility ? RB_RT_STOCHASTIC_RAW_DIFFUSE : RB_RT_STOCHASTIC_DIFFUSE;
-		if ((debug_light || debug_visibility) && rb->has_texture(RB_SCOPE_RT_SHADOWS, source)) {
+		const bool debug_analytic = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_ANALYTIC;
+		StringName source = RB_RT_STOCHASTIC_DIFFUSE;
+		if (debug_visibility) {
+			source = RB_RT_STOCHASTIC_RAW_DIFFUSE;
+		} else if (debug_analytic) {
+			source = RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE;
+		}
+		if ((debug_light || debug_visibility || debug_analytic) && rb->has_texture(RB_SCOPE_RT_SHADOWS, source)) {
 			Size2i rtsize = texture_storage->render_target_get_size(render_target);
 			// Half resolution when the pass runs at half resolution; the blit
 			// filters it up, which is what the reconstruction does anyway.

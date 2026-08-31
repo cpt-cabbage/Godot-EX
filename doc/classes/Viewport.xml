@@ -778,6 +778,9 @@
 			That is what makes it the view to judge the ray budget by. Every speckle here was produced by tracing too few rays at that pixel, with nothing else in the frame able to mask it; raising [member ProjectSettings.rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel] is what removes it, while the denoiser settings only decide how well the rest of the pipeline hides what is left.
 			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
 		</constant>
+		<constant name="DEBUG_DRAW_STOCHASTIC_ANALYTIC" value="31" enum="DebugDraw">
+			Draws the unshadowed lighting the stochastic sampler computed for each pixel's light cell — the factor the filtered visibility ratio is multiplied back into. Compared against [constant DEBUG_DRAW_STOCHASTIC_VISIBILITY], it separates a sampling problem from a shading one.
+		</constant>
 		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_NEAREST" value="0" enum="DefaultCanvasItemTextureFilter">
 			The texture filter reads from the nearest pixel only. This makes the texture look pixelated from up close, and grainy from a distance (due to mipmaps not being sampled).
 		</constant>

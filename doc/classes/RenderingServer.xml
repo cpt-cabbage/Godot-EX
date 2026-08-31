@@ -5692,6 +5692,9 @@
 			Draws the unfiltered shadow ratio the stochastic sampler traced, with the lighting divided out: white is fully lit, black fully shadowed. See [constant Viewport.DEBUG_DRAW_STOCHASTIC_VISIBILITY].
 			[b]Note:[/b] Only supported when using the Forward+ rendering method, on a device whose driver supports ray queries.
 		</constant>
+		<constant name="VIEWPORT_DEBUG_DRAW_STOCHASTIC_ANALYTIC" value="31" enum="ViewportDebugDraw">
+			Draws the unshadowed lighting the stochastic sampler computed for each pixel's light cell, the factor the filtered visibility ratio is multiplied back into. See [constant Viewport.DEBUG_DRAW_STOCHASTIC_ANALYTIC].
+		</constant>
 		<constant name="VIEWPORT_VRS_DISABLED" value="0" enum="ViewportVRSMode">
 			Variable rate shading is disabled.
 		</constant>

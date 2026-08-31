@@ -4638,6 +4638,7 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 		case VIEW_DISPLAY_DEBUG_GI_BUFFER:
 		case VIEW_DISPLAY_DEBUG_STOCHASTIC_LIGHT:
 		case VIEW_DISPLAY_DEBUG_STOCHASTIC_VISIBILITY:
+		case VIEW_DISPLAY_DEBUG_STOCHASTIC_ANALYTIC:
 		case VIEW_DISPLAY_DEBUG_DISABLE_LOD:
 		case VIEW_DISPLAY_DEBUG_CLUSTER_OMNI_LIGHTS:
 		case VIEW_DISPLAY_DEBUG_CLUSTER_SPOT_LIGHTS:
@@ -4665,6 +4666,7 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 				VIEW_DISPLAY_DEBUG_GI_BUFFER,
 				VIEW_DISPLAY_DEBUG_STOCHASTIC_LIGHT,
 				VIEW_DISPLAY_DEBUG_STOCHASTIC_VISIBILITY,
+				VIEW_DISPLAY_DEBUG_STOCHASTIC_ANALYTIC,
 				VIEW_DISPLAY_DEBUG_DISABLE_LOD,
 				VIEW_DISPLAY_DEBUG_PSSM_SPLITS,
 				VIEW_DISPLAY_DEBUG_DECAL_ATLAS,
@@ -4699,6 +4701,7 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 				Viewport::DEBUG_DRAW_GI_BUFFER,
 				Viewport::DEBUG_DRAW_STOCHASTIC_LIGHT,
 				Viewport::DEBUG_DRAW_STOCHASTIC_VISIBILITY,
+				Viewport::DEBUG_DRAW_STOCHASTIC_ANALYTIC,
 				Viewport::DEBUG_DRAW_DISABLE_LOD,
 				Viewport::DEBUG_DRAW_PSSM_SPLITS,
 				Viewport::DEBUG_DRAW_DECAL_ATLAS,
@@ -6889,6 +6892,8 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 			TTRC("Displays only the direct lighting the ray-traced stochastic pass produced for local lights, without material colour.\nRequires Stochastic Direct Lighting to be enabled in the Project Settings, and a device whose driver supports ray queries."));
 	_add_advanced_debug_draw_mode_item(display_submenu, TTRC("Stochastic Light Visibility"), VIEW_DISPLAY_DEBUG_STOCHASTIC_VISIBILITY, SupportedRenderingMethods::FORWARD_PLUS,
 			TTRC("Displays the unfiltered shadow ratio the sampler traced, before the denoiser runs: white is fully lit, black fully shadowed, with no light colour in it.\nThis is where the ray budget's noise can actually be seen and judged.\nRequires Stochastic Direct Lighting to be enabled in the Project Settings, and a device whose driver supports ray queries."));
+	_add_advanced_debug_draw_mode_item(display_submenu, TTRC("Stochastic Analytic Lighting"), VIEW_DISPLAY_DEBUG_STOCHASTIC_ANALYTIC, SupportedRenderingMethods::FORWARD_PLUS,
+			TTRC("Displays the unshadowed lighting the sampler computed for each pixel's light cell, the factor the filtered visibility is multiplied back into.\nAgainst the visibility mode it separates a sampling problem from a shading one: a light that comes out too dim is either being over-occluded by its rays or was never evaluated at full strength.\nRequires Stochastic Direct Lighting to be enabled in the Project Settings, and a device whose driver supports ray queries."));
 	display_submenu->add_separator();
 	_add_advanced_debug_draw_mode_item(display_submenu, TTRC("Disable Mesh LOD"), VIEW_DISPLAY_DEBUG_DISABLE_LOD, SupportedRenderingMethods::ALL,
 			TTRC("Renders all meshes with their highest level of detail regardless of their distance from the camera."));
