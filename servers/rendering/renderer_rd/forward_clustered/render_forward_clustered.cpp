@@ -1880,6 +1880,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	stochastic_quality.denoise = GLOBAL_GET("rendering/ray_tracing/denoiser/enabled");
 	stochastic_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/denoiser/temporal_frames"));
 	stochastic_quality.spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/denoiser/spatial_stride"));
+	stochastic_quality.spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/denoiser/spatial_iterations"));
 	stochastic_quality.variance_threshold = GLOBAL_GET("rendering/ray_tracing/denoiser/variance_threshold");
 
 	// Lazily create the ray tracing backend the first frame anything needs it.
@@ -2570,6 +2571,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			gi_quality.ao_range = rt_gi_ao_range;
 				gi_quality.denoise = stochastic_quality.denoise;
 				gi_quality.spatial_stride = stochastic_quality.spatial_stride;
+				gi_quality.spatial_iterations = stochastic_quality.spatial_iterations;
 				gi_quality.variance_threshold = stochastic_quality.variance_threshold;
 			}
 
@@ -2604,7 +2606,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
-							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, stochastic_quality, velocity);
+							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_near, scene_data->z_far, stochastic_quality, velocity);
 				}
 				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;
@@ -4257,7 +4259,10 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		RD::Uniform u;
 		u.binding = 40 + i;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_SPECULAR : RB_RT_STOCHASTIC_VIEW_DEPTH);
+		// The stochastic view depth ping-pongs too (the old parity validates
+		// history); the upsample wants the one the sampling pass wrote.
+		const StringName &stochastic_depth_name = (rt_shadows != nullptr && rt_shadows->get_history_parity()) ? RB_RT_STOCHASTIC_VIEW_DEPTH_0 : RB_RT_STOCHASTIC_VIEW_DEPTH_1;
+		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_SPECULAR : stochastic_depth_name);
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		// Additive terms: black when inactive.
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);

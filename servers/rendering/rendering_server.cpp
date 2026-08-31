@@ -3731,6 +3731,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
+	// A-trous iterations of the spatial filter, each at twice the previous
+	// stride: 1 reaches +-2*stride pixels, 2 reaches +-6, 3 reaches +-14.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_iterations", PROPERTY_HINT_RANGE, "1,3,1"), 2);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/denoiser/variance_threshold", PROPERTY_HINT_RANGE, "0.0,0.5,0.001"), 0.02);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality", PROPERTY_HINT_ENUM, "Hard (Fastest),Soft Very Low (Faster),Soft Low (Fast),Soft Medium (Average),Soft High (Slow),Soft Ultra (Slowest)"), 2);

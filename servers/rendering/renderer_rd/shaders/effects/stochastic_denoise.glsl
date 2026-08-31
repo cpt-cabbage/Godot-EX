@@ -24,17 +24,40 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // diffuse weights. It rides on the GI-only variants (VALIDATE_DEPTH for the
 // temporal pass, FILTER_DIRECTIONAL for the spatial one) rather than a runtime
 // flag, so the direct lighting variants keep their existing set layouts.
+//
+// DEPTH_HISTORY (shared by the GI temporal variant and the direct lighting
+// temporal variant via DIRECT_DEPTH_VALIDATION) binds the signal's own
+// previous-frame view depth and rejects history whose reprojected depth
+// disagrees: a revealed pixel inherits whatever surface used to be there
+// otherwise. The direct ratios additionally keep their neighborhood clamp;
+// the two gates complement each other.
 #ifdef VALIDATE_DEPTH
 #define HAS_DIRECTIONAL
 // The GI accumulates unbounded HDR radiance through a 32-frame feedback loop,
 // where the packed format's rounding compounds; direct lighting accumulates
 // bounded [0;1] visibility ratios and stays packed.
 #define LIGHTING_FORMAT rgba16f
+#define DEPTH_HISTORY
 #else
 #define LIGHTING_FORMAT r11f_g11f_b10f
 #endif
+#ifdef DIRECT_DEPTH_VALIDATION
+#define DEPTH_HISTORY
+#endif
 #ifdef FILTER_DIRECTIONAL
 #define HAS_DIRECTIONAL
+#endif
+// The spatial pass can run several a-trous iterations at doubling strides. All
+// but the last write to a scratch buffer that stays in the accumulation format
+// and skips both the analytic modulation (a runtime flag) and the directional
+// renormalization, which is not idempotent. Only the GI path needs the extra
+// variant: the direct lighting buffers are packed end to end, so its
+// intermediate iterations reuse the plain spatial variant with the modulation
+// flag cleared.
+#ifdef SPATIAL_HDR_OUT
+#define SPATIAL_OUT_FORMAT rgba16f
+#else
+#define SPATIAL_OUT_FORMAT r11f_g11f_b10f
 #endif
 
 layout(set = 0, binding = 0) uniform sampler2D in_diffuse;
@@ -53,10 +76,12 @@ layout(set = 0, binding = 7) uniform sampler2D history_meta;
 // Motion vectors from the previous frame's color pass (uv_prev = uv + velocity).
 // A dummy binding when motion vectors are not rendered (FLAG_HAS_VELOCITY unset).
 layout(set = 0, binding = 8) uniform sampler2D velocity_texture;
-#ifdef VALIDATE_DEPTH
+#ifdef DEPTH_HISTORY
 // The signal's own view depth from the previous frame (at the signal's
-// resolution), for disocclusion rejection when history clipping is off.
+// resolution), for disocclusion rejection.
 layout(set = 0, binding = 9) uniform sampler2D prev_view_depth_texture;
+#endif
+#ifdef HAS_DIRECTIONAL
 // This frame's directional term and its history.
 layout(set = 0, binding = 10) uniform sampler2D in_directional;
 layout(set = 0, binding = 11) uniform sampler2D history_directional;
@@ -94,9 +119,10 @@ layout(set = 0, binding = 8) uniform sampler2D in_directional;
 
 // The spatial pass writes the final buffers, which stay packed on both paths:
 // they are written once and read four times per fragment by the upsample, so
-// the rounding never compounds.
-layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
+// the rounding never compounds. Intermediate a-trous iterations keep the
+// accumulation format instead (SPATIAL_HDR_OUT).
+layout(set = 1, binding = 0, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
 #ifdef FILTER_DIRECTIONAL
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
 #endif
@@ -127,6 +153,24 @@ params;
 
 float luminance(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Depth buffer value -> view-space distance. Comparing raw buffer depths
+// directly would mean comparing a nonlinear quantity: the same world-space
+// step is worth a large depth difference close to the camera and a vanishing
+// one far away, so a fixed tolerance over-rejects near neighbors and lets
+// distant surfaces bleed together.
+float linearize_depth(float p_depth) {
+	float ndc_z = clamp(p_depth, 0.0, 1.0) * 2.0 - 1.0;
+	return 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near + ndc_z * (params.z_far - params.z_near));
+}
+
+// The inverse, so a view-space tolerance can be turned into a pair of raw
+// depth bounds once per pixel: the kernel's taps then cost a comparison each
+// instead of a linearization.
+float depth_from_linear(float p_view_depth) {
+	float ndc_z = (2.0 * params.z_near * params.z_far / max(p_view_depth, 1e-6) - (params.z_far + params.z_near)) / (params.z_far - params.z_near);
+	return (ndc_z + 1.0) * 0.5;
 }
 
 vec3 rgb_to_ycocg(vec3 c) {
@@ -254,16 +298,18 @@ void main() {
 			}
 		}
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
-#ifdef VALIDATE_DEPTH
+#ifdef DEPTH_HISTORY
 		if (history_usable) {
-			// Disocclusion check: without history clipping, a revealed pixel
-			// would otherwise inherit whatever surface used to be there. The
-			// signal recorded its own view depth last frame; compare it to
-			// where this surface reprojects to.
+			// Disocclusion check: a revealed pixel would otherwise inherit
+			// whatever surface used to be there. The signal recorded its own
+			// view depth last frame; compare it to where this surface
+			// reprojects to. On the direct ratios this complements the
+			// neighborhood clamp (which catches lighting changes but is blind
+			// to a surface swap at equal brightness); on the sparse GI signal
+			// it is the only gate, since clipping is off there.
 			ivec2 prev_pixel = clamp(ivec2(prev_uv * vec2(params.screen_size)), ivec2(0), params.screen_size - 1);
 			float prev_depth = texelFetch(prev_view_depth_texture, prev_pixel, 0).r;
-			float prev_ndc_z = clamp(prev_ndc.z / prev_ndc.w, 0.0, 1.0) * 2.0 - 1.0;
-			float predicted_depth = 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near + prev_ndc_z * (params.z_far - params.z_near));
+			float predicted_depth = linearize_depth(prev_ndc.z / prev_ndc.w);
 			if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
 				history_usable = false;
 			}
@@ -361,7 +407,11 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
 	}
 	imageStore(out_diffuse, pixel, vec4(d, 0.0));
 	imageStore(out_specular, pixel, vec4(s, 0.0));
-#ifdef FILTER_DIRECTIONAL
+#if defined(FILTER_DIRECTIONAL) && defined(SPATIAL_HDR_OUT)
+	// Intermediate iteration: carry the moment through unchanged, the last one
+	// renormalizes it against the irradiance it will actually be paired with.
+	imageStore(out_directional, pixel, dir);
+#elif defined(FILTER_DIRECTIONAL)
 	float l0 = max(luminance(d), 1e-6);
 	float len = length(dir.xyz);
 	float ratio = mix(2.0 / 3.0, len / l0, p_confidence);
@@ -435,6 +485,13 @@ void main() {
 		return;
 	}
 
+	// Depth edge stopping, as the raw-buffer window matching a relative
+	// view-space tolerance around this pixel.
+	float center_view_depth = linearize_depth(center_depth);
+	float depth_bound_a = depth_from_linear(center_view_depth * (1.0 - params.depth_tolerance));
+	float depth_bound_b = depth_from_linear(center_view_depth * (1.0 + params.depth_tolerance));
+	float depth_min = min(depth_bound_a, depth_bound_b);
+	float depth_max = max(depth_bound_a, depth_bound_b);
 	vec3 center_normal = normalize(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).xyz * 2.0 - 1.0);
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
@@ -474,9 +531,10 @@ void main() {
 				continue;
 			}
 
-			// SVGF edge-stopping functions: depth, normal and luminance.
-			float depth_diff = abs(sd - center_depth) / max(center_depth, 1e-6);
-			if (depth_diff >= params.depth_tolerance) {
+			// SVGF edge-stopping functions: depth, normal and luminance. The
+			// depth test is the view-space tolerance expressed as a raw-depth
+			// window, so it means the same thing at every range.
+			if (sd < depth_min || sd > depth_max) {
 				continue;
 			}
 			vec3 n = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);

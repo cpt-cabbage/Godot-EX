@@ -63,7 +63,9 @@
 #define RB_RT_STOCHASTIC_MOMENTS_1 SNAME("stochastic_moments_1")
 #define RB_RT_STOCHASTIC_VISIBLE_LIGHT SNAME("stochastic_visible_light")
 #define RB_RT_STOCHASTIC_RAW_META SNAME("stochastic_raw_meta")
-#define RB_RT_STOCHASTIC_VIEW_DEPTH SNAME("stochastic_view_depth")
+// Ping-ponged: the previous frame's copy validates history reprojection.
+#define RB_RT_STOCHASTIC_VIEW_DEPTH_0 SNAME("stochastic_view_depth_0")
+#define RB_RT_STOCHASTIC_VIEW_DEPTH_1 SNAME("stochastic_view_depth_1")
 #define RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE SNAME("stochastic_analytic_diffuse")
 #define RB_RT_STOCHASTIC_ANALYTIC_SPECULAR SNAME("stochastic_analytic_specular")
 #define RB_RT_STOCHASTIC_META_0 SNAME("stochastic_meta_0")
@@ -308,6 +310,7 @@ private:
 		DENOISE_VARIANT_SPATIAL,
 		DENOISE_VARIANT_TEMPORAL_VALIDATE, // Temporal with depth-validated history (the GI signal).
 		DENOISE_VARIANT_SPATIAL_DIRECTIONAL, // Spatial carrying the GI directional buffer along.
+		DENOISE_VARIANT_SPATIAL_DIRECTIONAL_HDR, // The same, writing an intermediate a-trous iteration into the unpacked accumulation buffers.
 		DENOISE_VARIANT_MAX,
 	};
 
@@ -384,6 +387,7 @@ public:
 		bool denoise = true;
 		uint32_t temporal_frames = 16; // Accumulation cap.
 		int32_t spatial_stride = 2;
+		int32_t spatial_iterations = 2; // A-trous iterations, each at twice the previous stride.
 		float variance_threshold = 0.02f;
 	};
 
@@ -419,6 +423,7 @@ public:
 		uint32_t temporal_frames = 32;
 		bool denoise = true;
 		int32_t spatial_stride = 2;
+		int32_t spatial_iterations = 2;
 		float variance_threshold = 0.02f;
 		float ao_range = 3.0f; // Distance the near-field visibility term saturates at.
 	};
@@ -460,7 +465,7 @@ public:
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
 
 	// Call once per frame, per render buffer, before that buffer's per-view
 	// process() calls. Selects the viewport's own temporal state (creating it
