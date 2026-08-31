@@ -2104,7 +2104,7 @@ void fragment_shader(in SceneData scene_data) {
 	// specular band (sharp reflections stay with probes / SSR, whose
 	// sharpness the blurry radiance cache cannot match). Reflection probes
 	// later still override inside their volumes, as with SDFGI.
-	if (implementation_data.rt_gi != 0u && !sc_is_transparent_pass()) {
+	if (implementation_data.rt_gi != 0u) {
 		vec3 rt_gi_ambient = vec3(0.0);
 		vec3 rt_gi_reflection = vec3(0.0);
 		// xyz: first radiance moment (world space), w: near-field visibility.
