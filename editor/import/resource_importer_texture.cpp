@@ -40,6 +40,12 @@
 #include "editor/themes/editor_scale.h"
 #include "editor/themes/editor_theme_manager.h"
 #include "scene/resources/compressed_texture.h"
+#include "servers/rendering/color_management.h"
+
+#include "modules/modules_enabled.gen.h" // For ocio.
+#ifdef MODULE_OCIO_ENABLED
+#include "modules/ocio/ocio_server.h"
+#endif
 
 void ResourceImporterTexture::_texture_reimport_roughness(const Ref<CompressedTexture2D> &p_tex, const String &p_normal_path, RSE::TextureDetectRoughnessChannel p_channel) {
 	ERR_FAIL_COND(p_tex.is_null());
@@ -129,6 +135,18 @@ void ResourceImporterTexture::update_imports() {
 			// 3D detected, disable the callback.
 			cf->set_value("params", "detect_3d/compress_to", 0);
 
+			// Being used in 3D is what makes a texture scene-referred, so this is
+			// the moment its colour space stops being a guess. Only fill in a
+			// choice the user has not made, and only for colour: normal and
+			// roughness maps carry directions and gloss, not colour.
+			if (ColorManagement::is_enabled() &&
+					int(cf->get_value("params", "color/input_space")) == COLOR_SPACE_AUTO &&
+					int(cf->get_value("params", "compress/normal_map")) != NORMAL_MAP_ENABLE &&
+					int(cf->get_value("params", "roughness/mode")) <= 1) {
+				print_line(vformat(TTR("%s: Texture detected as used in 3D. Converting it into the project's working colour space."), String(E.key)));
+				cf->set_value("params", "color/input_space", COLOR_SPACE_SRGB);
+			}
+
 			String compress_string;
 			if (compress_to == 1) {
 				// In practice, either (or both) of these values will always be `true`,
@@ -204,6 +222,11 @@ String ResourceImporterTexture::get_resource_type() const {
 }
 
 bool ResourceImporterTexture::get_option_visibility(const String &p_path, const String &p_option, const HashMap<StringName, Variant> &p_options) const {
+	if (p_option == "color/input_space") {
+		// Without a working space there is nothing to convert into, and the
+		// option would only be a way to corrupt textures.
+		return ColorManagement::is_enabled();
+	}
 	if (p_option == "compress/high_quality_mode") {
 		int compress_mode = int(p_options["compress/mode"]);
 		return compress_mode == COMPRESS_VRAM_COMPRESSED && bool(p_options["compress/high_quality"]);
@@ -280,6 +303,7 @@ void ResourceImporterTexture::get_import_options(const String &p_path, List<Impo
 	r_options->push_back(ImportOption(PropertyInfo(Variant::BOOL, "process/fix_alpha_border"), p_preset != PRESET_3D));
 	r_options->push_back(ImportOption(PropertyInfo(Variant::BOOL, "process/premult_alpha"), false));
 	r_options->push_back(ImportOption(PropertyInfo(Variant::BOOL, "process/normal_map_invert_y"), false));
+	r_options->push_back(ImportOption(PropertyInfo(Variant::INT, "color/input_space", PROPERTY_HINT_ENUM, "Auto (2D: unchanged; set on first 3D use),sRGB (Texture),Linear Rec. 709,Working Space,Raw / Data"), p_preset == PRESET_3D ? COLOR_SPACE_SRGB : COLOR_SPACE_AUTO));
 	r_options->push_back(ImportOption(PropertyInfo(Variant::BOOL, "process/hdr_as_srgb"), false));
 	r_options->push_back(ImportOption(PropertyInfo(Variant::BOOL, "process/hdr_clamp_exposure"), false));
 
@@ -455,6 +479,128 @@ void ResourceImporterTexture::_save_ctex(const Ref<Image> &p_image, const String
 	}
 
 	save_to_ctex_format(f, image, p_compress_mode, used_channels, p_vram_compression, p_vram_compression_profile, p_lossy_quality, p_basisu_params, Image::BPTC_DETECT);
+}
+
+// Applies `p_fn` to every RGB channel of an RGBAF image, leaving alpha alone.
+static void _map_rgb(Ref<Image> p_image, float (*p_fn)(float)) {
+	Vector<uint8_t> data = p_image->get_data();
+	float *values = reinterpret_cast<float *>(data.ptrw());
+	const int64_t texels = int64_t(p_image->get_width()) * p_image->get_height();
+	for (int64_t i = 0; i < texels; i++) {
+		values[i * 4 + 0] = p_fn(values[i * 4 + 0]);
+		values[i * 4 + 1] = p_fn(values[i * 4 + 1]);
+		values[i * 4 + 2] = p_fn(values[i * 4 + 2]);
+	}
+	p_image->set_data(p_image->get_width(), p_image->get_height(), false, Image::FORMAT_RGBAF, data);
+}
+
+static float _srgb_to_linear_f(float p_value) {
+	return p_value < 0.04045f ? p_value / 12.92f : Math::pow((p_value + 0.055f) / 1.055f, 2.4f);
+}
+
+static float _linear_to_srgb_f(float p_value) {
+	return p_value < 0.0031308f ? p_value * 12.92f : 1.055f * Math::pow(p_value, 1.0f / 2.4f) - 0.055f;
+}
+
+// Image::convert() quantises float to 8 bit by truncation rather than rounding
+// (see the uint8_t(CLAMP(c * 255.0, ...)) conversions in core/io/image.cpp), so
+// a value written back through it always lands on the darker code. Adding half a
+// code value first turns that into round-to-nearest. Without it the round trip
+// this conversion introduces would darken every imported texture by up to a full
+// code value, which is a visible, systematic error rather than noise.
+static float _linear_to_srgb_8bit_f(float p_value) {
+	return _linear_to_srgb_f(p_value) + 0.5f / 255.0f;
+}
+
+void ResourceImporterTexture::_convert_to_working_space(Ref<Image> p_image, int p_input_space, int p_normal_mode, int p_roughness_mode, const String &p_source_file) {
+	if (p_image.is_null() || p_image->is_compressed() || !ColorManagement::is_enabled()) {
+		return;
+	}
+
+#ifdef MODULE_OCIO_ENABLED
+	const OCIOServer *ocio = OCIOServer::get_singleton();
+	if (!ocio || !ocio->is_enabled()) {
+		return;
+	}
+
+	// Integer formats are stored non-linearly and decoded by the sampler's sRGB
+	// view, so whatever is written back has to carry that encoding again.
+	const Image::Format original_format = p_image->get_format();
+	const bool stored_encoded = original_format < Image::FORMAT_RF;
+
+	String linear_source;
+	bool source_encoded = false;
+
+	switch (p_input_space) {
+		case COLOR_SPACE_RAW: {
+			// Directions, masks and gloss are not colour. Converting them would
+			// corrupt them, so leave the numbers exactly as authored.
+			return;
+		} break;
+		case COLOR_SPACE_SRGB: {
+			linear_source = OCIOServer::LINEAR_REC709_SPACE;
+			source_encoded = true;
+		} break;
+		case COLOR_SPACE_LINEAR_REC709: {
+			linear_source = OCIOServer::LINEAR_REC709_SPACE;
+		} break;
+		case COLOR_SPACE_WORKING: {
+			return; // Already in the working space; nothing to do.
+		} break;
+		default: { // COLOR_SPACE_AUTO
+			// Whether a texture belongs in the working space depends on how it is
+			// used, not on what it looks like. A 3D albedo map is scene-referred:
+			// it is multiplied by light, so it has to share the renderer's basis.
+			// A 2D sprite is display-referred, because canvas items are composited
+			// after the tonemapper has already produced display values --
+			// converting one would visibly shift its colours for no reason.
+			//
+			// Auto therefore does nothing, and the importer writes an explicit
+			// choice instead: the 3D preset defaults to sRGB, and
+			// update_imports() sets it the moment a texture is first seen in 3D,
+			// the same way it already turns on normal-map compression. A texture
+			// used in both 2D and 3D can only have one answer and needs a manual
+			// choice.
+			return;
+		} break;
+	}
+
+	const String working_space = ocio->get_working_space();
+	if (working_space.is_empty() || linear_source == working_space) {
+		return;
+	}
+
+	const bool had_mipmaps = p_image->has_mipmaps();
+	if (had_mipmaps) {
+		// Mipmaps are regenerated after import anyway, and converting them here
+		// would only waste time.
+		p_image->clear_mipmaps();
+	}
+	p_image->convert(Image::FORMAT_RGBAF);
+
+	if (source_encoded) {
+		_map_rgb(p_image, _srgb_to_linear_f);
+	}
+
+	const Error err = OCIOBackend::transform_image(ocio->get_config(), linear_source, working_space, p_image);
+	if (err != OK) {
+		ERR_PRINT(vformat("Could not convert '%s' into the working space; importing it unconverted.", p_source_file));
+		if (source_encoded) {
+			_map_rgb(p_image, _linear_to_srgb_f);
+		}
+		p_image->convert(original_format);
+		return;
+	}
+
+	if (stored_encoded) {
+		// sRGB -> working is gamut-widening, so the result stays inside [0, 1]
+		// and re-encoding to 8 bits loses nothing but a little precision.
+		const bool eight_bit = original_format >= Image::FORMAT_L8 && original_format <= Image::FORMAT_RGBA8;
+		_map_rgb(p_image, eight_bit ? _linear_to_srgb_8bit_f : _linear_to_srgb_f);
+	}
+
+	p_image->convert(original_format);
+#endif // MODULE_OCIO_ENABLED
 }
 
 void ResourceImporterTexture::_save_editor_meta(const Dictionary &p_metadata, const String &p_to_path) {
@@ -812,6 +958,12 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 	Ref<Image> image;
 	image.instantiate();
 	RETURN_IF_ERROR(ImageLoader::load_image(p_source_file, image, nullptr, loader_flags, scale));
+
+	// Bring the texture into the project's working space before anything else
+	// looks at its pixels, so that mipmaps, roughness and channel packing are all
+	// computed on the values the renderer will actually sample.
+	_convert_to_working_space(image, int(p_options["color/input_space"]), normal, roughness, p_source_file);
+
 	images_imported.push_back(image);
 
 	// Load the editor-only image.
@@ -1045,6 +1197,13 @@ String ResourceImporterTexture::get_import_settings_string() const {
 		}
 
 		index++;
+	}
+
+	// Textures have the working space baked in, so a change of working space has
+	// to invalidate every imported texture.
+	if (ColorManagement::is_enabled()) {
+		s += "|cm:" + String(GLOBAL_GET(SNAME("rendering/color_management/working_space"))) +
+				"|" + String(GLOBAL_GET(SNAME("rendering/color_management/ocio_config")));
 	}
 
 	return s;

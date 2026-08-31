@@ -49,6 +49,24 @@ public:
 		COMPRESS_BASIS_UNIVERSAL
 	};
 
+	// Which colour space a source image's pixels are in. The importer converts
+	// them into the project's working space so that the renderer samples values
+	// that mean what it assumes they mean.
+	enum ColorSpace {
+		COLOR_SPACE_AUTO,
+		COLOR_SPACE_SRGB,
+		COLOR_SPACE_LINEAR_REC709,
+		COLOR_SPACE_WORKING,
+		COLOR_SPACE_RAW,
+	};
+
+	// Values of the "compress/normal_map" option.
+	enum NormalMapMode {
+		NORMAL_MAP_DETECT,
+		NORMAL_MAP_ENABLE,
+		NORMAL_MAP_DISABLE,
+	};
+
 	enum ChannelRemap {
 		REMAP_R,
 		REMAP_G,
@@ -89,6 +107,8 @@ protected:
 	void _save_ctex(const Ref<Image> &p_image, const String &p_to_path, CompressMode p_compress_mode, float p_lossy_quality, const Image::BasisUniversalPackerParams &p_basisu_params, Image::CompressMode p_vram_compression, Image::CompressProfile p_vram_compression_profile, bool p_mipmaps, bool p_streamable, bool p_detect_3d, bool p_detect_srgb, bool p_detect_normal, bool p_force_normal, bool p_srgb_friendly, uint32_t p_limit_mipmap, const Ref<Image> &p_normal, Image::RoughnessChannel p_roughness_channel);
 	void _save_editor_meta(const Dictionary &p_metadata, const String &p_to_path);
 	Dictionary _load_editor_meta(const String &p_to_path) const;
+
+	static void _convert_to_working_space(Ref<Image> p_image, int p_input_space, int p_normal_mode, int p_roughness_mode, const String &p_source_file);
 
 	static inline void _remap_channels(Ref<Image> &r_image, ChannelRemap p_options[4]);
 	static inline void _clamp_hdr_exposure(Ref<Image> &r_image);
