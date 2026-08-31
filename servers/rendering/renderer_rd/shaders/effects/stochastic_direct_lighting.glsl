@@ -160,10 +160,23 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 // So the stride now selects candidates only. Up to this many lights the cell
 // is summed exactly; the evaluations are shared with the candidate set, so a
 // cell at the cap costs its own size in entry_eval calls rather than the ~17
-// the candidate budget already pays. That is ALU, not registers, which is what
-// this pass is actually bound by. Past the cap the strided estimate returns,
-// stratified per light so the levels break up into grain.
-#define MAX_ANALYTIC_LIGHTS 64u
+// the candidate budget already pays. That is ALU, not registers.
+//
+// The cap sits at the cluster builder's own default element limit, which makes
+// the sum exact for every scene it can represent, because the strided estimate
+// past it is far more expensive than the evaluations it saves. It is the one
+// noisy term the denoiser never sees -- it is multiplied into the ratio after
+// filtering -- so its grain lands in the image whole, and it does not average
+// out over frames either. Measured on stochastic_demo at 1440p, packing the
+// scene until cells overflow:
+//
+//   200 lights   cap 64: 0.05743 noise, 73.2ms   exact: 0.00428, 73.3ms
+//   500 lights   cap 64: 0.10096 noise, 142.8ms  exact: 0.00357, 148.0ms
+//
+// Evaluating every light in the cell costs 3.6% of the frame at 500 lights and
+// removes 28x the noise. Only a project raising max_clustered_elements past
+// this falls back to the estimate.
+#define MAX_ANALYTIC_LIGHTS 512u
 
 // r11f_g11f_b10f saturates near 65024, and an over-range value stores as +Inf.
 // The denoiser multiplies this buffer into the ratio, so a fully shadowed
