@@ -146,10 +146,27 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 #define MAX_DISCOVERY_CANDIDATES 12u
 #define MAX_CANDIDATES 20u
 
+// On a guiding miss (the pixel's history reprojected off screen or behind the
+// camera) the tile list is borrowed from elsewhere on screen and is only a
+// guess, so the paper shifts the sample budget from exploiting it to
+// discovering what is actually there: "we still reuse closest tile, as likely
+// it has some useful lights, but we also increase the ratio of hidden light
+// samples in order to speedup new visible light discovery".
+//
+// The split moves but the total does not. Candidate evaluation, not tracing,
+// dominates this pass (entry_eval runs ~17x/pixel) and it is register-bound,
+// so raising MAX_CANDIDATES to widen discovery would cost occupancy on every
+// pixel to fix a band at the frame edge. Re-splitting the same 20 slots is
+// free: the miss path evaluates exactly as many lights as the hit path.
+#define MISS_GUIDED_CANDIDATES 4u
+#define MISS_DISCOVERY_CANDIDATES 16u
+
 // Hidden lights (not on the visible list) are clamped to this share of the
 // total sampling weight, relaxed when the visible lights are dim (paper's
 // hidden light budget). Weight clamping keeps the RIS estimator unbiased.
+// The paper raises the share to 50% on a reprojection miss.
 #define HIDDEN_WEIGHT_BUDGET 0.2
+#define MISS_HIDDEN_WEIGHT_BUDGET 0.5
 #define DIM_VISIBLE_WEIGHT 0.25
 
 // Samples whose unshadowed contribution is below this fraction of the pixel's
@@ -492,26 +509,47 @@ void main() {
 	// up as an 8 pixel grid.
 	uint visible_list[LIST_SIZE];
 	uint visible_count = 0u;
+	// Set while guiding is on but this pixel's history is not where the list it
+	// gets was built: it reprojected off screen (rotating the camera sweeps a
+	// band of these off the frame every frame) or behind the camera. The list is
+	// still used -- the nearest tile is a better guess than nothing -- but the
+	// candidate and hidden-weight budgets below shift toward discovery to hedge
+	// it. Stays false when guiding is disabled outright: that is not a miss,
+	// there is simply no guide to be wrong about.
+	bool guide_miss = false;
 	if ((params.flags & FLAG_LIGHT_GUIDING) != 0u) {
+		guide_miss = true;
 		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		if (prev_ndc.w > 0.0) {
 			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 			vec2 jitter = stbn_sample(pixel, 4u) - 0.5;
 			vec2 tile_coord = (prev_uv * vec2(params.screen_size)) / float(TILE_SIZE) + jitter;
-			ivec2 tile = ivec2(floor(tile_coord));
-			if (all(greaterThanEqual(tile, ivec2(0))) && tile.x < params.tiles_x && tile.y < params.tiles_y) {
-				uint base = uint(tile.y * params.tiles_x + tile.x) * uint(LIST_SIZE);
-				for (uint i = 0u; i < uint(LIST_SIZE); i++) {
-					uint entry = prev_light_list.data[base + i];
-					if (entry == INVALID_LIGHT) {
-						break;
-					}
-					// Drop stale entries from lights that no longer exist.
-					uint idx = entry & ENTRY_ID_MASK;
-					uint count = (entry & AREA_BIT) != 0u ? params.area_light_count : ((entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count);
-					if (idx < count) {
-						visible_list[visible_count++] = entry;
-					}
+			// Clamp into the grid rather than rejecting what falls outside it.
+			// Rotating the camera pushes a band along the leading frame edges
+			// off the previous frame every frame (and the jitter alone pushes
+			// border pixels out half the time); dropping the guide there leaves
+			// those pixels sampling from the discovery stride alone, a visibly
+			// noisier estimate whose boundary reads as a hard edge tracking the
+			// rotation. The nearest border tile is the best available guess for
+			// what a pixel just outside it saw, and guiding only shapes the
+			// proposal distribution -- RIS divides the same weight back out, so
+			// a wrong guess costs variance, never bias.
+			ivec2 want_tile = ivec2(floor(tile_coord));
+			ivec2 tile = clamp(want_tile, ivec2(0), ivec2(params.tiles_x - 1, params.tiles_y - 1));
+			// Clamping is exactly what makes this a miss: the list now describes
+			// a different part of the screen than the pixel came from.
+			guide_miss = tile != want_tile;
+			uint base = uint(tile.y * params.tiles_x + tile.x) * uint(LIST_SIZE);
+			for (uint i = 0u; i < uint(LIST_SIZE); i++) {
+				uint entry = prev_light_list.data[base + i];
+				if (entry == INVALID_LIGHT) {
+					break;
+				}
+				// Drop stale entries from lights that no longer exist.
+				uint idx = entry & ENTRY_ID_MASK;
+				uint count = (entry & AREA_BIT) != 0u ? params.area_light_count : ((entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count);
+				if (idx < count) {
+					visible_list[visible_count++] = entry;
 				}
 			}
 		}
@@ -527,7 +565,8 @@ void main() {
 	// lighting detail, and the rays only estimate a visibility ratio.
 	vec3 analytic_diffuse = vec3(0.0);
 	vec3 analytic_specular = vec3(0.0);
-	for (uint i = 0u; i < visible_count && candidate_count < MAX_GUIDED_CANDIDATES; i++) {
+	uint guided_budget = guide_miss ? MISS_GUIDED_CANDIDATES : MAX_GUIDED_CANDIDATES;
+	for (uint i = 0u; i < visible_count && candidate_count < guided_budget; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
 		entry_eval(entry, view_pos, view_normal, roughness, f, s);
@@ -579,7 +618,11 @@ void main() {
 			}
 		}
 
-		uint stride = max(1u, (cell_count + MAX_DISCOVERY_CANDIDATES - 1u) / MAX_DISCOVERY_CANDIDATES);
+		// "If we detect a history miss we increase number of evaluated lights
+		// from the light grid cell" -- a shorter stride over the cell, paid for
+		// by the guided slots the miss just gave back.
+		uint discovery_budget = guide_miss ? MISS_DISCOVERY_CANDIDATES : MAX_DISCOVERY_CANDIDATES;
+		uint stride = max(1u, (cell_count + discovery_budget - 1u) / discovery_budget);
 		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
 		float stride_mult = float(stride);
 
@@ -637,7 +680,8 @@ void main() {
 			hidden_weight_sum += candidate_weights[i];
 		}
 		if (hidden_weight_sum > 0.0) {
-			float budget = (HIDDEN_WEIGHT_BUDGET / (1.0 - HIDDEN_WEIGHT_BUDGET)) * guided_weight_sum;
+			float share = guide_miss ? MISS_HIDDEN_WEIGHT_BUDGET : HIDDEN_WEIGHT_BUDGET;
+			float budget = (share / (1.0 - share)) * guided_weight_sum;
 			float scale = min(1.0, budget / hidden_weight_sum);
 			float relax = clamp(1.0 - guided_weight_sum / DIM_VISIBLE_WEIGHT, 0.0, 1.0);
 			scale = mix(scale, 1.0, relax);
