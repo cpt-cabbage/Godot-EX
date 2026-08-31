@@ -60,6 +60,10 @@ class RenderingServerDefault : public RenderingServer {
 	};
 
 	static int changes;
+	// Of those, the ones the renderer asked for itself, so they do not read back
+	// as a scene change on the next frame.
+	static int self_repaints;
+	static bool changes_at_draw;
 	RID test_cube;
 
 	List<Callable> frame_drawn_callbacks;
@@ -112,6 +116,23 @@ public:
 		changes++;
 	}
 #endif
+
+	// Ask for one more frame without marking the scene as changed. Temporal
+	// effects use this to keep accumulating while everything else sits idle:
+	// in low processor usage mode (the editor's default) nothing is drawn once
+	// the scene stops changing, which otherwise freezes an accumulating pass on
+	// whatever noise its last frame happened to carry.
+	_FORCE_INLINE_ static void repaint_request() {
+		changes++;
+		self_repaints++;
+	}
+
+	// Whether the frame currently being drawn was asked for by an actual change,
+	// as opposed to one of those repaints. Temporal effects use it to know when
+	// their accumulation has to start over.
+	_FORCE_INLINE_ static bool had_changes_at_draw() {
+		return changes_at_draw;
+	}
 
 #define WRITE_ACTION redraw_request();
 #define ASYNC_COND_PUSH (Thread::get_caller_id() != server_thread)

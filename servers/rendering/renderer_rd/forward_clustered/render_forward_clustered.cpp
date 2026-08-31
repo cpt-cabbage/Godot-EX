@@ -1869,6 +1869,44 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	}
 }
 
+void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+	// The ray traced passes average their samples over many frames, and those
+	// frames only happen when something draws. A viewport in low processor usage
+	// mode -- the editor's default -- stops drawing the moment the scene settles,
+	// so without this the accumulation would freeze on whatever noise the frame
+	// that answered the last edit happened to carry, and holding the camera still
+	// would never clean the image up.
+	RenderSceneDataRD *scene_data = p_render_data->scene_data;
+
+	// A frame the scene itself asked for restarts the count, and so does moving
+	// the view: reprojection carries the history across small camera motion, but
+	// disocclusions and changed shading angles still have to converge again.
+	if (RenderingServerDefault::had_changes_at_draw() ||
+			scene_data->cam_transform != scene_data->prev_cam_transform ||
+			scene_data->cam_projection != scene_data->prev_cam_projection) {
+		p_rb_data->rt_converged_frames = 0;
+	}
+
+	// The longest history any enabled pass fills, plus a few frames for the
+	// denoiser's convergence ramp to follow it.
+	uint32_t frames_needed = 0;
+	if (use_raytraced_shadows && rt_shadows != nullptr) {
+		frames_needed = MAX(frames_needed, rt_shadows->shadow_temporal_frames);
+	}
+	if (use_stochastic_lighting) {
+		frames_needed = MAX(frames_needed, stochastic_quality.temporal_frames);
+	}
+	if (use_rt_gi) {
+		frames_needed = MAX(frames_needed, rt_gi_temporal_frames);
+	}
+	frames_needed += 4;
+
+	if (p_rb_data->rt_converged_frames < frames_needed) {
+		p_rb_data->rt_converged_frames++;
+		RenderingServerDefault::repaint_request();
+	}
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -2537,6 +2575,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
+			_request_ray_tracing_convergence(p_render_data, rb_data.ptr());
 		}
 	}
 

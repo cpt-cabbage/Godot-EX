@@ -46,6 +46,8 @@
 // careful, these may run in different threads than the rendering server
 
 int RenderingServerDefault::changes = 0;
+int RenderingServerDefault::self_repaints = 0;
+bool RenderingServerDefault::changes_at_draw = false;
 
 /* FREE */
 
@@ -444,7 +446,12 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	ERR_FAIL_COND_MSG(!Thread::is_main_thread(), "Manually triggering the draw function from the RenderingServer can only be done on the main thread. Call this function from the main thread or use call_deferred().");
 	// Needs to be done before changes is reset to 0, to not force the editor to redraw.
 	RS::get_singleton()->emit_signal(SNAME("frame_pre_draw"));
+	// Recorded before the counter is cleared: a frame whose only pending
+	// requests came from the renderer itself is an idle repaint, and temporal
+	// accumulation may carry on across it.
+	changes_at_draw = changes > self_repaints;
 	changes = 0;
+	self_repaints = 0;
 	if (create_thread) {
 		command_queue.push(this, &RenderingServerDefault::_draw, p_present, frame_step);
 	} else {

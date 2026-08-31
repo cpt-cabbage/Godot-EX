@@ -109,6 +109,10 @@ public:
 	public:
 		ClusterBuilderRD *cluster_builder = nullptr;
 
+		// Frames the ray traced passes have accumulated over since the view last
+		// moved or the scene last changed; see _request_ray_tracing_convergence().
+		uint32_t rt_converged_frames = 0;
+
 		struct SSEffectsData {
 			Projection ssil_last_frame_projections[RendererSceneRender::MAX_RENDER_VIEWS];
 			Transform3D ssil_last_frame_transform;
@@ -793,6 +797,11 @@ private:
 	// Reads the live ray tracing project settings (called once per frame) and
 	// lazily creates the ray tracing backend when first enabled.
 	void _update_ray_tracing_settings();
+
+	// Keeps frames coming while the ray traced passes are still filling their
+	// temporal history, so a viewport that only redraws on change (the editor)
+	// converges instead of freezing on the frame the last edit produced.
+	void _request_ray_tracing_convergence(RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
 
 	// The directional light whose shadow the ray traced path owns this frame
 	// (null when none): its shadow map is neither rendered nor sampled.
