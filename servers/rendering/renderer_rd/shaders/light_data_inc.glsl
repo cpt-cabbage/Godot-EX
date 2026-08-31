@@ -52,7 +52,9 @@ struct ReflectionData {
 	bool box_project;
 	uint ambient_mode;
 	float exposure_normalization;
-	float pad0;
+	// 0 for probes that re-render every frame: they already carry the current
+	// lighting, so re-fitting them to it would apply it twice.
+	float refit_strength;
 	float pad1;
 	float pad2;
 	//0-8 is intensity,8-9 is ambient, mode

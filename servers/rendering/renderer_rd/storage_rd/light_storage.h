@@ -328,7 +328,7 @@ private:
 		uint32_t box_project;
 		uint32_t ambient_mode;
 		float exposure_normalization;
-		uint32_t pad0;
+		float refit_strength; // 0 for probes that re-render every frame.
 		uint32_t pad1;
 		uint32_t pad2;
 		float local_matrix[16]; // up to here for spot and omni, rest is for directional

@@ -2339,7 +2339,13 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #if !defined(USE_LIGHTMAP)
-		if (ambient_accum.a > 0.0) {
+		// A probe's ambient is the diffuse lighting captured at bake time. With
+		// a traced per-frame irradiance available it is strictly the staler of
+		// the two, and letting it overwrite the live value is what pins interior
+		// GI to whatever the light was when the probe was captured. Probes keep
+		// owning indirect specular, which is the term they actually resolve
+		// better than a blurry radiance cache does.
+		if (ambient_accum.a > 0.0 && !bool(implementation_data.rt_gi & 32u)) {
 			ambient_light = ambient_accum.rgb;
 		}
 #endif

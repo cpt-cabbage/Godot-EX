@@ -182,6 +182,11 @@ layout(constant_id = 2) const bool sc_emulate_point_size = false;
 
 #define REFLECTION_MULTIPLIER 1.0
 
+// This renderer has a live per-frame irradiance estimate (the ray-traced GI
+// buffers), so reflection probes can be re-fit to it. The mobile renderer
+// shares reflection_process() but has no such estimate.
+#define REFLECTION_REFIT_AVAILABLE
+
 #define SDFGI_MAX_CASCADES 8
 
 /* Set 0: Base Pass (never changes) */

@@ -1368,7 +1368,40 @@ void reflection_process(uint ref_index, vec3 vertex, hvec3 ref_vec, hvec3 normal
 
 		float roughness_lod = sqrt(roughness) * MAX_ROUGHNESS_LOD;
 		vec2 reflection_uv = vec3_to_oct_with_border(local_ref_vec, border_size);
-		reflection.rgb = hvec3(textureLod(sampler2DArray(reflection_atlas, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(reflection_uv, reflections.data[ref_index].index), roughness_lod).rgb) * REFLECTION_MULTIPLIER;
+		vec3 reflection_hi = textureLod(sampler2DArray(reflection_atlas, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(reflection_uv, reflections.data[ref_index].index), roughness_lod).rgb;
+
+#ifdef REFLECTION_REFIT_AVAILABLE
+		// A probe is captured once and then keeps showing whatever the lighting
+		// was at capture time, which with fully dynamic indirect lighting reads
+		// as a stale tint that will not follow the scene. Dividing the fetch by
+		// the probe's own irradiance -- its top roughness mip, in the same
+		// direction, so the ratio is local contrast and not a normal-dependent
+		// tint -- and multiplying by this frame's traced irradiance re-fits it
+		// to the light that is actually there.
+		//
+		// Only where the reflection is blurry enough for the ratio to mean
+		// something: toward a mirror the numerator is a sharp fetch against a
+		// fully blurred divisor, which is high-frequency nonsense, and a mirror
+		// should show the probe as captured anyway. Kept in float: this is a
+		// ratio of two small values and half would flush it to zero.
+		float refit_weight = smoothstep(0.1, 0.4, float(roughness)) * reflections.data[ref_index].refit_strength;
+		if (!bool(implementation_data.rt_gi & 32u)) {
+			refit_weight = 0.0; // No live irradiance estimate to fit against.
+		}
+		if (refit_weight > 0.0 && reflections.data[ref_index].ambient_mode != REFLECTION_AMBIENT_DISABLED) {
+			vec3 probe_irradiance;
+			if (reflections.data[ref_index].ambient_mode == REFLECTION_AMBIENT_COLOR) {
+				// The author stated the ambient this probe was captured under.
+				probe_irradiance = reflections.data[ref_index].ambient;
+			} else {
+				probe_irradiance = textureLod(sampler2DArray(reflection_atlas, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(reflection_uv, reflections.data[ref_index].index), MAX_ROUGHNESS_LOD).rgb;
+			}
+			vec3 ratio = clamp(reflection_hi / max(probe_irradiance, vec3(1e-3)), vec3(0.25), vec3(4.0));
+			reflection_hi = mix(reflection_hi, ratio * vec3(ambient_light), refit_weight);
+		}
+#endif // REFLECTION_REFIT_AVAILABLE
+
+		reflection.rgb = hvec3(reflection_hi) * REFLECTION_MULTIPLIER;
 		reflection.rgb *= half(reflections.data[ref_index].exposure_normalization);
 		reflection.a = reflection_blend;
 

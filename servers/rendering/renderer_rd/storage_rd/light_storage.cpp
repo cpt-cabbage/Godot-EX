@@ -2032,6 +2032,10 @@ void LightStorage::update_reflection_probe_buffer(RenderDataRD *p_render_data, c
 			reflection_ubo.exposure_normalization = exposure / probe->baked_exposure;
 		}
 
+		// A probe that re-renders every frame already carries the current
+		// lighting, so the shader must not re-fit it to that lighting again.
+		reflection_ubo.refit_strength = probe->update_mode == RSE::REFLECTION_PROBE_UPDATE_ALWAYS ? 0.0f : 1.0f;
+
 		Color ambient_linear = probe->ambient_color.srgb_to_linear();
 		float interior_ambient_energy = probe->ambient_color_energy;
 		reflection_ubo.ambient[0] = ambient_linear.r * interior_ambient_energy;
