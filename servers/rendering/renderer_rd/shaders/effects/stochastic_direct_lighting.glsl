@@ -133,22 +133,26 @@ layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D 
 #define QUAD_MASK_BITS (0xFu << QUAD_MASK_SHIFT)
 #define ENTRY_ID_MASK 0x03FFFFFFu
 #define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | ENTRY_ID_MASK)
-// Bounds the RIS estimator. Rarely selected lights produce a huge
-// weight_sum/selected_weight ratio, which shows up as fireflies and, once
-// filtered, as blotches. Slightly biased, but far lower variance.
-#define ESTIMATOR_CLAMP 48.0
-
 // Candidate set: the guided (visible list) candidates plus a strided subset of
 // the cluster cell. Keeping the per-pixel candidate count fixed is what makes
 // the cost independent of the total light count (MegaLights' central promise);
 // the stride multiplier keeps the subset an unbiased representation.
+// Slack on the per-reservoir firefly bound, as a multiple of a reservoir's
+// natural share of the cell. See the bound itself for why it cannot be 1.
+#define FIREFLY_HEADROOM 8.0
+
 #define MAX_GUIDED_CANDIDATES 8u
 #define MAX_DISCOVERY_CANDIDATES 12u
 #define MAX_CANDIDATES 20u
 
 // The analytic (unshadowed) term bypasses the denoiser entirely -- it is the
 // factor the filtered visibility ratio is multiplied back into, and the whole
-// demodulation only holds if it is exact. It used to be built from the same
+// demodulation only holds if it is exact. It is also the ratio's own
+// denominator (see the estimator below), which is what makes every sampling
+// weight in this pass cancel: the numerator estimates the cell's shadowed sum
+// and this is the cell's unshadowed sum, so the proposal appears in one and
+// not the other only if the two describe different populations. They must
+// describe the same one. It used to be built from the same
 // strided subset that feeds the candidate set, scaled by the stride: unbiased
 // in expectation, but every non-guided light was then a Bernoulli(1/stride)
 // sample, all of them sharing one per-pixel phase, so a pixel's analytic value
@@ -293,9 +297,28 @@ float luminance(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
-// Perceptual weight (MegaLights): tames very strong lights.
+// Selection weight. MegaLights compresses this perceptually (log2(lum + 1)) to
+// tame very strong lights, which is the right call when the estimator's output
+// is radiance. Ours is a visibility ratio against a fixed analytic denominator,
+// and there the compression is what makes it boil.
+//
+// Write the candidate weight as w_i = L_i * m_i, with m_i the inverse
+// probability the candidate was offered (the stride). Then the sum of the
+// weights is the cell's own analytic luminance, the estimator's
+// weight_sum / selected_weight * m_c collapses to that same constant, and the
+// pixel's ratio is the plain mean of the visibilities its rays measured -- the
+// weights carry no variance at all, only the binary hit/miss does. Compress the
+// weight and that cancellation breaks: L_c / w_c then ranges over two orders of
+// magnitude across a set like a bright window plus two dozen dim fills, so
+// which light the reservoir happened to draw moves the pixel's value far more
+// than whether that light was actually occluded. Re-drawn every frame, that is
+// the boil.
+//
+// It stayed invisible while the denominator was a second estimate from the same
+// draw, because then the compression divided straight back out (see the ratio
+// estimator). It was never doing the job its name claims; it was cancelling.
 float light_weight(float lum) {
-	return log2(lum + 1.0);
+	return lum;
 }
 
 // Bounds an analytic buffer to what its storage format can hold. Scales by the
@@ -647,6 +670,18 @@ void main() {
 	// zero radiance anyway and is dropped by the w <= 0.0 test.)
 	vec3 analytic_diffuse = vec3(0.0);
 	vec3 analytic_specular = vec3(0.0);
+	// The same two sums as scalar luminance, in the |luminance| convention the
+	// ray terms use. These are the ratio's denominators: taking them from the
+	// vec3 sums instead would normalize by |sum L| where the numerator estimates
+	// sum |L|, which differ as soon as a negative light is in the cell.
+	float analytic_lum_d = 0.0;
+	float analytic_lum_s = 0.0;
+	// One over the probability that a discovery candidate was offered to the
+	// reservoirs at all: it is on the candidate list only when the cell stride's
+	// phase picked it. Guided candidates are offered unconditionally, so theirs
+	// is 1. The estimator needs this to scale a subset's estimate up to the
+	// cell, which is the population the analytic denominator covers.
+	float discovery_mult = 1.0;
 	uint guided_budget = guide_miss ? MISS_GUIDED_CANDIDATES : MAX_GUIDED_CANDIDATES;
 	for (uint i = 0u; i < visible_count && candidate_count < guided_budget; i++) {
 		uint entry = visible_list[i];
@@ -678,9 +713,24 @@ void main() {
 	uint guided_count = candidate_count;
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
-	// newly visible lights are still found. The stride multiplier on the weight
-	// keeps the subset an unbiased stand-in for the cell's full light list, and
-	// bounds the per-pixel cost regardless of how many lights the scene has.
+	// newly visible lights are still found, at a per-pixel cost that does not
+	// grow with the scene's light count.
+	//
+	// The subset is a stand-in for the cell only if something scales its
+	// estimate back up by the stride, and the multiplier on the candidate
+	// weights is not that something: it lands on every discovery weight alike,
+	// so it appears in weight_sum and selected_weight together and the
+	// estimator divides it straight back out. It survives here to keep the
+	// guided and discovery weights on one scale for the hidden-light budget;
+	// the scaling that matters is discovery_mult, applied in the estimator.
+	//
+	// Getting that wrong is what made the cluster grid visible. cell_count, and
+	// through it the stride, is constant across a 32 pixel cluster cell, so an
+	// unscaled subset estimate normalized against the subset's own sum is a
+	// quantity whose error is constant per cell: a cell where the stride ticks
+	// 1 -> 2 halves the sampled population in one step, and the boundary shows
+	// up as a stair-stepped edge on large flat surfaces. No ray count removes
+	// it -- more reservoirs converge to the subset's answer, not the cell's.
 	//
 	// The same walk accumulates the analytic term, but on its own terms: up to
 	// MAX_ANALYTIC_LIGHTS the cell is summed exactly, sharing its entry_eval
@@ -710,6 +760,7 @@ void main() {
 		uint stride = max(1u, (cell_count + discovery_budget - 1u) / discovery_budget);
 		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
 		float stride_mult = float(stride);
+		discovery_mult = stride_mult;
 
 		// Small enough to sum the analytic term exactly, so it stops being an
 		// estimate at all.
@@ -752,6 +803,8 @@ void main() {
 					float analytic_scale = analytic_exact ? 1.0 : stride_mult;
 					analytic_diffuse += f * analytic_scale;
 					analytic_specular += s * analytic_scale;
+					analytic_lum_d += abs(luminance(f)) * analytic_scale;
+					analytic_lum_s += abs(luminance(s)) * analytic_scale;
 					if (!sampled) {
 						continue;
 					}
@@ -829,16 +882,25 @@ void main() {
 	uint traced_quadrant[MAX_RESERVOIRS];
 	uint traced_count = 0u;
 
-	// Ratio estimator: the rays only measure what fraction of the (RIS
-	// estimated) unshadowed luminance survives occlusion; the analytic
-	// candidate sum carries the lighting itself. The estimator clamp appears
-	// in numerator and denominator alike, so its bias largely cancels, and
-	// culled samples simply drop out of the ratio instead of counting as
-	// shadowed.
+	// Ratio estimator: the rays only measure what fraction of the unshadowed
+	// luminance survives occlusion; the analytic cell sum carries the lighting
+	// itself. The numerator below is an unbiased estimate of the cell's
+	// shadowed luminance and the denominator is the cell's unshadowed
+	// luminance, computed exactly.
+	//
+	// The denominator used to be a second estimate built from the same samples
+	// (sum of estimator * lum). That is a self-normalized estimator, and it
+	// cancels the RIS estimator rather than dividing the proposal out: with one
+	// reservoir it collapses to the selected light's visibility exactly, so the
+	// pixel converges to sum_i p_i V_i under the *proposal* p, not to
+	// sum_i L_i V_i / sum_i L_i. Every weight this pass applies for sampling
+	// reasons -- light_weight's log2 compression, the stride subset, the guided
+	// list's visibility hint, the hidden-light budget -- then landed in the
+	// image as bias instead of cancelling. Dividing by a fixed reference is
+	// what makes them cancel; dividing by another estimate from the same draw
+	// is what stopped them.
 	float vis_num_d = 0.0;
-	float vis_den_d = 0.0;
 	float vis_num_s = 0.0;
-	float vis_den_s = 0.0;
 	// Per-unique-light visible energy, for the shading confidence heuristic.
 	float traced_energy[MAX_RESERVOIRS];
 	for (uint t = 0u; t < MAX_RESERVOIRS; t++) {
@@ -853,10 +915,14 @@ void main() {
 		}
 		uint entry = candidate_entries[c];
 
-		// Exposure-relative culling: skip rays for samples too dim to matter.
-		if (candidate_lum[c] < CULL_CONTRIBUTION_FRACTION * total_lum) {
-			continue;
-		}
+		// Exposure-relative culling: samples too dim to matter skip their ray.
+		// They can no longer drop out of the ratio the way they did when the
+		// denominator was built from the samples themselves -- the denominator
+		// is the whole cell now, so a skipped sample that contributed nothing
+		// would read as fully shadowed. Count it unshadowed instead: it is
+		// below CULL_CONTRIBUTION_FRACTION of the pixel's luminance either way,
+		// which bounds the error at that threshold's own share.
+		bool culled = candidate_lum[c] < CULL_CONTRIBUTION_FRACTION * total_lum;
 
 		vec3 f, s;
 		entry_eval(entry, view_pos, view_normal, roughness, f, s);
@@ -887,7 +953,7 @@ void main() {
 		if (!has_extent) {
 			has_extent = ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].size : omni_lights.data[entry & ENTRY_ID_MASK].size) > 0.0;
 		}
-		if (!found || has_extent) {
+		if (!culled && (!found || has_extent)) {
 			// The first reservoir keeps the blue-noise stream; duplicates
 			// decorrelate with a per-reservoir Cranley-Patterson rotation.
 			vec2 sample_rnd = stbn_sample(pixel, 6u);
@@ -974,40 +1040,96 @@ void main() {
 			}
 		}
 
-		// RIS estimator weight_sum / selected_weight, averaged over the
-		// reservoirs and clamped to bound variance.
-		float estimator = min(reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6), ESTIMATOR_CLAMP) / float(params.reservoir_count);
+		// RIS estimator weight_sum / selected_weight, times one over the
+		// probability that this candidate was offered at all, averaged over the
+		// reservoirs. The second factor is what lifts a strided subset's
+		// estimate to the cell the analytic denominator covers; guided
+		// candidates were offered unconditionally, so theirs is 1. It costs no
+		// storage -- a candidate is guided exactly when its index is below
+		// guided_count.
+		//
+		// There is no clamp on weight_sum / selected_weight any more. It bounded
+		// fireflies back when the estimator cancelled between numerator and
+		// denominator, which is to say it bounded nothing; against a fixed
+		// denominator it would be a systematic darkening of every pixel whose
+		// reservoir picked a dim light. The ratio's own [0;1] clamp below is the
+		// bound now, and it is the one the denoiser was designed around.
+		float estimator = reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6);
+		estimator *= (c < guided_count) ? 1.0 : discovery_mult;
+		estimator /= float(params.reservoir_count);
 		float lum_d = abs(luminance(f));
 		float lum_s = abs(luminance(s));
-		vis_den_d += estimator * lum_d;
-		vis_den_s += estimator * lum_s;
 
 		// Pick one traced light uniformly to seed next frame's tile list,
 		// carrying how visible its ray found it (area lights record which rect
 		// quadrant the ray reached instead), so guiding can down-weight
-		// shadowed lights without dropping them from the list.
-		traced_found++;
-		if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + traced_found)) < 1.0 / float(traced_found)) {
-			chosen_visible_light = entry & ENTRY_KEY_MASK;
-			if ((entry & AREA_BIT) != 0u) {
-				if (visibility > 0.0) {
-					chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
+		// shadowed lights without dropping them from the list. A culled sample
+		// never traced a ray, so it has no measured visibility to report and
+		// does not enter the draw.
+		if (!culled) {
+			traced_found++;
+			if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + traced_found)) < 1.0 / float(traced_found)) {
+				chosen_visible_light = entry & ENTRY_KEY_MASK;
+				if ((entry & AREA_BIT) != 0u) {
+					if (visibility > 0.0) {
+						chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
+					}
+				} else {
+					chosen_visible_light |= uint(clamp(visibility, 0.0, 1.0) * 15.0 + 0.5) << QUAD_MASK_SHIFT;
 				}
-			} else {
-				chosen_visible_light |= uint(clamp(visibility, 0.0, 1.0) * 15.0 + 0.5) << QUAD_MASK_SHIFT;
 			}
 		}
 
 		if (visibility <= 0.0) {
 			continue;
 		}
-		vis_num_d += estimator * lum_d * visibility;
-		vis_num_s += estimator * lum_s * visibility;
-		traced_energy[slot] += estimator * (lum_d + lum_s) * visibility;
+		// Firefly bound. A reservoir's term is an estimate of the cell's whole
+		// shadowed sum divided by the reservoir count, so its natural scale is
+		// analytic_lum / reservoir_count -- which is exactly why the bound has
+		// to sit well above that and not at it. Capping at the natural scale
+		// clips a symmetric fluctuation at its own mean and removes the upper
+		// half of it, darkening every pixel whose proposal is even slightly
+		// mismatched; measured on the game project it cost 18% of the frame's
+		// mean brightness. FIREFLY_HEADROOM is the slack: below it the term is
+		// ordinary variance the denoiser is there to average, above it the
+		// reservoir picked a light whose share of the selection weight bears no
+		// relation to its share of this signal (the reservoirs select on
+		// diffuse + specular luminance, so a nearly-all-specular pick divides a
+		// small lum_d by a small probability) and no amount of averaging brings
+		// it back.
+		float share = FIREFLY_HEADROOM / float(params.reservoir_count);
+		vis_num_d += min(estimator * lum_d, analytic_lum_d * share) * visibility;
+		vis_num_s += min(estimator * lum_s, analytic_lum_s * share) * visibility;
+		// A culled sample has no slot of its own (it never traced), and its
+		// energy is below the cull threshold anyway, so it stays out of the
+		// dominance heuristic rather than landing on another light's slot.
+		if (!culled) {
+			traced_energy[slot] += estimator * (lum_d + lum_s) * visibility;
+		}
 	}
 
-	float ratio_d = clamp(vis_den_d > 0.0 ? vis_num_d / vis_den_d : 0.0, 0.0, 1.0);
-	float ratio_s = clamp(vis_den_s > 0.0 ? vis_num_s / vis_den_s : 0.0, 0.0, 1.0);
+	// The ceiling is FIREFLY_HEADROOM, not 1, and that is not a rounding of the
+	// physical bound -- it is the difference between an unbiased estimator and a
+	// darkened one.
+	//
+	// The true ratio cannot exceed 1, but an unbiased estimate of it can, and
+	// clipping at 1 removes only the upper half of that spread. The old
+	// self-normalized form was a weighted average of per-light visibilities, so
+	// it sat inside [0;1] by construction and the clamp never fired; against a
+	// fixed denominator it fires constantly, and it takes energy out every time.
+	// Measured on the game project's 26 lights it cost 22% of the frame's
+	// brightness, and the giveaway was that the mean rose with the ray count --
+	// 0.520, 0.566, 0.584 of the reference at 1, 2 and 4 rays. An unbiased
+	// estimator's mean cannot depend on how many samples it averages; a clipped
+	// one can, because more samples narrow the spread that was being clipped.
+	//
+	// Letting the frame's value overshoot is what keeps the mean right, and the
+	// denoiser is where it comes back down: the temporal average converges to
+	// the true ratio, and the neighborhood clamp bounds what a single frame can
+	// do. The per-reservoir cap above is then the one bound in the pass, instead
+	// of two that disagree.
+	float ratio_d = clamp(analytic_lum_d > 0.0 ? vis_num_d / analytic_lum_d : 0.0, 0.0, FIREFLY_HEADROOM);
+	float ratio_s = clamp(analytic_lum_s > 0.0 ? vis_num_s / analytic_lum_s : 0.0, 0.0, FIREFLY_HEADROOM);
 
 	// Shading confidence: the share of visible energy carried by the single
 	// strongest light. Where one light dominates, the shadow signal is nearly
