@@ -719,7 +719,23 @@ void main() {
 				break;
 			}
 		}
-		if (!found) {
+		// Lights with a sampling extent (area rects, sized omni/spot) trace a
+		// fresh sample point per reservoir instead of reusing the first ray:
+		// when few lights dominate, the reservoirs all agree, and deduplicating
+		// them would collapse the pixel to a single binary penumbra sample per
+		// frame no matter the rays_per_pixel setting. Zero-extent lights keep
+		// the dedupe (their duplicate rays would be identical).
+		bool has_extent = (entry & AREA_BIT) != 0u;
+		if (!has_extent) {
+			has_extent = ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].size : omni_lights.data[entry & ENTRY_ID_MASK].size) > 0.0;
+		}
+		if (!found || has_extent) {
+			// The first reservoir keeps the blue-noise stream; duplicates
+			// decorrelate with a per-reservoir Cranley-Patterson rotation.
+			vec2 sample_rnd = stbn_sample(pixel, 6u);
+			if (r > 0u) {
+				sample_rnd = fract(sample_rnd + vec2(hash_to_float(pcg_hash(pixel_seed + 0x9E37u * r)), hash_to_float(pcg_hash(pixel_seed + 0x85EBu * r))));
+			}
 			vec3 view_target;
 			if ((entry & AREA_BIT) != 0u) {
 				// Sample a point on the rect, warping the random variable
@@ -731,7 +747,7 @@ void main() {
 				if (qmask == 0u) {
 					qmask = 0xFu;
 				}
-				vec2 rnd = stbn_sample(pixel, 6u);
+				vec2 rnd = sample_rnd;
 				float qw[4];
 				float qtotal = 0.0;
 				for (uint q = 0u; q < 4u; q++) {
@@ -762,7 +778,7 @@ void main() {
 					vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
 					vec3 tangent = normalize(cross(up, dir));
 					vec3 bitangent = cross(dir, tangent);
-					vec2 rnd = stbn_sample(pixel, 6u);
+					vec2 rnd = sample_rnd;
 					float ang = rnd.x * 6.2831853;
 					float rad = sqrt(rnd.y) * ld.size;
 					view_target += (tangent * cos(ang) + bitangent * sin(ang)) * rad;
@@ -799,11 +815,13 @@ void main() {
 				}
 				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			}
-			traced_candidates[traced_count] = c;
-			traced_visibility[traced_count] = visibility;
-			traced_quadrant[traced_count] = quadrant;
-			slot = traced_count;
-			traced_count++;
+			if (!found) {
+				traced_candidates[traced_count] = c;
+				traced_visibility[traced_count] = visibility;
+				traced_quadrant[traced_count] = quadrant;
+				slot = traced_count;
+				traced_count++;
+			}
 		}
 
 		// RIS estimator weight_sum / selected_weight, averaged over the

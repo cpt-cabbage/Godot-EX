@@ -797,6 +797,14 @@ private:
 	// scene handed over by the culler, so off-screen occluders block rays).
 	bool rt_scene_ready = false;
 
+	// Whether the stochastic / RT GI passes actually dispatched this frame.
+	// The scene shader flags must not point at their buffers otherwise: a
+	// skipped pass (no lights, TLAS not ready) leaves stale lighting frozen on
+	// screen. Set by the tracing block in _render_scene, consumed by the
+	// opaque _setup_environment that follows it.
+	bool stochastic_traced_this_frame = false;
+	bool rt_gi_traced_this_frame = false;
+
 public:
 	virtual bool needs_ray_tracing_instances() override;
 	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) override;

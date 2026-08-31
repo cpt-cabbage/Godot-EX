@@ -327,9 +327,12 @@ void main() {
 	// Only filter where the signal is actually noisy relative to its
 	// magnitude; elsewhere the temporal result is already converged and
 	// filtering would only cost sharpness. Also skip where a single light
-	// carried ~80%+ of the energy (shading confidence): its shadow signal is
+	// carried ~80%+ of the energy (shading confidence) AND the raw signal is
+	// itself steady: fully lit or fully shadowed under a dominant light is
 	// nearly binary, converges fast temporally, and spatial filtering would
-	// only soften the edge.
+	// only soften the edge. Its penumbra is the opposite case (high raw
+	// variance that the capped temporal accumulation can never average out),
+	// so the dominance skip must not apply there.
 	float rel_d = var_d / max(moments.x * moments.x, 1e-6);
 	float rel_s = var_s / max(moments.z * moments.z, 1e-6);
 	vec4 meta = texelFetch(meta_texture, pixel, 0);
@@ -344,8 +347,8 @@ void main() {
 	bool newly_revealed = meta.a > 0.25;
 	bool young_d = frames_d < 4.0;
 	bool young_s = frames_s < 4.0;
-	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0));
-	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0));
+	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
+	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
 	if (!filter_d && !filter_s) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb);
 		return;
