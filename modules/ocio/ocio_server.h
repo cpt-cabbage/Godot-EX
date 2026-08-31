@@ -43,16 +43,34 @@
 class OCIOServer : public Object {
 	GDCLASS(OCIOServer, Object);
 
+public:
+	// What colour management actually managed to do with the project's settings.
+	// A project that cares can check this instead of hoping the console was read.
+	enum Status {
+		STATUS_DISABLED, // Turned off in the project settings; the engine renders as it always did.
+		STATUS_ACTIVE, // The configured config loaded and is in use.
+		STATUS_FALLBACK, // The configured config could not be loaded; a built-in one took over.
+		STATUS_FAILED, // Nothing loaded. Colour management is off despite being enabled.
+	};
+
+private:
 	static OCIOServer *singleton;
 
 	OCIOBackend::ConfigID config = OCIOBackend::INVALID_CONFIG;
 	String config_description;
+
+	Status status = STATUS_DISABLED;
+	String status_message;
+	String last_error;
 
 	bool enabled = false;
 	String working_space;
 	String default_texture_space;
 	String display;
 	String view;
+
+	// Whatever this config calls linear Rec. 709, resolved once at load.
+	String linear_rec709_space;
 
 	// Working space -> linear Rec.709, for the handful of places that need the
 	// primaries change without going through a processor (canvas attribute
@@ -70,6 +88,20 @@ class OCIOServer : public Object {
 	void _resolve_defaults();
 	void _verify_authored_matrix() const;
 
+	// The spellings a config might use for linear Rec. 709, and the first one
+	// the loaded config actually knows.
+	static Vector<String> _linear_rec709_candidates();
+	String _resolve_linear_rec709() const;
+
+	// Republishes the settings' inspector hints from the config that just loaded,
+	// so the project settings offer the names this config actually defines.
+	void _update_property_hints() const;
+
+	// Picks up a display or view chosen while the editor is running. The config
+	// itself and the working space are not re-read: textures have the working
+	// space baked in at import, so changing it is a restart, not a live edit.
+	void _on_settings_changed();
+
 protected:
 	static void _bind_methods();
 
@@ -86,8 +118,15 @@ public:
 	static constexpr const char *SETTING_VIEW = "rendering/color_management/view";
 
 	// The name ACES configs give plain linear Rec. 709, which is the space the
-	// engine converts from when it has nothing better to go on.
+	// engine converts from when it has nothing better to go on. Configs that do
+	// not use this name are searched for one of the aliases in ocio_server.cpp,
+	// so this is the preferred spelling rather than the only one accepted.
 	static constexpr const char *LINEAR_REC709_SPACE = "Linear Rec.709 (sRGB)";
+
+	// The name the loaded config actually knows linear Rec. 709 by, which is what
+	// the texture importer has to convert from. Empty when nothing matched, and
+	// then no texture conversion is possible.
+	String get_linear_rec709_space() const { return linear_rec709_space; }
 
 	static void register_project_settings();
 
@@ -100,6 +139,17 @@ public:
 
 	OCIOBackend::ConfigID get_config() const { return config; }
 	String get_config_description() const { return config_description; }
+
+	// What happened the last time the config was loaded, and a sentence saying so
+	// in the terms the project settings use. The message is never empty, so the
+	// editor and `--verbose` always have something concrete to show instead of
+	// leaving a failed setup looking identical to a disabled one.
+	Status get_status() const { return status; }
+	String get_status_message() const { return status_message; }
+	// The library's own diagnostic for the last failure, empty when there was
+	// none. Separate from the message because it is OpenColorIO's wording, not
+	// Godot's, and is what a config author needs to see.
+	String get_last_error() const { return last_error; }
 
 	String get_working_space() const { return working_space; }
 	String get_default_texture_space() const { return default_texture_space; }
@@ -129,7 +179,9 @@ public:
 	String get_display_shader_source(const String &p_display, const String &p_view, const String &p_look);
 
 	// Introspection, also exposed to scripts and used to build inspector hints.
-	PackedStringArray get_color_spaces() const;
+	// `p_scene_referred_only` drops the display-referred spaces, which describe
+	// the output of a view and so are never a valid working or texture space.
+	PackedStringArray get_color_spaces(bool p_scene_referred_only = false) const;
 	PackedStringArray get_displays() const;
 	PackedStringArray get_views(const String &p_display) const;
 	PackedStringArray get_looks() const;
@@ -149,3 +201,5 @@ public:
 	// highlights stay above 1.0.
 	Color display_transform(const Color &p_color, const String &p_display, const String &p_view, const String &p_look, bool p_output_linear = false) const;
 };
+
+VARIANT_ENUM_CAST(OCIOServer::Status);

@@ -5829,6 +5829,7 @@
 			Uses an adjustable film-like tonemapping curve and desaturates bright values for a more realistic appearance. Better than other tonemappers at maintaining the hue of colors as they become brighter. The slowest tonemapping option.
 		</constant>
 		<constant name="ENV_TONE_MAPPER_OCIO" value="5" enum="EnvironmentToneMapper">
+			Renders through an OpenColorIO display and view transform in place of a built-in curve, selected with [method environment_set_tonemap_ocio]. See [constant Environment.TONE_MAPPER_OCIO]; falls back to [constant ENV_TONE_MAPPER_AGX] when no transform can be built.
 		</constant>
 		<constant name="ENV_SSR_ROUGHNESS_QUALITY_DISABLED" value="0" enum="EnvironmentSSRRoughnessQuality">
 			Lowest quality of roughness filter for screen-space reflections. Rough materials will not have blurrier screen-space reflections compared to smooth (non-rough) materials. This is the fastest option.

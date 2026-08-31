@@ -125,6 +125,7 @@ private:
 	String ocio_look;
 	void _update_tonemap();
 	void _update_tonemap_ocio();
+	static bool _is_ocio_available();
 
 	// SSR
 	bool ssr_enabled = false;

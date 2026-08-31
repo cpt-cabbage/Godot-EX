@@ -277,15 +277,25 @@ String get_default_builtin_config_name() {
 
 // --- Introspection -------------------------------------------------------
 
-Vector<String> get_color_spaces(ConfigID p_config) {
+Vector<String> get_color_spaces(ConfigID p_config, bool p_scene_referred_only) {
 	Vector<String> names;
 	OCIO::ConstConfigRcPtr config = find_config(p_config);
 	ERR_FAIL_COND_V(!config, names);
 
 	OCIO_GUARD_V(names, {
-		const int count = config->getNumColorSpaces();
+		// A config's colour spaces come in two families. Scene-referred ones
+		// describe light before a view has been applied, which is what a working
+		// space and a texture's input space have to be; display-referred ones
+		// describe the output of a view, and naming one as a working space would
+		// ask the renderer to light with display values.
+		const OCIO::SearchReferenceSpaceType search =
+				p_scene_referred_only ? OCIO::SEARCH_REFERENCE_SPACE_SCENE : OCIO::SEARCH_REFERENCE_SPACE_ALL;
+		// Active only, which is what a config's inactive list is for: the author
+		// marked those spaces as ones not to offer. A project that names one
+		// anyway still works, because looking a name up resolves it regardless.
+		const int count = config->getNumColorSpaces(search, OCIO::COLORSPACE_ACTIVE);
 		for (int i = 0; i < count; i++) {
-			names.push_back(from_ocio(config->getColorSpaceNameByIndex(i)));
+			names.push_back(from_ocio(config->getColorSpaceNameByIndex(search, OCIO::COLORSPACE_ACTIVE, i)));
 		}
 		return names;
 	});

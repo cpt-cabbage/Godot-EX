@@ -3692,12 +3692,16 @@ void RenderingServer::init() {
 	// Ray tracing (raytraced shadows + stochastic direct lighting). All of
 	// these are live: they are read every frame, so changing them in the
 	// project settings updates the running viewport without a restart.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_shadows/enabled"), false);
+	// The three master toggles are basic settings: they are the way into the
+	// whole category, and a feature nobody can find without ticking "Advanced"
+	// is a feature nobody turns on. Everything under them is a quality dial and
+	// stays advanced.
+	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_shadows/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/rays_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), 4);
 	// Accumulation cap for the sun/area shadow mask. A per-pixel convergence
 	// counter carries the first frames, so this can be long without a slow start.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
+	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/light_guiding"), true);
@@ -3715,7 +3719,7 @@ void RenderingServer::init() {
 	// Ray-traced indirect lighting: a per-pixel final gather that traces
 	// hardware rays and shades hits from the SDFGI cascades (sky-only when no
 	// SDFGI is active). Replaces the SDFGI/VoxelGI screen resolve and SSIL.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
+	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/half_resolution"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance"), true);

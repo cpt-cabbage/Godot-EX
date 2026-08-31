@@ -209,10 +209,29 @@ void Environment::_update_ambient_light() {
 
 // Tonemap
 
+// Whether TONE_MAPPER_OCIO can actually do anything: the module has to be
+// compiled in and the project's colour management has to have loaded a config.
+// Without both, the renderer falls back to AgX.
+bool Environment::_is_ocio_available() {
+#ifdef MODULE_OCIO_ENABLED
+	const OCIOServer *ocio = OCIOServer::get_singleton();
+	return ocio != nullptr && ocio->is_enabled();
+#else
+	return false;
+#endif
+}
+
 void Environment::set_tonemapper(ToneMapper p_tone_mapper) {
 	tone_mapper = p_tone_mapper;
 	_update_tonemap();
 	notify_property_list_changed();
+
+	if (p_tone_mapper == TONE_MAPPER_OCIO && !_is_ocio_available()) {
+		// One line, once, naming the setting to turn on. Otherwise the only sign
+		// is that the image looks like AgX, which is not a symptom anyone traces
+		// back to a project setting.
+		WARN_PRINT_ONCE("Environment: the OpenColorIO tonemapper needs 'rendering/color_management/enabled' turned on and a config that loads. Falling back to AgX.");
+	}
 }
 
 Environment::ToneMapper Environment::get_tonemapper() const {
@@ -1197,6 +1216,17 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 	if (p_property.name == "tonemap_agx_contrast") {
 		if (tone_mapper != TONE_MAPPER_AGX) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		return;
+	}
+
+	if (p_property.name == "tonemap_mode") {
+		// The OpenColorIO entry stays at its index whatever happens -- removing it
+		// would renumber the enum and silently change what a saved scene means --
+		// but a project that cannot use it should be told so in the dropdown
+		// rather than by the render quietly coming out as AgX.
+		if (!_is_ocio_available()) {
+			p_property.hint_string = "Linear,Reinhard,Filmic,ACES,AgX,OpenColorIO (Unavailable)";
 		}
 		return;
 	}

@@ -2921,30 +2921,36 @@
 		<member name="rendering/color_management/default_texture_space" type="String" setter="" getter="" default="&quot;sRGB - Texture&quot;">
 			The colour space an authored [Color] and an ordinary imported texture are taken to be in. Godot has always assumed sRGB, and there is rarely a reason to change this.
 			The conversion from here into [member rendering/color_management/working_space] is applied as a transfer function and a 3×3 matrix rather than a full OpenColorIO processor, because it runs per colour in the renderer. If the named space turns out not to be a plain sRGB encoding, the engine says so at startup and the values will be slightly off.
-			Requires [member rendering/color_management/enabled].
+			The inspector offers the colour spaces the loaded config defines, but accepts any name, so a project can be authored against a config a collaborator has and this machine does not.
+			Requires [member rendering/color_management/enabled], and a restart: this is baked into every imported texture.
 		</member>
 		<member name="rendering/color_management/display" type="String" setter="" getter="" default="&quot;&quot;">
 			The OpenColorIO display the project renders for, such as [code]sRGB - Display[/code]. An empty string uses the config's default display. Individual scenes can override it with [member Environment.ocio_display].
+			Applied as soon as it changes: a display and a view only decide how the same render is looked at, so switching one updates the running editor without a restart or a reimport. A name the config does not define falls back to its default, with a warning naming both.
 			Requires [member rendering/color_management/enabled].
 		</member>
 		<member name="rendering/color_management/enabled" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], colours are managed through OpenColorIO: textures, authored colours and light colours are converted into [member rendering/color_management/working_space], and an OpenColorIO display and view can replace the built-in tonemapper (see [constant Environment.TONE_MAPPER_OCIO]).
 			A project that leaves this off renders exactly as it did before. Requires the [code]ocio[/code] module and a restart.
 			[b]Note:[/b] Textures have the working space baked in at import, so turning this on or changing the working space reimports them.
+			[method OCIOServer.get_status] and [method OCIOServer.get_status_message] say what actually happened at startup, which is worth checking before concluding that colour management is doing nothing: a config that fails to load falls back to a built-in one, and one that fails entirely leaves the engine rendering as though this setting were off.
 		</member>
 		<member name="rendering/color_management/ocio_config" type="String" setter="" getter="" default="&quot;ocio://default&quot;">
 			Which OpenColorIO config to use: either a path to a [code].ocio[/code] file, or one of the [code]ocio://[/code] URIs naming a config compiled into OpenColorIO itself, which cannot go missing. [code]ocio://default[/code] tracks the current recommended ACES config and [code]ocio://studio-config-latest[/code] selects the larger studio variant; [method OCIOServer.get_builtin_config_names] lists them all.
-			Prefer saving the concrete versioned name over [code]ocio://default[/code] for a project you want to render the same way in future, since the alias moves with OpenColorIO releases.
-			Requires [member rendering/color_management/enabled].
+			Prefer saving the concrete versioned name over [code]ocio://default[/code] for a project you want to render the same way in future, since the alias moves with OpenColorIO releases. The inspector offers both, along with every versioned built-in config this build of OpenColorIO carries.
+			A config that cannot be loaded falls back to the built-in ACES config rather than leaving the project unmanaged, and the reason OpenColorIO gave is printed with the warning.
+			Requires [member rendering/color_management/enabled], and a restart: this is baked into every imported texture.
 		</member>
 		<member name="rendering/color_management/view" type="String" setter="" getter="" default="&quot;&quot;">
 			The OpenColorIO view the project renders through, such as [code]ACES 1.0 - SDR Video[/code]. Views belong to a display, so the choices depend on [member rendering/color_management/display]. An empty string uses that display's default view. Individual scenes can override it with [member Environment.ocio_view].
+			Applied as soon as it changes, like the display it belongs to. A name the chosen display does not define falls back to that display's default, with a warning naming both.
 			Requires [member rendering/color_management/enabled].
 		</member>
 		<member name="rendering/color_management/working_space" type="String" setter="" getter="" default="&quot;ACEScg&quot;">
 			The colour space the renderer works in. ACEScg is a wide, scene-referred space whose primaries enclose Rec. 709, so nothing an sRGB source can express falls outside it.
 			This is where the difference shows up: lighting multiplies albedo by light per channel, and a per-channel product depends on the basis it is taken in. A teal surface with no red component in sRGB has a small positive red component in ACEScg, so it can pick up warmth from an orange light instead of staying stubbornly green.
-			Falls back to the config's [code]scene_linear[/code] role if the named space is not defined. Requires [member rendering/color_management/enabled].
+			Falls back to the config's [code]scene_linear[/code] role if the named space is not defined, with a warning naming both. It has to be a linear space: authored colours reach it through a 3×3 matrix, and a log or display-encoded space cannot be expressed as one, which the engine says at startup rather than rendering something quietly wrong.
+			Requires [member rendering/color_management/enabled], and a restart: this is baked into every imported texture.
 		</member>
 		<member name="rendering/driver/depth_prepass/disable_for_vendors" type="String" setter="" getter="" default="&quot;PowerVR,Mali,Adreno,Apple&quot;">
 			Disables [member rendering/driver/depth_prepass/enable] conditionally for certain vendors. By default, disables the depth prepass for mobile devices as mobile devices do not benefit from the depth prepass due to their unique architecture.
@@ -3295,60 +3301,109 @@
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
 		<member name="rendering/ray_tracing/denoiser/enabled" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the noisy output of [member rendering/ray_tracing/stochastic_direct_lighting/enabled] and [member rendering/ray_tracing/raytraced_gi/enabled] is denoised: accumulated over time along motion vectors, then filtered spatially where it is still noisy.
+			Turning this off shows the raw traced samples. That is a debugging view rather than a quality setting — at any affordable ray count the result is far too noisy to ship — but it is the only way to see what the tracing itself is producing, and it makes the effect of a ray count change obvious in a way the denoised image hides.
+			[b]Note:[/b] Only used by the Forward+ renderer, on a device whose driver supports ray queries.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/spatial_iterations" type="int" setter="" getter="" default="2">
+			How many à-trous iterations the spatial filter runs, each at twice the previous iteration's stride. With [member rendering/ray_tracing/denoiser/spatial_stride] at its default, 1 iteration reaches ±2 pixels, 2 reaches ±6 and 3 reaches ±14.
+			Reach is what removes low-frequency blotching, which is the artefact left over once temporal accumulation has handled the high-frequency noise. More iterations cost roughly a full-screen pass each and blur across detail the edge-stopping functions fail to catch.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/spatial_stride" type="int" setter="" getter="" default="2">
+			The base pixel stride of the spatial filter's first à-trous iteration; every further iteration doubles it. Raising this widens the filter's reach without costing more taps, at the price of the sparser sampling showing up as structure in flat regions.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/temporal_frames" type="int" setter="" getter="" default="16">
+			The number of frames the temporal accumulator averages over, as a cap: a per-pixel convergence counter carries the first frames at full weight, so a high value does not mean a slow start, only a longer memory once converged.
+			Longer memory means less noise and more lag behind moving lights and moving objects. History that fails reprojection — newly revealed pixels, or a depth mismatch — is discarded regardless.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/variance_threshold" type="float" setter="" getter="" default="0.02">
+			Relative variance below which a pixel skips the spatial filter entirely. A converged pixel with a stable estimate has nothing left to gain from being blurred with its neighbours, and skipping it is what keeps sharp contact shadows and small bright highlights from being softened by a filter aimed at noise elsewhere in the frame.
+			Raising this skips more pixels, which is faster and sharper but leaves residual noise where the estimate was not as settled as the variance suggested. [code]0.0[/code] always filters.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/directional" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the gather records which direction its light arrived from, not only how much. That direction is what lets flat irradiance be re-based onto normal-mapped detail (see [member rendering/ray_tracing/raytraced_gi/directionality]), lets indirect specular be occluded (see [member rendering/ray_tracing/raytraced_gi/specular_occlusion]), and lets a reflection probe captured under different lighting be re-fitted (see [member rendering/ray_tracing/raytraced_gi/reflection_probe_refit]).
+			Turning it off saves the extra buffer and the bandwidth to write it, and disables all three of those.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/directionality" type="float" setter="" getter="" default="1.0">
+			How far the directional term re-bases indirect light onto the fragment's own normal. Indirect lighting is gathered per pixel at geometric resolution, so without this a normal-mapped surface receives the same bounce light everywhere and its detail only shows in direct light. [code]0.0[/code] leaves the irradiance flat; values above [code]1.0[/code] exaggerate the effect past what the recorded direction supports.
+			Requires [member rendering/ray_tracing/raytraced_gi/directional].
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/enabled" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], indirect lighting is gathered by tracing hardware rays from each pixel and shading what they hit, in place of the screen-space resolve that [SDFGI] and [VoxelGI] otherwise perform. It also replaces SSIL: the same rays that gather bounce light measure how far they got, which is a truer occlusion term than a depth-buffer estimate.
+			The hits are shaded from whichever radiance cache is available — SDFGI cascades first, [VoxelGI] volumes next — and from sky visibility alone when neither is active, which is a usable ambient-occlusion-and-sky pass in a scene with no GI set up at all.
+			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/half_resolution" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the gather runs at half resolution and is reconstructed to full resolution afterwards, which is roughly four times cheaper. Indirect lighting is low-frequency almost everywhere, so this is on by default and the cost of turning it off is rarely repaid.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/occlusion_range" type="float" setter="" getter="" default="3.0">
+			The world-space distance, in metres, at which the near-field visibility term saturates: a ray that travels this far without hitting anything counts as fully unoccluded. This is the ambient occlusion radius, and it should match the scale of the geometry whose contact you want to see — small for interior clutter, larger for architecture.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/rays_per_pixel" type="int" setter="" getter="" default="1">
+			How many indirect rays each pixel traces per frame. One ray per pixel plus temporal accumulation is the intended operating point; more rays converge faster after a cut or a lighting change but cost close to linearly, and do nothing the denoiser's history was not already going to do.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/reflection_probe_refit" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], a [ReflectionProbe]'s captured radiance is re-fitted to the irradiance the gather measures this frame. A probe is captured once under the lighting of that moment; when the lighting since moved — a day cycle, a light switched off — its reflections keep the old lighting and disagree with everything around them. Re-fitting rescales what the probe returns so it agrees with the light actually arriving.
+			Requires [member rendering/ray_tracing/raytraced_gi/directional].
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], a ray that hits something visible on screen is shaded from the previous frame's rendered colour rather than from the radiance cache. On-screen geometry is shaded at full quality, so this is both sharper and more accurate than the cache wherever it applies, and it is the difference between coloured bounce light off a nearby wall and the cache's blurry approximation of it.
+			Rays that hit off-screen geometry fall back to the cache regardless.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/specular" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the gather also produces an indirect specular term, so rough reflections come from traced rays instead of only from probes and screen-space reflections. Turning it off leaves indirect diffuse traced and indirect specular to the existing sources.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/specular_occlusion" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], indirect specular is occluded using how far the gather's rays actually got. Reflections in a corner or under a shelf otherwise stay at full strength where no light can reach them, which reads as a glow in exactly the places that should be darkest.
+			Requires [member rendering/ray_tracing/raytraced_gi/directional].
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/temporal_frames" type="int" setter="" getter="" default="32">
+			The accumulation cap for indirect lighting, in frames. Higher than the direct lighting equivalent by default because indirect light changes more slowly than a shadow edge does, so it can afford a longer memory. See [member rendering/ray_tracing/denoiser/temporal_frames].
 		</member>
 		<member name="rendering/ray_tracing/raytraced_shadows/enabled" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], the [DirectionalLight3D] sun's shadow is ray traced against the scene instead of sampled from a shadow map. There is no cascade split to tune, no shadow bias to fight, and no resolution to run out of at a distance; the penumbra follows [member Light3D.light_angular_distance] exactly rather than approximating it with a filter width.
+			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_shadows/rays_per_pixel" type="int" setter="" getter="" default="4">
+			How many shadow rays each pixel traces per frame towards the sun's angular extent. This is what a soft shadow's penumbra is sampled with, so a wide sun angle wants more of them; a hard sun is well served by the minimum plus temporal accumulation.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_shadows/temporal_frames" type="int" setter="" getter="" default="16">
+			The accumulation cap for the sun and area-light shadow mask, in frames. See [member rendering/ray_tracing/denoiser/temporal_frames]; the same per-pixel convergence counter applies, so this can be long without a visibly slow start.
 		</member>
 		<member name="rendering/ray_tracing/sdfgi/ray_query" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], [SDFGI] traces its probe rays against the scene's ray tracing acceleration structure instead of marching its own signed distance field. The distance field is a voxelisation, so it cannot represent anything thinner than a voxel; tracing the real geometry stops light leaking through thin walls and floors, which is the artefact SDFGI is otherwise most often blamed for.
+			Only takes effect when an acceleration structure exists, which means when SDFGI is active and some ray tracing feature has caused one to be built.
+			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/enabled" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], direct lighting from local lights ([OmniLight3D], [SpotLight3D] and area lights) is estimated by sampling a few lights per pixel and tracing their shadows, instead of shading every light analytically against its own shadow map.
+			The cost of this path is set by the ray budget rather than by the number of lights, which is what makes hundreds of shadow-casting lights affordable: a shadow map costs a render pass per light per frame, while a traced sample costs the same whether the scene has ten lights or a thousand. The estimate is noisy by construction and depends on the denoiser to be usable.
+			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/half_resolution" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], the direct lighting estimate is traced at half resolution and reconstructed to full resolution afterwards. Off by default: unlike indirect light, direct light carries shadow edges, and reconstructing an edge from half-resolution samples softens exactly the detail this path exists to get right.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/light_guiding" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the choice of which lights to sample is guided by which lights were actually visible from the same place last frame. Sampling lights uniformly wastes most of the budget on lights that turn out to be occluded or too distant to matter; guiding spends it on the ones that contributed, which is worth several times the ray count in noise.
+			The guiding deliberately keeps some budget for lights it has not seen recently, so a light that becomes visible is still found.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/ray_bias" type="float" setter="" getter="" default="0.08">
+			How far along the ray, in metres, a shadow ray starts, so that a surface does not shadow itself through floating-point error in its own position. This is the ray traced equivalent of shadow map bias, and it has the same failure mode: too small and surfaces acquire a dark grain, too large and contact shadows detach from whatever casts them.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel" type="int" setter="" getter="" default="4">
+			How many lights each pixel samples and shadow-traces per frame. This is the whole budget of the path, and the setting to reach for first when trading quality against cost.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the first part of each shadow ray is marched through the depth buffer before it is handed to the acceleration structure. Near-field occlusion resolved this way is both cheaper than a trace and finer than the acceleration structure can represent, so it recovers small contact shadows the traced result misses.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], local lights whose shadows this path traces do not render shadow maps at all. Not rendering them is the single largest cost this path avoids — it is where the win over shadow mapping actually comes from — so there is rarely a reason to turn it off.
+			Turn it off to keep those shadow maps for the transparent pass, which still shades local lights analytically and so has no traced shadow to use. Transparent surfaces otherwise take local light unshadowed.
+			Requires [member rendering/ray_tracing/stochastic_direct_lighting/enabled].
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], volumetric fog takes its local light shadows from traced rays as well, so that light shafts through fog agree with the shadows on the surfaces around them. Without it, fog is lit by whatever local shadow information the fog pass can reach on its own, which with [member rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps] on is none.
+			Requires [member rendering/ray_tracing/stochastic_direct_lighting/enabled] and [member Environment.volumetric_fog_enabled].
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

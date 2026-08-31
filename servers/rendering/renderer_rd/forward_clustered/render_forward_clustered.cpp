@@ -1851,6 +1851,20 @@ RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) 
 
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+
+	// Every ray traced feature is silently dropped on a device without ray
+	// queries, which from the outside is indistinguishable from having left the
+	// setting off. Say so once, naming the settings that were asked for, so the
+	// answer to "why does this look the same as before" is in the log.
+	if (!supports_ray_query) {
+		const bool wanted = bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled")) ||
+				bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled")) ||
+				bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
+		if (wanted) {
+			WARN_PRINT_ONCE("Ray tracing is enabled in the project settings, but this device's rendering driver reports no ray query support. Every 'rendering/ray_tracing' feature is rendering as if it were off.");
+		}
+	}
+
 	use_raytraced_shadows = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
 	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/rays_per_pixel"));
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));

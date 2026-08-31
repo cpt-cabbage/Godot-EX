@@ -528,6 +528,12 @@ void ResourceImporterTexture::_convert_to_working_space(Ref<Image> p_image, int 
 	const Image::Format original_format = p_image->get_format();
 	const bool stored_encoded = original_format < Image::FORMAT_RF;
 
+	// Whichever name this config knows linear Rec. 709 by. Empty means the config
+	// does not define the space at all, which the server warns about at load;
+	// there is then nothing to convert from, so leave the pixels alone rather
+	// than fail per texture.
+	const String rec709 = ocio->get_linear_rec709_space();
+
 	String linear_source;
 	bool source_encoded = false;
 
@@ -538,11 +544,11 @@ void ResourceImporterTexture::_convert_to_working_space(Ref<Image> p_image, int 
 			return;
 		} break;
 		case COLOR_SPACE_SRGB: {
-			linear_source = OCIOServer::LINEAR_REC709_SPACE;
+			linear_source = rec709;
 			source_encoded = true;
 		} break;
 		case COLOR_SPACE_LINEAR_REC709: {
-			linear_source = OCIOServer::LINEAR_REC709_SPACE;
+			linear_source = rec709;
 		} break;
 		case COLOR_SPACE_WORKING: {
 			return; // Already in the working space; nothing to do.
@@ -566,7 +572,7 @@ void ResourceImporterTexture::_convert_to_working_space(Ref<Image> p_image, int 
 	}
 
 	const String working_space = ocio->get_working_space();
-	if (working_space.is_empty() || linear_source == working_space) {
+	if (linear_source.is_empty() || working_space.is_empty() || linear_source == working_space) {
 		return;
 	}
 

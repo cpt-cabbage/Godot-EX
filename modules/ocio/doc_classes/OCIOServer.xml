@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <class name="OCIOServer" inherits="Object" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
 	<brief_description>
+		The project's OpenColorIO config, and the colour space the renderer works in.
 	</brief_description>
 	<description>
+		Owns the OpenColorIO config named by [member ProjectSettings.rendering/color_management/ocio_config] and everything the rest of the engine asks about colour: which space the renderer works in, which display and view it renders through, and what an authored [Color] means.
+		The server exists whether or not colour management is turned on, so it is always safe to call. When [member ProjectSettings.rendering/color_management/enabled] is off, or no config could be loaded, [method is_enabled] returns [code]false[/code] and the engine renders exactly as it did before colour management existed — the introspection methods return empty arrays and the conversion methods do the plain sRGB conversion Godot has always done. Code that only wants correct colours therefore does not need to check anything; code that wants to know what is going on should read [method get_status].
+		[method transform_color] and [method display_transform] run the same transforms the renderer runs on the GPU, on the CPU. That is what makes a render checkable: a value put through [method display_transform] and the same pixel out of the renderer must agree.
+		[b]Note:[/b] Only available when the [code]ocio[/code] module is compiled in. Check with [method Engine.has_singleton] before using it.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -11,6 +16,8 @@
 			<return type="Color" />
 			<param index="0" name="color" type="Color" />
 			<description>
+				Converts a colour authored in the inspector — display-referred sRGB, which is what a [Color] has always meant — into the scene-referred working space the renderer lights with. This is the conversion the engine applies to every light colour, albedo and clear colour.
+				Returns [method Color.srgb_to_linear] unchanged when colour management is off, so it can be called unconditionally.
 			</description>
 		</method>
 		<method name="display_transform" qualifiers="const">
@@ -19,27 +26,43 @@
 			<param index="1" name="display" type="String" default="&quot;&quot;" />
 			<param index="2" name="view" type="String" default="&quot;&quot;" />
 			<param index="3" name="look" type="String" default="&quot;&quot;" />
+			<param index="4" name="output_linear" type="bool" default="false" />
 			<description>
+				Runs a working-space colour through a display and view transform, on the CPU. Empty [param display] and [param view] use the project's settings; an empty [param look] keeps whatever looks the view itself carries.
+				[param output_linear] mirrors what the renderer asks the transform for: linear Rec. 709 rather than encoded for the display, which is how an HDR view's highlights stay above [code]1.0[/code]. Pass [code]false[/code] to get the display-encoded value a viewer would show.
+				Returns [param color] unchanged when colour management is off or the transform could not be built.
 			</description>
 		</method>
 		<method name="get_builtin_config_names" qualifiers="const">
 			<return type="PackedStringArray" />
 			<description>
+				The names of every config compiled into this build of OpenColorIO, such as [code]studio-config-v2.2.0_aces-v1.3_ocio-v2.4[/code]. Prefixed with [code]ocio://[/code] these are valid values for [member ProjectSettings.rendering/color_management/ocio_config], and unlike a file on disk they cannot go missing.
 			</description>
 		</method>
 		<method name="get_color_spaces" qualifiers="const">
 			<return type="PackedStringArray" />
+			<param index="0" name="scene_referred_only" type="bool" default="false" />
 			<description>
+				Every colour space the loaded config defines, in the config's own order. Empty when colour management is off.
+				With [param scene_referred_only] the display-referred spaces are left out. Those describe the output of a view rather than light arriving at a surface, so they are never a valid working space or texture input space — which is why the project settings offer only the scene-referred ones.
 			</description>
 		</method>
 		<method name="get_config_description" qualifiers="const">
 			<return type="String" />
 			<description>
+				Where the loaded config came from: the value of [member ProjectSettings.rendering/color_management/ocio_config] when that loaded, or [code]built-in: <![CDATA[<name>]]>[/code] when it did not and a built-in config took over. Empty when colour management is off.
+			</description>
+		</method>
+		<method name="get_default_texture_space" qualifiers="const">
+			<return type="String" />
+			<description>
+				The colour space an authored [Color] and an ordinary imported texture are taken to be in, resolved from [member ProjectSettings.rendering/color_management/default_texture_space] or from the config's [code]color_picking[/code] role.
 			</description>
 		</method>
 		<method name="get_display" qualifiers="const">
 			<return type="String" />
 			<description>
+				The display the project renders for, resolved: never empty while colour management is on, even when [member ProjectSettings.rendering/color_management/display] is, because an empty setting means the config's default display.
 			</description>
 		</method>
 		<method name="get_display_shader_source">
@@ -48,42 +71,77 @@
 			<param index="1" name="view" type="String" default="&quot;&quot;" />
 			<param index="2" name="look" type="String" default="&quot;&quot;" />
 			<description>
+				The GLSL OpenColorIO generates for a display and view transform, which is what the renderer splices into its tonemapping shader. For inspection: reading it is the way to see what a view actually does, and whether it resolved to the LUTs you expected.
+				Empty when colour management is off or the transform could not be built.
 			</description>
 		</method>
 		<method name="get_displays" qualifiers="const">
 			<return type="PackedStringArray" />
 			<description>
+				Every display the loaded config defines, such as [code]sRGB - Display[/code] and [code]Display P3 - Display[/code]. Empty when colour management is off.
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				OpenColorIO's own message for the last failure to load a config, or an empty string when there was none. Separate from [method get_status_message] because this is the library's wording rather than Godot's, and it is what a config author needs to see: it distinguishes a missing file from a bad path from a malformed config.
+			</description>
+		</method>
+		<method name="get_linear_rec709_space" qualifiers="const">
+			<return type="String" />
+			<description>
+				The name the loaded config knows linear Rec. 709 by. Configs spell it differently — [code]Linear Rec.709 (sRGB)[/code] in the ACES configs shipped with OpenColorIO, [code]Utility - Linear - sRGB[/code] in the older ACES 1.0.3 config — and the engine needs it by name, because it is what an ordinary sRGB texture and an ordinary authored [Color] decode to before the change of primaries.
+				Empty when the config defines no such space under any name the engine recognises, in which case textures are imported unconverted and authored colours keep their Rec. 709 meaning. The server warns about this at startup.
 			</description>
 		</method>
 		<method name="get_looks" qualifiers="const">
 			<return type="PackedStringArray" />
 			<description>
+				Every look the loaded config defines, such as [code]ACES 1.3 Reference Gamut Compression[/code]. Empty when colour management is off.
+			</description>
+		</method>
+		<method name="get_status" qualifiers="const">
+			<return type="int" enum="OCIOServer.Status" />
+			<description>
+				What colour management managed to do with the project's settings the last time the config was loaded. Worth checking before concluding that colour management is doing nothing: [constant STATUS_FALLBACK] and [constant STATUS_FAILED] both look, from the render alone, a lot like [constant STATUS_DISABLED].
+			</description>
+		</method>
+		<method name="get_status_message" qualifiers="const">
+			<return type="String" />
+			<description>
+				A sentence saying what [method get_status] means, in the terms the project settings use — which config loaded, which working space, display and view are in force, or why none are. Never empty.
 			</description>
 		</method>
 		<method name="get_view" qualifiers="const">
 			<return type="String" />
 			<description>
+				The view the project renders through, resolved: never empty while colour management is on, even when [member ProjectSettings.rendering/color_management/view] is, because an empty setting means the display's default view.
 			</description>
 		</method>
 		<method name="get_views" qualifiers="const">
 			<return type="PackedStringArray" />
 			<param index="0" name="display" type="String" default="&quot;&quot;" />
 			<description>
+				Every view the given display defines, such as [code]ACES 1.0 - SDR Video[/code]. Views belong to a display, so this list changes with [param display]; an empty [param display] uses the project's own. Empty when colour management is off.
 			</description>
 		</method>
 		<method name="get_working_space" qualifiers="const">
 			<return type="String" />
 			<description>
+				The colour space the renderer works in, resolved from [member ProjectSettings.rendering/color_management/working_space] or from the config's [code]scene_linear[/code] role. Empty when colour management is off.
 			</description>
 		</method>
 		<method name="is_enabled" qualifiers="const">
 			<return type="bool" />
 			<description>
+				Whether colour management is both turned on and working. Every caller should treat [code]false[/code] as "behave exactly like stock Godot": it covers the setting being off, the module having no config to load, and the config having loaded but defining no usable working space.
 			</description>
 		</method>
 		<method name="reload">
 			<return type="void" />
 			<description>
+				Re-reads the colour-management project settings and reloads the config, discarding the cached GPU shaders that belonged to the old one. Safe to call at any time.
+				Rarely needed by hand: the display and the view are picked up automatically when they change, and the config, working space and texture space are marked as needing a restart because they are baked into every imported texture, so reloading them under a running editor would show textures that are still in the old space through the new matrix.
 			</description>
 		</method>
 		<method name="transform_color" qualifiers="const">
@@ -92,7 +150,22 @@
 			<param index="1" name="from" type="String" />
 			<param index="2" name="to" type="String" />
 			<description>
+				Converts a colour between two of the config's colour spaces, on the CPU. Returns [param color] unchanged when colour management is off or either name is one the config does not define.
 			</description>
 		</method>
 	</methods>
+	<constants>
+		<constant name="STATUS_DISABLED" value="0" enum="Status">
+			Colour management is turned off in the project settings. The engine renders in linear Rec. 709, exactly as it always has.
+		</constant>
+		<constant name="STATUS_ACTIVE" value="1" enum="Status">
+			The configured config loaded and is in use.
+		</constant>
+		<constant name="STATUS_FALLBACK" value="2" enum="Status">
+			The config named by [member ProjectSettings.rendering/color_management/ocio_config] could not be loaded, and a built-in ACES config took over so that the project still renders. [method get_last_error] says why the named one failed.
+		</constant>
+		<constant name="STATUS_FAILED" value="3" enum="Status">
+			Colour management is turned on but nothing could be loaded, so it is off anyway and the render is stock Godot's. [method get_last_error] says why.
+		</constant>
+	</constants>
 </class>

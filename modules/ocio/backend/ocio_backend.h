@@ -72,7 +72,9 @@ String get_default_builtin_config_name();
 
 // --- Introspection -------------------------------------------------------
 
-Vector<String> get_color_spaces(ConfigID p_config);
+// `p_scene_referred_only` drops the display-referred spaces, which are the
+// output of a view and can never be a working space or a texture's input space.
+Vector<String> get_color_spaces(ConfigID p_config, bool p_scene_referred_only = false);
 Vector<String> get_displays(ConfigID p_config);
 Vector<String> get_views(ConfigID p_config, const String &p_display);
 Vector<String> get_looks(ConfigID p_config);
