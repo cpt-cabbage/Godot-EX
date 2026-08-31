@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+import os
+
+Import("env")
+Import("env_modules")
+
+env_ocio = env_modules.Clone()
+
+
+def enable_exceptions(target_env):
+    """Re-enable C++ exceptions for one environment.
+
+    Godot builds with disable_exceptions=True by default (-fno-exceptions), but
+    OpenColorIO signals every error by throwing, so the library and the module
+    code that calls it must be compiled with exception support.
+    """
+    if not env["disable_exceptions"]:
+        return target_env
+    if env.msvc:
+        # SConstruct defines _HAS_EXCEPTIONS=0 instead of passing a flag; drop
+        # that definition before turning exceptions back on.
+        target_env["CPPDEFINES"] = [
+            d for d in target_env["CPPDEFINES"] if not (isinstance(d, tuple) and d[0] == "_HAS_EXCEPTIONS")
+        ]
+        target_env.Append(CXXFLAGS=["/EHsc"])
+    else:
+        target_env["CXXFLAGS"] = [f for f in target_env["CXXFLAGS"] if f != "-fno-exceptions"]
+        target_env.Append(CXXFLAGS=["-fexceptions"])
+    return target_env
+
+
+# Thirdparty source files
+
+thirdparty_obj = []
+
+if env["builtin_opencolorio"]:
+    ocio_dir = "#thirdparty/opencolorio/"
+    imath_dir = "#thirdparty/imath/"
+    yaml_dir = "#thirdparty/yaml-cpp/"
+    pystring_dir = "#thirdparty/pystring/"
+    expat_dir = "#thirdparty/expat/"
+
+    def collect(root, suffix, exclude=()):
+        """Recursively list sources under `root`, relative to the repo root."""
+        base = Dir(root).abspath
+        found = []
+        for dirpath, _dirnames, filenames in os.walk(base):
+            for name in sorted(filenames):
+                if not name.endswith(suffix) or name in exclude:
+                    continue
+                found.append(root + os.path.relpath(os.path.join(dirpath, name), base).replace(os.sep, "/"))
+        return sorted(found)
+
+    # SystemMonitor_{macos,windows}.cpp are #included by SystemMonitor.cpp rather
+    # than compiled on their own, so they must stay out of the source list.
+    opencolorio_sources = collect(
+        ocio_dir + "src/",
+        ".cpp",
+        exclude=("SystemMonitor_macos.cpp", "SystemMonitor_windows.cpp"),
+    )
+    yaml_sources = collect(yaml_dir + "src/", ".cpp")
+    expat_sources = [
+        expat_dir + "lib/xmlparse.c",
+        expat_dir + "lib/xmlrole.c",
+        expat_dir + "lib/xmltok.c",
+    ]
+    thirdparty_sources = (
+        opencolorio_sources
+        + yaml_sources
+        + expat_sources
+        + [imath_dir + "Imath/half.cpp", pystring_dir + "pystring.cpp"]
+    )
+
+    env_ocio.Prepend(
+        CPPPATH=[
+            ocio_dir + "include",
+            ocio_dir + "include/OpenColorIO",
+            ocio_dir + "src",
+            ocio_dir + "src/OpenColorIO",
+            ocio_dir + "generated_include",
+            ocio_dir + "ext/xxHash/include",
+            ocio_dir + "ext/sampleicc/include",
+            imath_dir,
+            yaml_dir + "include",
+            pystring_dir,
+            expat_dir + "lib",
+        ]
+    )
+    env_ocio.Append(
+        CPPDEFINES=[
+            # Omit Imath's 128 KB half-to-float lookup table; the bit-shift path
+            # is used instead. Must match thirdparty/imath/Imath/ImathConfig.h.
+            "IMATH_HALF_NO_LOOKUP_TABLE",
+            # All of these are linked statically into the engine binary.
+            "YAML_CPP_STATIC_DEFINE",
+            "XML_STATIC",
+            "HAVE_EXPAT_CONFIG_H",
+        ]
+    )
+
+    if env["platform"] == "windows":
+        env_ocio.Append(CPPDEFINES=["OpenColorIO_SKIP_IMPORTS"])
+
+    env_thirdparty = enable_exceptions(env_ocio.Clone())
+    env_thirdparty.force_optimization_on_debug()
+    env_thirdparty.disable_warnings()
+    env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+    env.modules_sources += thirdparty_obj
+
+# Godot source files
+
+module_obj = []
+
+# The backend/ directory holds every translation unit that includes an
+# OpenColorIO header, and is the only part of Godot built with exceptions
+# enabled. OCIO reports all errors by throwing, and an exception must never
+# unwind through a frame compiled with -fno-exceptions, so the boundary has to
+# be a whole translation unit rather than a single wrapper function: nothing
+# outside backend/ may call into the library. Those files catch via the
+# OCIO_GUARD macro in backend/ocio_firewall.h and hand back plain Error codes
+# and Godot types, so the rest of the module — and the rest of the engine —
+# never sees an OCIO type or an exception.
+env_backend = enable_exceptions(env_ocio.Clone())
+env_backend.add_source_files(module_obj, "backend/*.cpp")
+
+env_ocio.add_source_files(module_obj, "*.cpp")
+
+env.modules_sources += module_obj
+
+# Needed to force rebuilding the module files when the thirdparty library is updated.
+env.Depends(module_obj, thirdparty_obj)
