@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="OCIOServer" inherits="Object" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+	</brief_description>
+	<description>
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="authored_to_working" qualifiers="const">
+			<return type="Color" />
+			<param index="0" name="color" type="Color" />
+			<description>
+			</description>
+		</method>
+		<method name="display_transform" qualifiers="const">
+			<return type="Color" />
+			<param index="0" name="color" type="Color" />
+			<param index="1" name="display" type="String" default="&quot;&quot;" />
+			<param index="2" name="view" type="String" default="&quot;&quot;" />
+			<param index="3" name="look" type="String" default="&quot;&quot;" />
+			<description>
+			</description>
+		</method>
+		<method name="get_builtin_config_names" qualifiers="const">
+			<return type="PackedStringArray" />
+			<description>
+			</description>
+		</method>
+		<method name="get_color_spaces" qualifiers="const">
+			<return type="PackedStringArray" />
+			<description>
+			</description>
+		</method>
+		<method name="get_config_description" qualifiers="const">
+			<return type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="get_display" qualifiers="const">
+			<return type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="get_display_shader_source">
+			<return type="String" />
+			<param index="0" name="display" type="String" default="&quot;&quot;" />
+			<param index="1" name="view" type="String" default="&quot;&quot;" />
+			<param index="2" name="look" type="String" default="&quot;&quot;" />
+			<description>
+			</description>
+		</method>
+		<method name="get_displays" qualifiers="const">
+			<return type="PackedStringArray" />
+			<description>
+			</description>
+		</method>
+		<method name="get_looks" qualifiers="const">
+			<return type="PackedStringArray" />
+			<description>
+			</description>
+		</method>
+		<method name="get_view" qualifiers="const">
+			<return type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="get_views" qualifiers="const">
+			<return type="PackedStringArray" />
+			<param index="0" name="display" type="String" default="&quot;&quot;" />
+			<description>
+			</description>
+		</method>
+		<method name="get_working_space" qualifiers="const">
+			<return type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="is_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>
+			</description>
+		</method>
+		<method name="reload">
+			<return type="void" />
+			<description>
+			</description>
+		</method>
+		<method name="transform_color" qualifiers="const">
+			<return type="Color" />
+			<param index="0" name="color" type="Color" />
+			<param index="1" name="from" type="String" />
+			<param index="2" name="to" type="String" />
+			<description>
+			</description>
+		</method>
+	</methods>
+</class>

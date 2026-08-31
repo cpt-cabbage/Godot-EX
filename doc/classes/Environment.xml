@@ -200,6 +200,15 @@
 			The strength that is used when blurring across the screen to generate the glow effect. This affects the distance and intensity of the blur. When using the Mobile rendering method, this should be increased to compensate for the lower dynamic range.
 			[b]Note:[/b] [member glow_strength] has no effect when using the Compatibility rendering method, due to this rendering method using a simpler glow implementation optimized for low-end devices.
 		</member>
+		<member name="ocio_display" type="String" setter="set_ocio_display" getter="get_ocio_display" default="&quot;&quot;">
+			The OpenColorIO display to render for, such as [code]sRGB - Display[/code] or [code]Display P3 - Display[/code]. An empty string uses [member ProjectSettings.rendering/color_management/display]. Only used when [member tonemap_mode] is [constant TONE_MAPPER_OCIO].
+		</member>
+		<member name="ocio_look" type="String" setter="set_ocio_look" getter="get_ocio_look" default="&quot;&quot;">
+			An OpenColorIO look to apply in place of whatever looks the view itself carries, such as [code]ACES 1.3 Reference Gamut Compression[/code]. An empty string keeps the view's own looks. Only used when [member tonemap_mode] is [constant TONE_MAPPER_OCIO].
+		</member>
+		<member name="ocio_view" type="String" setter="set_ocio_view" getter="get_ocio_view" default="&quot;&quot;">
+			The OpenColorIO view to render through, such as [code]ACES 1.0 - SDR Video[/code]. Views belong to a display, so the choices depend on [member ocio_display]. An empty string uses [member ProjectSettings.rendering/color_management/view]. Only used when [member tonemap_mode] is [constant TONE_MAPPER_OCIO].
+		</member>
 		<member name="reflected_light_source" type="int" setter="set_reflection_source" getter="get_reflection_source" enum="Environment.ReflectionSource" default="0">
 			The reflected (specular) light source.
 		</member>
@@ -443,6 +452,12 @@
 		</constant>
 		<constant name="TONE_MAPPER_AGX" value="4" enum="ToneMapper">
 			Uses an adjustable film-like tonemapping curve and desaturates bright values for a more realistic appearance. Better than other tonemappers at maintaining the hue of colors as they become brighter. The slowest tonemapping option.
+		</constant>
+		<constant name="TONE_MAPPER_OCIO" value="5" enum="ToneMapper">
+			Uses an OpenColorIO display and view transform in place of a built-in curve, selected with [member ocio_display], [member ocio_view] and [member ocio_look]. Unlike [constant TONE_MAPPER_ACES], which is a rational approximation of the ACES curve, this is the real transform from the project's OpenColorIO config, so it matches what Nuke, Resolve, Houdini or Blender produce from the same config.
+			Requires colour management to be enabled with [member ProjectSettings.rendering/color_management/enabled] and the [code]ocio[/code] module to be compiled in. Falls back to [constant TONE_MAPPER_AGX] when no transform can be built, and is only supported by the Forward+ renderer.
+			The view's result is expressed in linear Rec. 709 rather than encoded for the display, so it behaves like any other tonemapper: Godot applies whatever encoding the target needs. An HDR view therefore works as-is, returning values above [code]1.0[/code] where [code]1.0[/code] is reference white, which the compositor clamps to the display's actual headroom ([method Window.get_output_max_linear_value]). Choose a view whose peak luminance matches the display, since a 1000-nit view on a display with less headroom simply clips.
+			[b]Note:[/b] Godot presents to a Rec. 709 surface, so a wide-gamut display such as [code]Display P3 - Display[/code] currently renders the same as [code]sRGB - Display[/code]. Selecting it becomes meaningful once a wide-gamut surface can be requested.
 		</constant>
 		<constant name="GLOW_BLEND_MODE_ADDITIVE" value="0" enum="GlowBlendMode">
 			Adds the glow effect to the scene.

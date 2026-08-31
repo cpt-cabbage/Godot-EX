@@ -2918,6 +2918,34 @@
 		<member name="rendering/camera/depth_of_field/depth_of_field_use_jitter" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], jitters DOF samples to make effect slightly blurrier and hide lines created from low sample rates. This can result in a slightly grainy appearance when used with a low number of samples.
 		</member>
+		<member name="rendering/color_management/default_texture_space" type="String" setter="" getter="" default="&quot;sRGB - Texture&quot;">
+			The colour space an authored [Color] and an ordinary imported texture are taken to be in. Godot has always assumed sRGB, and there is rarely a reason to change this.
+			The conversion from here into [member rendering/color_management/working_space] is applied as a transfer function and a 3×3 matrix rather than a full OpenColorIO processor, because it runs per colour in the renderer. If the named space turns out not to be a plain sRGB encoding, the engine says so at startup and the values will be slightly off.
+			Requires [member rendering/color_management/enabled].
+		</member>
+		<member name="rendering/color_management/display" type="String" setter="" getter="" default="&quot;&quot;">
+			The OpenColorIO display the project renders for, such as [code]sRGB - Display[/code]. An empty string uses the config's default display. Individual scenes can override it with [member Environment.ocio_display].
+			Requires [member rendering/color_management/enabled].
+		</member>
+		<member name="rendering/color_management/enabled" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], colours are managed through OpenColorIO: textures, authored colours and light colours are converted into [member rendering/color_management/working_space], and an OpenColorIO display and view can replace the built-in tonemapper (see [constant Environment.TONE_MAPPER_OCIO]).
+			A project that leaves this off renders exactly as it did before. Requires the [code]ocio[/code] module and a restart.
+			[b]Note:[/b] Textures have the working space baked in at import, so turning this on or changing the working space reimports them.
+		</member>
+		<member name="rendering/color_management/ocio_config" type="String" setter="" getter="" default="&quot;ocio://default&quot;">
+			Which OpenColorIO config to use: either a path to a [code].ocio[/code] file, or one of the [code]ocio://[/code] URIs naming a config compiled into OpenColorIO itself, which cannot go missing. [code]ocio://default[/code] tracks the current recommended ACES config and [code]ocio://studio-config-latest[/code] selects the larger studio variant; [method OCIOServer.get_builtin_config_names] lists them all.
+			Prefer saving the concrete versioned name over [code]ocio://default[/code] for a project you want to render the same way in future, since the alias moves with OpenColorIO releases.
+			Requires [member rendering/color_management/enabled].
+		</member>
+		<member name="rendering/color_management/view" type="String" setter="" getter="" default="&quot;&quot;">
+			The OpenColorIO view the project renders through, such as [code]ACES 1.0 - SDR Video[/code]. Views belong to a display, so the choices depend on [member rendering/color_management/display]. An empty string uses that display's default view. Individual scenes can override it with [member Environment.ocio_view].
+			Requires [member rendering/color_management/enabled].
+		</member>
+		<member name="rendering/color_management/working_space" type="String" setter="" getter="" default="&quot;ACEScg&quot;">
+			The colour space the renderer works in. ACEScg is a wide, scene-referred space whose primaries enclose Rec. 709, so nothing an sRGB source can express falls outside it.
+			This is where the difference shows up: lighting multiplies albedo by light per channel, and a per-channel product depends on the basis it is taken in. A teal surface with no red component in sRGB has a small positive red component in ACEScg, so it can pick up warmth from an orange light instead of staying stubbornly green.
+			Falls back to the config's [code]scene_linear[/code] role if the named space is not defined. Requires [member rendering/color_management/enabled].
+		</member>
 		<member name="rendering/driver/depth_prepass/disable_for_vendors" type="String" setter="" getter="" default="&quot;PowerVR,Mali,Adreno,Apple&quot;">
 			Disables [member rendering/driver/depth_prepass/enable] conditionally for certain vendors. By default, disables the depth prepass for mobile devices as mobile devices do not benefit from the depth prepass due to their unique architecture.
 		</member>
@@ -3265,6 +3293,62 @@
 			If [code]true[/code], [OccluderInstance3D] nodes will be usable for occlusion culling in 3D in the root viewport. In custom viewports, [member Viewport.use_occlusion_culling] must be set to [code]true[/code] instead.
 			[b]Note:[/b] Enabling occlusion culling has a cost on the CPU. Only enable occlusion culling if you actually plan to use it. Large open scenes with few or no objects blocking the view will generally not benefit much from occlusion culling. Large open scenes generally benefit more from mesh LOD and visibility ranges ([member GeometryInstance3D.visibility_range_begin] and [member GeometryInstance3D.visibility_range_end]) compared to occlusion culling.
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
+		</member>
+		<member name="rendering/ray_tracing/denoiser/enabled" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/denoiser/spatial_iterations" type="int" setter="" getter="" default="2">
+		</member>
+		<member name="rendering/ray_tracing/denoiser/spatial_stride" type="int" setter="" getter="" default="2">
+		</member>
+		<member name="rendering/ray_tracing/denoiser/temporal_frames" type="int" setter="" getter="" default="16">
+		</member>
+		<member name="rendering/ray_tracing/denoiser/variance_threshold" type="float" setter="" getter="" default="0.02">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/directional" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/directionality" type="float" setter="" getter="" default="1.0">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/enabled" type="bool" setter="" getter="" default="false">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/half_resolution" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/occlusion_range" type="float" setter="" getter="" default="3.0">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/rays_per_pixel" type="int" setter="" getter="" default="1">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/reflection_probe_refit" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/specular" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/specular_occlusion" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/temporal_frames" type="int" setter="" getter="" default="32">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_shadows/enabled" type="bool" setter="" getter="" default="false">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_shadows/rays_per_pixel" type="int" setter="" getter="" default="4">
+		</member>
+		<member name="rendering/ray_tracing/raytraced_shadows/temporal_frames" type="int" setter="" getter="" default="16">
+		</member>
+		<member name="rendering/ray_tracing/sdfgi/ray_query" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/enabled" type="bool" setter="" getter="" default="false">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/half_resolution" type="bool" setter="" getter="" default="false">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/light_guiding" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/ray_bias" type="float" setter="" getter="" default="0.08">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel" type="int" setter="" getter="" default="4">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps" type="bool" setter="" getter="" default="true">
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows" type="bool" setter="" getter="" default="true">
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

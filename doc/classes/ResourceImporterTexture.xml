@@ -10,6 +10,12 @@
 		<link title="Importing images">$DOCS_URL/tutorials/assets_pipeline/importing_images.html</link>
 	</tutorials>
 	<members>
+		<member name="color/input_space" type="int" setter="" getter="" default="0">
+			The colour space this texture's pixels are in, used to convert it into [member ProjectSettings.rendering/color_management/working_space]. Only has an effect when [member ProjectSettings.rendering/color_management/enabled] is [code]true[/code].
+			Whether a texture belongs in the working space depends on how it is used. A 3D albedo map is scene-referred: it gets multiplied by light, so it has to share the renderer's basis. A 2D sprite is display-referred, because canvas items are composited after tonemapping has already produced display values, and converting one would visibly shift its colours.
+			[b]Auto[/b] therefore converts nothing. The 3D preset instead defaults this to [b]sRGB (Texture)[/b], and the importer sets it automatically the first time a texture is seen in 3D, the same way it enables normal map compression. A texture used in both 2D and 3D can only have one answer and needs a choice made by hand.
+			[b]Raw / Data[/b] leaves the pixels untouched, which is what normal maps, masks and roughness maps need — they carry directions and gloss rather than colour.
+		</member>
 		<member name="compress/channel_pack" type="int" setter="" getter="" default="0">
 			Controls how color channels should be used in the imported texture.
 			[b]sRGB Friendly:[/b] Prevents the R and RG color formats from being used, as they do not support nonlinear sRGB encoding.
