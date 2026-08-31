@@ -2503,7 +2503,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		if ((has_sun || has_area || run_stochastic || run_rt_gi) && rt_scene_ready) {
 			RENDER_TIMESTAMP("Raytraced Shadows");
 			RD::get_singleton()->draw_command_begin_label("Raytraced Shadows");
-			rt_shadows->advance_frame();
+			rt_shadows->advance_frame(rb);
 
 			// The GI gather's radiance cache and sky fallback.
 			RendererRD::RaytracedShadows::GiCascades gi_cascades;

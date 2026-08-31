@@ -93,7 +93,65 @@
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
+// Per-viewport temporal state, attached to the render buffers rather than held
+// on the (single, renderer-wide) RaytracedShadows object.
+#define RB_SCOPE_RT_STATE SNAME("rb_rt_state")
+
 namespace RendererRD {
+
+// One viewport's temporal state for the ray-traced passes.
+//
+// RaytracedShadows itself is created once per renderer and is walked through by
+// every viewport that draws: the editor's 3D views, SubViewports, reflection
+// probe faces. The history textures the temporal filters ping-pong, though, are
+// created per render buffer. Keeping the ping-pong parity and the frame counter
+// on the shared object meant an extra scene render in the same displayed frame
+// flipped the parity back to where it started, so a viewport wrote the same
+// history slot every frame and read one that was never updated -- temporal
+// accumulation silently stopped, and the image stayed at single-frame noise.
+// The same applies to everything else here: a reprojection matrix or a visible
+// light list from another viewport is not history, it is a different picture.
+//
+// So this rides on the render buffers, whose lifetime already matches the
+// textures it indexes, and free_data() releases it with them.
+class RenderBuffersRT : public RenderBufferCustomDataRD {
+	GDCLASS(RenderBuffersRT, RenderBufferCustomDataRD);
+
+public:
+	// Advanced once per displayed frame for this viewport, by advance_frame().
+	uint32_t frame_index = 0;
+	bool history_parity = false;
+
+	// Per view: this frame's and the previous frame's reprojection matrices.
+	// The previous one classifies moving objects in the one-frame-stale
+	// velocity buffer; it is uploaded once per frame into a small UBO shared
+	// by every temporal pass of that view.
+	struct ReprojectHistory {
+		Projection current;
+		Projection previous;
+		uint32_t frame = UINT32_MAX;
+		RID ubo;
+	};
+	LocalVector<ReprojectHistory> reproject_history; // Per view.
+
+	LocalVector<RID> stochastic_params_ubos; // Per view.
+	LocalVector<RID> rt_gi_params_ubos; // Per view.
+
+	// Visible light lists, one fixed-size list per 8x8 tile, ping-ponged so the
+	// sampling pass reads the list the previous frame produced. Sized to this
+	// viewport's tile grid, so sharing them across viewports of different sizes
+	// reallocated (and so cleared) them every frame.
+	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = 8;
+	static constexpr uint32_t LIGHT_LIST_SIZE = 8;
+	struct LightListBuffers {
+		RID buffers[2];
+		Size2i tiles;
+	};
+	LocalVector<LightListBuffers> light_lists; // Per view.
+
+	virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
+	virtual void free_data() override;
+};
 
 // Ray-traced directional (sun) shadows using inline ray queries.
 // Maintains a BLAS per mesh and a per-frame TLAS over the visible instances,
@@ -159,20 +217,12 @@ private:
 		DENOISE_FLAG_HAS_HIT_DISTANCE = 16, // Spatial: hit distance joins the edge-stopping weights.
 	};
 
-	uint32_t frame_index = 0;
-	bool history_parity = false;
+	// The viewport currently being rendered, selected by advance_frame(). Every
+	// temporal pass reads its counters and buffers through this rather than
+	// from members: this object is shared by every viewport the renderer draws,
+	// while the history textures it ping-pongs are owned per render buffer.
+	RenderBuffersRT *rb_state = nullptr;
 
-	// Per view: this frame's and the previous frame's reprojection matrices.
-	// The previous one classifies moving objects in the one-frame-stale
-	// velocity buffer; it is uploaded once per frame into a small UBO shared
-	// by every temporal pass of that view.
-	struct ReprojectHistory {
-		Projection current;
-		Projection previous;
-		uint32_t frame = UINT32_MAX;
-		RID ubo;
-	};
-	LocalVector<ReprojectHistory> reproject_history;
 	RID _update_reproject_ubo(uint32_t p_view, const Projection &p_reproject);
 
 	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.
@@ -213,17 +263,8 @@ private:
 		uint32_t flags; // 1: light guiding, 2: screen traces.
 		uint32_t pad0;
 	};
-	LocalVector<RID> stochastic_params_ubos; // Per view.
-
-	// Visible light lists, one fixed-size list per 8x8 tile, ping-ponged so the
-	// sampling pass reads the list the previous frame produced.
-	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = 8;
-	static constexpr uint32_t LIGHT_LIST_SIZE = 8;
-	struct LightListBuffers {
-		RID buffers[2];
-		Size2i tiles;
-	};
-	LocalVector<LightListBuffers> light_lists; // Per view.
+	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
+	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;
 
 	StochasticLightListShaderRD light_list_shader;
 	RID light_list_shader_version;
@@ -261,7 +302,6 @@ private:
 		float ao_range; // Hit distances are normalized and clamped against this.
 		float inv_ao_range;
 	};
-	LocalVector<RID> rt_gi_params_ubos; // Per view.
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
@@ -422,12 +462,18 @@ public:
 	// (RB_RT_STOCHASTIC_*).
 	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
 
-	// Call once per frame before the per-view process() calls.
-	void advance_frame() { frame_index++; history_parity = !history_parity; }
+	// Call once per frame, per render buffer, before that buffer's per-view
+	// process() calls. Selects the viewport's own temporal state (creating it
+	// on first use) and advances it; everything below reads it through
+	// rb_state. Passing the buffers is what keeps one viewport's extra render
+	// -- a SubViewport, a probe face, an editor preview -- from advancing
+	// another's history.
+	void advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers);
 
 	// Which ping-pong slot the current frame writes (for bindings that must
-	// pick the freshly written texture, like the GI view depth).
-	bool get_history_parity() const { return history_parity; }
+	// pick the freshly written texture, like the GI view depth). Valid for the
+	// buffer named by the most recent advance_frame().
+	bool get_history_parity() const { return rb_state != nullptr && rb_state->history_parity; }
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return tlas; }

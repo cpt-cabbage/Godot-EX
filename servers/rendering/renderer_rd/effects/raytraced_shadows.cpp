@@ -177,24 +177,6 @@ RaytracedShadows::~RaytracedShadows() {
 	RD::get_singleton()->free_rid(ltc_lut1_texture);
 	RD::get_singleton()->free_rid(ltc_lut2_texture);
 	RD::get_singleton()->free_rid(material_sampler);
-	for (const RID &ubo : stochastic_params_ubos) {
-		RD::get_singleton()->free_rid(ubo);
-	}
-	for (const RID &ubo : rt_gi_params_ubos) {
-		RD::get_singleton()->free_rid(ubo);
-	}
-	for (const ReprojectHistory &h : reproject_history) {
-		if (h.ubo.is_valid()) {
-			RD::get_singleton()->free_rid(h.ubo);
-		}
-	}
-	for (const LightListBuffers &lists : light_lists) {
-		for (const RID &buffer : lists.buffers) {
-			if (buffer.is_valid()) {
-				RD::get_singleton()->free_rid(buffer);
-			}
-		}
-	}
 	shader.version_free(shader_version);
 	rt_gi_shader.version_free(rt_gi_shader_version);
 	decode_shader.version_free(decode_shader_version);
@@ -498,21 +480,60 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	return rd->tlas_build(tlas, as_instances) == OK;
 }
 
-RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
-	while (reproject_history.size() <= p_view) {
-		reproject_history.push_back(ReprojectHistory());
+void RenderBuffersRT::free_data() {
+	RenderingDevice *rd = RD::get_singleton();
+	for (const RID &ubo : stochastic_params_ubos) {
+		rd->free_rid(ubo);
 	}
-	ReprojectHistory &h = reproject_history[p_view];
+	stochastic_params_ubos.clear();
+	for (const RID &ubo : rt_gi_params_ubos) {
+		rd->free_rid(ubo);
+	}
+	rt_gi_params_ubos.clear();
+	for (const ReprojectHistory &h : reproject_history) {
+		if (h.ubo.is_valid()) {
+			rd->free_rid(h.ubo);
+		}
+	}
+	reproject_history.clear();
+	for (const LightListBuffers &lists : light_lists) {
+		for (const RID &buffer : lists.buffers) {
+			if (buffer.is_valid()) {
+				rd->free_rid(buffer);
+			}
+		}
+	}
+	light_lists.clear();
+}
+
+void RaytracedShadows::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	Ref<RenderBuffersRT> state;
+	if (p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
+		state = p_render_buffers->get_custom_data(RB_SCOPE_RT_STATE);
+	} else {
+		state.instantiate();
+		p_render_buffers->set_custom_data(RB_SCOPE_RT_STATE, state);
+	}
+	state->frame_index++;
+	state->history_parity = !state->history_parity;
+	rb_state = state.ptr();
+}
+
+RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
+	while (rb_state->reproject_history.size() <= p_view) {
+		rb_state->reproject_history.push_back(RenderBuffersRT::ReprojectHistory());
+	}
+	RenderBuffersRT::ReprojectHistory &h = rb_state->reproject_history[p_view];
 	if (h.ubo.is_null()) {
 		h.ubo = RD::get_singleton()->uniform_buffer_create(sizeof(float) * 16);
 	}
-	if (h.frame != frame_index) {
+	if (h.frame != rb_state->frame_index) {
 		// After a gap (first frame, or the pass was disabled for a while) fall
 		// back to the current matrix: the classification then sees zero object
 		// motion, which is the safe default.
-		h.previous = (h.frame != UINT32_MAX && h.frame + 1 == frame_index) ? h.current : p_reproject;
+		h.previous = (h.frame != UINT32_MAX && h.frame + 1 == rb_state->frame_index) ? h.current : p_reproject;
 		h.current = p_reproject;
-		h.frame = frame_index;
+		h.frame = rb_state->frame_index;
 		float m[16];
 		for (int col = 0; col < 4; col++) {
 			for (int row = 0; row < 4; row++) {
@@ -525,6 +546,8 @@ RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p
 }
 
 void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity) {
+	// Selected by advance_frame(), which every caller runs first for this buffer.
+	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -568,7 +591,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	push_constant.axis_v[3] = 10000.0f; // Max distance.
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
-	push_constant.frame_index = frame_index;
+	push_constant.frame_index = rb_state->frame_index;
 	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
 
 	(void)view_count;
@@ -610,8 +633,8 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->compute_list_end();
 
 		// Temporal accumulation: blurred + reprojected history -> mask (+ new history).
-		const StringName &history_read_name = history_parity ? RB_RT_SHADOW_HISTORY_1 : RB_RT_SHADOW_HISTORY_0;
-		const StringName &history_write_name = history_parity ? RB_RT_SHADOW_HISTORY_0 : RB_RT_SHADOW_HISTORY_1;
+		const StringName &history_read_name = rb_state->history_parity ? RB_RT_SHADOW_HISTORY_1 : RB_RT_SHADOW_HISTORY_0;
+		const StringName &history_write_name = rb_state->history_parity ? RB_RT_SHADOW_HISTORY_0 : RB_RT_SHADOW_HISTORY_1;
 		RID history_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_read_name, p_view, 0);
 		RID history_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_write_name, p_view, 0);
 
@@ -655,6 +678,8 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 }
 
 void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays) {
+	// Selected by advance_frame(), which every caller runs first for this buffer.
+	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(tlas.is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -690,7 +715,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	push_constant.axis_v[3] = 10000.0f; // Max distance.
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
-	push_constant.frame_index = frame_index;
+	push_constant.frame_index = rb_state->frame_index;
 	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
 
 	RID area_shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_AREA);
@@ -728,6 +753,8 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 }
 
 void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
+	// Selected by advance_frame(), which every caller runs first for this buffer.
+	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(tlas.is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cluster_buffer.is_null());
@@ -787,10 +814,10 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 
 	// Visible light lists, sized to the tile grid.
 	Size2i tiles((size.x + LIGHT_LIST_TILE_SIZE - 1) / LIGHT_LIST_TILE_SIZE, (size.y + LIGHT_LIST_TILE_SIZE - 1) / LIGHT_LIST_TILE_SIZE);
-	while (light_lists.size() <= p_view) {
-		light_lists.push_back(LightListBuffers());
+	while (rb_state->light_lists.size() <= p_view) {
+		rb_state->light_lists.push_back(RenderBuffersRT::LightListBuffers());
 	}
-	LightListBuffers &lists = light_lists[p_view];
+	RenderBuffersRT::LightListBuffers &lists = rb_state->light_lists[p_view];
 	if (lists.tiles != tiles || lists.buffers[0].is_null()) {
 		for (RID &buffer : lists.buffers) {
 			if (buffer.is_valid()) {
@@ -804,16 +831,16 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		}
 		lists.tiles = tiles;
 	}
-	RID list_read = lists.buffers[history_parity ? 1 : 0];
-	RID list_write = lists.buffers[history_parity ? 0 : 1];
+	RID list_read = lists.buffers[rb_state->history_parity ? 1 : 0];
+	RID list_write = lists.buffers[rb_state->history_parity ? 0 : 1];
 	// The sampling pass traces into the raw targets; the denoiser filters them
 	// into the buffers the scene shader reads.
 	RID diffuse_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_DIFFUSE, p_view, 0);
 	RID specular_slice = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_SPECULAR, p_view, 0);
 	RID depth = p_render_buffers->get_depth_texture(p_view);
 
-	while (stochastic_params_ubos.size() <= p_view) {
-		stochastic_params_ubos.push_back(rd->uniform_buffer_create(sizeof(StochasticParamsUBO)));
+	while (rb_state->stochastic_params_ubos.size() <= p_view) {
+		rb_state->stochastic_params_ubos.push_back(rd->uniform_buffer_create(sizeof(StochasticParamsUBO)));
 	}
 
 	StochasticParamsUBO params = {};
@@ -839,7 +866,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	params.screen_size[1] = size.y;
 	params.omni_light_count = p_omni_light_count;
 	params.spot_light_count = p_spot_light_count;
-	params.frame_index = frame_index;
+	params.frame_index = rb_state->frame_index;
 	params.ray_bias = p_quality.ray_bias;
 	params.tiles_x = tiles.x;
 	params.tiles_y = tiles.y;
@@ -861,7 +888,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// occupancy on every pixel.
 	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0);
-	rd->buffer_update(stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
+	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
 
@@ -871,7 +898,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ light_storage->get_omni_light_buffer() }));
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ light_storage->get_spot_light_buffer() }));
 	RD::Uniform u_list(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ list_read }));
-	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ stochastic_params_ubos[p_view] }));
+	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ rb_state->stochastic_params_ubos[p_view] }));
 	RD::Uniform u_cluster(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, Vector<RID>({ p_cluster_buffer }));
 	RD::Uniform u_stbn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, stbn_texture }));
 	RD::Uniform u_area(RD::UNIFORM_TYPE_STORAGE_BUFFER, 9, Vector<RID>({ light_storage->get_area_light_buffer() }));
@@ -933,14 +960,14 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// variance-driven spatial pass into the buffers the scene shader reads.
 	RID final_diffuse = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE, p_view, 0);
 	RID final_specular = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR, p_view, 0);
-	RID hist_read_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_HIST_DIFFUSE_1 : RB_RT_STOCHASTIC_HIST_DIFFUSE_0, p_view, 0);
-	RID hist_write_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_HIST_DIFFUSE_0 : RB_RT_STOCHASTIC_HIST_DIFFUSE_1, p_view, 0);
-	RID hist_read_s = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_HIST_SPECULAR_1 : RB_RT_STOCHASTIC_HIST_SPECULAR_0, p_view, 0);
-	RID hist_write_s = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_HIST_SPECULAR_0 : RB_RT_STOCHASTIC_HIST_SPECULAR_1, p_view, 0);
-	RID moments_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_MOMENTS_1 : RB_RT_STOCHASTIC_MOMENTS_0, p_view, 0);
-	RID moments_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_MOMENTS_0 : RB_RT_STOCHASTIC_MOMENTS_1, p_view, 0);
-	RID meta_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_META_1 : RB_RT_STOCHASTIC_META_0, p_view, 0);
-	RID meta_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, history_parity ? RB_RT_STOCHASTIC_META_0 : RB_RT_STOCHASTIC_META_1, p_view, 0);
+	RID hist_read_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_HIST_DIFFUSE_1 : RB_RT_STOCHASTIC_HIST_DIFFUSE_0, p_view, 0);
+	RID hist_write_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_HIST_DIFFUSE_0 : RB_RT_STOCHASTIC_HIST_DIFFUSE_1, p_view, 0);
+	RID hist_read_s = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_HIST_SPECULAR_1 : RB_RT_STOCHASTIC_HIST_SPECULAR_0, p_view, 0);
+	RID hist_write_s = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_HIST_SPECULAR_0 : RB_RT_STOCHASTIC_HIST_SPECULAR_1, p_view, 0);
+	RID moments_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_MOMENTS_1 : RB_RT_STOCHASTIC_MOMENTS_0, p_view, 0);
+	RID moments_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_MOMENTS_0 : RB_RT_STOCHASTIC_MOMENTS_1, p_view, 0);
+	RID meta_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_META_1 : RB_RT_STOCHASTIC_META_0, p_view, 0);
+	RID meta_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, rb_state->history_parity ? RB_RT_STOCHASTIC_META_0 : RB_RT_STOCHASTIC_META_1, p_view, 0);
 
 	StochasticDenoisePushConstant denoise_push_constant = {};
 	for (int col = 0; col < 4; col++) {
@@ -1020,6 +1047,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 }
 
 void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality) {
+	// Selected by advance_frame(), which every caller runs first for this buffer.
+	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(tlas.is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cascades.sdfgi_ubo.is_null());
@@ -1091,12 +1120,12 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RID raw_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_DIRECTIONAL, p_view, 0);
 	// The gather writes this frame's parity; the temporal pass validates its
 	// history against the other one (last frame's).
-	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
-	RID prev_view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_VIEW_DEPTH_1 : RB_RT_GI_VIEW_DEPTH_0, p_view, 0);
+	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
+	RID prev_view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_VIEW_DEPTH_1 : RB_RT_GI_VIEW_DEPTH_0, p_view, 0);
 	RID depth = p_render_buffers->get_depth_texture(p_view);
 
-	while (rt_gi_params_ubos.size() <= p_view) {
-		rt_gi_params_ubos.push_back(rd->uniform_buffer_create(sizeof(RtGiParamsUBO)));
+	while (rb_state->rt_gi_params_ubos.size() <= p_view) {
+		rb_state->rt_gi_params_ubos.push_back(rd->uniform_buffer_create(sizeof(RtGiParamsUBO)));
 	}
 
 	RtGiParamsUBO params = {};
@@ -1115,7 +1144,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.full_screen_size[0] = full_size.x;
 	params.full_screen_size[1] = full_size.y;
 	params.depth_scale = depth_scale;
-	params.frame_index = frame_index;
+	params.frame_index = rb_state->frame_index;
 	params.ray_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	params.flags = 0;
 	if (p_quality.screen_radiance && p_screen_radiance.is_valid()) {
@@ -1154,7 +1183,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.voxel_gi_count = MIN(p_cascades.voxel_gi_count, 8u);
 	params.ao_range = MAX(p_quality.ao_range, 0.01f);
 	params.inv_ao_range = 1.0f / params.ao_range;
-	rd->buffer_update(rt_gi_params_ubos[p_view], 0, sizeof(RtGiParamsUBO), &params);
+	rd->buffer_update(rb_state->rt_gi_params_ubos[p_view], 0, sizeof(RtGiParamsUBO), &params);
 
 	RID shader_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 0);
 	RID default_3d = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
@@ -1177,7 +1206,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
-	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ rt_gi_params_ubos[p_view] }));
+	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ rb_state->rt_gi_params_ubos[p_view] }));
 	RD::Uniform u_stbn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, stbn_texture }));
 	RD::Uniform u_sdf(RD::UNIFORM_TYPE_TEXTURE, 5, sdf_ids);
 	RD::Uniform u_light(RD::UNIFORM_TYPE_TEXTURE, 6, light_ids);
@@ -1213,17 +1242,17 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	// unset so "dominance" is zero).
 	RID final_ambient = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT, p_view, 0);
 	RID final_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION, p_view, 0);
-	RID hist_read_a = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_AMBIENT_1 : RB_RT_GI_HIST_AMBIENT_0, p_view, 0);
-	RID hist_write_a = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_AMBIENT_0 : RB_RT_GI_HIST_AMBIENT_1, p_view, 0);
-	RID hist_read_r = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_REFLECTION_1 : RB_RT_GI_HIST_REFLECTION_0, p_view, 0);
-	RID hist_write_r = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_REFLECTION_0 : RB_RT_GI_HIST_REFLECTION_1, p_view, 0);
-	RID moments_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_MOMENTS_1 : RB_RT_GI_MOMENTS_0, p_view, 0);
-	RID moments_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_MOMENTS_0 : RB_RT_GI_MOMENTS_1, p_view, 0);
-	RID meta_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_META_1 : RB_RT_GI_META_0, p_view, 0);
-	RID meta_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_META_0 : RB_RT_GI_META_1, p_view, 0);
+	RID hist_read_a = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_AMBIENT_1 : RB_RT_GI_HIST_AMBIENT_0, p_view, 0);
+	RID hist_write_a = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_AMBIENT_0 : RB_RT_GI_HIST_AMBIENT_1, p_view, 0);
+	RID hist_read_r = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_REFLECTION_1 : RB_RT_GI_HIST_REFLECTION_0, p_view, 0);
+	RID hist_write_r = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_REFLECTION_0 : RB_RT_GI_HIST_REFLECTION_1, p_view, 0);
+	RID moments_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_MOMENTS_1 : RB_RT_GI_MOMENTS_0, p_view, 0);
+	RID moments_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_MOMENTS_0 : RB_RT_GI_MOMENTS_1, p_view, 0);
+	RID meta_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_1 : RB_RT_GI_META_0, p_view, 0);
+	RID meta_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_0 : RB_RT_GI_META_1, p_view, 0);
 	RID final_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_DIRECTIONAL, p_view, 0);
-	RID hist_read_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_DIRECTIONAL_1 : RB_RT_GI_HIST_DIRECTIONAL_0, p_view, 0);
-	RID hist_write_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, history_parity ? RB_RT_GI_HIST_DIRECTIONAL_0 : RB_RT_GI_HIST_DIRECTIONAL_1, p_view, 0);
+	RID hist_read_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_DIRECTIONAL_1 : RB_RT_GI_HIST_DIRECTIONAL_0, p_view, 0);
+	RID hist_write_d = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_DIRECTIONAL_0 : RB_RT_GI_HIST_DIRECTIONAL_1, p_view, 0);
 
 	StochasticDenoisePushConstant denoise_push_constant = {};
 	for (int col = 0; col < 4; col++) {
