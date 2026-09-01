@@ -406,62 +406,94 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 				continue;
 			}
 		}
-		uint32_t surface_mask = inst->data->shadow_casting_surface_mask;
+		const uint32_t casting_mask = inst->data->shadow_casting_surface_mask;
 
-		MeshBlas *entry;
-		if (is_skinned) {
-			// Deformed geometry: its own BLAS over the skinned vertex buffers,
-			// rebuilt every frame (the skinning dispatch is recorded earlier in
-			// the cull, so the build reads this frame's positions).
-			entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
-		} else {
-			entry = _resolve_mesh_blas(mesh, surface_mask);
-		}
-		if (entry == nullptr || entry->blas.is_null()) {
-			continue;
-		}
-		if (is_skinned) {
-			for (const DecodeJob &job : entry->decode_jobs) {
-				_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
+		// Shadow rays cull front faces so that, like shadow maps, a surface
+		// occludes only through the faces its material draws. Surfaces drawn
+		// double-sided or with front-face culling need their own TLAS
+		// instance carrying the flag that changes that, so the casting
+		// surfaces split into up to three BLASes by facing class.
+		struct FacingClass {
+			uint32_t mask;
+			BitField<RD::AccelerationStructureInstanceFlagBits> flags;
+		};
+		const uint32_t double_sided = casting_mask & inst->data->double_sided_shadow_surface_mask;
+		const uint32_t front_cull = casting_mask & inst->data->front_cull_shadow_surface_mask & ~double_sided;
+		const FacingClass classes[3] = {
+			{ casting_mask & ~double_sided & ~front_cull, {} },
+			{ double_sided, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT },
+			{ front_cull, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT },
+		};
+
+		for (const FacingClass &facing : classes) {
+			const uint32_t surface_mask = facing.mask;
+			if (surface_mask == 0) {
+				continue;
 			}
-			rd->blas_build(entry->blas);
-			entry->built = true;
-		} else if (!entry->built) {
-			rd->blas_build(entry->blas);
-			entry->built = true;
-		}
 
-		RD::AccelerationStructureInstance as_instance;
-		// Instance mask from the object's render layers so per-light shadow
-		// caster masks can cull rays (exact for layers 1-8; objects on only
-		// higher layers degrade to always casting).
-		uint32_t layers = inst->layer_mask & 0xFF;
-		as_instance.mask = layers != 0 ? layers : 0xFF;
-		// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
-		as_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
-		as_instance.blas = entry->blas;
-
-		if (is_multimesh) {
-			// One TLAS instance per multimesh instance, sharing the BLAS. The
-			// per-instance transforms come from the multimesh data cache
-			// (reading it makes GPU-set buffers CPU-local once, then stays
-			// cheap). Capped so pathological instance counts (grass fields)
-			// cannot explode the TLAS; instances past the cap just don't
-			// occlude, matching how they'd LOD out of shadow maps anyway.
-			const int MAX_MULTIMESH_TLAS_INSTANCES = 16384;
-			int instance_count = mesh_storage->multimesh_get_instance_count(inst->data->base);
-			int visible = mesh_storage->multimesh_get_visible_instances(inst->data->base);
-			if (visible >= 0) {
-				instance_count = MIN(instance_count, visible);
+			MeshBlas *entry;
+			if (is_skinned) {
+				// Deformed geometry: its own BLAS over the skinned vertex buffers,
+				// rebuilt every frame (the skinning dispatch is recorded earlier in
+				// the cull, so the build reads this frame's positions).
+				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
+			} else {
+				entry = _resolve_mesh_blas(mesh, surface_mask);
 			}
-			instance_count = MIN(instance_count, MAX_MULTIMESH_TLAS_INSTANCES);
-			for (int mm = 0; mm < instance_count; mm++) {
-				as_instance.transform = inst->transform * mesh_storage->multimesh_instance_get_transform(inst->data->base, mm);
+			if (entry == nullptr || entry->blas.is_null()) {
+				continue;
+			}
+			if (is_skinned) {
+				for (const DecodeJob &job : entry->decode_jobs) {
+					_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
+				}
+				rd->blas_build(entry->blas);
+				entry->built = true;
+			} else if (!entry->built) {
+				rd->blas_build(entry->blas);
+				entry->built = true;
+			}
+
+			RD::AccelerationStructureInstance as_instance;
+			// Instance mask from the object's render layers so per-light shadow
+			// caster masks can cull rays (exact for layers 1-8; objects on only
+			// higher layers degrade to always casting).
+			uint32_t layers = inst->layer_mask & 0xFF;
+			as_instance.mask = layers != 0 ? layers : 0xFF;
+			// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
+			as_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+			as_instance.blas = entry->blas;
+
+			// A mirrored transform needs no facing flip here, unlike the raster
+			// passes' flipped cull: intersection tests facing in the BLAS's
+			// own space, where a reflection leaves the drawn side the drawn
+			// side (rt_lab/facing_test.gd MIRROR=1 measures both cases).
+			auto push_instance = [&](const Transform3D &p_transform) {
+				as_instance.transform = p_transform;
+				as_instance.flags = facing.flags;
 				as_instances.push_back(as_instance);
+			};
+
+			if (is_multimesh) {
+				// One TLAS instance per multimesh instance, sharing the BLAS. The
+				// per-instance transforms come from the multimesh data cache
+				// (reading it makes GPU-set buffers CPU-local once, then stays
+				// cheap). Capped so pathological instance counts (grass fields)
+				// cannot explode the TLAS; instances past the cap just don't
+				// occlude, matching how they'd LOD out of shadow maps anyway.
+				const int MAX_MULTIMESH_TLAS_INSTANCES = 16384;
+				int instance_count = mesh_storage->multimesh_get_instance_count(inst->data->base);
+				int visible = mesh_storage->multimesh_get_visible_instances(inst->data->base);
+				if (visible >= 0) {
+					instance_count = MIN(instance_count, visible);
+				}
+				instance_count = MIN(instance_count, MAX_MULTIMESH_TLAS_INSTANCES);
+				for (int mm = 0; mm < instance_count; mm++) {
+					push_instance(inst->transform * mesh_storage->multimesh_instance_get_transform(inst->data->base, mm));
+				}
+			} else {
+				push_instance(inst->transform);
 			}
-		} else {
-			as_instance.transform = inst->transform;
-			as_instances.push_back(as_instance);
 		}
 	}
 

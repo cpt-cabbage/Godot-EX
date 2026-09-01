@@ -36,9 +36,11 @@ bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
 	if (caster_mask == 0u) {
 		return false; // The light casts no shadows from any object.
 	}
+	// Back faces culled: the shadow-map convention, where only the faces a
+	// material draws occlude (see trace_visible in the stochastic pass).
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas,
-			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
 			caster_mask, p_origin, params.axis_u.w, p_dir, p_max_dist);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;

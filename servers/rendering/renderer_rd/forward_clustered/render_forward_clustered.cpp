@@ -4817,7 +4817,15 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	if (flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
 		ginstance->data->has_shadow_casting_surface = true;
 		// Surfaces past the first 32 conservatively count as casting.
-		ginstance->data->shadow_casting_surface_mask |= p_surface < 32 ? (1u << p_surface) : 0xFFFFFFFFu;
+		const uint32_t surface_bit = p_surface < 32 ? (1u << p_surface) : 0xFFFFFFFFu;
+		ginstance->data->shadow_casting_surface_mask |= surface_bit;
+		// The same cull decision the shadow pass makes below (see the
+		// FLAG_USES_DOUBLE_SIDED_SHADOWS branch in _render_list_template).
+		if ((flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS) || p_material->shader_data->cull_mode == RSE::CULL_MODE_DISABLED) {
+			ginstance->data->double_sided_shadow_surface_mask |= surface_bit;
+		} else if (p_material->shader_data->cull_mode == RSE::CULL_MODE_FRONT) {
+			ginstance->data->front_cull_shadow_surface_mask |= surface_bit;
+		}
 	}
 
 	if (p_material->shader_data->uses_particle_trails) {
@@ -4985,6 +4993,8 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 	// Recomputed below as surfaces are added.
 	ginstance->data->has_shadow_casting_surface = false;
 	ginstance->data->shadow_casting_surface_mask = 0;
+	ginstance->data->double_sided_shadow_surface_mask = 0;
+	ginstance->data->front_cull_shadow_surface_mask = 0;
 
 	//add geometry for drawing
 	switch (ginstance->data->base_type) {

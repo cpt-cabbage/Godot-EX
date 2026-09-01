@@ -821,8 +821,9 @@ void main() {
 				float rq_dist = length(rq_delta);
 				if (rq_dist > 0.1) {
 					rayQueryEXT rq;
+					// Back faces culled, as the other shadow rays do (shadow-map semantics).
 					rayQueryInitializeEXT(rq, tlas,
-							gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+							gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
 							0xFF, rq_world_origin, 0.05, rq_delta / rq_dist, rq_dist - 0.05);
 					rayQueryProceedEXT(rq);
 					if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {

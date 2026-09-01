@@ -492,9 +492,16 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	if (dist < 1e-4) {
 		return true;
 	}
+	// Shadow maps see an occluder only through the faces its material does
+	// not cull, so a light inside a closed fixture mesh lights the room. The
+	// ray gets the same answer by culling the faces whose drawn side looks
+	// away from the light. Which flag that is depends on the winding
+	// convention the acceleration structure sees; on Metal, measured with
+	// rt_lab/facing_test.gd, it is back-face culling. Instances drawn
+	// double-sided carry the TLAS flag that turns culling off for them.
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas,
-			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
 			caster_mask, world_origin, params.ray_bias, delta / dist, dist - params.ray_bias);
 	rayQueryProceedEXT(rq);
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;

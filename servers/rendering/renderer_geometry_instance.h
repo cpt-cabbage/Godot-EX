@@ -134,6 +134,13 @@ public:
 		// (e.g. transparent glass) are excluded from ray tracing BLASes just
 		// as they are skipped by the shadow map passes.
 		uint32_t shadow_casting_surface_mask = 0xFFFFFFFF;
+		// Facing classes of the casting surfaces, for ray-traced shadows to
+		// occlude the way shadow maps do: a surface whose material culls back
+		// faces occludes from its front only; one drawn double-sided (material
+		// cull disabled, or the instance's double-sided shadow setting)
+		// occludes from both; one culling front faces occludes from its back.
+		uint32_t double_sided_shadow_surface_mask = 0;
+		uint32_t front_cull_shadow_surface_mask = 0;
 		bool dirty_dependencies = false;
 
 		DependencyTracker dependency_tracker;
