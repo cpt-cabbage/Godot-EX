@@ -3192,14 +3192,20 @@ void fragment_shader(in SceneData scene_data) {
 	// Stochastic direct lighting (mini-MegaLights): omni/spot/area
 	// contribution computed by the ray-traced compute pass. Demodulated:
 	// albedo, AO and metallic are applied by the common composite below.
+	// The specular buffer holds the lobe without its Fresnel term (rgb) and the
+	// Schlick weight (a): the compute pass has no material, so the Fresnel is
+	// applied here with this fragment's f0 / f90, as light_compute would. That
+	// is what lets metals and coloured f0 keep their highlights.
+	float stochastic_f90 = clamp(50.0 * f0.g, metallic, 1.0);
 	if (implementation_data.stochastic_direct_lights == 1u) {
 #ifdef USE_MULTIVIEW
 		diffuse_light += textureLod(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
-		direct_specular_light += textureLod(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
+		vec4 stochastic_spec = textureLod(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
 #else
 		diffuse_light += textureLod(sampler2D(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
-		direct_specular_light += textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
+		vec4 stochastic_spec = textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
+		direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
 	} else if (implementation_data.stochastic_direct_lights == 2u) {
 		// Half resolution buffers: depth-aware upsample. Each half-res texel
 		// stores the view depth it was lit at; weight the four nearest by
@@ -3225,12 +3231,12 @@ void fragment_shader(in SceneData scene_data) {
 		vec2 fr = pos - vec2(base);
 		float own_depth = -vertex.z;
 		vec3 up_diffuse = vec3(0.0);
-		vec3 up_specular = vec3(0.0);
+		vec4 up_specular = vec4(0.0);
 		float up_weight = 0.0;
 		// Best depth match, kept for when no tap agrees well enough to trust
 		// the blend.
 		vec3 near_diffuse = vec3(0.0);
-		vec3 near_specular = vec3(0.0);
+		vec4 near_specular = vec4(0.0);
 		float near_depth_weight = -1.0;
 		for (int i = 0; i < 4; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
@@ -3238,11 +3244,11 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef USE_MULTIVIEW
 			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
 			vec3 tap_diffuse = texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
-			vec3 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+			vec4 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
 #else
 			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
 			vec3 tap_diffuse = texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
-			vec3 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+			vec4 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
 #endif
 			float depth_weight = exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
 			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y)) * depth_weight;
@@ -3259,17 +3265,19 @@ void fragment_shader(in SceneData scene_data) {
 		}
 		// Any positive sum normalizes correctly, however small -- this only has
 		// to catch the case where every tap was rejected to nothing.
+		vec4 stochastic_spec;
 		if (up_weight > 1e-6) {
 			diffuse_light += up_diffuse / up_weight;
-			direct_specular_light += up_specular / up_weight;
+			stochastic_spec = up_specular / up_weight;
 		} else {
 			// Every tap disagreed on depth. Adding nothing, as this did, leaves
 			// the pixel with no direct lighting whatsoever -- a black speckle
 			// that crawls along silhouettes as the camera moves. A single
 			// mismatched sample is far closer to the truth than darkness.
 			diffuse_light += near_diffuse;
-			direct_specular_light += near_specular;
+			stochastic_spec = near_specular;
 		}
+		direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
 	}
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 

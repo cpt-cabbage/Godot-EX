@@ -93,6 +93,7 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n#define VALIDATE_DEPTH\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define FILTER_DIRECTIONAL\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define FILTER_DIRECTIONAL\n#define SPATIAL_HDR_OUT\n");
+	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define SPATIAL_SPEC_ALPHA_OUT\n");
 	stochastic_denoise_shader.initialize(stochastic_denoise_modes);
 	stochastic_denoise_shader_version = stochastic_denoise_shader.version_create();
 	for (int i = 0; i < DENOISE_VARIANT_MAX; i++) {
@@ -815,14 +816,22 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		// shading confidence in a small meta texture, full precision only for
 		// the moments the variance estimate needs.
 		const StringName lighting_names[] = {
-			RB_RT_STOCHASTIC_DIFFUSE, RB_RT_STOCHASTIC_SPECULAR,
+			RB_RT_STOCHASTIC_DIFFUSE,
 			RB_RT_STOCHASTIC_RAW_DIFFUSE, RB_RT_STOCHASTIC_RAW_SPECULAR,
 			RB_RT_STOCHASTIC_HIST_DIFFUSE_0, RB_RT_STOCHASTIC_HIST_DIFFUSE_1,
 			RB_RT_STOCHASTIC_HIST_SPECULAR_0, RB_RT_STOCHASTIC_HIST_SPECULAR_1,
-			RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE, RB_RT_STOCHASTIC_ANALYTIC_SPECULAR
+			RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE
 		};
 		for (const StringName &name : lighting_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
+		}
+		// The specular buffers the scene shader consumes carry the Fresnel weight
+		// in alpha (the analytic lobe is stored without its Fresnel term so the
+		// material's own f0 / f90 can be applied at composite time).
+		const StringName specular_names[] = { RB_RT_STOCHASTIC_SPECULAR, RB_RT_STOCHASTIC_ANALYTIC_SPECULAR };
+		for (const StringName &name : specular_names) {
+			p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
 		const StringName moments_names[] = { RB_RT_STOCHASTIC_MOMENTS_0, RB_RT_STOCHASTIC_MOMENTS_1 };
@@ -1108,7 +1117,10 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 
 		denoise_push_constant.flags = last ? DENOISE_FLAG_MODULATE_ANALYTIC : 0;
 		denoise_push_constant.stride = p_quality.spatial_stride << iteration;
-		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_SPATIAL);
+		// The final iteration writes the RGBA16F specular buffer (Fresnel weight
+		// in alpha); the intermediate ones stay in the packed scratch format.
+		const DenoiseVariant variant = last ? DENOISE_VARIANT_SPATIAL_SPEC_ALPHA : DENOISE_VARIANT_SPATIAL;
+		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, variant);
 		RD::Uniform u_in_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_diffuse }));
 		RD::Uniform u_in_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, in_specular }));
 		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));

@@ -115,7 +115,8 @@ layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_d
 // Unshadowed analytic lighting, multiplied back into the denoised visibility
 // ratios at the end of the denoiser's spatial pass.
 layout(set = 1, binding = 5, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_diffuse;
-layout(set = 1, binding = 6, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_specular;
+// rgb: the specular lobe without Fresnel, a: the Schlick weight (see light_eval).
+layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_analytic_specular;
 
 #define MAX_RESERVOIRS 4u
 #define TILE_SIZE 8
@@ -337,7 +338,8 @@ vec3 bound_analytic(vec3 c) {
 
 // Unshadowed diffuse (radiance, no albedo) and specular contribution of a
 // light at a view-space point. Zero when out of range or facing away.
-void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec3 light_rel_vec) {
+void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split, out vec3 light_rel_vec) {
+	spec_split = vec4(0.0);
 	LightData ld = is_spot ? spot_lights.data[idx] : omni_lights.data[idx];
 	light_rel_vec = ld.position - view_pos;
 	float light_length = length(light_rel_vec);
@@ -386,45 +388,66 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	}
 
 	float ndotl = clamp(size_A + dot(view_normal, l), 0.0, 1.0);
-	diffuse = color * (ndotl * (1.0 / M_PI) * attenuation);
 
-	// Schlick-GGX, dielectric F0. The prepass has no albedo/metallic, so the
-	// specular is an approximation the composite cannot recover exactly.
 	vec3 v = normalize(-view_pos);
 	vec3 h = normalize(v + l);
 	float ndotv = max(dot(view_normal, v), 1e-4);
-	float ndoth = clamp(dot(view_normal, h), 0.0, 1.0);
-	float ldoth = clamp(dot(l, h), 0.0, 1.0);
+	// The size term folded into every cosine, as light_compute does with its
+	// A parameter. This is what the scene shader renders for the same light
+	// through the clustered path, and the composite multiplies this pass's
+	// lobe by that shader's own Fresnel, so the two have to agree on the
+	// lobe. (Widening alpha by the subtended angle and renormalising, Karis'
+	// representative point, was tried here: it is the better sphere-light
+	// model, and it read as the stochastic path losing half the highlight of
+	// every sized lamp against the rest of the engine.)
+	float ndoth = clamp(size_A + dot(view_normal, h), 0.0, 1.0);
+	float ldoth = clamp(size_A + dot(l, h), 0.0, 1.0);
 
-	float alpha = max(roughness * roughness, 1e-3);
-	// Sphere light specular: widen the lobe by the light's subtended angle and
-	// renormalize so the wider lobe carries the same energy (Karis' normalized
-	// representative point). Folding size_A into ndoth instead, as the diffuse
-	// terminator does, pins ndoth to 1 across a whole cone, which holds D at
-	// its peak over a disc rather than falling off -- that is what turned close
-	// sized lights into flat-topped blown-out discs.
-	float alpha_prime = alpha;
-	if (ld.size > 0.0) {
-		alpha_prime = clamp(alpha + ld.size / (2.0 * max(light_length, 1e-3)), alpha, 1.0);
-	}
-	float sphere_norm = (alpha / alpha_prime) * (alpha / alpha_prime);
-	float alpha2 = alpha_prime * alpha_prime;
-	float d = ndoth * ndoth * (alpha2 - 1.0) + 1.0;
-	float D = min(alpha2 / (M_PI * d * d), D_GGX_MAX) * sphere_norm;
-	float k = alpha * 0.5;
-	float G = (ndotl / (ndotl * (1.0 - k) + k)) * (ndotv / (ndotv * (1.0 - k) + k));
+	// Burley diffuse, the scene shader's default (DIFFUSE_BURLEY in
+	// scene_forward_lights_inc.glsl). Lambert alone under-lit rough surfaces
+	// at grazing incidence by up to half -- exactly the band a lamp hanging
+	// near a wall or ceiling lights -- and the gather then bounced the
+	// shortfall around the room. Materials on the Lambert or wrap modes
+	// still get this term; the prepass cannot tell them apart.
+	float fd90_minus_1 = 2.0 * ldoth * ldoth * roughness - 0.5;
+	float fd_v = 1.0 + fd90_minus_1 * pow(1.0 - ndotv, 5.0);
+	float fd_l = 1.0 + fd90_minus_1 * pow(1.0 - ndotl, 5.0);
+	diffuse = color * (ndotl * (1.0 / M_PI) * fd_v * fd_l * attenuation);
+
+	// Schlick-GGX, dielectric F0. The prepass has no albedo/metallic, so the
+	// specular is an approximation the composite cannot recover exactly.
+
+	// Godot's D_GGX and V_GGX (scene_forward_lights_inc.glsl), term for term,
+	// with the same half-float ceiling. V is the height-correlated Smith
+	// visibility and includes the 1 / (4 NdotL NdotV) of the microfacet BRDF;
+	// the separable Schlick-GGX it replaced fell off quadratically at grazing
+	// incidence where this falls off linearly, which halved the specular tail
+	// of rough metals away from the highlight.
+	float alpha = roughness * roughness;
+	float ndoth_alpha = ndoth * alpha;
+	float ggx_k = alpha / max(1.0 - ndoth * ndoth + ndoth_alpha * ndoth_alpha, 1e-8);
+	float D = min(ggx_k * ggx_k * (1.0 / M_PI), D_GGX_MAX);
+	float V = min(0.5 / max(mix(2.0 * ndotl * ndotv, ndotl + ndotv, alpha), 1e-8), D_GGX_MAX);
+	// The prepass has no albedo or metallic, so the Fresnel term cannot be
+	// evaluated here. spec_split carries the lobe without it (rgb) and the
+	// Schlick weight (1 - LdotH)^5 (a); the scene shader, which knows the
+	// material's f0 and f90, reassembles F = f0 + (f90 - f0) * a there. The
+	// dielectric estimate below only feeds sampling weights and the ratio.
+	vec3 spec_base = color * attenuation * ndotl * D * V * ld.specular_amount;
+	float fc = pow(1.0 - ldoth, 5.0);
+	spec_split = vec4(spec_base, fc);
 	const float f0 = 0.04;
-	float F = f0 + (1.0 - f0) * pow(1.0 - ldoth, 5.0);
-	specular = color * attenuation * ndotl * (D * G * F / max(4.0 * ndotv, 1e-4)) * ld.specular_amount;
+	specular = spec_base * (f0 + (1.0 - f0) * fc);
 }
 
 // Unshadowed LTC diffuse and specular contribution of an area light, the
 // analytic core of the scene shader's light_process_area (clearcoat,
 // transmittance and material-dependent terms cannot apply here: the prepass
 // carries only normal and roughness, so the specular assumes a dielectric).
-void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular) {
+void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	diffuse = vec3(0.0);
 	specular = vec3(0.0);
+	spec_split = vec4(0.0);
 	LightData ld = area_lights.data[idx];
 	vec3 area_width = ld.area_width;
 	vec3 area_height = ld.area_height;
@@ -471,18 +494,24 @@ void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness,
 	vec2 ltc_fresnel = vec2(0.0);
 	vec3 specular_tex_color = vec3(1.0);
 	ltc_evaluate_specular(view_normal, eye_vec, roughness, points, ld.projector_rect, max_mipmap, area_light_atlas, material_sampler, material_sampler, ltc_lut1, ltc_lut2, ltc_specular, ltc_fresnel, specular_tex_color);
+	// LTC gives the Fresnel as two coefficients, F = f0 * x + (f90 - f0) * y.
+	// Same split as light_eval: rgb carries the f0 coefficient, a the ratio
+	// y / x the scene shader multiplies (f90 - f0) by.
+	float fx = max(ltc_fresnel.x, 0.0);
+	float fy = max(ltc_fresnel.y, 0.0);
+	vec3 spec_base = ltc_specular * specular_tex_color * ld.color * att_ltc * ld.specular_amount;
+	spec_split = vec4(spec_base * fx, fx > 1e-6 ? clamp(fy / fx, 0.0, 1.0) : 0.0);
 	const float f0 = 0.04;
-	float fresnel = f0 * max(ltc_fresnel.x, 0.0) + (1.0 - f0) * max(ltc_fresnel.y, 0.0);
-	specular = ltc_specular * fresnel * specular_tex_color * ld.color * att_ltc * ld.specular_amount;
+	specular = spec_base * (f0 * fx + (1.0 - f0) * fy);
 }
 
 // Unshadowed contribution of any encoded light entry.
-void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular) {
+void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	if ((entry & AREA_BIT) != 0u) {
-		area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular);
+		area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
 	} else {
 		vec3 unused_rel;
-		light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, unused_rel);
+		light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split, unused_rel);
 	}
 }
 
@@ -677,6 +706,12 @@ void main() {
 	// zero radiance anyway and is dropped by the w <= 0.0 test.)
 	vec3 analytic_diffuse = vec3(0.0);
 	vec3 analytic_specular = vec3(0.0);
+	// The specular lobe without its Fresnel term, and the luminance-weighted
+	// mean of the Schlick weight, for the scene shader to apply the material's
+	// own f0 / f90 to (see light_eval).
+	vec3 analytic_spec_base = vec3(0.0);
+	float analytic_fc_num = 0.0;
+	float analytic_fc_den = 0.0;
 	// The same two sums as scalar luminance, in the |luminance| convention the
 	// ray terms use. These are the ratio's denominators: taking them from the
 	// vec3 sums instead would normalize by |sum L| where the numerator estimates
@@ -693,7 +728,8 @@ void main() {
 	for (uint i = 0u; i < visible_count && candidate_count < guided_budget; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
-		entry_eval(entry, view_pos, view_normal, roughness, f, s);
+		vec4 ss_unused;
+		entry_eval(entry, view_pos, view_normal, roughness, f, s, ss_unused);
 		float lum = abs(luminance(f + s)); // abs: negative lights sample too.
 		float w = light_weight(lum);
 		// Down-weight lights the tile found mostly shadowed last frame; the
@@ -801,7 +837,8 @@ void main() {
 					}
 
 					vec3 f, s;
-					entry_eval(entry, view_pos, view_normal, roughness, f, s);
+					vec4 ss;
+					entry_eval(entry, view_pos, view_normal, roughness, f, s, ss);
 					// One evaluation serves both the analytic sum and, below,
 					// the candidate set. The analytic sum takes every cell light
 					// unscaled when exact, and the stride-scaled sampled subset
@@ -810,6 +847,10 @@ void main() {
 					float analytic_scale = analytic_exact ? 1.0 : stride_mult;
 					analytic_diffuse += f * analytic_scale;
 					analytic_specular += s * analytic_scale;
+					analytic_spec_base += ss.rgb * analytic_scale;
+					float ss_lum = abs(luminance(ss.rgb)) * analytic_scale;
+					analytic_fc_num += ss_lum * ss.a;
+					analytic_fc_den += ss_lum;
 					analytic_lum_d += abs(luminance(f)) * analytic_scale;
 					analytic_lum_s += abs(luminance(s)) * analytic_scale;
 					if (!sampled) {
@@ -932,7 +973,8 @@ void main() {
 		bool culled = candidate_lum[c] < CULL_CONTRIBUTION_FRACTION * total_lum;
 
 		vec3 f, s;
-		entry_eval(entry, view_pos, view_normal, roughness, f, s);
+		vec4 ss_unused;
+		entry_eval(entry, view_pos, view_normal, roughness, f, s, ss_unused);
 
 		float visibility = 1.0;
 		uint quadrant = 0u;
@@ -1160,7 +1202,7 @@ void main() {
 	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
 	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
 	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
-	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_specular), 0.0));
+	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_spec_base), analytic_fc_den > 0.0 ? analytic_fc_num / analytic_fc_den : 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 	imageStore(out_meta, pixel, vec4(dominance));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z));

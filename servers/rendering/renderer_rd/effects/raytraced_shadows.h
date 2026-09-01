@@ -315,6 +315,7 @@ private:
 		DENOISE_VARIANT_TEMPORAL_VALIDATE, // Temporal with depth-validated history (the GI signal).
 		DENOISE_VARIANT_SPATIAL_DIRECTIONAL, // Spatial carrying the GI directional buffer along.
 		DENOISE_VARIANT_SPATIAL_DIRECTIONAL_HDR, // The same, writing an intermediate a-trous iteration into the unpacked accumulation buffers.
+		DENOISE_VARIANT_SPATIAL_SPEC_ALPHA, // Direct lighting's final iteration: specular out carries the Fresnel weight in alpha.
 		DENOISE_VARIANT_MAX,
 	};
 

@@ -59,6 +59,14 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #else
 #define SPATIAL_OUT_FORMAT r11f_g11f_b10f
 #endif
+// The direct lighting's final iteration writes its specular with the analytic
+// buffer's Fresnel weight in alpha (see stochastic_direct_lighting.glsl,
+// light_eval), which the packed format has no room for.
+#if defined(SPATIAL_SPEC_ALPHA_OUT) || defined(SPATIAL_HDR_OUT)
+#define SPATIAL_SPEC_OUT_FORMAT rgba16f
+#else
+#define SPATIAL_SPEC_OUT_FORMAT r11f_g11f_b10f
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D in_diffuse;
 layout(set = 0, binding = 1) uniform sampler2D in_specular;
@@ -122,7 +130,7 @@ layout(set = 0, binding = 8) uniform sampler2D in_directional;
 // the rounding never compounds. Intermediate a-trous iterations keep the
 // accumulation format instead (SPATIAL_HDR_OUT).
 layout(set = 1, binding = 0, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
+layout(set = 1, binding = 1, SPATIAL_SPEC_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
 #ifdef FILTER_DIRECTIONAL
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
 #endif
@@ -485,12 +493,15 @@ void main() {
 // a wild reconstruction. Scaling the moment by a positive scalar is safe: it
 // scales the ratio by the same factor and cannot break its bound.
 void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
+	float spec_fresnel_weight = 0.0;
 	if ((params.flags & FLAG_MODULATE_ANALYTIC) != 0u) {
 		d *= texelFetch(analytic_diffuse, pixel, 0).rgb;
-		s *= texelFetch(analytic_specular, pixel, 0).rgb;
+		vec4 analytic_s = texelFetch(analytic_specular, pixel, 0);
+		s *= analytic_s.rgb;
+		spec_fresnel_weight = analytic_s.a;
 	}
 	imageStore(out_diffuse, pixel, vec4(d, 0.0));
-	imageStore(out_specular, pixel, vec4(s, 0.0));
+	imageStore(out_specular, pixel, vec4(s, spec_fresnel_weight));
 #if defined(FILTER_DIRECTIONAL) && defined(SPATIAL_HDR_OUT)
 	// Intermediate iteration: carry the moment through unchanged, the last one
 	// renormalizes it against the irradiance it will actually be paired with.
