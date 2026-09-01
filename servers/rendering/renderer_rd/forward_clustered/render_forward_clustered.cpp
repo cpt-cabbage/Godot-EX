@@ -1885,8 +1885,16 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/half_resolution");
 	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/rays_per_pixel"));
 	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance");
+	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_border_fade");
+	rt_gi_screen_radiance_clamp = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_clamp");
+	rt_gi_probe_floor = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/probe_floor");
+	use_rt_gi_screen_traces = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_traces");
+	use_rt_gi_light_cascade_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/light_cascade_radiance");
 	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
 	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/temporal_frames"));
+	rt_gi_spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_stride"));
+	rt_gi_spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_iterations"));
+	rt_gi_variance_threshold = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/variance_threshold");
 	use_rt_gi_directional = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional");
 	use_rt_gi_specular_occlusion = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular_occlusion");
 	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/reflection_probe_refit");
@@ -2550,6 +2558,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
 					if (sdfgi.is_valid() && sdfgi->cascades.size() > 0) {
 						gi_cascades.active = true;
+						gi_cascades.lightprobe_texture = sdfgi->lightprobe_texture;
+						gi_cascades.occlusion_texture = sdfgi->occlusion_texture;
 						for (uint32_t c = 0; c < sdfgi->cascades.size(); c++) {
 							gi_cascades.sdf.push_back(sdfgi->cascades[c].sdf_tex);
 							gi_cascades.light.push_back(sdfgi->cascades[c].light_tex);
@@ -2585,15 +2595,22 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.rays_per_pixel = rt_gi_rays;
 				gi_quality.half_resolution = use_rt_gi_half_res;
 				gi_quality.screen_radiance = use_rt_gi_screen_radiance;
+				gi_quality.screen_radiance_border_fade = rt_gi_screen_radiance_border_fade;
+				gi_quality.screen_radiance_clamp = rt_gi_screen_radiance_clamp;
+				gi_quality.probe_floor = rt_gi_probe_floor;
 				gi_quality.specular = use_rt_gi_specular;
-				gi_quality.screen_traces = stochastic_quality.screen_traces;
+				gi_quality.screen_traces = use_rt_gi_screen_traces;
+				gi_quality.light_cascade_radiance = use_rt_gi_light_cascade_radiance;
 				gi_quality.ray_bias = stochastic_quality.ray_bias;
 				gi_quality.temporal_frames = rt_gi_temporal_frames;
-			gi_quality.ao_range = rt_gi_ao_range;
+				gi_quality.ao_range = rt_gi_ao_range;
 				gi_quality.denoise = stochastic_quality.denoise;
-				gi_quality.spatial_stride = stochastic_quality.spatial_stride;
-				gi_quality.spatial_iterations = stochastic_quality.spatial_iterations;
-				gi_quality.variance_threshold = stochastic_quality.variance_threshold;
+				gi_quality.spatial_stride = rt_gi_spatial_stride;
+				gi_quality.spatial_iterations = rt_gi_spatial_iterations;
+				gi_quality.variance_threshold = rt_gi_variance_threshold;
+				if (run_rt_gi && !gi_cascades.active && gi_cascades.voxel_gi_count == 0) {
+					WARN_PRINT_ONCE("Ray-traced GI is enabled but the scene has neither SDFGI nor a VoxelGI to shade ray hits from: off-screen hits return black, so interiors go dark. Enable SDFGI on the WorldEnvironment (or add a VoxelGI).");
+				}
 			}
 
 			stochastic_traced_this_frame = run_stochastic;

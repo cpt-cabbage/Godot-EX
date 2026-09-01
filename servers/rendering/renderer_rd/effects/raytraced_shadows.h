@@ -303,6 +303,10 @@ private:
 		uint32_t voxel_gi_count;
 		float ao_range; // Hit distances are normalized and clamped against this.
 		float inv_ao_range;
+		float screen_radiance_border_fade;
+		float screen_radiance_clamp;
+		float probe_floor;
+		float pad;
 	};
 
 	enum DenoiseVariant {
@@ -417,6 +421,13 @@ public:
 		uint32_t rays_per_pixel = 1;
 		bool half_resolution = true;
 		bool screen_radiance = true;
+		float screen_radiance_border_fade = 0.08f; // uv width of the hand-back to the cache; 0 is a hard switch.
+		float screen_radiance_clamp = 4.0f; // Absolute firefly ceiling on the screen term, in exposure-normalized units.
+		float probe_floor = 0.5f; // Neutral albedo turning probe irradiance into outgoing radiance.
+		bool light_cascade_radiance = false; // Shade hits from the light cascades instead of the probes.
+		// The gather's own screen traces, separate from the direct lighting
+		// pass': the two passes want different things from a contact trace, and
+		// sharing one setting means neither can be isolated.
 		bool specular = true;
 		bool screen_traces = true;
 		float ray_bias = 0.08f;
@@ -437,6 +448,8 @@ public:
 		LocalVector<RID> aniso1;
 		RID sdfgi_ubo; // GI::SDFGIData, required even when inactive.
 		bool active = false;
+		RID lightprobe_texture; // SDFGI lightprobes, the dense floor under the sparse light cascades.
+		RID occlusion_texture;
 		RID voxel_gi_ubo; // GI::VoxelGIData array, required even when unused.
 		LocalVector<RID> voxel_gi_textures;
 		uint32_t voxel_gi_count = 0;

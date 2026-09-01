@@ -1089,7 +1089,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::Uniform u_out_s(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_specular }));
 
 		RD::ComputeListID list = rd->compute_list_begin();
-		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_SPATIAL]);
+		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_d, u_in_s, u_dn_depth, u_moments, u_normal, u_meta, u_analytic_d, u_analytic_s), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_d, u_out_s), 1);
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
@@ -1202,6 +1202,9 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.frame_index = rb_state->frame_index;
 	params.ray_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	params.flags = 0;
+	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
+	params.screen_radiance_clamp = MAX(p_quality.screen_radiance_clamp, 0.0f);
+	params.probe_floor = MAX(p_quality.probe_floor, 0.0f);
 	if (p_quality.screen_radiance && p_screen_radiance.is_valid()) {
 		params.flags |= 1; // FLAG_SCREEN_RADIANCE
 	}
@@ -1229,6 +1232,9 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	if (p_cascades.voxel_gi_count > 0) {
 		params.flags |= 64; // FLAG_VOXEL_GI
+	}
+	if (p_quality.light_cascade_radiance) {
+		params.flags |= 128; // FLAG_LIGHT_CASCADE_RADIANCE
 	}
 	params.sky_energy = p_sky.energy;
 	params.ray_bias = p_quality.ray_bias;
@@ -1278,6 +1284,10 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		voxel_ids.push_back(tex.is_valid() ? tex : default_3d);
 	}
 	RD::Uniform u_voxel_tex(RD::UNIFORM_TYPE_TEXTURE, 14, voxel_ids);
+	RID lightprobe = p_cascades.lightprobe_texture.is_valid() ? p_cascades.lightprobe_texture : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
+	RID occlusion = p_cascades.occlusion_texture.is_valid() ? p_cascades.occlusion_texture : default_3d;
+	RD::Uniform u_lightprobe(RD::UNIFORM_TYPE_TEXTURE, 15, Vector<RID>({ lightprobe }));
+	RD::Uniform u_occlusion(RD::UNIFORM_TYPE_TEXTURE, 16, Vector<RID>({ occlusion }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
@@ -1285,7 +1295,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

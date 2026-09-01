@@ -783,8 +783,16 @@ private:
 	bool use_rt_gi_half_res = true;
 	uint32_t rt_gi_rays = 1;
 	bool use_rt_gi_screen_radiance = true;
+	float rt_gi_screen_radiance_border_fade = 0.08f;
+	float rt_gi_screen_radiance_clamp = 4.0f;
+	float rt_gi_probe_floor = 0.5f;
+	bool use_rt_gi_screen_traces = true;
+	bool use_rt_gi_light_cascade_radiance = false;
 	bool use_rt_gi_specular = true;
 	uint32_t rt_gi_temporal_frames = 32;
+	int rt_gi_spatial_stride = 2;
+	int rt_gi_spatial_iterations = 2;
+	float rt_gi_variance_threshold = 0.02f;
 	bool use_rt_gi_directional = true;
 	bool use_rt_gi_specular_occlusion = true;
 	bool use_rt_gi_probe_refit = true;

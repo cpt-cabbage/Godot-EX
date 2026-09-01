@@ -43,6 +43,9 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint voxel_gi_count;
 	float ao_range; // Hit distances are normalized and clamped against this.
 	float inv_ao_range;
+	float screen_radiance_border_fade;
+	float screen_radiance_clamp;
+	float probe_floor; // Neutral albedo the probe irradiance is turned into radiance with.
 }
 params;
 
@@ -53,6 +56,7 @@ params;
 #define FLAG_SKY_MODE_COLOR 16u
 #define FLAG_SCREEN_TRACES 32u
 #define FLAG_VOXEL_GI 64u
+#define FLAG_LIGHT_CASCADE_RADIANCE 128u
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -140,6 +144,15 @@ voxel_gi_instances;
 
 layout(set = 0, binding = 14) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_INSTANCES];
 
+// The SDFGI lightprobes: irradiance, octahedrally encoded per probe, already
+// converged over the integrator's accumulation window. Unlike the light
+// cascades these cover all space rather than only solid cells, which is what
+// makes them usable as a floor under a one-ray-per-pixel gather.
+layout(set = 0, binding = 15) uniform texture2DArray lightprobe_texture;
+layout(set = 0, binding = 16) uniform texture3D occlusion_texture;
+
+#define SDFGI_OCT_SIZE 6
+
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_ambient;
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_reflection;
 // View depth of the shaded texel, for the half-resolution upsample.
@@ -226,10 +239,89 @@ vec3 voxel_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	return vec3(0.0);
 }
 
-// Direct light stored in the SDFGI cascades at a camera-relative world
-// position, shaded with the local SDF gradient normal (the same evaluation
-// the probe integrator uses at its ray hits). p_backup_dir provides the
-// half-cell pull-back direction (the incoming ray).
+vec2 octahedron_wrap(vec2 v) {
+	vec2 signVal;
+	signVal.x = v.x >= 0.0 ? 1.0 : -1.0;
+	signVal.y = v.y >= 0.0 ? 1.0 : -1.0;
+	return (1.0 - abs(v.yx)) * signVal;
+}
+
+vec2 octahedron_encode(vec3 n) {
+	n /= (abs(n.x) + abs(n.y) + abs(n.z));
+	n.xy = n.z >= 0.0 ? n.xy : octahedron_wrap(n.xy);
+	n.xy = n.xy * 0.5 + 0.5;
+	return n.xy;
+}
+
+// Irradiance arriving at a camera-relative world position, trilinearly
+// interpolated from the eight surrounding lightprobes and weighted by their
+// occlusion. This is the same evaluation the deferred SDFGI resolve performs
+// (sdfvoxel_gi_process in gi.glsl), diffuse only.
+vec3 sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal) {
+	if (!bool(params.flags & FLAG_SDFGI)) {
+		return vec3(0.0);
+	}
+	vec3 p = vec3(rel_pos.x, rel_pos.y * sdfgi.y_mult, rel_pos.z);
+	vec3 n = normalize(vec3(normal.x, normal.y * sdfgi.y_mult, normal.z));
+
+	for (uint c = 0u; c < sdfgi.max_cascades; c++) {
+		vec3 cascade_pos = (p - sdfgi.cascades[c].position) * sdfgi.cascades[c].to_probe;
+		if (any(lessThan(cascade_pos, vec3(0.0))) || any(greaterThanEqual(cascade_pos, sdfgi.cascade_probe_size))) {
+			continue;
+		}
+		cascade_pos += n * sdfgi.normal_bias;
+
+		ivec3 probe_base_pos = ivec3(floor(cascade_pos));
+		ivec3 tex_pos = ivec3(probe_base_pos.xy, int(c));
+		tex_pos.x += probe_base_pos.z * sdfgi.probe_axis_size;
+		tex_pos.xy = tex_pos.xy * (SDFGI_OCT_SIZE + 2) + ivec2(1);
+		vec3 diffuse_posf = (vec3(tex_pos) + vec3(octahedron_encode(n) * float(SDFGI_OCT_SIZE), 0.0)) * sdfgi.lightprobe_tex_pixel_size;
+
+		vec4 accum = vec4(0.0);
+		for (uint j = 0u; j < 8u; j++) {
+			ivec3 offset = (ivec3(j) >> ivec3(0, 1, 2)) & ivec3(1, 1, 1);
+			ivec3 probe_posi = probe_base_pos + offset;
+
+			vec3 probe_pos = vec3(probe_posi);
+			vec3 probe_to_pos = cascade_pos - probe_pos;
+			vec3 probe_dir = normalize(-probe_to_pos);
+			vec3 trilinear = vec3(1.0) - abs(probe_to_pos);
+			float weight = trilinear.x * trilinear.y * trilinear.z * max(0.005, dot(n, probe_dir));
+
+			if (sdfgi.use_occlusion) {
+				ivec3 occ_indexv = abs((sdfgi.cascades[c].probe_world_offset + probe_posi) & ivec3(1, 1, 1)) * ivec3(1, 2, 4);
+				vec4 occ_mask = mix(vec4(0.0), vec4(1.0), equal(ivec4(occ_indexv.x | occ_indexv.y), ivec4(0, 1, 2, 3)));
+
+				vec3 occ_pos = clamp(cascade_pos, probe_pos - sdfgi.occlusion_clamp, probe_pos + sdfgi.occlusion_clamp) * sdfgi.probe_to_uvw;
+				occ_pos.z += float(c);
+				if (occ_indexv.z != 0) {
+					occ_pos.x += 1.0;
+				}
+				occ_pos *= sdfgi.occlusion_renormalize;
+				float occlusion = dot(textureLod(sampler3D(occlusion_texture, linear_sampler_mipmaps), occ_pos, 0.0), occ_mask);
+				weight *= max(occlusion, 0.01);
+			}
+
+			vec3 pos_uvw = diffuse_posf;
+			pos_uvw.xy += vec2(offset.xy) * sdfgi.lightprobe_uv_offset.xy;
+			pos_uvw.x += float(offset.z) * sdfgi.lightprobe_uv_offset.z;
+			accum += vec4(textureLod(sampler2DArray(lightprobe_texture, linear_sampler_mipmaps), pos_uvw, 0.0).rgb * weight, weight);
+		}
+
+		if (accum.a > 0.0) {
+			accum.rgb /= accum.a;
+		}
+		return accum.rgb * sdfgi.cascades[c].exposure_normalization * sdfgi.energy;
+	}
+	return vec3(0.0);
+}
+
+// Radiance leaving a camera-relative world position, resolved through the
+// cache chain the idTech 8 gather uses (Sousa 2025, slide 21): a tier is taken
+// only when it reports a valid entry, and an invalid one hands over to the
+// next rather than contributing a value. Here that is the SDFGI light
+// cascades, then the lightprobes. Blending the two instead would put a second
+// voxel-scale pattern on top of the first, since they disagree per hit.
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	if (!bool(params.flags & FLAG_SDFGI)) {
 		if (bool(params.flags & FLAG_VOXEL_GI)) {
@@ -237,18 +329,33 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 		}
 		return vec3(0.0);
 	}
+	// The light cascades hold albedo x (direct + feedback x probe): a feedback
+	// quantity, deliberately dimmer than the irradiance the probes carry and
+	// than the rendered colour the screen tier returns. Reading it as radiance
+	// makes it the odd tier out, and every switch into it is both a step in
+	// brightness and, through the screen tier's reuse of last frame, a place
+	// for the recirculation to settle low. Off by default; the probes are the
+	// tier that matches what SDFGI itself puts on screen.
+	if (!bool(params.flags & FLAG_LIGHT_CASCADE_RADIANCE)) {
+		return sdfgi_probe_irradiance(rel_pos, -ray_dir) * params.probe_floor;
+	}
+
 	vec3 p = vec3(rel_pos.x, rel_pos.y * sdfgi.y_mult, rel_pos.z);
 	vec3 d = normalize(vec3(ray_dir.x, ray_dir.y * sdfgi.y_mult, ray_dir.z));
 
 	for (uint c = 0u; c < sdfgi.max_cascades; c++) {
-		// Sample half a cell back along the ray, where the SDF march would
-		// have stopped (just outside the surface).
-		vec3 cell_pos = (p - sdfgi.cascades[c].position) * sdfgi.cascades[c].to_cell - d * 0.5;
+		// At the hit, not half a cell back along the ray. The pull-back put
+		// the tap on the air side of the surface, where the cascade holds
+		// nothing: filtered against empty neighbours every tap came back
+		// scaled by how the ray happened to enter the cell, which is a
+		// voxel-scale mottle rather than a radiance.
+		vec3 cell_pos = (p - sdfgi.cascades[c].position) * sdfgi.cascades[c].to_cell;
 		if (any(lessThan(cell_pos, vec3(0.0))) || any(greaterThanEqual(cell_pos, sdfgi.grid_size))) {
 			continue;
 		}
 		vec3 uvw = cell_pos / sdfgi.grid_size;
 
+		// The gradient wants filtering; the light and coverage do not.
 		const float EPSILON = 0.001;
 		vec3 hit_normal = vec3(
 				texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw + vec3(EPSILON, 0.0, 0.0)).r - texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw - vec3(EPSILON, 0.0, 0.0)).r,
@@ -261,15 +368,39 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 			hit_normal /= nl;
 		}
 
-		vec3 hit_light = texture(sampler3D(light_cascades[c], linear_sampler_mipmaps), uvw).rgb;
-		vec4 aniso0 = texture(sampler3D(aniso0_cascades[c], linear_sampler_mipmaps), uvw);
+		// Point-fetch the cell the hit landed in. The anisotropic coverage is
+		// written only where geometry was voxelized, so a zero sum is the
+		// cache saying it has no entry here -- the distinction between "no
+		// data" and "black surface" the chain needs to pick a tier. A hit that
+		// landed a hair outside its surface gets one step along the ray, into
+		// the solid cell, before the entry is called invalid.
+		ivec3 grid_max = ivec3(sdfgi.grid_size) - ivec3(1);
+		ivec3 celli = clamp(ivec3(cell_pos), ivec3(0), grid_max);
+		vec4 aniso0 = texelFetch(sampler3D(aniso0_cascades[c], linear_sampler_mipmaps), celli, 0);
+		vec2 aniso1 = texelFetch(sampler3D(aniso1_cascades[c], linear_sampler_mipmaps), celli, 0).rg;
+		if (dot(aniso0, vec4(1.0)) + dot(aniso1, vec2(1.0)) <= 0.0) {
+			celli = clamp(ivec3(cell_pos + d * 0.5), ivec3(0), grid_max);
+			aniso0 = texelFetch(sampler3D(aniso0_cascades[c], linear_sampler_mipmaps), celli, 0);
+			aniso1 = texelFetch(sampler3D(aniso1_cascades[c], linear_sampler_mipmaps), celli, 0).rg;
+		}
+		if (dot(aniso0, vec4(1.0)) + dot(aniso1, vec2(1.0)) <= 0.0) {
+			// No entry at this resolution. Coarser cascades have larger cells
+			// and so are likelier to have voxelized the surface at all; only
+			// once every one of them comes up empty is the tier exhausted.
+			continue;
+		}
+
+		vec3 hit_light = texelFetch(sampler3D(light_cascades[c], linear_sampler_mipmaps), celli, 0).rgb;
 		vec3 hit_aniso0 = aniso0.rgb;
-		vec3 hit_aniso1 = vec3(aniso0.a, texture(sampler3D(aniso1_cascades[c], linear_sampler_mipmaps), uvw).rg);
+		vec3 hit_aniso1 = vec3(aniso0.a, aniso1);
 
 		vec3 radiance = hit_light * (dot(max(vec3(0.0), (hit_normal * hit_aniso0)), vec3(1.0)) + dot(max(vec3(0.0), (-hit_normal * hit_aniso1)), vec3(1.0)));
 		return radiance * sdfgi.cascades[c].exposure_normalization * sdfgi.energy;
 	}
-	return vec3(0.0);
+
+	// Last tier. Always valid where the probe grid reaches, so a hit never
+	// falls through to a spurious zero.
+	return sdfgi_probe_irradiance(rel_pos, -ray_dir) * params.probe_floor;
 }
 
 // On-screen hits can read last frame's rendered radiance, which carries the
@@ -308,11 +439,23 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 cache_radiance) {
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
 	float l = luminance(col);
-	float clamp_l = luminance(cache_radiance) * 4.0 + 0.5;
+	// Firefly ceiling. Keying this to the cache alone closes a loop: the gather
+	// writes the buffer this reads, so where the cache is dim the ceiling caps
+	// the screen term below the light actually in the room, the image dims, and
+	// the next frame reads the dimmer image -- a wall lit only by bounce
+	// ratchets down to the cache value over the accumulation window. The
+	// absolute term is what the cache cannot drag down.
+	float clamp_l = max(luminance(cache_radiance) * 4.0, params.screen_radiance_clamp) + 0.5;
 	if (l > clamp_l) {
 		col *= clamp_l / l;
 	}
-	return col;
+	// Both lookups have to be well inside for the sample to be trustworthy:
+	// uv carries the depth test, prev_uv the colour fetch. Whichever is nearer
+	// an edge decides how much of the boost survives.
+	vec2 border = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
+	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
+	return mix(cache_radiance, col,
+			smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)));
 }
 
 #define SCREEN_TRACE_STEPS 6
@@ -323,7 +466,13 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 cache_radiance) {
 // Short screen-space march for contact occlusion the biased BVH ray misses.
 // Returns true and the view-space hit point when the depth buffer blocks the
 // first stretch of the ray.
-bool screen_trace_hit(vec3 view_origin, vec3 view_dir, float jitter, out vec3 hit_view_pos) {
+bool screen_trace_hit(vec3 view_origin, vec3 view_normal, vec3 view_dir, float jitter, out vec3 hit_view_pos) {
+	// Start off the surface, as the BVH ray does. Starting on it, a ray leaving
+	// at a grazing angle stays within the acceptance window of the very surface
+	// it left, and the first step reports a hit against it -- which lands in
+	// r_hit_distance as a contact at a few centimetres and drives this pixel's
+	// visibility term to zero while its neighbour's stays at one.
+	view_origin += view_normal * params.ray_bias;
 	float trace_dist = SCREEN_TRACE_DISTANCE;
 	for (int i = 0; i < SCREEN_TRACE_STEPS; i++) {
 		float t = trace_dist * (float(i) + jitter + 0.5) / float(SCREEN_TRACE_STEPS);
@@ -359,7 +508,8 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 vie
 	r_hit_distance = params.ao_range; // Nothing hit within range.
 	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
 		vec3 hit_view;
-		if (screen_trace_hit(view_origin, view_dir, jitter, hit_view)) {
+		vec3 view_normal = transpose(mat3(params.world_from_view)) * world_normal;
+		if (screen_trace_hit(view_origin, view_normal, view_dir, jitter, hit_view)) {
 			mat3 world_basis = mat3(params.world_from_view);
 			vec3 rel_hit = world_basis * hit_view;
 			r_hit_distance = length(hit_view - view_origin);

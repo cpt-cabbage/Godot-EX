@@ -323,6 +323,13 @@ void main() {
 			}
 		}
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+		vec4 hist_d4 = vec4(0.0);
+		vec4 hist_s4 = vec4(0.0);
+		vec4 hist_moments = vec4(0.0);
+		vec4 hist_meta = vec4(0.0);
+#ifdef HAS_DIRECTIONAL
+		vec4 hist_dir = vec4(0.0);
+#endif
 #ifdef DEPTH_HISTORY
 		if (history_usable) {
 			// Disocclusion check: a revealed pixel would otherwise inherit
@@ -332,19 +339,64 @@ void main() {
 			// neighborhood clamp (which catches lighting changes but is blind
 			// to a surface swap at equal brightness); on the sparse GI signal
 			// it is the only gate, since clipping is off there.
-			ivec2 prev_pixel = clamp(ivec2(prev_uv * vec2(params.screen_size)), ivec2(0), params.screen_size - 1);
-			float prev_depth = texelFetch(prev_view_depth_texture, prev_pixel, 0).r;
+			//
+			// The test runs per bilinear tap, not once at the nearest texel: a
+			// filtered fetch straddling a silhouette would otherwise blend the
+			// far surface's history into the near one at up to half weight,
+			// with nothing downstream to reject it. Taps that fail drop out and
+			// the rest renormalise; when every tap fails the pixel is revealed.
 			float predicted_depth = linearize_depth(prev_ndc.z / prev_ndc.w);
-			if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
-				history_usable = false;
+			vec2 hist_pos = prev_uv * vec2(params.screen_size) - 0.5;
+			ivec2 hist_base = ivec2(floor(hist_pos));
+			vec2 hist_fr = hist_pos - vec2(hist_base);
+			float hist_weight = 0.0;
+			for (int i = 0; i < 4; i++) {
+				ivec2 off = ivec2(i & 1, i >> 1);
+				ivec2 tp = hist_base + off;
+				if (any(lessThan(tp, ivec2(0))) || any(greaterThanEqual(tp, params.screen_size))) {
+					continue;
+				}
+				float w = (off.x == 1 ? hist_fr.x : 1.0 - hist_fr.x) * (off.y == 1 ? hist_fr.y : 1.0 - hist_fr.y);
+				if (w <= 1e-4) {
+					continue;
+				}
+				float prev_depth = texelFetch(prev_view_depth_texture, tp, 0).r;
+				if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
+					continue;
+				}
+				hist_d4 += texelFetch(history_diffuse, tp, 0) * w;
+				hist_s4 += texelFetch(history_specular, tp, 0) * w;
+				hist_moments += texelFetch(history_moments, tp, 0) * w;
+				hist_meta += texelFetch(history_meta, tp, 0) * w;
+#ifdef HAS_DIRECTIONAL
+				hist_dir += texelFetch(history_directional, tp, 0) * w;
+#endif
+				hist_weight += w;
 			}
+			history_usable = hist_weight > 0.05;
+			if (history_usable) {
+				float inv_weight = 1.0 / hist_weight;
+				hist_d4 *= inv_weight;
+				hist_s4 *= inv_weight;
+				hist_moments *= inv_weight;
+				hist_meta *= inv_weight;
+#ifdef HAS_DIRECTIONAL
+				hist_dir *= inv_weight;
+#endif
+			}
+		}
+#else
+		if (history_usable) {
+			hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
+			hist_s4 = textureLod(history_specular, prev_uv, 0.0);
+			hist_moments = textureLod(history_moments, prev_uv, 0.0);
+			hist_meta = textureLod(history_meta, prev_uv, 0.0);
+#ifdef HAS_DIRECTIONAL
+			hist_dir = textureLod(history_directional, prev_uv, 0.0);
+#endif
 		}
 #endif
 		if (history_usable) {
-			vec4 hist_d4 = textureLod(history_diffuse, prev_uv, 0.0);
-			vec4 hist_s4 = textureLod(history_specular, prev_uv, 0.0);
-			vec4 hist_moments = textureLod(history_moments, prev_uv, 0.0);
-			vec4 hist_meta = textureLod(history_meta, prev_uv, 0.0);
 
 			vec3 hist_d = hist_d4.rgb;
 			vec3 hist_s = hist_s4.rgb;
@@ -392,7 +444,7 @@ void main() {
 			// frames_d frames is the estimate we want. It must use the same
 			// alpha as the diffuse signal it is paired with, or the ratio
 			// between them stops being bounded.
-			result_directional = mix(textureLod(history_directional, prev_uv, 0.0), current_directional, alpha_d);
+			result_directional = mix(hist_dir, current_directional, alpha_d);
 #endif
 			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_d),
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));

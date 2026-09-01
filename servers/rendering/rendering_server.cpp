@@ -3725,11 +3725,49 @@ void RenderingServer::init() {
 	// hardware rays and shades hits from the SDFGI cascades (sky-only when no
 	// SDFGI is active). Replaces the SDFGI/VoxelGI screen resolve and SSIL.
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
+	// Half resolution is the dominant residual noise source (one ray per 2x2
+	// block: four times the variance at twice the correlation length, which
+	// the upsample turns into low-frequency blotches on flat walls), and full
+	// resolution at one ray measured cleaner than half at four. It stays the
+	// default because full resolution doubled the frame time on the M4 at
+	// 1440p (78 -> 158 ms on the interior test scene).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/half_resolution"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance"), true);
+	// Width, in uv, of the border band over which the screen-radiance boost
+	// hands back to the cache. 0 restores the hard switch at the frustum edge.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance_border_fade", PROPERTY_HINT_RANGE, "0.0,0.25,0.005"), 0.08);
+	// Firefly ceiling on the screen-radiance term, in exposure-normalized units
+	// (1.0 is a well-exposed white surface). The gather writes the buffer this
+	// term reads, so a ceiling keyed only to the radiance cache lets a dim cache
+	// drag the loop down; this is the floor under that ceiling.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance_clamp", PROPERTY_HINT_RANGE, "0.0,16.0,0.1,or_greater"), 4.0);
+	// The light cascades the gather shades hits from only hold values at solid
+	// cells; the lightprobes cover all space and are already converged, so they
+	// floor the lookup where a cell was never voxelized. Probes carry irradiance,
+	// so this is the neutral albedo that turns it into outgoing radiance. 0
+	// disables the floor and restores the cascade-only lookup.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/probe_floor", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.5);
+	// The gather's own short screen-space contact trace. Separate from the
+	// direct lighting pass' setting of the same name: they are different passes
+	// with different needs, and one shared toggle means neither can be turned
+	// off without moving the other.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_traces"), true);
+	// Shade the gather's hits from the SDFGI light cascades rather than its
+	// lightprobes. The cascades carry albedo and so keep a hit's colour, but
+	// they store a bounce-feedback quantity at solid cells only -- dimmer than
+	// the probes and full of holes at one ray per pixel. Off is the tier that
+	// agrees with what SDFGI itself puts on screen.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/light_cascade_radiance"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
+	// The gather's own spatial filter settings. It used to borrow the direct
+	// lighting denoiser's; the two signals have nothing in common but the
+	// filter code. Full-resolution GI wants one more a-trous iteration than
+	// half-resolution to cover the same footprint.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/spatial_iterations", PROPERTY_HINT_RANGE, "1,3,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/variance_threshold", PROPERTY_HINT_RANGE, "0.0,0.5,0.001"), 0.02);
 	// The gather also records which direction its light came from and how far
 	// its rays got, which re-bases the irradiance onto normal-mapped detail,
 	// occludes indirect specular, and re-fits reflection probes captured under

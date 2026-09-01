@@ -2133,23 +2133,41 @@ void fragment_shader(in SceneData scene_data) {
 		} else {
 			// Half resolution: the same depth-aware upsample the stochastic
 			// direct lighting uses, so GI does not bleed across silhouettes.
-			uvec2 rtgi_full_size = uvec2(1.0 / scene_data.screen_pixel_size);
-			ivec2 rtgi_half_size = ivec2((rtgi_full_size + uvec2(1)) >> 1);
-			vec2 rtgi_pos = screen_uv * vec2(rtgi_half_size) - 0.5;
+			// Same grid derivation as the direct lighting upsample below: round
+			// the reciprocal (truncation lands one pixel short for sizes whose
+			// inverse is inexact), and place the taps where the gather actually
+			// sampled -- full-res pixel 2p for half-res texel p, i.e. continuous
+			// coordinate 2p + 0.5, not the centre of the 2x2 block.
+			ivec2 rtgi_full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
+			ivec2 rtgi_half_size = (rtgi_full_size + ivec2(1)) >> 1;
+			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5) * 0.5;
 			ivec2 rtgi_base = ivec2(floor(rtgi_pos));
 			vec2 rtgi_fr = rtgi_pos - vec2(rtgi_base);
 			float rtgi_own_depth = -vertex.z;
 			float rtgi_weight = 0.0;
+			// The tap nearest this fragment by bilinear fraction, and the one the
+			// stopping functions trusted most: the basis normal comes from the
+			// first unless its weight was rejected, in which case the normal
+			// would be the surface on the other side of an edge.
+			ivec2 rtgi_near = ivec2(greaterThanEqual(rtgi_fr, vec2(0.5)));
+			int rtgi_near_i = rtgi_near.x + rtgi_near.y * 2;
+			float rtgi_near_w = 0.0;
+			vec3 rtgi_near_n = indirect_normal;
+			float rtgi_best_w = -1.0;
+			vec3 rtgi_best_n = indirect_normal;
 			rt_gi_directional = vec4(0.0);
 			for (int i = 0; i < 4; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
 				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
+				// The full-res pixel the gather read its normal from (it clamps
+				// the same way for odd sizes).
+				ivec2 rtgi_fp = min(hp * 2, rtgi_full_size - ivec2(1));
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
-				vec3 sn = normalize(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp * 2, int(ViewIndex)), 0).xyz * 2.0 - 1.0);
+				vec3 sn = normalize(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0).xyz * 2.0 - 1.0);
 #else
 				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
-				vec3 sn = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), hp * 2, 0).xyz * 2.0 - 1.0);
+				vec3 sn = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0).xyz * 2.0 - 1.0);
 #endif
 				float w = (1.0 - abs(float(off.x) - rtgi_fr.x)) * (1.0 - abs(float(off.y) - rtgi_fr.y));
 				w *= exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
@@ -2172,9 +2190,16 @@ void fragment_shader(in SceneData scene_data) {
 				// this fragment, so its normal is the basis the irradiance was
 				// integrated around. Taken unweighted on purpose: the weighted
 				// mean would converge on this fragment's own normal and the
-				// reconstruction below would collapse to a no-op.
-				if (i == 0) {
-					rt_gi_gather_normal = sn;
+				// reconstruction below would collapse to a no-op. It used to be
+				// tap 0, which is the top-left of the footprint, nearest only
+				// for a quarter of fragments and taken even with zero weight.
+				if (i == rtgi_near_i) {
+					rtgi_near_n = sn;
+					rtgi_near_w = w;
+				}
+				if (w > rtgi_best_w) {
+					rtgi_best_w = w;
+					rtgi_best_n = sn;
 				}
 				rtgi_weight += w;
 			}
@@ -2184,6 +2209,7 @@ void fragment_shader(in SceneData scene_data) {
 				rt_gi_ambient /= rtgi_weight;
 				rt_gi_reflection /= rtgi_weight;
 				rt_gi_directional /= rtgi_weight;
+				rt_gi_gather_normal = rtgi_near_w > 0.05 * rtgi_weight ? rtgi_near_n : rtgi_best_n;
 				rt_gi_valid = true;
 			}
 		}
@@ -2242,8 +2268,9 @@ void fragment_shader(in SceneData scene_data) {
 					float gi_den = (1.0 - gi_s) + gi_s * max(dot(gi_dir, rt_gi_gather_normal), 0.0);
 					// Exactly 1 when the two normals agree, so flat surfaces
 					// and every pixel of a scene without normal maps are
-					// unchanged.
-					ambient_light *= clamp(gi_num / max(gi_den, 0.15), 0.0, 3.0);
+					// unchanged. The range is what a one-ray, 32-frame moment
+					// can support: a factor of two either way, no more.
+					ambient_light *= clamp(gi_num / max(gi_den, 0.25), 0.5, 2.0);
 				}
 			}
 			if (bool(implementation_data.rt_gi & 4u)) {
