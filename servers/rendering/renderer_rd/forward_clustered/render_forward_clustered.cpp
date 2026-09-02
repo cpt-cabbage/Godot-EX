@@ -2022,7 +2022,22 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 		surface_cache_capture_list.set_page_pool(&surface_cache_capture_pool);
 		surface_cache_capture_list_ready = true;
 	}
-	const float exposure = p_render_data->scene_data->emissive_exposure_normalization;
+	// The emission a card stores has to carry the same exposure normalization
+	// the scene pass applies to emission, or the cards shade the gather's hits
+	// in a different unit from everything else the frame renders. That factor
+	// is resolved in RenderSceneDataRD::update_ubo -- the camera attributes'
+	// when the view has them (physical light units), else the value the scene
+	// data carries, else none -- while the scene data field alone stays at its
+	// default for an attributed camera; with physical units that left emissive
+	// lamps in the cards at their full physical intensity, and the multi-bounce
+	// term spread that through every interior card until the image clipped.
+	float exposure = p_render_data->scene_data->emissive_exposure_normalization;
+	if (p_render_data->camera_attributes.is_valid()) {
+		exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+	}
+	if (exposure <= 0.0f) {
+		exposure = 1.0f;
+	}
 	const uint32_t budget = MAX(cache->get_settings().captures_per_frame, 1u);
 	bool labelled = false;
 	for (uint32_t i = 0; i < budget; i++) {
