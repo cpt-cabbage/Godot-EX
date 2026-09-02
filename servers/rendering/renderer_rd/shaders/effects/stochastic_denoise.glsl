@@ -80,6 +80,24 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #else
 #define SPATIAL_SPEC_OUT_FORMAT r11f_g11f_b10f
 #endif
+// SPATIAL_MOMENTS_OUT: the intermediate a-trous iterations also write their
+// filtered moments, so the next iteration's variance estimate, luminance edge
+// stop and skip-if-converged gate describe the signal it is actually filtering
+// instead of the unfiltered one (whose variance overstates what is left by
+// then, keeping the edge stops loose and the gating conservative at every
+// iteration after the first). The moments are averaged with the same a-trous
+// weights as the color (the Q2RTX construction, rather than SVGF's weighted
+// variance propagation): the moments of a weighted mixture are the weighted
+// average of its parts' moments, so the estimate stays exact for the output
+// signal wherever the neighborhood agrees, and the law of total variance adds
+// the neighborhood's own spread where it does not -- conservative exactly
+// where filtering is still doing work. The final iteration does not define
+// this (nothing consumes its moments): the temporally accumulated moments are
+// never overwritten, so the temporal pass's history stays an honest record of
+// the accumulated -- not the spatially filtered -- signal.
+#ifdef SPATIAL_MOMENTS_OUT
+#define MOMENTS_OUTPUT
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D in_diffuse;
 layout(set = 0, binding = 1) uniform sampler2D in_specular;
@@ -149,6 +167,9 @@ layout(set = 1, binding = 0, SPATIAL_OUT_FORMAT) uniform restrict writeonly imag
 layout(set = 1, binding = 1, SPATIAL_SPEC_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
 #ifdef FILTER_DIRECTIONAL
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
+#endif
+#ifdef MOMENTS_OUTPUT
+layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_moments;
 #endif
 #endif
 
@@ -608,12 +629,18 @@ void main() {
 #ifdef FILTER_DIRECTIONAL
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
 #endif
+#ifdef MOMENTS_OUTPUT
+		imageStore(out_moments, pixel, vec4(0.0));
+#endif
 		return;
 	}
 
 	// Denoiser disabled (sentinel threshold): pass the input through.
 	if (params.variance_threshold >= 1e5) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0);
+#ifdef MOMENTS_OUTPUT
+		imageStore(out_moments, pixel, texelFetch(moments_texture, pixel, 0));
+#endif
 		return;
 	}
 
@@ -650,6 +677,11 @@ void main() {
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	if (!filter_d && !filter_s) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
+#ifdef MOMENTS_OUTPUT
+		// Nothing was filtered: the moments this pixel hands to the next
+		// iteration are still the ones that describe its signal.
+		imageStore(out_moments, pixel, moments);
+#endif
 		return;
 	}
 
@@ -691,6 +723,9 @@ void main() {
 	}
 	if (!filter_d && !filter_s) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
+#ifdef MOMENTS_OUTPUT
+		imageStore(out_moments, pixel, moments);
+#endif
 		return;
 	}
 #endif
@@ -706,6 +741,10 @@ void main() {
 	vec4 sum_dir = center_dir;
 	float weight_d = 1.0;
 	float weight_s = 1.0;
+	// The moments ride the same weights as their signals (the center at 1),
+	// so the next iteration's variance describes the mixture this one output.
+	vec2 sum_mom_d = moments.xy;
+	vec2 sum_mom_s = moments.zw;
 
 	for (int y = -2; y <= 2; y++) {
 		for (int x = -2; x <= 2; x++) {
@@ -762,6 +801,14 @@ void main() {
 			sum_s += s * ws;
 			weight_d += wd;
 			weight_s += ws;
+#ifdef MOMENTS_OUTPUT
+			vec4 m = texelFetch(moments_texture, sp, 0);
+			sum_mom_d += m.xy * wd;
+			if (stride_s != stride) {
+				m = texelFetch(moments_texture, sp_s, 0);
+			}
+			sum_mom_s += m.zw * ws;
+#endif
 #ifdef FILTER_DIRECTIONAL
 			// Same weight as the diffuse signal, deliberately: the pair only
 			// stays consistent while both are averaged identically.
@@ -769,6 +816,13 @@ void main() {
 #endif
 		}
 	}
+
+#ifdef MOMENTS_OUTPUT
+	// A skipped signal keeps its own moments (its output is its input).
+	vec2 out_mom_d = filter_d ? sum_mom_d / weight_d : moments.xy;
+	vec2 out_mom_s = filter_s ? sum_mom_s / weight_s : moments.zw;
+	imageStore(out_moments, pixel, vec4(out_mom_d, out_mom_s));
+#endif
 
 	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb,
 			filter_s ? sum_s / weight_s : center_s4.rgb,

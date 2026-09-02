@@ -62,6 +62,10 @@
 #define RB_RT_STOCHASTIC_HIST_SPECULAR_1 SNAME("stochastic_hist_specular_1")
 #define RB_RT_STOCHASTIC_MOMENTS_0 SNAME("stochastic_moments_0")
 #define RB_RT_STOCHASTIC_MOMENTS_1 SNAME("stochastic_moments_1")
+// A-trous moments propagation beyond two iterations: iteration 0's filtered
+// moments fit in the moments pair the temporal pass just consumed, a third
+// iteration needs this one more.
+#define RB_RT_STOCHASTIC_MOMENTS_SCRATCH SNAME("stochastic_moments_scratch")
 #define RB_RT_STOCHASTIC_VISIBLE_LIGHT SNAME("stochastic_visible_light")
 #define RB_RT_STOCHASTIC_RAW_META SNAME("stochastic_raw_meta")
 // Ping-ponged: the previous frame's copy validates history reprojection.
@@ -85,6 +89,7 @@
 #define RB_RT_GI_HIST_REFLECTION_1 SNAME("hist_reflection_1")
 #define RB_RT_GI_MOMENTS_0 SNAME("moments_0")
 #define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
+#define RB_RT_GI_MOMENTS_SCRATCH SNAME("moments_scratch")
 #define RB_RT_GI_META_0 SNAME("meta_0")
 #define RB_RT_GI_META_1 SNAME("meta_1")
 // Ping-ponged: the previous frame's copy validates history reprojection.

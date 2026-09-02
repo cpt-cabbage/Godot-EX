@@ -104,10 +104,13 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 
 	Vector<String> stochastic_denoise_modes;
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n#define DIRECT_DEPTH_VALIDATION\n");
-	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n");
+	// The plain spatial variant only ever serves a-trous iterations that have
+	// a successor, so it carries the moments output (see the shader's
+	// SPATIAL_MOMENTS_OUT block); the final iteration uses SPEC_ALPHA below.
+	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define SPATIAL_MOMENTS_OUT\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n#define VALIDATE_DEPTH\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define FILTER_DIRECTIONAL\n");
-	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define FILTER_DIRECTIONAL\n#define SPATIAL_HDR_OUT\n");
+	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define FILTER_DIRECTIONAL\n#define SPATIAL_HDR_OUT\n#define SPATIAL_MOMENTS_OUT\n");
 	stochastic_denoise_modes.push_back("\n#define MODE_SPATIAL\n#define SPATIAL_SPEC_ALPHA_OUT\n");
 	stochastic_denoise_shader.initialize(stochastic_denoise_modes);
 	stochastic_denoise_shader_version = stochastic_denoise_shader.version_create();
@@ -954,7 +957,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 			p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
-		const StringName moments_names[] = { RB_RT_STOCHASTIC_MOMENTS_0, RB_RT_STOCHASTIC_MOMENTS_1 };
+		const StringName moments_names[] = { RB_RT_STOCHASTIC_MOMENTS_0, RB_RT_STOCHASTIC_MOMENTS_1, RB_RT_STOCHASTIC_MOMENTS_SCRATCH };
 		for (const StringName &name : moments_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
@@ -1220,25 +1223,35 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// analytic lighting back in at the end -- only the last iteration
 	// modulates, the earlier ones stay in ratio space.
 	//
-	// The moments are deliberately not refiltered between iterations: the
-	// variance estimate then belongs to the unfiltered signal, which makes the
-	// luminance stopping function (and the skip-if-converged test) more
-	// conservative at every iteration but never wrong.
+	// The moments are filtered alongside the color now (SPATIAL_MOMENTS_OUT in
+	// the shader): each intermediate iteration hands the next one the moments
+	// of the signal it output, so the variance that steers the luminance edge
+	// stop and the skip-if-converged gate tracks the filtering instead of
+	// describing the raw signal at every stride. The temporally accumulated
+	// moments are never overwritten -- the temporal pass's history stays an
+	// honest record of the accumulated, not the spatially filtered, signal --
+	// so the propagated ones live in scratch: iteration 0's output fits in the
+	// moments pair the temporal pass just consumed (free until next frame's
+	// temporal pass rewrites it, the same argument as the history scratch), and
+	// a third iteration needs one dedicated texture more.
 	//
-	// Scratch for the intermediate results: the sampling pass's raw buffers and
-	// the history the temporal pass just consumed are both finished with by
-	// here, and both are the packed format the spatial pass writes. The history
-	// pair is safe because next frame's parity makes it the temporal pass's
-	// output, which is written for every pixel.
+	// Color scratch for the intermediate results: the sampling pass's raw
+	// buffers and the history the temporal pass just consumed are both finished
+	// with by here, and both are the packed format the spatial pass writes. The
+	// history pair is safe because next frame's parity makes it the temporal
+	// pass's output, which is written for every pixel.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
 	RID scratch_d[2] = { diffuse_slice, hist_read_d };
 	RID scratch_s[2] = { specular_slice, hist_read_s };
+	RID moments_scratch = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_MOMENTS_SCRATCH, p_view, 0);
 	RID in_diffuse = hist_write_d;
 	RID in_specular = hist_write_s;
+	RID moments_in = moments_write;
 	for (int iteration = 0; iteration < spatial_iterations; iteration++) {
 		const bool last = iteration == spatial_iterations - 1;
 		RID out_diffuse = last ? final_diffuse : scratch_d[iteration & 1];
 		RID out_specular = last ? final_specular : scratch_s[iteration & 1];
+		RID out_moments = last ? RID() : (iteration == 0 ? moments_read : moments_scratch);
 
 		denoise_push_constant.flags = last ? DENOISE_FLAG_MODULATE_ANALYTIC : 0;
 		denoise_push_constant.stride = p_quality.spatial_stride << iteration;
@@ -1249,7 +1262,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::Uniform u_in_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_diffuse }));
 		RD::Uniform u_in_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, in_specular }));
 		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
-		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_write }));
+		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_in }));
 		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, p_normal_roughness }));
 		RD::Uniform u_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, meta_write }));
 		RD::Uniform u_analytic_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, analytic_diffuse }));
@@ -1260,13 +1273,21 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_d, u_in_s, u_dn_depth, u_moments, u_normal, u_meta, u_analytic_d, u_analytic_s), 0);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_d, u_out_s), 1);
+		if (last) {
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_d, u_out_s), 1);
+		} else {
+			RD::Uniform u_out_moments(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ out_moments }));
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_d, u_out_s, u_out_moments), 1);
+		}
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
 
 		in_diffuse = out_diffuse;
 		in_specular = out_specular;
+		if (!last) {
+			moments_in = out_moments;
+		}
 	}
 }
 
@@ -1322,7 +1343,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
-		const StringName moments_names[] = { RB_RT_GI_MOMENTS_0, RB_RT_GI_MOMENTS_1 };
+		const StringName moments_names[] = { RB_RT_GI_MOMENTS_0, RB_RT_GI_MOMENTS_1, RB_RT_GI_MOMENTS_SCRATCH };
 		for (const StringName &name : moments_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
@@ -1593,22 +1614,25 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 
 	// Iterated exactly like the direct path's spatial filter (see there for the
-	// scratch-buffer reasoning); the raw gather buffers and the consumed
-	// history are the unpacked accumulation format, so the intermediate
-	// iterations use the variant that writes it and leaves the directional
-	// moment un-renormalized.
+	// scratch-buffer and moments-propagation reasoning); the raw gather buffers
+	// and the consumed history are the unpacked accumulation format, so the
+	// intermediate iterations use the variant that writes it, leaves the
+	// directional moment un-renormalized, and carries the filtered moments on.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
 	RID scratch_a[2] = { raw_ambient, hist_read_a };
 	RID scratch_r[2] = { raw_reflection, hist_read_r };
 	RID scratch_dir[2] = { raw_directional, hist_read_d };
+	RID moments_scratch = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_MOMENTS_SCRATCH, p_view, 0);
 	RID in_ambient = hist_write_a;
 	RID in_reflection = hist_write_r;
 	RID in_directional = hist_write_d;
+	RID moments_in = moments_write;
 	for (int iteration = 0; iteration < spatial_iterations; iteration++) {
 		const bool last = iteration == spatial_iterations - 1;
 		RID out_ambient = last ? final_ambient : scratch_a[iteration & 1];
 		RID out_reflection = last ? final_reflection : scratch_r[iteration & 1];
 		RID out_directional = last ? final_directional : scratch_dir[iteration & 1];
+		RID out_moments = last ? RID() : (iteration == 0 ? moments_read : moments_scratch);
 		const DenoiseVariant variant = last ? DENOISE_VARIANT_SPATIAL_DIRECTIONAL : DENOISE_VARIANT_SPATIAL_DIRECTIONAL_HDR;
 
 		// GI filters radiance directly: no analytic modulation, the bindings
@@ -1619,7 +1643,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_in_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_ambient }));
 		RD::Uniform u_in_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, in_reflection }));
 		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
-		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_write }));
+		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_in }));
 		RD::Uniform u_normal_dn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, p_normal_roughness }));
 		RD::Uniform u_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, meta_write }));
 		RD::Uniform u_analytic_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, default_black }));
@@ -1632,7 +1656,12 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d), 0);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d), 1);
+		if (last) {
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d), 1);
+		} else {
+			RD::Uniform u_out_moments(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ out_moments }));
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d, u_out_moments), 1);
+		}
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
@@ -1640,5 +1669,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		in_ambient = out_ambient;
 		in_reflection = out_reflection;
 		in_directional = out_directional;
+		if (!last) {
+			moments_in = out_moments;
+		}
 	}
 }
