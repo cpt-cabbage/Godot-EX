@@ -106,6 +106,9 @@ layout(set = 0, binding = 9) uniform sampler2D prev_view_depth_texture;
 // This frame's directional term and its history.
 layout(set = 0, binding = 10) uniform sampler2D in_directional;
 layout(set = 0, binding = 11) uniform sampler2D history_directional;
+// Roughness decides how far the reflection follows its virtual image
+// rather than the surface when reprojecting.
+layout(set = 0, binding = 12) uniform sampler2D normal_roughness_texture;
 #endif
 
 layout(set = 1, binding = 0, LIGHTING_FORMAT) uniform restrict writeonly image2D out_diffuse;
@@ -262,10 +265,21 @@ void main() {
 	}
 
 	vec3 current_diffuse = texelFetch(in_diffuse, pixel, 0).rgb;
-	vec3 current_specular = texelFetch(in_specular, pixel, 0).rgb;
+	vec4 current_specular4 = texelFetch(in_specular, pixel, 0);
+	vec3 current_specular = current_specular4.rgb;
 #ifdef HAS_DIRECTIONAL
 	vec4 current_directional = texelFetch(in_directional, pixel, 0);
 	vec4 result_directional = current_directional;
+	// The reflection's virtual view depth (gather output alpha), and how much
+	// of the way toward it the reflection's history is looked up: all of it
+	// for a mirror, none for a rough surface whose lobe has no single image.
+	float virtual_view_depth = current_specular4.a;
+	float nr_roughness = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).w;
+	if (nr_roughness > 0.5) {
+		nr_roughness = 1.0 - nr_roughness;
+	}
+	nr_roughness /= (127.0 / 255.0);
+	float virtual_weight = 1.0 - smoothstep(0.15, 0.6, nr_roughness);
 #endif
 
 	// 5x5 neighborhood statistics for history rectification.
@@ -437,6 +451,24 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 			hist_dir = textureLod(history_directional, prev_uv, 0.0);
 #endif
+		}
+#endif
+#ifdef HAS_DIRECTIONAL
+		// Reflection history at the virtual image's reprojection: the same
+		// screen position, at the virtual depth, run through the same
+		// reprojection, then blended toward the surface reprojection by
+		// roughness. Fetched bilinearly with only the in-frame test: the
+		// reflecting surface's stored depth says nothing about where the
+		// image was, and a reflection that reprojects off frame keeps the
+		// surface's history rather than restarting.
+		if (history_usable && virtual_weight > 0.0 && virtual_view_depth > 0.0) {
+			vec4 prev_ndc_v = params.reproject * vec4(uv * 2.0 - 1.0, depth_from_linear(virtual_view_depth), 1.0);
+			if (prev_ndc_v.w > 0.0) {
+				vec2 prev_uv_v = mix(prev_uv, (prev_ndc_v.xy / prev_ndc_v.w) * 0.5 + 0.5, virtual_weight);
+				if (all(greaterThanEqual(prev_uv_v, vec2(0.0))) && all(lessThanEqual(prev_uv_v, vec2(1.0)))) {
+					hist_s4 = textureLod(history_specular, prev_uv_v, 0.0);
+				}
+			}
 		}
 #endif
 		if (history_usable) {
@@ -636,12 +668,31 @@ void main() {
 	// kernel and ignore the luminance stopping function for a few frames.
 	int stride = newly_revealed ? params.stride * 2 : params.stride;
 
+	int stride_s = stride;
 #ifdef FILTER_DIRECTIONAL
 	// Where the gather's rays hit close by, the irradiance varies over the same
 	// short scale (the contact darkening under and beside objects), so a wide
 	// kernel would average that detail away. Tighten the footprint in
 	// proportion to how far the rays actually got.
 	stride = max(1, int(round(float(stride) * max(center_dir.w, 0.25))));
+	// The reflection's kernel follows roughness: a rough lobe is as wide as
+	// the diffuse one, a mirror's image must not be filtered at all.
+	{
+		float r = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).w;
+		if (r > 0.5) {
+			r = 1.0 - r;
+		}
+		r /= (127.0 / 255.0);
+		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
+		if (spec_scale < 0.25) {
+			filter_s = false;
+		}
+		stride_s = max(1, int(round(float(stride_s) * spec_scale)));
+	}
+	if (!filter_d && !filter_s) {
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
+		return;
+	}
 #endif
 
 	// Rotate the sparse kernel per pixel so its footprint does not imprint a
@@ -663,28 +714,36 @@ void main() {
 			}
 			ivec2 sp = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride)))), ivec2(0), params.screen_size - 1);
 			float sd = texelFetch(depth_texture, sp * params.depth_scale, 0).r;
-			if (sd == 0.0) {
-				continue;
-			}
-
 			// SVGF edge-stopping functions: depth, normal and luminance. The
 			// depth test is the view-space tolerance expressed as a raw-depth
 			// window, so it means the same thing at every range.
-			if (sd < depth_min || sd > depth_max) {
+			float w_spatial = 0.0;
+			if (sd != 0.0 && sd >= depth_min && sd <= depth_max) {
+				vec3 n = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);
+				float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
+				w_spatial = exp(-0.3 * float(x * x + y * y)) * w_normal;
+			}
+			// The specular taps sit on their own stride.
+			ivec2 sp_s = sp;
+			float w_spatial_s = w_spatial;
+			if (stride_s != stride) {
+				sp_s = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride_s)))), ivec2(0), params.screen_size - 1);
+				float sd_s = texelFetch(depth_texture, sp_s * params.depth_scale, 0).r;
+				w_spatial_s = 0.0;
+				if (sd_s != 0.0 && sd_s >= depth_min && sd_s <= depth_max) {
+					vec3 n_s = normalize(texelFetch(normal_roughness_texture, sp_s * params.depth_scale, 0).xyz * 2.0 - 1.0);
+					w_spatial_s = exp(-0.3 * float(x * x + y * y)) * pow(max(dot(center_normal, n_s), 0.0), 32.0);
+				}
+			}
+			if (w_spatial <= 0.0 && w_spatial_s <= 0.0) {
 				continue;
 			}
-			vec3 n = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);
-			float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
-			if (w_normal <= 0.0) {
-				continue;
-			}
-			float w_spatial = exp(-0.3 * float(x * x + y * y)) * w_normal;
 
 			vec3 d = texelFetch(in_diffuse, sp, 0).rgb;
-			vec3 s = texelFetch(in_specular, sp, 0).rgb;
+			vec3 s = texelFetch(in_specular, sp_s, 0).rgb;
 
 			float wd = w_spatial;
-			float ws = w_spatial;
+			float ws = w_spatial_s;
 			if (!newly_revealed && !young_d) {
 				wd *= exp(-abs(luminance(d) - moments.x) / sigma_d);
 			}
