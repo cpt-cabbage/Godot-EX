@@ -500,15 +500,68 @@ bool screen_trace_hit(vec3 view_origin, vec3 view_normal, vec3 view_dir, float j
 	return false;
 }
 
+// View-space position of a full-resolution depth texel; the origin (which no
+// visible point can be) for the sky.
+vec3 view_position_at(ivec2 full_pixel) {
+	full_pixel = clamp(full_pixel, ivec2(0), params.full_screen_size - 1);
+	float d = texelFetch(depth_texture, full_pixel, 0).r;
+	if (d == 0.0) {
+		return vec3(0.0);
+	}
+	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
+	vec4 v = params.view_from_ndc * vec4(uv * 2.0 - 1.0, d, 1.0);
+	return v.xyz / v.w;
+}
+
+// The geometric normal of the visible surface at a pixel, from the depth
+// buffer: the plane through the pixel and its nearest neighbours, taking on
+// each axis the neighbour closer in depth so the plane does not straddle a
+// silhouette. Faces the camera by construction, which is the side the rays
+// have to leave from. Falls back to p_fallback where the neighbourhood is sky.
+vec3 geometric_normal(ivec2 full_pixel, vec3 view_pos, vec3 p_fallback) {
+	vec3 px = view_position_at(full_pixel + ivec2(1, 0));
+	vec3 mx = view_position_at(full_pixel - ivec2(1, 0));
+	vec3 py = view_position_at(full_pixel + ivec2(0, 1));
+	vec3 my = view_position_at(full_pixel - ivec2(0, 1));
+	bool has_px = px != vec3(0.0);
+	bool has_mx = mx != vec3(0.0);
+	bool has_py = py != vec3(0.0);
+	bool has_my = my != vec3(0.0);
+	if (!(has_px || has_mx) || !(has_py || has_my)) {
+		return p_fallback;
+	}
+	vec3 dx = (has_px && (!has_mx || abs(px.z - view_pos.z) <= abs(view_pos.z - mx.z))) ? px - view_pos : view_pos - mx;
+	vec3 dy = (has_py && (!has_my || abs(py.z - view_pos.z) <= abs(view_pos.z - my.z))) ? py - view_pos : view_pos - my;
+	vec3 n = cross(dx, dy);
+	float len = length(n);
+	if (len < 1e-12) {
+		return p_fallback;
+	}
+	n /= len;
+	// The camera is at the view-space origin.
+	return dot(n, view_pos) > 0.0 ? -n : n;
+}
+
+// Keeps a sample direction on the surface's side of its geometric plane:
+// one drawn from a lobe around a normal-mapped shading normal can point into
+// the surface, and is folded across the plane rather than traced into it.
+vec3 fold_above(vec3 dir, vec3 geo_normal) {
+	float below = dot(dir, geo_normal);
+	return below < 0.0 ? dir - 2.0 * below * geo_normal : dir;
+}
+
 // One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
 // miss. Positions are camera-relative world space (the cascade convention).
 // r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
 // escaped), which the denoiser uses to keep contact GI away from far-field GI.
-vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
+// world_geo_normal is the geometric normal: the ray origins are pushed off
+// the surface along it, and the shading normal, which may lean into the
+// surface, has no say in that.
+vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
 	r_hit_distance = params.ao_range; // Nothing hit within range.
 	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
 		vec3 hit_view;
-		vec3 view_normal = transpose(mat3(params.world_from_view)) * world_normal;
+		vec3 view_normal = transpose(mat3(params.world_from_view)) * world_geo_normal;
 		if (screen_trace_hit(view_origin, view_normal, view_dir, jitter, hit_view)) {
 			mat3 world_basis = mat3(params.world_from_view);
 			vec3 rel_hit = world_basis * hit_view;
@@ -538,7 +591,7 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_normal, vec3 world_dir, vec3 vie
 		}
 	}
 
-	vec3 origin = rel_origin + world_normal * params.ray_bias;
+	vec3 origin = rel_origin + world_geo_normal * params.ray_bias;
 	// The TLAS lives in absolute world space; positions here are
 	// camera-relative, so the query origin adds the camera origin back.
 	rayQueryEXT rq;
@@ -579,6 +632,29 @@ void main() {
 
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
 	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
+	// The surface the rays actually leave from. The buffer holds the shading
+	// normal, and two things about it can put a ray behind the surface:
+	//
+	// - The scene shader turns a double-sided material's normal toward the
+	//   viewer by winding (gl_FrontFacing), which is wrong for a mesh whose
+	//   triangles wind against their vertex normals -- an authoring slip
+	//   common in imported assets, and one the raster path barely shows. Here
+	//   it is fatal: every ray leaves through the wall, the screen trace's
+	//   first step lands on the wall itself, the on-screen radiance read there
+	//   is the wall's own last-frame colour, and that loop converges on black.
+	// - A normal map tilts the shading normal, and a cosine lobe around a
+	//   tilted normal puts part of itself below the real surface. Those rays
+	//   meet the wall two march steps in and read its own colour back, and
+	//   report a hit distance of centimetres that the near-field visibility
+	//   takes for contact occlusion: the wall's bumps come out as bright
+	//   self-lit patches ringed by dark bands.
+	//
+	// So the shading normal is made to agree with the geometric one, and the
+	// rays below are kept on the geometric normal's side.
+	vec3 geo_view_normal = geometric_normal(full_pixel, view_pos, view_normal);
+	if (dot(view_normal, geo_view_normal) < 0.0) {
+		view_normal = -view_normal;
+	}
 	float roughness = nr.w;
 	if (roughness > 0.5) {
 		roughness = 1.0 - roughness;
@@ -591,6 +667,7 @@ void main() {
 	mat3 world_basis = mat3(params.world_from_view);
 	vec3 rel_pos = world_basis * view_pos;
 	vec3 world_normal = normalize(world_basis * view_normal);
+	vec3 world_geo_normal = normalize(world_basis * geo_view_normal);
 
 	vec3 irradiance = vec3(0.0);
 	// First moment of the incoming radiance and the near-field visibility,
@@ -599,13 +676,13 @@ void main() {
 	float visibility = 0.0;
 	for (uint r = 0u; r < params.ray_count; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
-		vec3 dir = cosine_hemisphere(world_normal, rnd);
+		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float t_hit;
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
-		vec3 radiance = max(trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
+		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
 		irradiance += radiance;
 		moment += luminance(radiance) * dir;
 		// Only nearby geometry occludes: in an open scene nearly every ray
@@ -634,9 +711,10 @@ void main() {
 		if (dot(dir, world_normal) <= 1e-4) {
 			dir = reflect(-v, world_normal);
 		}
+		dir = fold_above(dir, world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float spec_t_hit;
-		reflection = trace_radiance(rel_pos, world_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
+		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
 	}
 
 	imageStore(out_ambient, pixel, vec4(irradiance, 0.0));

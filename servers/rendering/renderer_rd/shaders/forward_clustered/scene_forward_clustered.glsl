@@ -1233,6 +1233,26 @@ void fragment_shader(in SceneData scene_data) {
 	if (!gl_FrontFacing) {
 		normal_highp = -normal_highp;
 	}
+	{
+		// Winding says which side of the triangle is being drawn; it does not
+		// say which side its vertex normals belong to. A mesh whose triangles
+		// wind against their normals (imported assets do this) passes the test
+		// above with a normal pointing into the surface, away from the camera,
+		// and every N.V term downstream -- Fresnel, the reflection direction,
+		// specular occlusion, the ray-traced gather's hemisphere -- then runs
+		// on the back of the wall. The face's own plane, from the position
+		// derivatives, settles it: a normal more than 120 degrees from the
+		// camera-facing side of that plane can only be an inverted one. The
+		// margin leaves silhouette interpolation alone, where a smooth normal
+		// legitimately leans past the face by tens of degrees.
+		vec3 face_normal = cross(dFdx(vertex_interp), dFdy(vertex_interp));
+		if (dot(face_normal, vertex_interp) > 0.0) {
+			face_normal = -face_normal;
+		}
+		if (dot(normal_highp, face_normal) < -0.5 * length(normal_highp) * length(face_normal)) {
+			normal_highp = -normal_highp;
+		}
+	}
 #endif // DO_SIDE_CHECK
 #endif // NORMAL_USED
 
@@ -2115,9 +2135,16 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 rt_gi_reflection = vec3(0.0);
 		// xyz: first radiance moment (world space), w: near-field visibility.
 		vec4 rt_gi_directional = vec4(0.0, 0.0, 0.0, 1.0);
+		// The gather faces every normal it reads toward the viewer (a mesh wound
+		// against its vertex normals writes them pointing into the surface;
+		// see stochastic_indirect_gi.glsl), so its moment is expressed against
+		// the viewer-facing side. The re-basing below has to compare against
+		// normals facing the same way, or such a wall has its irradiance
+		// re-based onto its own back and comes out half as bright.
+		vec3 rt_gi_face = dot(indirect_normal, view) < 0.0 ? -indirect_normal : indirect_normal;
 		// The normal the gather actually sampled around, which the directional
 		// reconstruction re-bases onto this fragment's normal.
-		vec3 rt_gi_gather_normal = indirect_normal;
+		vec3 rt_gi_gather_normal = rt_gi_face;
 		bool rt_gi_valid = false;
 		if ((implementation_data.rt_gi & 3u) == 1u) {
 #ifdef USE_MULTIVIEW
@@ -2152,9 +2179,9 @@ void fragment_shader(in SceneData scene_data) {
 			ivec2 rtgi_near = ivec2(greaterThanEqual(rtgi_fr, vec2(0.5)));
 			int rtgi_near_i = rtgi_near.x + rtgi_near.y * 2;
 			float rtgi_near_w = 0.0;
-			vec3 rtgi_near_n = indirect_normal;
+			vec3 rtgi_near_n = rt_gi_face;
 			float rtgi_best_w = -1.0;
-			vec3 rtgi_best_n = indirect_normal;
+			vec3 rtgi_best_n = rt_gi_face;
 			rt_gi_directional = vec4(0.0);
 			for (int i = 0; i < 4; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
@@ -2169,6 +2196,8 @@ void fragment_shader(in SceneData scene_data) {
 				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
 				vec3 sn = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0).xyz * 2.0 - 1.0);
 #endif
+				// Faced the way the gather faced it.
+				sn = dot(sn, view) < 0.0 ? -sn : sn;
 				float w = (1.0 - abs(float(off.x) - rtgi_fr.x)) * (1.0 - abs(float(off.y) - rtgi_fr.y));
 				w *= exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
 				// Depth alone lets GI bleed across a silhouette where two
@@ -2176,7 +2205,7 @@ void fragment_shader(in SceneData scene_data) {
 				// box edge being the everyday case. A gentler exponent than
 				// the denoiser's, since half-res taps are legitimately a
 				// little further apart in normal.
-				w *= pow(max(dot(indirect_normal, sn), 0.0), 8.0);
+				w *= pow(max(dot(rt_gi_face, sn), 0.0), 8.0);
 #ifdef USE_MULTIVIEW
 				rt_gi_ambient += texelFetch(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
 				rt_gi_reflection += texelFetch(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
@@ -2264,7 +2293,7 @@ void fragment_shader(in SceneData scene_data) {
 					// invisible few percent.
 					float gi_s = clamp((gi_q - 2.0 / 3.0) * 12.0, 0.0, 1.0) * implementation_data.rt_gi_directionality;
 					gi_s = min(gi_s, 0.75); // Keeps the denominator away from zero.
-					float gi_num = (1.0 - gi_s) + gi_s * max(dot(gi_dir, indirect_normal), 0.0);
+					float gi_num = (1.0 - gi_s) + gi_s * max(dot(gi_dir, rt_gi_face), 0.0);
 					float gi_den = (1.0 - gi_s) + gi_s * max(dot(gi_dir, rt_gi_gather_normal), 0.0);
 					// Exactly 1 when the two normals agree, so flat surfaces
 					// and every pixel of a scene without normal maps are

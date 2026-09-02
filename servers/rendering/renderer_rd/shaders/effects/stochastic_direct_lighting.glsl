@@ -633,6 +633,15 @@ void main() {
 
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
 	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
+	// Face the normal toward the viewer: the scene shader decides a
+	// double-sided material's side by winding, and a mesh whose triangles wind
+	// against their vertex normals writes a normal pointing into the surface
+	// (see the same test in stochastic_indirect_gi.glsl). Shading such a pixel
+	// would put N.L below zero for every light in the room and start its shadow
+	// rays behind the wall.
+	if (dot(view_normal, view_pos) > 0.0) {
+		view_normal = -view_normal;
+	}
 	float roughness = nr.w;
 	if (roughness > 0.5) {
 		roughness = 1.0 - roughness;
