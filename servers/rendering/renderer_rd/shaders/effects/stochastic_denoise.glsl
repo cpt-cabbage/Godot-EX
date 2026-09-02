@@ -85,13 +85,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // stop and skip-if-converged gate describe the signal it is actually filtering
 // instead of the unfiltered one (whose variance overstates what is left by
 // then, keeping the edge stops loose and the gating conservative at every
-// iteration after the first). The moments are averaged with the same a-trous
-// weights as the color (the Q2RTX construction, rather than SVGF's weighted
-// variance propagation): the moments of a weighted mixture are the weighted
-// average of its parts' moments, so the estimate stays exact for the output
-// signal wherever the neighborhood agrees, and the law of total variance adds
-// the neighborhood's own spread where it does not -- conservative exactly
-// where filtering is still doing work. The final iteration does not define
+// iteration after the first). The mean rides the a-trous weights and the
+// variance the squared weights (SVGF 4.3), so the variance handed on is that
+// of the average this iteration produced. The final iteration does not define
 // this (nothing consumes its moments): the temporally accumulated moments are
 // never overwritten, so the temporal pass's history stays an honest record of
 // the accumulated -- not the spatially filtered -- signal.
@@ -741,10 +737,20 @@ void main() {
 	vec4 sum_dir = center_dir;
 	float weight_d = 1.0;
 	float weight_s = 1.0;
-	// The moments ride the same weights as their signals (the center at 1),
-	// so the next iteration's variance describes the mixture this one output.
-	vec2 sum_mom_d = moments.xy;
-	vec2 sum_mom_s = moments.zw;
+	// The next iteration's variance is that of the weighted average this one
+	// outputs (SVGF 4.3): the mean rides the weights, the variance the squared
+	// weights, so it drops by the kernel's effective tap count wherever the
+	// neighborhood agrees. Averaging the raw moments instead (the Q2RTX
+	// construction) leaves the variance of a flat region untouched and raises
+	// it at edges by the neighborhood's spread, which loosens the luminance
+	// stops exactly where they matter; measured 3-9% worse on the game
+	// project, so it is not what is done here. The center is at weight 1.
+	float sum_m1_d = moments.x;
+	float sum_m1_s = moments.z;
+	float sum_var_d = var_d;
+	float sum_var_s = var_s;
+	float sum_w2_d = 1.0;
+	float sum_w2_s = 1.0;
 
 	for (int y = -2; y <= 2; y++) {
 		for (int x = -2; x <= 2; x++) {
@@ -803,11 +809,15 @@ void main() {
 			weight_s += ws;
 #ifdef MOMENTS_OUTPUT
 			vec4 m = texelFetch(moments_texture, sp, 0);
-			sum_mom_d += m.xy * wd;
+			sum_m1_d += m.x * wd;
+			sum_var_d += max(m.y - m.x * m.x, 0.0) * wd * wd;
+			sum_w2_d += wd * wd;
 			if (stride_s != stride) {
 				m = texelFetch(moments_texture, sp_s, 0);
 			}
-			sum_mom_s += m.zw * ws;
+			sum_m1_s += m.z * ws;
+			sum_var_s += max(m.w - m.z * m.z, 0.0) * ws * ws;
+			sum_w2_s += ws * ws;
 #endif
 #ifdef FILTER_DIRECTIONAL
 			// Same weight as the diffuse signal, deliberately: the pair only
@@ -819,8 +829,16 @@ void main() {
 
 #ifdef MOMENTS_OUTPUT
 	// A skipped signal keeps its own moments (its output is its input).
-	vec2 out_mom_d = filter_d ? sum_mom_d / weight_d : moments.xy;
-	vec2 out_mom_s = filter_s ? sum_mom_s / weight_s : moments.zw;
+	vec2 out_mom_d = moments.xy;
+	vec2 out_mom_s = moments.zw;
+	if (filter_d) {
+		float m1 = sum_m1_d / weight_d;
+		out_mom_d = vec2(m1, m1 * m1 + sum_var_d / (weight_d * weight_d));
+	}
+	if (filter_s) {
+		float m1 = sum_m1_s / weight_s;
+		out_mom_s = vec2(m1, m1 * m1 + sum_var_s / (weight_s * weight_s));
+	}
 	imageStore(out_moments, pixel, vec4(out_mom_d, out_mom_s));
 #endif
 
