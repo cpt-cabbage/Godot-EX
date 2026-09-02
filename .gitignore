@@ -263,6 +263,8 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
+# OpenColorIO ships source under ops/log/, which the rule above would drop from a fresh checkout.
+!thirdparty/opencolorio/src/OpenColorIO/ops/log/
 [Ll]ogs/
 
 # Do not ignore arch-specific folders anywhere under thirdparty libraries
