@@ -333,6 +333,11 @@ private:
 			uint32_t rt_gi;
 			float rt_gi_directionality;
 			uint32_t local_shadow_maps; // Zero: no local shadow map was rendered this frame, so the analytic paths must treat omni/spot/area lights as unshadowed instead of sampling a stale atlas rect.
+
+			uint32_t rt_transparent_shadows; // Bit 0: local lights trace their own shadow ray per fragment (transparent pass); bit 1: so does the first directional light.
+			float rt_ray_bias; // Origin offset / t_min for those rays, shared with the stochastic pass.
+			uint32_t rt_transparent_max_rays; // Local-light rays a fragment may trace; lights past the budget stay unshadowed.
+			uint32_t rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
 		};
 
 		struct PushConstantUbershader {
@@ -778,6 +783,22 @@ private:
 	bool use_stochastic_half_res = false;
 	bool use_stochastic_fog_shadows = false;
 	bool use_stochastic_skip_local_shadow_maps = true;
+	// Transparent-pass shadow rays (RT_TRANSPARENT_SHADOWS in the scene
+	// shader): on the frames the traced paths own a light's shadow, the
+	// transparent pass has no shadow map to sample and traces per fragment.
+	bool use_stochastic_transparent_shadows = true;
+	uint32_t stochastic_transparent_max_rays = 4;
+	// The scene shader declares the TLAS binding whenever the device can trace,
+	// so the binding needs an acceleration structure on every frame, including
+	// the ones before any traced pass has built the real one: a one-triangle
+	// placeholder far outside any ray's range stands in for it then.
+	bool scene_shader_ray_query = false;
+	RID rt_dummy_vertex_buffer;
+	RID rt_dummy_index_buffer;
+	RID rt_dummy_blas;
+	RID rt_dummy_tlas;
+	void _ensure_rt_dummy_tlas();
+	RID _get_scene_shader_tlas() const;
 	bool use_rt_sdfgi_probes = false;
 	bool use_rt_gi = false;
 	bool use_rt_gi_half_res = true;

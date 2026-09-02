@@ -635,6 +635,16 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 	}
 #endif
 
+#if defined(RT_TRANSPARENT_SHADOWS) && !defined(SHADOWS_DISABLED)
+	// No shadow map this frame: trace the light's centre instead, while the
+	// fragment's ray budget lasts (see the clustered scene shader).
+	if (!LOCAL_SHADOW_MAPS_RENDERED && rt_transparent_ray_budget > 0u && omni_attenuation > HALF_FLT_MIN && omni_lights.data[idx].shadow_opacity > 0.001 && omni_lights.data[idx].shadow_caster_mask != 0u) {
+		rt_transparent_ray_budget--;
+		bool visible = rt_transparent_trace_visible(vertex, vec3(normal), omni_lights.data[idx].position, omni_lights.data[idx].shadow_caster_mask);
+		shadow = visible ? half(1.0) : half(1.0 - omni_lights.data[idx].shadow_opacity);
+	}
+#endif // RT_TRANSPARENT_SHADOWS
+
 	vec3 color = omni_lights.data[idx].color;
 
 #ifdef LIGHT_TRANSMITTANCE_USED
@@ -888,6 +898,14 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 		}
 	}
 #endif // SHADOWS_DISABLED
+
+#if defined(RT_TRANSPARENT_SHADOWS) && !defined(SHADOWS_DISABLED)
+	if (!LOCAL_SHADOW_MAPS_RENDERED && rt_transparent_ray_budget > 0u && spot_attenuation > HALF_FLT_MIN && spot_lights.data[idx].shadow_opacity > 0.001 && spot_lights.data[idx].shadow_caster_mask != 0u) {
+		rt_transparent_ray_budget--;
+		bool visible = rt_transparent_trace_visible(vertex, vec3(normal), spot_lights.data[idx].position, spot_lights.data[idx].shadow_caster_mask);
+		shadow = visible ? half(1.0) : half(1.0 - spot_lights.data[idx].shadow_opacity);
+	}
+#endif // RT_TRANSPARENT_SHADOWS
 
 	vec3 color = spot_lights.data[idx].color;
 
@@ -1145,6 +1163,14 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 		}
 	}
 #endif
+#if defined(RT_TRANSPARENT_SHADOWS) && !defined(SHADOWS_DISABLED)
+	// One ray toward the rect's centre: hard, like the omni/spot rays above.
+	if (!LOCAL_SHADOW_MAPS_RENDERED && rt_transparent_ray_budget > 0u && light_attenuation_raw > HALF_FLT_MIN && area_lights.data[idx].shadow_opacity > 0.001 && area_lights.data[idx].shadow_caster_mask != 0u) {
+		rt_transparent_ray_budget--;
+		bool visible = rt_transparent_trace_visible(vertex, vec3(normal), area_lights.data[idx].position, area_lights.data[idx].shadow_caster_mask);
+		shadow = visible ? half(1.0) : half(1.0 - area_lights.data[idx].shadow_opacity);
+	}
+#endif // RT_TRANSPARENT_SHADOWS
 	light_attenuation_ltc = light_attenuation_ltc * shadow;
 	half light_attenuation = light_attenuation_raw * shadow;
 	hvec3 color = hvec3(area_lights.data[idx].color);

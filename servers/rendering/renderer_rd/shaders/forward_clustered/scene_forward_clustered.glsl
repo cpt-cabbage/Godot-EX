@@ -1,6 +1,6 @@
 #[vertex]
 
-#version 450
+#version 460
 
 #VERSION_DEFINES
 
@@ -861,9 +861,17 @@ void main() {
 
 #[fragment]
 
-#version 450
+#version 460
 
 #VERSION_DEFINES
+
+#ifdef RT_TRANSPARENT_SHADOWS
+// The transparent pass traces its own shadow rays (see rt_transparent_* below).
+#extension GL_EXT_ray_query : enable
+#define RT_TRANSPARENT_SUN_RAY bool(implementation_data.rt_transparent_shadows & 2u)
+#else
+#define RT_TRANSPARENT_SUN_RAY false
+#endif
 
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
@@ -877,6 +885,30 @@ void main() {
 /* Include half precision types. */
 #include "../half_inc.glsl"
 #include "scene_forward_clustered_inc.glsl"
+
+#if defined(RT_TRANSPARENT_SHADOWS) && !defined(MODE_RENDER_SDF)
+// The transparent pass's shadow rays trace this (see rt_transparent_* further
+// down). Every variant of this shader shares one render-pass uniform set
+// (the SDF variant excepted: it has its own set 1 in the include above), so
+// every variant has to declare the binding -- and, unlike an unreferenced
+// texture, an unreferenced acceleration structure is dropped from the SPIR-V,
+// which would give the depth and material variants a different set layout.
+// rt_transparent_keep_binding() below is the reference that keeps it.
+layout(set = 1, binding = 47) uniform accelerationStructureEXT rt_tlas;
+
+void rt_transparent_keep_binding() {
+	// Never taken: the budget is clamped to 16 on the CPU. The compiler
+	// cannot prove that, so the query, and the binding, survive.
+	if (implementation_data.rt_transparent_max_rays == 0xFFFFFFFFu) {
+		rayQueryEXT rq;
+		rayQueryInitializeEXT(rq, rt_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, vec3(0.0), 0.01, vec3(0.0, 1.0, 0.0), 0.02);
+		rayQueryProceedEXT(rq);
+		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+			discard;
+		}
+	}
+}
+#endif // RT_TRANSPARENT_SHADOWS && !MODE_RENDER_SDF
 
 /* Varyings */
 
@@ -1050,6 +1082,63 @@ layout(location = 2) out vec2 motion_vector;
 // their shadows instead. The mobile renderer shares the light include but has
 // no implementation data block, so the condition is a macro with a default.
 #define LOCAL_SHADOW_MAPS_RENDERED (implementation_data.local_shadow_maps != 0u)
+
+#ifdef RT_TRANSPARENT_SHADOWS
+// Transparent surfaces are shaded analytically, per fragment, with no
+// history: the stochastic pass's traced visibility is a screen-space result
+// keyed to the opaque depth, and the local shadow maps it replaces are no
+// longer rendered. So on the frames the stochastic pass owns local shadows,
+// the transparent pass traces one hard shadow ray per light itself, from the
+// fragment toward the light's centre, up to a per-fragment budget. The TLAS
+// is the same one every other traced pass uses (world space, absolute).
+// (Declared with the render-pass bindings above, since every variant must
+// carry it.)
+
+// Rays this fragment may still trace for local lights; main() fills it from
+// the budget when the pass is active and leaves it zero otherwise, which is
+// what keeps the opaque pass and every other consumer of the light include
+// bit-identical to before.
+uint rt_transparent_ray_budget = 0u;
+
+// One hard visibility ray from a view-space fragment toward a view-space
+// target, both converted to the TLAS's world space. The origin steps off the
+// surface along the side of its normal that faces the target, by the same
+// bias the stochastic pass uses; t_min repeats the bias so an origin that
+// still touches the surface cannot hit it.
+bool rt_transparent_trace_visible(vec3 view_origin, vec3 view_normal, vec3 view_target, uint caster_mask) {
+	mat4 rt_inv_view = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
+			scene_data_block.data.inv_view_matrix[1],
+			scene_data_block.data.inv_view_matrix[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+	vec3 delta = view_target - view_origin;
+	float dist = length(delta);
+	if (dist < 1e-4) {
+		return true;
+	}
+	vec3 dir = delta / dist;
+	float bias = implementation_data.rt_ray_bias;
+	vec3 n = normalize(view_normal);
+	n *= sign(dot(n, dir)) >= 0.0 ? 1.0 : -1.0;
+	vec3 world_origin = (rt_inv_view * vec4(view_origin + n * bias, 1.0)).xyz;
+	vec3 world_dir = normalize(mat3(rt_inv_view) * dir);
+	float t_max = dist - bias;
+	if (t_max <= bias) {
+		return true;
+	}
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, rt_tlas,
+			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+			caster_mask, world_origin, bias, world_dir, t_max);
+	rayQueryProceedEXT(rq);
+	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+
+// The same ray toward a directional light: a view-space direction instead of
+// a target, and a range that covers the whole scene.
+bool rt_transparent_trace_visible_dir(vec3 view_origin, vec3 view_normal, vec3 view_to_light, uint caster_mask) {
+	return rt_transparent_trace_visible(view_origin, view_normal, view_origin + normalize(view_to_light) * 16384.0, caster_mask);
+}
+#endif // RT_TRANSPARENT_SHADOWS
 
 #include "../scene_forward_lights_inc.glsl"
 
@@ -2667,7 +2756,9 @@ void fragment_shader(in SceneData scene_data) {
 
 				// The ray traced mask owns the first directional light's shadow
 				// when active; its shadow map is stale and must not be sampled.
-				if (directional_lights.data[i].shadow_opacity > 0.001 && !(implementation_data.rt_sun_shadow != 0u && i == 0u)) {
+				// Same for the transparent pass on the frames it traces the
+				// sun itself: the cascades were not rendered either.
+				if (directional_lights.data[i].shadow_opacity > 0.001 && !((implementation_data.rt_sun_shadow != 0u || RT_TRANSPARENT_SUN_RAY) && i == 0u)) {
 					float depth_z = -vertex.z;
 					vec3 light_dir = directional_lights.data[i].direction;
 					vec3 base_normal_bias = geo_normal * (1.0 - max(0.0, dot(light_dir, -geo_normal)));
@@ -2973,12 +3064,27 @@ void fragment_shader(in SceneData scene_data) {
 			// Only the first directional light is traced for now; the light's
 			// shadow opacity applies to the traced result too.
 			if (i == 0) {
-#ifdef USE_MULTIVIEW
-				float rt_mask = texture(sampler2DArray(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r;
-#else
-				float rt_mask = texture(sampler2D(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), screen_uv).r;
+#ifdef RT_TRANSPARENT_SHADOWS
+				if (RT_TRANSPARENT_SUN_RAY) {
+					// The screen-space mask is keyed to the opaque depth, so
+					// a transparent surface floating in front of it would
+					// wear whatever shadow lies behind it. Trace the sun from
+					// the fragment instead (hard: the pass has no history to
+					// resolve a penumbra into).
+					if (directional_lights.data[i].shadow_opacity > 0.001 && implementation_data.rt_sun_caster_mask != 0u) {
+						bool sun_visible = rt_transparent_trace_visible_dir(vertex, geo_normal, directional_lights.data[i].direction, implementation_data.rt_sun_caster_mask);
+						shadow = min(shadow, sun_visible ? 1.0 : 1.0 - directional_lights.data[i].shadow_opacity);
+					}
+				} else
 #endif
-				shadow = min(shadow, mix(1.0, rt_mask, directional_lights.data[i].shadow_opacity));
+				{
+#ifdef USE_MULTIVIEW
+					float rt_mask = texture(sampler2DArray(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex)).r;
+#else
+					float rt_mask = texture(sampler2D(rt_shadow_mask, SAMPLER_LINEAR_CLAMP), screen_uv).r;
+#endif
+					shadow = min(shadow, mix(1.0, rt_mask, directional_lights.data[i].shadow_opacity));
+				}
 			}
 
 			blur_shadow(shadow);
@@ -3034,6 +3140,12 @@ void fragment_shader(in SceneData scene_data) {
 		}
 #endif // USE_VERTEX_LIGHTING
 	}
+
+#ifdef RT_TRANSPARENT_SHADOWS
+	// Local lights below shade analytically; hand them a ray budget only on
+	// the frames their shadow maps were skipped (see rt_transparent_* above).
+	rt_transparent_ray_budget = (!LOCAL_SHADOW_MAPS_RENDERED && bool(implementation_data.rt_transparent_shadows & 1u)) ? implementation_data.rt_transparent_max_rays : 0u;
+#endif
 
 #ifndef USE_VERTEX_LIGHTING
 	if (implementation_data.stochastic_direct_lights == 0u) { //omni lights
@@ -3560,6 +3672,9 @@ void main() {
 	if (dp_clip > 0.0) {
 		discard;
 	}
+#endif
+#if defined(RT_TRANSPARENT_SHADOWS) && !defined(MODE_RENDER_SDF)
+	rt_transparent_keep_binding();
 #endif
 
 	fragment_shader(scene_data_block.data);

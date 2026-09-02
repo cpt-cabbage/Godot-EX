@@ -358,6 +358,11 @@ struct ImplementationData {
 	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers (1: full res, 2: half res).
 	float rt_gi_directionality; // Scales how far the directional term re-bases irradiance onto the fragment normal.
 	uint local_shadow_maps; // Zero: no omni/spot/area shadow map was rendered this frame (the stochastic pass owns those shadows), so the analytic paths must not sample the atlas.
+
+	uint rt_transparent_shadows; // Bit 0: local lights trace their own shadow ray per fragment (transparent pass); bit 1: so does the first directional light.
+	float rt_ray_bias; // Origin offset / t_min for those rays, shared with the stochastic pass.
+	uint rt_transparent_max_rays; // Local-light rays a fragment may trace; lights past the budget stay unshadowed.
+	uint rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {

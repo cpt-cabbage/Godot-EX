@@ -758,6 +758,35 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// unshadowed rather than sample stale depth. Reflection probes render into
 	// their own pass with their own atlas and are never skipped.
 	scene_state.ubo.local_shadow_maps = (stochastic_owns_local_shadows && p_render_data->reflection_probe.is_null()) ? 0 : 1;
+	// The transparent pass, on those same frames, has nothing to sample for
+	// its shadows: the local atlas was skipped, and the sun's cascades were
+	// skipped too while its screen-space mask is keyed to the opaque depth.
+	// So it traces per fragment instead (RT_TRANSPARENT_SHADOWS in the scene
+	// shader). Bit 0: local lights; bit 1: the first directional light. Only
+	// with a TLAS the traced passes built this frame, and never for reflection
+	// probes, which render their own shadow maps.
+	{
+		uint32_t flags = 0;
+		uint32_t sun_caster_mask = 0;
+		const bool tlas_ready = rt_shadows != nullptr && rt_scene_ready && rt_shadows->get_tlas().is_valid();
+		if (scene_shader_ray_query && use_stochastic_transparent_shadows && tlas_ready && !p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) {
+			if (scene_state.ubo.local_shadow_maps == 0) {
+				flags |= 1;
+			}
+			RID sun = _get_rt_sun_base(p_render_data);
+			if (sun.is_valid()) {
+				flags |= 2;
+				// Remapped to the 8-bit instance mask hardware rays support,
+				// the same way the traced sun pass does it.
+				uint32_t caster = RendererRD::LightStorage::get_singleton()->light_get_shadow_caster_mask(sun);
+				sun_caster_mask = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
+			}
+		}
+		scene_state.ubo.rt_transparent_shadows = flags;
+		scene_state.ubo.rt_ray_bias = stochastic_quality.ray_bias;
+		scene_state.ubo.rt_transparent_max_rays = stochastic_transparent_max_rays;
+		scene_state.ubo.rt_sun_caster_mask = sun_caster_mask;
+	}
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1849,6 +1878,53 @@ RID RenderForwardClustered::_get_rt_sun_base(const RenderDataRD *p_render_data) 
 	return RID();
 }
 
+void RenderForwardClustered::_ensure_rt_dummy_tlas() {
+	RD *rd = RD::get_singleton();
+	if (rt_dummy_tlas.is_valid() && rd->acceleration_structure_is_valid(rt_dummy_tlas)) {
+		return;
+	}
+	// One triangle, far outside the range of any ray the scene shader casts
+	// (16384 units for the sun, the light's distance otherwise), so a ray
+	// against it can only miss. Its buffers are never freed behind its back,
+	// so the validity check above is only formal.
+	if (rt_dummy_tlas.is_valid()) {
+		rd->free_rid(rt_dummy_tlas);
+		rt_dummy_tlas = RID();
+	}
+	if (rt_dummy_blas.is_null()) {
+		const float verts[9] = { 1.0e7f, 1.0e7f, 1.0e7f, 1.0e7f + 1.0f, 1.0e7f, 1.0e7f, 1.0e7f, 1.0e7f + 1.0f, 1.0e7f };
+		const uint32_t indices[3] = { 0, 1, 2 };
+		rt_dummy_vertex_buffer = rd->vertex_buffer_create(sizeof(verts), Span<uint8_t>((const uint8_t *)verts, sizeof(verts)), RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		rt_dummy_index_buffer = rd->index_buffer_create(3, RD::INDEX_BUFFER_FORMAT_UINT32, Span<uint8_t>((const uint8_t *)indices, sizeof(indices)), false, RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		RD::AccelerationStructureGeometry geometry;
+		geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+		geometry.vertex_buffer = rt_dummy_vertex_buffer;
+		geometry.vertex_stride = 12;
+		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+		geometry.vertex_count = 3;
+		geometry.index_buffer = rt_dummy_index_buffer;
+		geometry.index_count = 3;
+		rt_dummy_blas = rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), 0);
+		ERR_FAIL_COND(rt_dummy_blas.is_null());
+		rd->blas_build(rt_dummy_blas);
+	}
+	rt_dummy_tlas = rd->tlas_create(1, 0);
+	ERR_FAIL_COND(rt_dummy_tlas.is_null());
+	RD::AccelerationStructureInstance instance;
+	instance.blas = rt_dummy_blas;
+	instance.mask = 0xFF;
+	// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
+	instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+	rd->tlas_build(rt_dummy_tlas, Span<RD::AccelerationStructureInstance>(&instance, 1));
+}
+
+RID RenderForwardClustered::_get_scene_shader_tlas() const {
+	if (rt_shadows != nullptr && rt_scene_ready && rt_shadows->get_tlas().is_valid()) {
+		return rt_shadows->get_tlas();
+	}
+	return rt_dummy_tlas;
+}
+
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
@@ -1877,6 +1953,13 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
 	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps");
+	use_stochastic_transparent_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows");
+	stochastic_transparent_max_rays = CLAMP(int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays")), 1, 16);
+	if (scene_shader_ray_query) {
+		// Outside any draw list, which is where an acceleration structure
+		// may be built; the scene shader's TLAS binding reads it later.
+		_ensure_rt_dummy_tlas();
+	}
 	use_rt_sdfgi_probes = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/sdfgi/ray_query"));
 	if (rt_shadows != nullptr) {
 		rt_shadows->shadow_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/temporal_frames"));
@@ -4422,6 +4505,18 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
+	if (scene_shader_ray_query) {
+		// The transparent pass's shadow rays (RT_TRANSPARENT_SHADOWS). The
+		// real TLAS when the traced passes built one this frame, otherwise
+		// the placeholder, which nothing traces against (the ubo flags stay
+		// clear in that case).
+		RD::Uniform u;
+		u.binding = 47;
+		u.uniform_type = RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE;
+		u.append_id(_get_scene_shader_tlas());
+		uniforms.push_back(u);
+	}
+
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.get_default_shader_rd(is_multiview), RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
@@ -5851,6 +5946,13 @@ RenderForwardClustered::RenderForwardClustered() {
 			defines += "\n#define USE_DOUBLE_PRECISION \n";
 		}
 #endif
+		if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+			// The transparent pass can trace its own shadow rays (see
+			// RT_TRANSPARENT_SHADOWS in the scene shader). Devices without
+			// ray queries compile the shader exactly as before.
+			scene_shader_ray_query = true;
+			defines += "\n#define RT_TRANSPARENT_SHADOWS\n";
+		}
 
 		scene_shader.init(defines);
 	}
@@ -5954,6 +6056,14 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (rt_shadows != nullptr) {
 		memdelete(rt_shadows);
 		rt_shadows = nullptr;
+	}
+	// The placeholder TLAS depends on its BLAS, which depends on the buffers;
+	// free from the top so nothing is freed twice by the dependency cascade.
+	for (RID *rid : { &rt_dummy_tlas, &rt_dummy_blas, &rt_dummy_vertex_buffer, &rt_dummy_index_buffer }) {
+		if (rid->is_valid()) {
+			RD::get_singleton()->free_rid(*rid);
+			*rid = RID();
+		}
 	}
 
 	if (ss_effects != nullptr) {

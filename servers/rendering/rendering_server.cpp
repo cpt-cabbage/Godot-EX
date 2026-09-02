@@ -3718,6 +3718,12 @@ void RenderingServer::init() {
 	// largest cost this path can avoid. Turn this off to keep them for the
 	// transparent pass, which still shades local lights analytically.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps"), true);
+	// On those frames the transparent pass has no shadow map to sample either,
+	// so it traces one hard ray per light per fragment instead, toward the
+	// light's centre, up to this many local lights per fragment (the rest stay
+	// unshadowed). The ray-traced sun is traced the same way there.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays", PROPERTY_HINT_RANGE, "1,16,1"), 4);
 	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
 	// available, i.e. any other ray tracing feature is on or SDFGI is active).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);
