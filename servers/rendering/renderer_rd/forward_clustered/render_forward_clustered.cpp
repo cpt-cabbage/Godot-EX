@@ -1888,6 +1888,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_border_fade");
 	rt_gi_screen_radiance_clamp = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_clamp");
 	rt_gi_probe_floor = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/probe_floor");
+	use_rt_gi_cache_calibration = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/cache_calibration");
 	use_rt_gi_screen_traces = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_traces");
 	use_rt_gi_light_cascade_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/light_cascade_radiance");
 	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
@@ -2598,6 +2599,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.screen_radiance_border_fade = rt_gi_screen_radiance_border_fade;
 				gi_quality.screen_radiance_clamp = rt_gi_screen_radiance_clamp;
 				gi_quality.probe_floor = rt_gi_probe_floor;
+				gi_quality.cache_calibration = use_rt_gi_cache_calibration;
 				gi_quality.specular = use_rt_gi_specular;
 				gi_quality.screen_traces = use_rt_gi_screen_traces;
 				gi_quality.light_cascade_radiance = use_rt_gi_light_cascade_radiance;

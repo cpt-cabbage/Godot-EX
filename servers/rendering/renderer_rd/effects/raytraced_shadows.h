@@ -139,6 +139,32 @@ public:
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
 
+	// Calibration of the gather's radiance cache tier against its screen tier.
+	// A hit that lands on screen is shaded from last frame's rendered colour; one
+	// that does not falls back to the cache (SDFGI lightprobes times a guessed
+	// albedo), which measured at about half the on-screen tier in a closed
+	// room -- the probes carry roughly half the light of a radiosity solve, and
+	// the guessed albedo is a guess. Every on-screen hit sees both values for
+	// the same point, so the gather sums the two over a subsample of its hits
+	// and their ratio, read back asynchronously and smoothed, scales the cache
+	// for the hits that have nothing else. With the on-screen loop already a
+	// contraction (albedo below one), scaling the off-screen tier to the same
+	// level converges the whole to the radiosity solution rather than running
+	// away. Ref-counted so the readback callback stays safe after the buffers
+	// it belongs to are gone.
+	class RtGiCacheCalibration : public RefCounted {
+	public:
+		// [0]: the solid tier (light cascades / VoxelGI), [1]: the probe tier.
+		float scale[2] = { 1.0f, 1.0f };
+		bool pending = false;
+		void on_readback(const Vector<uint8_t> &p_data);
+	};
+	struct RtGiCalibration {
+		RID buffer; // { uint sum_screen[2], sum_cache[2], samples[2] } in 1/1024 luminance units, per tier.
+		Ref<RtGiCacheCalibration> state;
+	};
+	LocalVector<RtGiCalibration> rt_gi_calibration; // Per view.
+
 	// Visible light lists, one fixed-size list per 8x8 tile, ping-ponged so the
 	// sampling pass reads the list the previous frame produced. Sized to this
 	// viewport's tile grid, so sharing them across viewports of different sizes
@@ -306,7 +332,9 @@ private:
 		float screen_radiance_border_fade;
 		float screen_radiance_clamp;
 		float probe_floor;
-		float pad;
+		float cache_scale; // Solid-tier (cascade / VoxelGI) hit radiance is multiplied by this (see RtGiCacheCalibration).
+		float probe_scale; // Probe-tier hit radiance likewise.
+		float pad[3];
 	};
 
 	enum DenoiseVariant {
@@ -425,7 +453,8 @@ public:
 		float screen_radiance_border_fade = 0.08f; // uv width of the hand-back to the cache; 0 is a hard switch.
 		float screen_radiance_clamp = 4.0f; // Absolute firefly ceiling on the screen term, in exposure-normalized units.
 		float probe_floor = 0.5f; // Neutral albedo turning probe irradiance into outgoing radiance.
-		bool light_cascade_radiance = false; // Shade hits from the light cascades instead of the probes.
+		bool cache_calibration = true; // Scale the cache tier by the measured screen/cache ratio of on-screen hits.
+		bool light_cascade_radiance = false; // Shade hits from the light cascades where they have an entry, the probes elsewhere.
 		// The gather's own screen traces, separate from the direct lighting
 		// pass': the two passes want different things from a contact trace, and
 		// sharing one setting means neither can be isolated.

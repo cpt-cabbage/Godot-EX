@@ -30,6 +30,8 @@
 
 #include "raytraced_shadows.h"
 
+#include "core/object/callable_mp.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/effects/stochastic_stbn_data.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -514,6 +516,37 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	return rd->tlas_build(tlas, as_instances) == OK;
 }
 
+void RenderBuffersRT::RtGiCacheCalibration::on_readback(const Vector<uint8_t> &p_data) {
+	pending = false;
+	if (p_data.size() < 24) {
+		return;
+	}
+	const uint32_t *sums = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	bool debug = OS::get_singleton()->has_environment("RT_GI_CALIB_DEBUG");
+	for (int tier = 0; tier < 2; tier++) {
+		uint32_t sum_screen = sums[tier];
+		uint32_t sum_cache = sums[2 + tier];
+		uint32_t samples = sums[4 + tier];
+		// Too few hits to mean anything (a frame looking at the sky, a scene
+		// without a cache, a tier that never answered): hold the last estimate.
+		if (samples < 64 || sum_cache == 0) {
+			continue;
+		}
+		// The bounds are wide because the measured deficits are: against a
+		// radiosity solve of a closed room, the cascades read 1/13 of the
+		// rendered colour and the probes 1/15.
+		float ratio = CLAMP(float(sum_screen) / float(sum_cache), 0.25f, 16.0f);
+		if (debug) {
+			print_line(vformat("RT_GI_CALIB tier=%d screen=%.3f cache=%.3f samples=%d ratio=%.3f scale=%.3f", tier, sum_screen / 1024.0f / samples, sum_cache / 1024.0f / samples, samples, ratio, scale[tier]));
+		}
+		// Smoothed over frames: the ratio is a screen-wide mean over whatever
+		// happens to be on screen, so it moves with the view (0.7 to 1.1 across
+		// the four walls of a test interior), and a step in it is a step in
+		// every off-screen bounce. About a second's drift at 60 Hz.
+		scale[tier] = Math::lerp(scale[tier], ratio, 0.03f);
+	}
+}
+
 void RenderBuffersRT::free_data() {
 	RenderingDevice *rd = RD::get_singleton();
 	for (const RID &ubo : stochastic_params_ubos) {
@@ -524,6 +557,10 @@ void RenderBuffersRT::free_data() {
 		rd->free_rid(ubo);
 	}
 	rt_gi_params_ubos.clear();
+	for (const RtGiCalibration &c : rt_gi_calibration) {
+		rd->free_rid(c.buffer);
+	}
+	rt_gi_calibration.clear();
 	for (const ReprojectHistory &h : reproject_history) {
 		if (h.ubo.is_valid()) {
 			rd->free_rid(h.ubo);
@@ -1226,6 +1263,13 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	while (rb_state->rt_gi_params_ubos.size() <= p_view) {
 		rb_state->rt_gi_params_ubos.push_back(rd->uniform_buffer_create(sizeof(RtGiParamsUBO)));
 	}
+	while (rb_state->rt_gi_calibration.size() <= p_view) {
+		RenderBuffersRT::RtGiCalibration c;
+		c.buffer = rd->storage_buffer_create(32);
+		c.state.instantiate();
+		rb_state->rt_gi_calibration.push_back(c);
+	}
+	RenderBuffersRT::RtGiCalibration &calibration = rb_state->rt_gi_calibration[p_view];
 
 	RtGiParamsUBO params = {};
 	Projection ndc_from_view = p_view_from_ndc.inverse();
@@ -1249,8 +1293,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
 	params.screen_radiance_clamp = MAX(p_quality.screen_radiance_clamp, 0.0f);
 	params.probe_floor = MAX(p_quality.probe_floor, 0.0f);
+	// The calibration only has data while hits can be shaded from the screen.
+	bool calibrate = p_quality.cache_calibration && p_quality.screen_radiance && p_screen_radiance.is_valid();
+	params.cache_scale = calibrate ? calibration.state->scale[0] : 1.0f;
+	params.probe_scale = calibrate ? calibration.state->scale[1] : 1.0f;
 	if (p_quality.screen_radiance && p_screen_radiance.is_valid()) {
 		params.flags |= 1; // FLAG_SCREEN_RADIANCE
+	}
+	if (calibrate) {
+		params.flags |= 256; // FLAG_CALIBRATE_CACHE
 	}
 	if (p_quality.specular) {
 		params.flags |= 2; // FLAG_SPECULAR
@@ -1332,17 +1383,27 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RID occlusion = p_cascades.occlusion_texture.is_valid() ? p_cascades.occlusion_texture : default_3d;
 	RD::Uniform u_lightprobe(RD::UNIFORM_TYPE_TEXTURE, 15, Vector<RID>({ lightprobe }));
 	RD::Uniform u_occlusion(RD::UNIFORM_TYPE_TEXTURE, 16, Vector<RID>({ occlusion }));
+	RD::Uniform u_calibration(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, Vector<RID>({ calibration.buffer }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
 	RD::Uniform u_out_directional(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ raw_directional }));
 
+	if (calibrate) {
+		rd->buffer_clear(calibration.buffer, 0, 32);
+	}
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	// One readback in flight at a time; the sums land a few frames later and
+	// feed the next dispatches' cache_scale.
+	if (calibrate && !calibration.state->pending) {
+		calibration.state->pending = true;
+		rd->buffer_get_data_async(calibration.buffer, callable_mp(calibration.state.ptr(), &RenderBuffersRT::RtGiCacheCalibration::on_readback), 0, 32);
+	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
 	// instantiated over the GI's own history/moments textures. GI is a lower

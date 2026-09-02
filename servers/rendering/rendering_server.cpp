@@ -3748,16 +3748,24 @@ void RenderingServer::init() {
 	// so this is the neutral albedo that turns it into outgoing radiance. 0
 	// disables the floor and restores the cascade-only lookup.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/probe_floor", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.5);
+	// Scale the cache tier (probes x probe_floor) by the measured ratio of the
+	// screen tier to the cache tier over the frame's on-screen hits. The probes
+	// carry about half the light of a radiosity solve in a closed room and the
+	// floor is a guessed albedo; the on-screen hits see both tiers for the same
+	// points, which is exactly the correction the off-screen hits lack.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/cache_calibration"), true);
 	// The gather's own short screen-space contact trace. Separate from the
 	// direct lighting pass' setting of the same name: they are different passes
 	// with different needs, and one shared toggle means neither can be turned
 	// off without moving the other.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_traces"), true);
-	// Shade the gather's hits from the SDFGI light cascades rather than its
-	// lightprobes. The cascades carry albedo and so keep a hit's colour, but
-	// they store a bounce-feedback quantity at solid cells only -- dimmer than
-	// the probes and full of holes at one ray per pixel. Off is the tier that
-	// agrees with what SDFGI itself puts on screen.
+	// Shade the gather's hits from the SDFGI light cascades where they have an
+	// entry (solid cells: albedo x direct light and some bounce), the
+	// lightprobes elsewhere (bounce light only). Either tier is far dimmer
+	// than the rendered colour and gets its brightness from cache_calibration;
+	// calibrated, the probes land within 5% of a radiosity solve of a closed
+	// room while the cascades overshoot it by a third, so the probes stay the
+	// default.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/light_cascade_radiance"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);

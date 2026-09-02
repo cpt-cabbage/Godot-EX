@@ -786,6 +786,7 @@ private:
 	float rt_gi_screen_radiance_border_fade = 0.08f;
 	float rt_gi_screen_radiance_clamp = 4.0f;
 	float rt_gi_probe_floor = 0.5f;
+	bool use_rt_gi_cache_calibration = true;
 	bool use_rt_gi_screen_traces = true;
 	bool use_rt_gi_light_cascade_radiance = false;
 	bool use_rt_gi_specular = true;

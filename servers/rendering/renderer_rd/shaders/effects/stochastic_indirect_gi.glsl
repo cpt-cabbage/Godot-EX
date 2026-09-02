@@ -46,6 +46,11 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float screen_radiance_border_fade;
 	float screen_radiance_clamp;
 	float probe_floor; // Neutral albedo the probe irradiance is turned into radiance with.
+	float cache_scale; // Multiplies the solid cache tier (see FLAG_CALIBRATE_CACHE).
+	float probe_scale; // Multiplies the probe tier.
+	float pad0;
+	float pad1;
+	float pad2;
 }
 params;
 
@@ -57,6 +62,7 @@ params;
 #define FLAG_SCREEN_TRACES 32u
 #define FLAG_VOXEL_GI 64u
 #define FLAG_LIGHT_CASCADE_RADIANCE 128u
+#define FLAG_CALIBRATE_CACHE 256u
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -150,6 +156,22 @@ layout(set = 0, binding = 14) uniform texture3D voxel_gi_textures[MAX_VOXEL_GI_I
 // makes them usable as a floor under a one-ray-per-pixel gather.
 layout(set = 0, binding = 15) uniform texture2DArray lightprobe_texture;
 layout(set = 0, binding = 16) uniform texture3D occlusion_texture;
+
+// Calibration of the cache tier against the screen tier: on-screen hits see
+// both values for the same point, and their summed ratio (read back on the
+// CPU, smoothed, handed back as params.cache_scale) is what the off-screen
+// hits are missing. Fixed point in 1/1024 luminance units over a subsample of
+// pixels, so a frame's sums fit 32 bits.
+layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
+	// [0]: solid tier (cascades / VoxelGI), [1]: probe tier.
+	uint sum_screen[2];
+	uint sum_cache[2];
+	uint samples[2];
+}
+calibration;
+
+// Set per pixel in main(): this pixel's hits contribute to the calibration.
+bool calibrate_pixel = false;
 
 #define SDFGI_OCT_SIZE 6
 
@@ -316,28 +338,72 @@ vec3 sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal) {
 	return vec3(0.0);
 }
 
+// The surface normal at a hit, from the distance field's gradient in the
+// finest cascade holding the point, faced against the ray. The reversed ray
+// direction is not a normal: a grazing hit read the probes along the wall,
+// with the normal bias sliding along it and half the irradiance cone inside
+// it, and came back at a fraction of what the resolve puts on screen for the
+// same wall.
+vec3 sdfgi_hit_normal(vec3 rel_pos, vec3 ray_dir) {
+	vec3 p = vec3(rel_pos.x, rel_pos.y * sdfgi.y_mult, rel_pos.z);
+	vec3 d = normalize(vec3(ray_dir.x, ray_dir.y * sdfgi.y_mult, ray_dir.z));
+	for (uint c = 0u; c < sdfgi.max_cascades; c++) {
+		vec3 cell_pos = (p - sdfgi.cascades[c].position) * sdfgi.cascades[c].to_cell;
+		if (any(lessThan(cell_pos, vec3(0.0))) || any(greaterThanEqual(cell_pos, sdfgi.grid_size))) {
+			continue;
+		}
+		vec3 uvw = cell_pos / sdfgi.grid_size;
+		const float EPSILON = 0.001;
+		vec3 n = vec3(
+				texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw + vec3(EPSILON, 0.0, 0.0)).r - texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw - vec3(EPSILON, 0.0, 0.0)).r,
+				texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw + vec3(0.0, EPSILON, 0.0)).r - texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw - vec3(0.0, EPSILON, 0.0)).r,
+				texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw + vec3(0.0, 0.0, EPSILON)).r - texture(sampler3D(sdf_cascades[c], linear_sampler_mipmaps), uvw - vec3(0.0, 0.0, EPSILON)).r);
+		float nl = length(n);
+		if (nl < 1e-6) {
+			break;
+		}
+		n /= nl;
+		// Back to world orientation (the y scale is undone on the way out).
+		n = normalize(vec3(n.x, n.y / sdfgi.y_mult, n.z));
+		return dot(n, ray_dir) > 0.0 ? -n : n;
+	}
+	return -ray_dir;
+}
+
 // Radiance leaving a camera-relative world position, resolved through the
 // cache chain the idTech 8 gather uses (Sousa 2025, slide 21): a tier is taken
 // only when it reports a valid entry, and an invalid one hands over to the
 // next rather than contributing a value. Here that is the SDFGI light
 // cascades, then the lightprobes. Blending the two instead would put a second
 // voxel-scale pattern on top of the first, since they disagree per hit.
+// Which tier the last sdfgi_cache_radiance() call answered from: 0 the light
+// cascades or a VoxelGI volume (albedo x direct light and some bounce, at
+// solid cells), 1 the lightprobes (bounce light only, everywhere). The two
+// are different quantities with different deficits, and the calibration
+// against the screen tier keeps one scale for each.
+#define CACHE_TIER_SOLID 0u
+#define CACHE_TIER_PROBE 1u
+uint cache_tier = CACHE_TIER_PROBE;
+
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
+	cache_tier = CACHE_TIER_PROBE;
 	if (!bool(params.flags & FLAG_SDFGI)) {
 		if (bool(params.flags & FLAG_VOXEL_GI)) {
+			cache_tier = CACHE_TIER_SOLID;
 			return voxel_cache_radiance(rel_pos, ray_dir);
 		}
 		return vec3(0.0);
 	}
-	// The light cascades hold albedo x (direct + feedback x probe): a feedback
-	// quantity, deliberately dimmer than the irradiance the probes carry and
-	// than the rendered colour the screen tier returns. Reading it as radiance
-	// makes it the odd tier out, and every switch into it is both a step in
-	// brightness and, through the screen tier's reuse of last frame, a place
-	// for the recirculation to settle low. Off by default; the probes are the
-	// tier that matches what SDFGI itself puts on screen.
+	// The light cascades hold albedo x (direct + feedback x probe) at solid
+	// cells; the probes hold the bounce irradiance everywhere, and nothing of
+	// the direct light falling on the hit, which in a lit room is most of what
+	// leaves it. Against a radiosity solve of a closed box neither tier is
+	// near the rendered colour on its own (cascades 1/13 of it, probes 1/15),
+	// so both are calibrated against the screen tier; the cascades stay the
+	// first choice because they carry the hit's albedo and where the light
+	// actually falls, which a scale on a flat probe field cannot recover.
 	if (!bool(params.flags & FLAG_LIGHT_CASCADE_RADIANCE)) {
-		return sdfgi_probe_irradiance(rel_pos, -ray_dir) * params.probe_floor;
+		return sdfgi_probe_irradiance(rel_pos, sdfgi_hit_normal(rel_pos, ray_dir)) * params.probe_floor;
 	}
 
 	vec3 p = vec3(rel_pos.x, rel_pos.y * sdfgi.y_mult, rel_pos.z);
@@ -371,17 +437,25 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 		// Point-fetch the cell the hit landed in. The anisotropic coverage is
 		// written only where geometry was voxelized, so a zero sum is the
 		// cache saying it has no entry here -- the distinction between "no
-		// data" and "black surface" the chain needs to pick a tier. A hit that
-		// landed a hair outside its surface gets one step along the ray, into
-		// the solid cell, before the entry is called invalid.
+		// data" and "black surface" the chain needs to pick a tier. The hit
+		// lies on the surface, and the voxelized cell is the one just inside
+		// it, so the search steps into the surface along its normal and along
+		// the ray before the entry is called invalid. With the single half-step
+		// along the ray this used to take, most hits on a wall found an empty
+		// cell and the tier fell through to the probes, which carry no direct
+		// light at all.
 		ivec3 grid_max = ivec3(sdfgi.grid_size) - ivec3(1);
-		ivec3 celli = clamp(ivec3(cell_pos), ivec3(0), grid_max);
-		vec4 aniso0 = texelFetch(sampler3D(aniso0_cascades[c], linear_sampler_mipmaps), celli, 0);
-		vec2 aniso1 = texelFetch(sampler3D(aniso1_cascades[c], linear_sampler_mipmaps), celli, 0).rg;
-		if (dot(aniso0, vec4(1.0)) + dot(aniso1, vec2(1.0)) <= 0.0) {
-			celli = clamp(ivec3(cell_pos + d * 0.5), ivec3(0), grid_max);
+		vec3 probes_at[6] = vec3[](vec3(0.0), -hit_normal * 0.5, d * 0.5, -hit_normal * 1.0, d * 1.0, -hit_normal * 1.5);
+		ivec3 celli = ivec3(0);
+		vec4 aniso0 = vec4(0.0);
+		vec2 aniso1 = vec2(0.0);
+		for (int k = 0; k < 6; k++) {
+			celli = clamp(ivec3(cell_pos + probes_at[k]), ivec3(0), grid_max);
 			aniso0 = texelFetch(sampler3D(aniso0_cascades[c], linear_sampler_mipmaps), celli, 0);
 			aniso1 = texelFetch(sampler3D(aniso1_cascades[c], linear_sampler_mipmaps), celli, 0).rg;
+			if (dot(aniso0, vec4(1.0)) + dot(aniso1, vec2(1.0)) > 0.0) {
+				break;
+			}
 		}
 		if (dot(aniso0, vec4(1.0)) + dot(aniso1, vec2(1.0)) <= 0.0) {
 			// No entry at this resolution. Coarser cascades have larger cells
@@ -395,18 +469,25 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 		vec3 hit_aniso1 = vec3(aniso0.a, aniso1);
 
 		vec3 radiance = hit_light * (dot(max(vec3(0.0), (hit_normal * hit_aniso0)), vec3(1.0)) + dot(max(vec3(0.0), (-hit_normal * hit_aniso1)), vec3(1.0)));
+		cache_tier = CACHE_TIER_SOLID;
 		return radiance * sdfgi.cascades[c].exposure_normalization * sdfgi.energy;
 	}
 
 	// Last tier. Always valid where the probe grid reaches, so a hit never
 	// falls through to a spurious zero.
-	return sdfgi_probe_irradiance(rel_pos, -ray_dir) * params.probe_floor;
+	return sdfgi_probe_irradiance(rel_pos, sdfgi_hit_normal(rel_pos, ray_dir)) * params.probe_floor;
 }
 
 // On-screen hits can read last frame's rendered radiance, which carries the
 // texture detail and emissive surfaces the cache lacks. Luminance-clamped
 // against the cache value so screen feedback cannot run away.
-vec3 screen_radiance_boost(vec3 view_hit, vec3 cache_radiance) {
+vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
+	// The cache tier as the hits that have nothing else see it. The scale is
+	// the calibration's estimate of the screen tier over the cache tier (1
+	// when off), applied before the screen lookup so both fallbacks below and
+	// the border hand-back agree.
+	uint tier = cache_tier;
+	vec3 cache_radiance = raw_cache_radiance * (tier == CACHE_TIER_SOLID ? params.cache_scale : params.probe_scale);
 	if (!bool(params.flags & FLAG_SCREEN_RADIANCE)) {
 		return cache_radiance;
 	}
@@ -439,6 +520,19 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 cache_radiance) {
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
 	float l = luminance(col);
+	// Both tiers for the same point: what the calibration is made of. The raw
+	// cache value, not the scaled one, or the estimate would chase itself.
+	// Sampled before the firefly ceiling, which is keyed to the very scale
+	// being estimated. Hits at the frame border are left out along with the
+	// rest of what the hand-back below distrusts.
+	if (calibrate_pixel) {
+		vec2 border_c = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
+		if (min(border_c.x, border_c.y) >= params.screen_radiance_border_fade) {
+			atomicAdd(calibration.sum_screen[tier], uint(min(l, 64.0) * 1024.0));
+			atomicAdd(calibration.sum_cache[tier], uint(min(luminance(raw_cache_radiance), 64.0) * 1024.0));
+			atomicAdd(calibration.samples[tier], 1u);
+		}
+	}
 	// Firefly ceiling. Keying this to the cache alone closes a loop: the gather
 	// writes the buffer this reads, so where the cache is dim the ceiling caps
 	// the screen term below the light actually in the room, the image dims, and
@@ -629,6 +723,10 @@ void main() {
 	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
 	vec4 view_pos4 = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	vec3 view_pos = view_pos4.xyz / view_pos4.w;
+
+	// One pixel in sixteen feeds the calibration sums: plenty for a mean, and
+	// the 32-bit fixed-point sums cannot overflow at any screen size in use.
+	calibrate_pixel = bool(params.flags & FLAG_CALIBRATE_CACHE) && ((pixel.x | pixel.y) & 3) == 0;
 
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
 	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
