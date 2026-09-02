@@ -747,7 +747,7 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// irradiance onto the fragment normal; bit 4: take specular occlusion from
 	// the traced bent normal; bit 5: re-fit reflection probes to the frame's
 	// irradiance.
-	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u)) : 0;
+	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u)) : 0;
 	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
@@ -1901,6 +1901,13 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/reflection_probe_refit");
 	rt_gi_ao_range = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/occlusion_range");
 	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directionality");
+	use_surface_cache = GLOBAL_GET("rendering/ray_tracing/surface_cache/enabled");
+	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
+	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/atlas_size"));
+	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/texels_per_meter");
+	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/captures_per_frame"));
+	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
+	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
@@ -1918,6 +1925,44 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	if ((use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || (use_rt_sdfgi_probes && sdfgi_used_last_frame)) && rt_shadows == nullptr) {
 		rt_shadows = memnew(RendererRD::RaytracedShadows(sky.sky_use_octmap_array));
 	}
+	if (rt_shadows != nullptr) {
+		rt_shadows->set_surface_cache_enabled(use_rt_gi && use_surface_cache, surface_cache_settings, use_surface_cache_mirror);
+	}
+}
+
+void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data) {
+	RendererRD::SurfaceCache *cache = rt_shadows != nullptr ? rt_shadows->get_surface_cache() : nullptr;
+	if (cache == nullptr) {
+		return;
+	}
+	if (!surface_cache_capture_list_ready) {
+		surface_cache_capture_list.set_page_pool(&surface_cache_capture_pool);
+		surface_cache_capture_list_ready = true;
+	}
+	const float exposure = p_render_data->scene_data->emissive_exposure_normalization;
+	const uint32_t budget = MAX(cache->get_settings().captures_per_frame, 1u);
+	bool labelled = false;
+	for (uint32_t i = 0; i < budget; i++) {
+		RendererRD::SurfaceCache::CaptureJob job;
+		if (!cache->next_capture(job)) {
+			break;
+		}
+		if (!labelled) {
+			RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
+			labelled = true;
+		}
+		surface_cache_capture_list.clear();
+		surface_cache_capture_list.push_back(job.instance);
+		for (uint32_t c = 0; c < RendererRD::SurfaceCache::CARDS_PER_SET; c++) {
+			_render_material(job.camera[c], job.projection[c], true, surface_cache_capture_list, cache->get_capture_framebuffer(), Rect2i(0, 0, job.size, job.size), exposure);
+			cache->commit_capture(job, c);
+		}
+		cache->finish_capture(job);
+	}
+	if (labelled) {
+		RD::get_singleton()->draw_command_end_label();
+	}
+	surface_cache_capture_list.clear();
 }
 
 void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
@@ -2613,6 +2658,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_rt_gi && !gi_cascades.active && gi_cascades.voxel_gi_count == 0) {
 					WARN_PRINT_ONCE("Ray-traced GI is enabled but the scene has neither SDFGI nor a VoxelGI to shade ray hits from: off-screen hits return black, so interiors go dark. Enable SDFGI on the WorldEnvironment (or add a VoxelGI).");
 				}
+			}
+
+			if (run_rt_gi && rt_shadows->get_surface_cache() != nullptr) {
+				// Cards first (the material pass draws them), then their
+				// lighting, so the gather below reads this frame's radiance.
+				_surface_cache_capture(p_render_data);
+				rt_shadows->update_surface_cache_lighting(p_render_data->scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), p_render_data->directional_light_count, stochastic_quality.ray_bias, gi_cascades, gi_sky);
 			}
 
 			stochastic_traced_this_frame = run_stochastic;

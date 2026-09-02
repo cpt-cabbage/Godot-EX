@@ -2303,7 +2303,10 @@ void fragment_shader(in SceneData scene_data) {
 				}
 			}
 			if (bool(implementation_data.rt_gi & 4u)) {
-				float rt_gi_spec_blend = smoothstep(0.2, 0.35, roughness);
+				// With the surface cache the gather traces a mirror ray for
+				// smooth surfaces too, so the traced term covers every
+				// roughness; SSR still overrides it below where it hits.
+				float rt_gi_spec_blend = bool(implementation_data.rt_gi & 64u) ? 1.0 : smoothstep(0.2, 0.35, roughness);
 				indirect_specular_light = mix(indirect_specular_light, rt_gi_reflection, rt_gi_spec_blend);
 			}
 		}

@@ -17,6 +17,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../oct_inc.glsl"
+#include "surface_cache_inc.glsl"
 
 #define SDFGI_MAX_CASCADES 8
 
@@ -48,8 +49,8 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float probe_floor; // Neutral albedo the probe irradiance is turned into radiance with.
 	float cache_scale; // Multiplies the solid cache tier (see FLAG_CALIBRATE_CACHE).
 	float probe_scale; // Multiplies the probe tier.
-	float pad0;
-	float pad1;
+	uint surface_cache_atlas_size;
+	uint surface_cache_frame; // The cache's own clock, stamped on the sets hits reach.
 	float pad2;
 }
 params;
@@ -63,6 +64,8 @@ params;
 #define FLAG_VOXEL_GI 64u
 #define FLAG_LIGHT_CASCADE_RADIANCE 128u
 #define FLAG_CALIBRATE_CACHE 256u
+#define FLAG_SURFACE_CACHE 512u // Hits read the surface cache's lit cards where one covers them.
+#define FLAG_MIRROR 1024u // Smooth surfaces trace a mirror ray instead of leaving reflections to probes.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -169,6 +172,29 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint samples[2];
 }
 calibration;
+
+// The surface cache (see surface_cache.cpp): per TLAS instance the record the
+// ray query's custom index names, per card set its six captures, and the lit
+// radiance atlas those captures were shaded into. Hits that land on a card
+// read it instead of the coarse caches below, and stamp the set so the
+// lighting pass relights it next frame.
+layout(set = 0, binding = 18, std430) restrict readonly buffer CardInstances {
+	CardInstance data[];
+}
+card_instances;
+
+layout(set = 0, binding = 19, std430) restrict readonly buffer CardSets {
+	CardSet data[];
+}
+card_sets;
+
+layout(set = 0, binding = 20, std430) restrict writeonly buffer CardRequests {
+	uint frame[];
+}
+card_requests;
+
+layout(set = 0, binding = 21) uniform sampler2D card_lighting_atlas;
+layout(set = 0, binding = 22) uniform sampler2D card_depth_atlas;
 
 // Set per pixel in main(): this pixel's hits contribute to the calibration.
 bool calibrate_pixel = false;
@@ -383,6 +409,7 @@ vec3 sdfgi_hit_normal(vec3 rel_pos, vec3 ray_dir) {
 // against the screen tier keeps one scale for each.
 #define CACHE_TIER_SOLID 0u
 #define CACHE_TIER_PROBE 1u
+#define CACHE_TIER_CARD 2u // Surface cache: already outgoing radiance, never calibrated.
 uint cache_tier = CACHE_TIER_PROBE;
 
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
@@ -487,7 +514,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// when off), applied before the screen lookup so both fallbacks below and
 	// the border hand-back agree.
 	uint tier = cache_tier;
-	vec3 cache_radiance = raw_cache_radiance * (tier == CACHE_TIER_SOLID ? params.cache_scale : params.probe_scale);
+	vec3 cache_radiance = raw_cache_radiance * (tier == CACHE_TIER_SOLID ? params.cache_scale : (tier == CACHE_TIER_PROBE ? params.probe_scale : 1.0));
 	if (!bool(params.flags & FLAG_SCREEN_RADIANCE)) {
 		return cache_radiance;
 	}
@@ -525,7 +552,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// Sampled before the firefly ceiling, which is keyed to the very scale
 	// being estimated. Hits at the frame border are left out along with the
 	// rest of what the hand-back below distrusts.
-	if (calibrate_pixel) {
+	if (calibrate_pixel && tier < 2u) {
 		vec2 border_c = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
 		if (min(border_c.x, border_c.y) >= params.screen_radiance_border_fade) {
 			atomicAdd(calibration.sum_screen[tier], uint(min(l, 64.0) * 1024.0));
@@ -550,6 +577,74 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
 	return mix(cache_radiance, col,
 			smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)));
+}
+
+// Radiance from the surface cache at a hit, if a captured card covers it.
+// The hit goes into the instance's local space and onto each of the six
+// cards; a card counts where the hit lies inside its frame, faces the ray
+// (a card only saw surfaces facing its own axis) and stored a depth within
+// a texel or two of the hit's, which is what keeps a hit on one wall from
+// reading the card of the wall behind it. Among the valid cards the one
+// facing the ray most squarely wins.
+bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
+	r_radiance = vec3(0.0);
+	r_set = SURFACE_CACHE_INVALID;
+	if (p_instance_id == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardInstance inst = card_instances.data[p_instance_id];
+	if (inst.set == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardSet s = card_sets.data[inst.set];
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+		return false;
+	}
+	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
+	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
+	float size = s.card_size;
+	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
+	float best_w = 0.0;
+	vec2 best_uv = vec2(0.0);
+	uint best_card = 0u;
+	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
+		vec3 axis, u, v;
+		card_basis(k, axis, u, v);
+		float facing = -dot(axis, local_dir);
+		if (facing <= 0.0) {
+			continue;
+		}
+		vec2 uv01;
+		float depth;
+		card_project(s, k, local_pos, uv01, depth);
+		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
+			continue;
+		}
+		ivec2 texel = card_origin(s, k) + clamp(ivec2(uv01 * size), ivec2(0), ivec2(int(size) - 1));
+		float stored = texelFetch(card_depth_atlas, texel, 0).r;
+		if (stored <= 0.0) {
+			continue;
+		}
+		// Two texels of the card's own footprint, or a slice of the box.
+		float texel_world = (longest + 2.0 * s.margin) / size;
+		float tolerance = max(2.0 * texel_world, 0.02 * longest);
+		if (abs(stored - depth) > tolerance) {
+			continue;
+		}
+		if (facing > best_w) {
+			best_w = facing;
+			best_uv = uv01;
+			best_card = k;
+		}
+	}
+	if (best_w <= 0.0) {
+		return false;
+	}
+	// Bilinear inside the card, never across its border.
+	vec2 atlas_texel = vec2(card_origin(s, best_card)) + clamp(best_uv * size, vec2(0.5), vec2(size - 0.5));
+	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), 0.0).rgb;
+	r_set = inst.set;
+	return true;
 }
 
 #define SCREEN_TRACE_STEPS 6
@@ -698,6 +793,16 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 		vec3 rel_hit = origin + world_dir * t_hit;
 		mat3 view_basis = transpose(mat3(params.world_from_view));
 		vec3 view_hit = view_basis * rel_hit;
+		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
+			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+			vec3 card_radiance;
+			uint card_set;
+			if (surface_cache_lookup(instance_id, rel_hit + params.world_from_view[3].xyz, world_dir, card_radiance, card_set)) {
+				card_requests.frame[card_set] = params.surface_cache_frame;
+				cache_tier = CACHE_TIER_CARD;
+				return screen_radiance_boost(view_hit, card_radiance);
+			}
+		}
 		return screen_radiance_boost(view_hit, sdfgi_cache_radiance(rel_hit, world_dir));
 	}
 	return sky_eval(world_dir);
@@ -794,10 +899,19 @@ void main() {
 	visibility *= inv_rays;
 
 	vec3 reflection = vec3(0.0);
-	if (bool(params.flags & FLAG_SPECULAR) && roughness > 0.2) {
-		// GGX half-vector sampling around the mirror direction. Only the
-		// rough band uses this: sharp reflections stay with SSR / probes,
-		// whose sharpness the blurry cache cannot match.
+	// Where the reflected image lives: the virtual point behind the surface,
+	// at the hit distance beyond it along the view ray, expressed as a view
+	// depth. The temporal filter reprojects the reflection by this rather
+	// than by the surface, which is what stops a glossy floor's reflection
+	// from smearing as the camera moves. Defaults to the surface itself.
+	float virtual_view_depth = -view_pos.z;
+	// Smooth surfaces get a mirror ray only when the surface cache is there to
+	// give the hit a surface at texture resolution; otherwise the rough band
+	// alone, with sharp reflections left to SSR / probes, whose sharpness the
+	// blurry cache cannot match.
+	bool mirror = bool(params.flags & FLAG_MIRROR) && roughness <= 0.2;
+	if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror)) {
+		// GGX half-vector sampling around the mirror direction.
 		vec2 rnd = stbn_sample(pixel, 6u);
 		vec3 v = normalize(-(world_basis * view_pos));
 		float alpha = roughness * roughness;
@@ -805,7 +919,7 @@ void main() {
 		float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
 		float st = sqrt(max(1.0 - ct * ct, 0.0));
 		vec3 h = normalize(basis_around(world_normal) * vec3(st * cos(phi), st * sin(phi), ct));
-		vec3 dir = reflect(-v, h);
+		vec3 dir = mirror ? reflect(-v, world_normal) : reflect(-v, h);
 		if (dot(dir, world_normal) <= 1e-4) {
 			dir = reflect(-v, world_normal);
 		}
@@ -813,10 +927,12 @@ void main() {
 		vec3 view_dir = transpose(world_basis) * dir;
 		float spec_t_hit;
 		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
+		float view_len = max(length(view_pos), 1e-4);
+		virtual_view_depth = -view_pos.z * (1.0 + min(spec_t_hit, 1e4) / view_len);
 	}
 
 	imageStore(out_ambient, pixel, vec4(irradiance, 0.0));
-	imageStore(out_reflection, pixel, vec4(reflection, 0.0));
+	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
 	imageStore(out_directional, pixel, vec4(moment, visibility));
 }

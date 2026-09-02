@@ -3785,6 +3785,15 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/reflection_probe_refit"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/occlusion_range", PROPERTY_HINT_RANGE, "0.1,20.0,0.1,or_greater"), 3.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/directionality", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
+	// Surface cache: material cards per instance, lit on the GPU, that the
+	// ray-traced GI shades its hits from (in place of the coarse SDFGI cache).
+	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/enabled"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/atlas_size", PROPERTY_HINT_ENUM, "1024,2048,4096"), 2048);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/texels_per_meter", PROPERTY_HINT_RANGE, "1.0,64.0,1.0"), 16.0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/mirror_reflections"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

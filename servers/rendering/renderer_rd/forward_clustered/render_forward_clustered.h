@@ -808,6 +808,17 @@ private:
 	// lazily creates the ray tracing backend when first enabled.
 	void _update_ray_tracing_settings();
 
+	// Surface cache (material cards the GI gather shades hits from): live
+	// settings, and the capture step that draws pending cards through the
+	// material pass each frame.
+	bool use_surface_cache = false;
+	bool use_surface_cache_mirror = true;
+	RendererRD::SurfaceCache::Settings surface_cache_settings;
+	PagedArrayPool<RenderGeometryInstance *> surface_cache_capture_pool;
+	PagedArray<RenderGeometryInstance *> surface_cache_capture_list;
+	bool surface_cache_capture_list_ready = false;
+	void _surface_cache_capture(RenderDataRD *p_render_data);
+
 	// Keeps frames coming while the ray traced passes are still filling their
 	// temporal history, so a viewport that only redraws on change (the editor)
 	// converges instead of freezing on the frame the last edit produced.

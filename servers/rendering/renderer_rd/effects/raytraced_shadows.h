@@ -40,6 +40,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
+#include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -334,8 +335,17 @@ private:
 		float probe_floor;
 		float cache_scale; // Solid-tier (cascade / VoxelGI) hit radiance is multiplied by this (see RtGiCacheCalibration).
 		float probe_scale; // Probe-tier hit radiance likewise.
-		float pad[3];
+		uint32_t surface_cache_atlas_size;
+		uint32_t surface_cache_frame; // The cache's clock (update_scene count), for hit requests.
+		float pad;
 	};
+
+	// The surface cache the gather shades hits from, when enabled (owned here;
+	// the renderer drives its captures through the material pass).
+	SurfaceCache *surface_cache = nullptr;
+	bool surface_cache_mirror_reflections = true;
+	uint32_t scene_frame = 0; // Counts update_scene() calls: the cache's clock.
+	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
@@ -525,6 +535,15 @@ public:
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return tlas; }
+
+	// Surface cache control. Enabling creates it (settings applied live);
+	// disabling frees it. update_scene() registers instances with it and
+	// process_rt_gi() lights and reads it.
+	void set_surface_cache_enabled(bool p_enabled, const SurfaceCache::Settings &p_settings, bool p_mirror_reflections);
+	SurfaceCache *get_surface_cache() const { return surface_cache; }
+
+	// Lights the surface cache for this frame; call before process_rt_gi.
+	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, const GiCascades &p_cascades, const GiSky &p_sky);
 
 	// p_sky_use_octmap_array selects the sky radiance octmap layout the GI
 	// gather shader compiles against (must match the sky renderer's).

@@ -180,6 +180,13 @@ RaytracedShadows::~RaytracedShadows() {
 	RD::get_singleton()->free_rid(stbn_texture);
 	RD::get_singleton()->free_rid(ltc_lut1_texture);
 	RD::get_singleton()->free_rid(ltc_lut2_texture);
+	if (surface_cache != nullptr) {
+		memdelete(surface_cache);
+		surface_cache = nullptr;
+	}
+	if (rt_gi_dummy_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(rt_gi_dummy_buffer);
+	}
 	RD::get_singleton()->free_rid(material_sampler);
 	shader.version_free(shader_version);
 	rt_gi_shader.version_free(rt_gi_shader_version);
@@ -387,6 +394,11 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	thread_local LocalVector<RD::AccelerationStructureInstance> as_instances;
 	as_instances.clear();
 
+	scene_frame++;
+	if (surface_cache != nullptr) {
+		surface_cache->begin_frame(scene_frame);
+	}
+
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	for (uint64_t i = 0; i < p_instances.size(); i++) {
@@ -410,6 +422,14 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 			}
 		}
 		const uint32_t casting_mask = inst->data->shadow_casting_surface_mask;
+
+		// Surface cache cards for this instance (one set per geometry
+		// instance; a multimesh's sub-instances share none, they fall back to
+		// the coarse cache at hits).
+		uint32_t card_set = SurfaceCache::INVALID_ID;
+		if (surface_cache != nullptr && !is_multimesh) {
+			card_set = surface_cache->add_instance(inst, is_skinned);
+		}
 
 		// Shadow rays cull front faces so that, like shadow maps, a surface
 		// occludes only through the faces its material draws. Surfaces drawn
@@ -474,6 +494,9 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 			auto push_instance = [&](const Transform3D &p_transform) {
 				as_instance.transform = p_transform;
 				as_instance.flags = facing.flags;
+				// The custom index a ray query hands back: the cache's record
+				// for this TLAS instance, or none.
+				as_instance.id = (surface_cache != nullptr && card_set != SurfaceCache::INVALID_ID) ? surface_cache->add_instance_record(card_set, p_transform) : SurfaceCache::INVALID_ID;
 				as_instances.push_back(as_instance);
 			};
 
@@ -498,6 +521,10 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 				push_instance(inst->transform);
 			}
 		}
+	}
+
+	if (surface_cache != nullptr) {
+		surface_cache->end_frame();
 	}
 
 	if (as_instances.is_empty()) {
@@ -575,6 +602,49 @@ void RenderBuffersRT::free_data() {
 		}
 	}
 	light_lists.clear();
+}
+
+void RaytracedShadows::set_surface_cache_enabled(bool p_enabled, const SurfaceCache::Settings &p_settings, bool p_mirror_reflections) {
+	surface_cache_mirror_reflections = p_mirror_reflections;
+	if (p_enabled && surface_cache == nullptr) {
+		surface_cache = memnew(SurfaceCache(p_settings, sky_uses_octmap_array));
+	} else if (!p_enabled && surface_cache != nullptr) {
+		memdelete(surface_cache);
+		surface_cache = nullptr;
+	} else if (surface_cache != nullptr) {
+		surface_cache->set_settings(p_settings);
+	}
+}
+
+void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, const GiCascades &p_cascades, const GiSky &p_sky) {
+	if (surface_cache == nullptr || tlas.is_null()) {
+		return;
+	}
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	SurfaceCache::LightingInputs in;
+	in.tlas = tlas;
+	in.omni_light_buffer = light_storage->get_omni_light_buffer();
+	in.spot_light_buffer = light_storage->get_spot_light_buffer();
+	in.directional_light_buffer = light_storage->get_directional_light_buffer();
+	in.omni_light_count = p_omni_light_count;
+	in.spot_light_count = p_spot_light_count;
+	in.directional_light_count = p_directional_light_count;
+	in.world_from_view = p_world_from_view;
+	in.frame = scene_frame;
+	in.ray_bias = p_ray_bias;
+	in.sdfgi_active = p_cascades.active;
+	in.sdfgi_ubo = p_cascades.sdfgi_ubo;
+	in.lightprobe_texture = p_cascades.lightprobe_texture;
+	in.occlusion_texture = p_cascades.occlusion_texture;
+	in.linear_sampler = material_sampler;
+	in.sky_mode = p_sky.mode;
+	in.sky_radiance = p_sky.radiance;
+	in.sky_octmap_array = sky_uses_octmap_array;
+	in.sky_orientation = p_sky.orientation;
+	in.sky_color = p_sky.color;
+	in.sky_energy = p_sky.energy;
+	in.sky_border = p_sky.border_size;
+	surface_cache->update_lighting(in);
 }
 
 void RaytracedShadows::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
@@ -1339,6 +1409,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.voxel_gi_count = MIN(p_cascades.voxel_gi_count, 8u);
 	params.ao_range = MAX(p_quality.ao_range, 0.01f);
 	params.inv_ao_range = 1.0f / params.ao_range;
+	const bool use_cards = surface_cache != nullptr && surface_cache->is_ready();
+	if (use_cards) {
+		params.flags |= 512; // FLAG_SURFACE_CACHE
+		if (surface_cache_mirror_reflections && p_quality.specular) {
+			params.flags |= 1024; // FLAG_MIRROR
+		}
+		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
+	}
+	params.surface_cache_frame = scene_frame;
 	rd->buffer_update(rb_state->rt_gi_params_ubos[p_view], 0, sizeof(RtGiParamsUBO), &params);
 
 	RID shader_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 0);
@@ -1384,6 +1463,21 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_lightprobe(RD::UNIFORM_TYPE_TEXTURE, 15, Vector<RID>({ lightprobe }));
 	RD::Uniform u_occlusion(RD::UNIFORM_TYPE_TEXTURE, 16, Vector<RID>({ occlusion }));
 	RD::Uniform u_calibration(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, Vector<RID>({ calibration.buffer }));
+	// The surface cache's tables and atlases; dummies when it is off (the
+	// shader never reads them without FLAG_SURFACE_CACHE).
+	if (rt_gi_dummy_buffer.is_null()) {
+		rt_gi_dummy_buffer = rd->storage_buffer_create(256);
+	}
+	RID sc_instances = use_cards ? surface_cache->get_instances_buffer() : rt_gi_dummy_buffer;
+	RID sc_sets = use_cards ? surface_cache->get_sets_buffer() : rt_gi_dummy_buffer;
+	RID sc_requests = use_cards ? surface_cache->get_requests_buffer() : rt_gi_dummy_buffer;
+	RID sc_lighting = use_cards ? surface_cache->get_lighting_atlas() : default_black;
+	RID sc_depth = use_cards ? surface_cache->get_depth_atlas() : default_black;
+	RD::Uniform u_sc_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 18, Vector<RID>({ sc_instances }));
+	RD::Uniform u_sc_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 19, Vector<RID>({ sc_sets }));
+	RD::Uniform u_sc_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ sc_requests }));
+	RD::Uniform u_sc_lighting(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 21, Vector<RID>({ material_sampler, sc_lighting }));
+	RD::Uniform u_sc_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 22, Vector<RID>({ sampler, sc_depth }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
@@ -1394,7 +1488,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
