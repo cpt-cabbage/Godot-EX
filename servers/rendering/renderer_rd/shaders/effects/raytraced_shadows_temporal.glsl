@@ -27,6 +27,10 @@ layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
 layout(set = 1, binding = 1, rg8) uniform restrict writeonly image2D dest_history;
 
 #define FLAG_HAS_VELOCITY 1u
+// Frame-edge history borrowing (see the reprojection block); same values as
+// the stochastic denoiser's.
+#define BORROW_BAND 0.15
+#define BORROW_FRAMES 4.0
 
 layout(push_constant, std430) uniform Params {
 	mat4 reproject; // Current NDC -> previous frame NDC.
@@ -98,9 +102,23 @@ void main() {
 				}
 			}
 		}
+		// History just off the previous frame (the band a camera pan sweeps in
+		// along the entering edge): borrow the nearest in-frame history as a
+		// warm start rather than restarting from one frame's rays, which draws
+		// the band as a noisy stripe against the converged interior. It counts
+		// as only a few frames, so the pixel's own rays take over quickly, and
+		// the neighborhood clamp below still bounds it. Not for history far
+		// outside (a camera cut): stretching the edge columns over the whole
+		// screen would be worse than the noise.
+		bool borrowed = false;
+		if (!(all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) &&
+				all(greaterThanEqual(prev_uv, vec2(-BORROW_BAND))) && all(lessThanEqual(prev_uv, vec2(1.0 + BORROW_BAND)))) {
+			prev_uv = clamp(prev_uv, vec2(0.0), vec2(1.0));
+			borrowed = true;
+		}
 		if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
 			vec2 hist = textureLod(history_mask, prev_uv, 0.0).rg;
-			float frames_prev = hist.g * 255.0;
+			float frames_prev = borrowed ? min(hist.g * 255.0, BORROW_FRAMES - 1.0) : hist.g * 255.0;
 			// A young pixel's neighborhood is itself noisy, so clamping it
 			// tightly would reject good history; the window closes as the
 			// estimate settles.

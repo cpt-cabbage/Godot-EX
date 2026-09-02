@@ -19,6 +19,19 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
 #define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
 
+// Frame-edge history borrowing (temporal pass, see the reprojection block).
+// How far outside the previous frame (in UV) a pixel's history may lie and
+// still borrow the nearest in-frame history instead of restarting.
+#define BORROW_BAND 0.15
+// The frame count a borrowed history is trusted as: it is lighting from a
+// neighbouring column, so it starts the accumulation and is then replaced by
+// the pixel's own samples over the next few frames.
+#define BORROW_FRAMES 4.0
+// Borrowed taps are compared against the depth of a surface point up to a
+// pan's width away, so a wall at a grazing angle needs more room than the
+// same-texel test; a different surface still fails.
+#define BORROW_DEPTH_TOLERANCE 0.25
+
 // The GI signal carries a directional companion buffer (first radiance moment
 // + near-field visibility) that must be blended and filtered with exactly the
 // diffuse weights. It rides on the GI-only variants (VALIDATE_DEPTH for the
@@ -331,6 +344,27 @@ void main() {
 			}
 		}
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+		// Frame-edge reveal: the pixel's history lies just off the previous
+		// frame. Rotating the camera sweeps a band of these along the entering
+		// edge every frame, and restarting each of them from a single raw
+		// sample draws that band as a hard, noisy stripe (with half-resolution
+		// GI, blotches) against the converged interior; the spatial pass cannot
+		// bridge it since the band is as wide as the pan is fast. The nearest
+		// in-frame history is a far better start than nothing -- the lighting
+		// is continuous across the frame edge wherever the surface is -- so
+		// borrow it, depth-validated below like any other tap, but at a low
+		// frame count so the borrowed value yields to real samples within a
+		// few frames. Bounded to a band near the edge: a camera cut reprojects
+		// the whole screen far outside, and stretching the edge columns over
+		// it would be worse than the noise.
+		bool borrowed = false;
+#ifdef DEPTH_HISTORY
+		if (!history_usable && all(greaterThanEqual(prev_uv, vec2(-BORROW_BAND))) && all(lessThanEqual(prev_uv, vec2(1.0 + BORROW_BAND)))) {
+			prev_uv = clamp(prev_uv, vec2(0.0), vec2(1.0));
+			history_usable = true;
+			borrowed = true;
+		}
+#endif
 		vec4 hist_d4 = vec4(0.0);
 		vec4 hist_s4 = vec4(0.0);
 		vec4 hist_moments = vec4(0.0);
@@ -358,6 +392,7 @@ void main() {
 			ivec2 hist_base = ivec2(floor(hist_pos));
 			vec2 hist_fr = hist_pos - vec2(hist_base);
 			float hist_weight = 0.0;
+			float depth_tolerance = borrowed ? BORROW_DEPTH_TOLERANCE : 0.1;
 			for (int i = 0; i < 4; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
 				ivec2 tp = hist_base + off;
@@ -369,7 +404,7 @@ void main() {
 					continue;
 				}
 				float prev_depth = texelFetch(prev_view_depth_texture, tp, 0).r;
-				if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > 0.1 * max(predicted_depth, 1.0)) {
+				if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > depth_tolerance * max(predicted_depth, 1.0)) {
 					continue;
 				}
 				hist_d4 += texelFetch(history_diffuse, tp, 0) * w;
@@ -438,6 +473,10 @@ void main() {
 			float frames_cap = 1.0 / max(params.blend_alpha, 1e-3);
 			frames_d = min(hist_meta.r * 64.0 * confidence_d + 1.0, frames_cap);
 			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
+			if (borrowed) {
+				frames_d = min(frames_d, BORROW_FRAMES);
+				frames_s = min(frames_s, BORROW_FRAMES);
+			}
 			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
 			float alpha_s = max(1.0 / frames_s, params.blend_alpha);
 
@@ -458,7 +497,9 @@ void main() {
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
 			dominance = mix(hist_meta.b, dominance, alpha_d);
 			// A usable history clears the disocclusion mark over a few frames.
-			reveal = max(hist_meta.a - 0.25, 0.0);
+			// A borrowed one is still young enough to want the widened kernel
+			// for a couple of frames, but not the full reset.
+			reveal = borrowed ? 0.5 : max(hist_meta.a - 0.25, 0.0);
 		}
 	}
 	if (reveal == 1.0) {
