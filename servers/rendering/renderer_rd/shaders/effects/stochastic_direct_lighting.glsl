@@ -26,6 +26,14 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "../area_lights_inc.glsl"
 #undef texture
 
+// Light-type permutation (MegaLights' tile classification, reduced to the one
+// axis that pays here): the LTC area-light paths cost registers in every
+// pixel whether or not the frame has an area light, and this pass is
+// occupancy-bound. RaytracedShadows builds one pipeline per value and picks
+// by the frame's area light count, so a scene without area lights never
+// carries the code at all. Every area branch below tests this first.
+layout(constant_id = 0) const bool sc_has_area_lights = true;
+
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
@@ -507,7 +515,7 @@ void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness,
 
 // Unshadowed contribution of any encoded light entry.
 void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
-	if ((entry & AREA_BIT) != 0u) {
+	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 		area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
 	} else {
 		vec3 unused_rel;
@@ -694,6 +702,9 @@ void main() {
 				}
 				// Drop stale entries from lights that no longer exist.
 				uint idx = entry & ENTRY_ID_MASK;
+				if (!sc_has_area_lights && (entry & AREA_BIT) != 0u) {
+					continue; // An area entry from a frame that still had them.
+				}
 				uint count = (entry & AREA_BIT) != 0u ? params.area_light_count : ((entry & SPOT_BIT) != 0u ? params.spot_light_count : params.omni_light_count);
 				if (idx < count) {
 					visible_list[visible_count++] = entry;
@@ -746,7 +757,7 @@ void main() {
 		// becomes unoccluded is re-found within a few frames (the sampling
 		// stays unbiased: the ratio estimator divides the same weight out).
 		float vis_guide;
-		if ((entry & AREA_BIT) != 0u) {
+		if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 			vis_guide = float(bitCount((entry >> QUAD_MASK_SHIFT) & 0xFu)) * 0.25;
 		} else {
 			vis_guide = float((entry >> QUAD_MASK_SHIFT) & 0xFu) * (1.0 / 15.0);
@@ -794,8 +805,9 @@ void main() {
 		uint cluster_z = uint(clamp((-view_pos.z / params.z_far) * 32.0, 0.0, 31.0));
 
 		// First pass: count the candidates in the cell (omni, spot, area).
+		const uint type_count = sc_has_area_lights ? 3u : 2u;
 		uint cell_count = 0u;
-		for (uint type = 0u; type < 3u; type++) {
+		for (uint type = 0u; type < type_count; type++) {
 			uint type_offset = cluster_offset + type * params.cluster_type_size;
 			uint item_min, item_max, item_from, item_to;
 			cluster_get_item_range(type_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
@@ -819,7 +831,7 @@ void main() {
 		bool analytic_exact = cell_count <= MAX_ANALYTIC_LIGHTS;
 
 		uint cell_index = 0u;
-		for (uint type = 0u; type < 3u; type++) {
+		for (uint type = 0u; type < type_count; type++) {
 			uint type_offset = cluster_offset + type * params.cluster_type_size;
 			uint item_min, item_max, item_from, item_to;
 			cluster_get_item_range(type_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
@@ -1007,7 +1019,7 @@ void main() {
 		// double-counts in both the ratio numerator and denominator, so it
 		// cancels there -- tracing a replacement instead was measured to add
 		// variance on both the rt_lab and game-project scenes and reverted).
-		bool has_extent = (entry & AREA_BIT) != 0u;
+		bool has_extent = sc_has_area_lights && (entry & AREA_BIT) != 0u;
 		if (!has_extent) {
 			has_extent = ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].size : omni_lights.data[entry & ENTRY_ID_MASK].size) > 0.0;
 		}
@@ -1019,7 +1031,7 @@ void main() {
 				sample_rnd = fract(sample_rnd + vec2(hash_to_float(pcg_hash(pixel_seed + 0x9E37u * r)), hash_to_float(pcg_hash(pixel_seed + 0x85EBu * r))));
 			}
 			vec3 view_target;
-			if ((entry & AREA_BIT) != 0u) {
+			if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 				// Sample the rect uniformly, recording which quadrant the sample
 				// landed in so the tile mask still says where the light was
 				// reachable.
@@ -1065,7 +1077,7 @@ void main() {
 			uint light_index = entry & ENTRY_ID_MASK;
 			float shadow_opacity;
 			uint caster_mask;
-			if ((entry & AREA_BIT) != 0u) {
+			if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 				shadow_opacity = area_lights.data[light_index].shadow_opacity;
 				caster_mask = area_lights.data[light_index].shadow_caster_mask;
 			} else if ((entry & SPOT_BIT) != 0u) {
@@ -1128,7 +1140,7 @@ void main() {
 			traced_found++;
 			if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + traced_found)) < 1.0 / float(traced_found)) {
 				chosen_visible_light = entry & ENTRY_KEY_MASK;
-				if ((entry & AREA_BIT) != 0u) {
+				if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 					if (visibility > 0.0) {
 						chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + quadrant);
 					}

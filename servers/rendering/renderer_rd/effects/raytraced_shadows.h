@@ -266,7 +266,8 @@ private:
 
 	StochasticDirectLightingShaderRD stochastic_shader;
 	RID stochastic_shader_version;
-	RID stochastic_pipeline;
+	RID stochastic_pipeline; // sc_has_area_lights = true.
+	RID stochastic_pipeline_no_area; // Area paths compiled out; frames with no area light.
 
 	struct StochasticParamsUBO {
 		float view_from_ndc[16];

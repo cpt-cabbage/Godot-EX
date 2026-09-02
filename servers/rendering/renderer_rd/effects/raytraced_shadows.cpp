@@ -74,7 +74,20 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	stochastic_modes.push_back("");
 	stochastic_shader.initialize(stochastic_modes);
 	stochastic_shader_version = stochastic_shader.version_create();
-	stochastic_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0));
+	{
+		// One pipeline per light-type class (see sc_has_area_lights in the
+		// shader): the LTC area paths are compiled out of the second, which
+		// serves every frame whose area light count is zero.
+		Vector<RD::PipelineSpecializationConstant> sc_list;
+		RD::PipelineSpecializationConstant sc;
+		sc.constant_id = 0;
+		sc.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_BOOL;
+		sc.bool_value = true;
+		sc_list.push_back(sc);
+		stochastic_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0), sc_list);
+		sc_list.write[0].bool_value = false;
+		stochastic_pipeline_no_area = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0), sc_list);
+	}
 
 	Vector<String> light_list_modes;
 	light_list_modes.push_back("");
@@ -1084,8 +1097,13 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	RD::Uniform u_analytic_d_out(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ analytic_diffuse }));
 	RD::Uniform u_analytic_s_out(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ analytic_specular }));
 
+	// RT_LAB_FORCE_AREA_PIPELINE=1 keeps the full pipeline on frames without
+	// area lights, so the two can be timed against each other from one build.
+	static const bool force_area_pipeline = OS::get_singleton()->get_environment("RT_LAB_FORCE_AREA_PIPELINE") == "1";
+	RID pipeline = (p_area_light_count > 0 || force_area_pipeline) ? stochastic_pipeline : stochastic_pipeline_no_area;
+
 	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, stochastic_pipeline);
+	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
