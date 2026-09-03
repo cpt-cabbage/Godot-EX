@@ -320,6 +320,7 @@ public:
 	RID get_requests_buffer() const { return requests_buffer; }
 	RID get_lighting_atlas() const { return lighting_atlas; }
 	RID get_depth_atlas() const { return depth_atlas; }
+	RID get_albedo_atlas() const { return albedo_atlas; }
 	RID get_change_atlas() const { return change_atlas; }
 	uint32_t get_set_count() const { return sets.size(); }
 	uint32_t get_instance_record_count() const { return instance_records.size(); }

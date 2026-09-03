@@ -415,6 +415,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	as_instances.clear();
 
 	scene_frame++;
+	alpha_tested_instances = 0;
 	if (surface_cache != nullptr) {
 		surface_cache->begin_frame(scene_frame);
 	}
@@ -462,11 +463,24 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		};
 		const uint32_t double_sided = casting_mask & inst->data->double_sided_shadow_surface_mask;
 		const uint32_t front_cull = casting_mask & inst->data->front_cull_shadow_surface_mask & ~double_sided;
-		const FacingClass classes[3] = {
-			{ casting_mask & ~double_sided & ~front_cull, {} },
-			{ double_sided, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT },
-			{ front_cull, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT },
+		// Surfaces whose material covers only part of its triangles are a
+		// class of their own per facing, flagged non-opaque: the shaders
+		// with card tables then get their hits as candidates and confirm
+		// them from the cards' coverage (shaders without keep the opaque ray
+		// flag and see them whole, as before).
+		const uint32_t alpha_tested = surface_cache != nullptr ? (casting_mask & inst->data->alpha_tested_shadow_surface_mask) : 0;
+		const uint32_t plain = casting_mask & ~double_sided & ~front_cull;
+		const FacingClass classes[6] = {
+			{ plain & ~alpha_tested, {} },
+			{ double_sided & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT },
+			{ front_cull & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT },
+			{ plain & alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT },
+			{ double_sided & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
+			{ front_cull & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
 		};
+		if (alpha_tested != 0) {
+			alpha_tested_instances++;
+		}
 
 		for (const FacingClass &facing : classes) {
 			const uint32_t surface_mask = facing.mask;
@@ -1095,7 +1109,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// registers, and sizing them past the rays actually requested costs
 	// occupancy on every pixel.
 	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
-	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0);
+	const bool cards_ready = surface_cache != nullptr && surface_cache->is_ready();
+	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0) | ((cards_ready && alpha_tested_instances > 0) ? 4 : 0); // 4: FLAG_ALPHA_CASTERS
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
@@ -1123,6 +1138,17 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		decal_atlas = ltc_lut1_texture; // Never sampled without a projector rect.
 	}
 	RD::Uniform u_decal_atlas(RD::UNIFORM_TYPE_TEXTURE, 14, Vector<RID>({ decal_atlas }));
+	// The surface cache's tables, for the coverage of alpha-tested casters
+	// at a shadow ray's candidate hits; dummies when the cache is off (no
+	// instance is flagged non-opaque then, so they are never read).
+	if (rt_gi_dummy_buffer.is_null()) {
+		rt_gi_dummy_buffer = rd->storage_buffer_create(256);
+	}
+	RID default_black_tex = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+	RD::Uniform u_sc_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 15, Vector<RID>({ cards_ready ? surface_cache->get_instances_buffer() : rt_gi_dummy_buffer }));
+	RD::Uniform u_sc_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 16, Vector<RID>({ cards_ready ? surface_cache->get_sets_buffer() : rt_gi_dummy_buffer }));
+	RD::Uniform u_sc_depth(RD::UNIFORM_TYPE_TEXTURE, 17, Vector<RID>({ cards_ready ? surface_cache->get_depth_atlas() : default_black_tex }));
+	RD::Uniform u_sc_albedo(RD::UNIFORM_TYPE_TEXTURE, 18, Vector<RID>({ cards_ready ? surface_cache->get_albedo_atlas() : default_black_tex }));
 	RID visible_light = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_VISIBLE_LIGHT, p_view, 0);
 	RID raw_meta = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_META, p_view, 0);
 	// This frame's parity is what the sampling pass writes and the composite
@@ -1148,7 +1174,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	rd->draw_command_begin_label("Stochastic Sampling");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

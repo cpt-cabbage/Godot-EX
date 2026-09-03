@@ -5,6 +5,7 @@
 #VERSION_DEFINES
 
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : enable
 
 // Stochastic direct lighting (mini-MegaLights).
 // Per pixel: weighted reservoir sampling over a candidate set built from the
@@ -82,6 +83,7 @@ params;
 
 #define FLAG_LIGHT_GUIDING 1u
 #define FLAG_SCREEN_TRACES 2u
+#define FLAG_ALPHA_CASTERS 4u // Some TLAS instances are non-opaque: their hits are candidates, confirmed from the cards' coverage.
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -111,6 +113,19 @@ layout(set = 0, binding = 12) uniform texture2D area_light_atlas;
 layout(set = 0, binding = 13) uniform sampler material_sampler;
 // Projector textures for omni/spot lights (same atlas as the scene shader).
 layout(set = 0, binding = 14) uniform texture2D decal_atlas_srgb;
+
+// The surface cache's tables, for the coverage of alpha-tested casters.
+#include "surface_cache_inc.glsl"
+layout(set = 0, binding = 15, std430) restrict readonly buffer CardInstances {
+	CardInstance data[];
+}
+card_instances;
+layout(set = 0, binding = 16, std430) restrict readonly buffer CardSets {
+	CardSet data[];
+}
+card_sets;
+layout(set = 0, binding = 17) uniform texture2D card_depth_atlas;
+layout(set = 0, binding = 18) uniform texture2D card_albedo_atlas;
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -523,6 +538,65 @@ void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, ou
 	}
 }
 
+
+// Coverage of a non-opaque candidate hit (an alpha-tested caster), from its
+// instance's cards: the card facing the ray most squarely whose stored depth
+// agrees with the hit, and its captured albedo alpha at that texel. A hit
+// with no card, or none agreeing, counts as covered, so a thick object never
+// leaks; only a texel the material left below half alpha lets the ray on.
+bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
+	if (p_instance_id == SURFACE_CACHE_INVALID) {
+		return true;
+	}
+	CardInstance inst = card_instances.data[p_instance_id];
+	if (inst.set == SURFACE_CACHE_INVALID) {
+		return true;
+	}
+	CardSet s = card_sets.data[inst.set];
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+		return true;
+	}
+	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
+	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
+	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
+	float best_w = 0.0;
+	float best_alpha = 1.0;
+	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
+		vec3 axis, u, v;
+		card_basis(k, axis, u, v);
+		float facing = abs(dot(axis, local_dir)); // Either side: the ray may come from behind the leaf.
+		if (facing <= 0.0) {
+			continue;
+		}
+		vec2 uv01;
+		float depth;
+		card_project(s, k, local_pos, uv01, depth);
+		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
+			continue;
+		}
+		uint packed = card_sets.data[inst.set].cards[k];
+		ivec2 dims = card_dims_packed(packed);
+		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
+		float stored = texelFetch(card_depth_atlas, texel, 0).r;
+		if (stored <= 0.0) {
+			continue;
+		}
+		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
+		float tolerance = max(2.0 * texel_world, 0.02 * longest);
+		if (abs(stored - depth) > tolerance) {
+			continue;
+		}
+		if (facing > best_w) {
+			best_w = facing;
+			best_alpha = texelFetch(card_albedo_atlas, texel, 0).a;
+		}
+	}
+	if (best_w <= 0.0) {
+		return true;
+	}
+	return best_alpha >= 0.5;
+}
+
 bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	vec3 delta = world_target - world_origin;
 	float dist = length(delta);
@@ -536,11 +610,34 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	// convention the acceleration structure sees; on Metal, measured with
 	// rt_lab/facing_test.gd, it is back-face culling. Instances drawn
 	// double-sided carry the TLAS flag that turns culling off for them.
+	// Non-opaque instances (alpha-tested casters) hand their hits back as
+	// candidates, confirmed where the cards say the material covers the
+	// point; without any of them the opaque flag skips that loop.
+	vec3 dir = delta / dist;
 	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, tlas,
-			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
-			caster_mask, world_origin, params.ray_bias, delta / dist, dist - params.ray_bias);
-	rayQueryProceedEXT(rq);
+	if ((params.flags & FLAG_ALPHA_CASTERS) == 0u) {
+		rayQueryInitializeEXT(rq, tlas,
+				gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+				caster_mask, world_origin, params.ray_bias, dir, dist - params.ray_bias);
+		rayQueryProceedEXT(rq);
+	} else {
+		rayQueryInitializeEXT(rq, tlas,
+				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+				caster_mask, world_origin, params.ray_bias, dir, dist - params.ray_bias);
+		// Past a few layers the ray is inside foliage, where it is dark
+		// anyway and every further leaf would cost a card lookup.
+		uint passed = 0u;
+		while (rayQueryProceedEXT(rq)) {
+			if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+				vec3 hit = world_origin + dir * rayQueryGetIntersectionTEXT(rq, false);
+				if (passed >= 4u || card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), hit, dir)) {
+					rayQueryConfirmIntersectionEXT(rq);
+				} else {
+					passed++;
+				}
+			}
+		}
+	}
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
 }
 

@@ -351,6 +351,7 @@ private:
 	SurfaceCache *surface_cache = nullptr;
 	bool surface_cache_mirror_reflections = true;
 	uint32_t scene_frame = 0; // Counts update_scene() calls: the cache's clock.
+	uint32_t alpha_tested_instances = 0; // TLAS instances flagged non-opaque this frame (see update_scene).
 	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
 
 	enum DenoiseVariant {

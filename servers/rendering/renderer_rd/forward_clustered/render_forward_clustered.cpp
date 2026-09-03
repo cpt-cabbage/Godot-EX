@@ -5052,6 +5052,9 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 		} else if (p_material->shader_data->cull_mode == RSE::CULL_MODE_FRONT) {
 			ginstance->data->front_cull_shadow_surface_mask |= surface_bit;
 		}
+		if (p_material->shader_data->uses_alpha_clip || (p_material->shader_data->uses_alpha && p_material->shader_data->uses_depth_prepass_alpha)) {
+			ginstance->data->alpha_tested_shadow_surface_mask |= surface_bit;
+		}
 	}
 
 	if (p_material->shader_data->uses_particle_trails) {
@@ -5221,6 +5224,7 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 	ginstance->data->shadow_casting_surface_mask = 0;
 	ginstance->data->double_sided_shadow_surface_mask = 0;
 	ginstance->data->front_cull_shadow_surface_mask = 0;
+	ginstance->data->alpha_tested_shadow_surface_mask = 0;
 
 	//add geometry for drawing
 	switch (ginstance->data->base_type) {

@@ -141,6 +141,11 @@ public:
 		// occludes from both; one culling front faces occludes from its back.
 		uint32_t double_sided_shadow_surface_mask = 0;
 		uint32_t front_cull_shadow_surface_mask = 0;
+		// Casting surfaces whose material covers only part of its triangles
+		// (alpha scissor or hash, or a blended alpha depth pre-pass): rays
+		// consult the surface cache's coverage at their hits instead of
+		// taking the whole triangle as an occluder.
+		uint32_t alpha_tested_shadow_surface_mask = 0;
 		bool dirty_dependencies = false;
 
 		DependencyTracker dependency_tracker;

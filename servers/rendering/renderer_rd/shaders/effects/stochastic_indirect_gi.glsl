@@ -5,6 +5,7 @@
 #VERSION_DEFINES
 
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : enable
 
 // Ray-traced indirect lighting ("Lumen-lite" final gather).
 // Per pixel: cosine-sampled hemisphere rays traced against the scene BVH,
@@ -600,6 +601,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 // a texel or two of the hit's, which is what keeps a hit on one wall from
 // reading the card of the wall behind it. Among the valid cards the one
 // facing the ray most squarely wins.
+
 bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
@@ -804,6 +806,10 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 	// The TLAS lives in absolute world space; positions here are
 	// camera-relative, so the query origin adds the camera origin back.
 	rayQueryEXT rq;
+	// The opaque flag: alpha-tested casters (non-opaque instances) occlude
+	// the bounce ray whole. Confirming their hits from the cards' coverage,
+	// as the direct pass does, cost 5.5 ms on the game project for a diffuse
+	// term that cannot show the holes.
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, t_max);
 	while (rayQueryProceedEXT(rq)) {
 	}
