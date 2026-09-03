@@ -2271,6 +2271,14 @@ void fragment_shader(in SceneData scene_data) {
 			vec3 rtgi_near_n = rt_gi_face;
 			float rtgi_best_w = -1.0;
 			vec3 rtgi_best_n = rt_gi_face;
+			// Best depth match on its own, for when every tap is rejected (the
+			// direct path's thin-feature fallback): a mismatched sample is far
+			// closer to the truth than the probe ambient a silhouette pixel
+			// would otherwise fall back to, which reads as a crawling speckle.
+			float rtgi_near_depth_w = -1.0;
+			vec3 rtgi_near_ambient = vec3(0.0);
+			vec3 rtgi_near_reflection = vec3(0.0);
+			vec4 rtgi_near_directional = vec4(0.0);
 			rt_gi_directional = vec4(0.0);
 			for (int i = 0; i < 4; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
@@ -2288,7 +2296,8 @@ void fragment_shader(in SceneData scene_data) {
 				// Faced the way the gather faced it.
 				sn = dot(sn, view) < 0.0 ? -sn : sn;
 				float w = (1.0 - abs(float(off.x) - rtgi_fr.x)) * (1.0 - abs(float(off.y) - rtgi_fr.y));
-				w *= exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
+				float rtgi_depth_w = exp(-abs(sd - rtgi_own_depth) / max(rtgi_own_depth * 0.1, 1e-4));
+				w *= rtgi_depth_w;
 				// Depth alone lets GI bleed across a silhouette where two
 				// surfaces meet at similar depth but face different ways -- a
 				// box edge being the everyday case. A gentler exponent than
@@ -2296,14 +2305,25 @@ void fragment_shader(in SceneData scene_data) {
 				// little further apart in normal.
 				w *= pow(max(dot(rt_gi_face, sn), 0.0), 8.0);
 #ifdef USE_MULTIVIEW
-				rt_gi_ambient += texelFetch(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
-				rt_gi_reflection += texelFetch(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb * w;
-				rt_gi_directional += texelFetch(sampler2DArray(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0) * w;
+				vec3 rtgi_tap_ambient = texelFetch(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+				vec3 rtgi_tap_reflection = texelFetch(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+				vec4 rtgi_tap_directional = texelFetch(sampler2DArray(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
 #else
-				rt_gi_ambient += texelFetch(sampler2D(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
-				rt_gi_reflection += texelFetch(sampler2D(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb * w;
-				rt_gi_directional += texelFetch(sampler2D(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), hp, 0) * w;
+				vec3 rtgi_tap_ambient = texelFetch(sampler2D(rt_gi_ambient_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+				vec3 rtgi_tap_reflection = texelFetch(sampler2D(rt_gi_reflection_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+				vec4 rtgi_tap_directional = texelFetch(sampler2D(rt_gi_directional_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
 #endif
+				rt_gi_ambient += rtgi_tap_ambient * w;
+				rt_gi_reflection += rtgi_tap_reflection * w;
+				rt_gi_directional += rtgi_tap_directional * w;
+				// Ranked on depth alone: where the taps disagree it is the one
+				// at our own depth that is right, however far it sits.
+				if (rtgi_depth_w > rtgi_near_depth_w) {
+					rtgi_near_depth_w = rtgi_depth_w;
+					rtgi_near_ambient = rtgi_tap_ambient;
+					rtgi_near_reflection = rtgi_tap_reflection;
+					rtgi_near_directional = rtgi_tap_directional;
+				}
 				// The nearest tap is the one whose gather most likely covered
 				// this fragment, so its normal is the basis the irradiance was
 				// integrated around. Taken unweighted on purpose: the weighted
@@ -2328,6 +2348,14 @@ void fragment_shader(in SceneData scene_data) {
 				rt_gi_reflection /= rtgi_weight;
 				rt_gi_directional /= rtgi_weight;
 				rt_gi_gather_normal = rtgi_near_w > 0.05 * rtgi_weight ? rtgi_near_n : rtgi_best_n;
+				rt_gi_valid = true;
+			} else {
+				// Every tap disagreed on depth and normal: the closest in depth,
+				// on this fragment's own normal (no gather basis to re-base from).
+				rt_gi_ambient = rtgi_near_ambient;
+				rt_gi_reflection = rtgi_near_reflection;
+				rt_gi_directional = rtgi_near_directional;
+				rt_gi_gather_normal = rt_gi_face;
 				rt_gi_valid = true;
 			}
 		}
