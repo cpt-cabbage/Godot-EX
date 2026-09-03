@@ -64,13 +64,14 @@ public:
 	static constexpr uint32_t MAX_SETS = 8192;
 	static constexpr uint32_t MAX_INSTANCE_RECORDS = 65536;
 	static constexpr uint32_t MAX_LIGHTS_PER_SET = 32;
-	static constexpr uint32_t PAGE_SIZE = 64; // Atlas pages; a card is at most one page.
+	static constexpr uint32_t PAGE_SIZE = 64; // Atlas pages; a card within one is a square slot, a larger one a block of pages.
+	static constexpr uint32_t MAX_CARD_EDGE = 256; // Four pages: the largest card edge a setting may ask for.
 
 	struct Settings {
 		uint32_t atlas_size = 2048;
 		float texels_per_meter = 16.0f;
 		uint32_t min_card_size = 8;
-		uint32_t max_card_size = 64;
+		uint32_t max_card_size = 128; // The longest card edge in texels; a card's two edges follow its own extents.
 		uint32_t captures_per_frame = 8;
 		uint32_t lighting_sets_per_frame = 64;
 		uint32_t temporal_frames = 16;
@@ -85,7 +86,8 @@ public:
 	struct CaptureJob {
 		uint32_t set = INVALID_ID;
 		RenderGeometryInstance *instance = nullptr;
-		uint32_t size = 0; // Card edge in texels.
+		uint32_t size = 0; // The longest card edge in texels.
+		Vector2i dims[CARDS_PER_SET]; // Each card's texels (width along u, height along v).
 		Transform3D camera[CARDS_PER_SET]; // World-space camera transforms.
 		Projection projection[CARDS_PER_SET];
 	};
@@ -156,8 +158,11 @@ private:
 
 	struct Slot {
 		uint32_t page = INVALID_ID;
-		uint32_t index = 0;
+		uint32_t index = 0; // Within the page, for a card of one page or less.
+		uint32_t run_x = 1; // A card larger than a page: a block of pages, from `page`.
+		uint32_t run_y = 1;
 	};
+	static constexpr uint32_t PAGE_CLASS_BLOCK = 0xFFFFFFFEu; // A page inside a multi-page block.
 
 	// GPU records, std430.
 	struct CardSetRecord {
@@ -172,7 +177,7 @@ private:
 		float pad1;
 		uint32_t flags;
 		uint32_t pad2[3];
-		uint32_t cards[8]; // x | y << 16 atlas texel origin, 6 used.
+		uint32_t cards[8]; // Per card: origin x (13 bits) | log2(width) - 2 (3 bits) | origin y << 16 (13 bits) | log2(height) - 2 << 29; six used.
 	};
 	static_assert(sizeof(CardSetRecord) == 176, "CardSetRecord layout must match the shaders.");
 
@@ -194,8 +199,9 @@ private:
 		AABB local_aabb;
 		Transform3D transform;
 		AABB world_aabb;
-		uint32_t size = 0; // Card edge in texels; 0 when the atlas had no room.
-		uint32_t size_class = INVALID_ID;
+		uint32_t size = 0; // The longest card edge in texels; 0 when the atlas had no room.
+		uint32_t size_class = INVALID_ID; // The class of that edge (a change re-allocates every card).
+		Vector2i dims[CARDS_PER_SET]; // Each card's texels.
 		Slot slots[CARDS_PER_SET];
 		bool captured = false;
 		bool pending_capture = false;
@@ -270,9 +276,12 @@ private:
 	void _create_atlases();
 	void _free_atlases();
 	bool _alloc_slot(uint32_t p_size_class, Slot &r_slot);
+	bool _alloc_block(uint32_t p_run_x, uint32_t p_run_y, Slot &r_slot);
+	bool _alloc_card(const Vector2i &p_dims, uint32_t p_set_edge, Slot &r_slot);
+	Vector2i _card_dims(const CardSet &p_set, uint32_t p_card, uint32_t p_edge) const;
 	void _free_slot(const Slot &p_slot);
 	void _free_set_slots(CardSet &p_set);
-	Vector2i _slot_origin(const Slot &p_slot, uint32_t p_size_class) const;
+	Vector2i _slot_origin(const Slot &p_slot) const;
 	uint32_t _size_class_for(uint32_t p_size) const;
 	void _release_set(uint32_t p_set);
 	void _card_camera(const CardSet &p_set, uint32_t p_card, Transform3D &r_camera, Projection &r_projection) const;

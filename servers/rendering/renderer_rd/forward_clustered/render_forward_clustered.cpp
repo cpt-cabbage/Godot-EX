@@ -2003,6 +2003,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
 	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/atlas_size"));
 	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/texels_per_meter");
+	surface_cache_settings.max_card_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/max_card_size"));
 	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/captures_per_frame"));
 	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
 	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));
@@ -2070,7 +2071,7 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 		surface_cache_capture_list.clear();
 		surface_cache_capture_list.push_back(job.instance);
 		for (uint32_t c = 0; c < RendererRD::SurfaceCache::CARDS_PER_SET; c++) {
-			_render_material(job.camera[c], job.projection[c], true, surface_cache_capture_list, cache->get_capture_framebuffer(), Rect2i(0, 0, job.size, job.size), exposure);
+			_render_material(job.camera[c], job.projection[c], true, surface_cache_capture_list, cache->get_capture_framebuffer(), Rect2i(0, 0, job.dims[c].x, job.dims[c].y), exposure);
 			cache->commit_capture(job, c);
 		}
 		cache->finish_capture(job);

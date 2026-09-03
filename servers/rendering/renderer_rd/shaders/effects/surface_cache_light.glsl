@@ -300,7 +300,6 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	}
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
 	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
-	float size = s.card_size;
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	ivec2 best_texel = ivec2(0);
@@ -317,12 +316,17 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
 			continue;
 		}
-		ivec2 texel = card_origin(s, k) + clamp(ivec2(uv01 * size), ivec2(0), ivec2(int(size) - 1));
+		uint packed = sets.data[inst.set].cards[k];
+		ivec2 dims = card_dims_packed(packed);
+		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
 		float stored = texelFetch(depth_atlas, texel, 0).r;
 		if (stored <= 0.0) {
 			continue;
 		}
-		float texel_world = (longest + 2.0 * s.margin) / size;
+		// The box's longest extent over the card's longer edge, as when the
+		// cards were square: a card's own (shorter) texel made the tolerance
+		// reject grazing hits that then paid for the probe fallback.
+		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
 		float tolerance = max(2.0 * texel_world, 0.02 * longest);
 		if (abs(stored - depth) > tolerance) {
 			continue;
@@ -367,7 +371,7 @@ struct Texel {
 
 // The texel's position, normal and material back out of the capture. False
 // where nothing was captured.
-bool read_texel(CardSet s, uint card, uint size, ivec2 texel_in_card, ivec2 texel, out Texel t) {
+bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 texel, out Texel t) {
 	float depth = texelFetch(depth_atlas, texel, 0).r;
 	if (depth <= 0.0) {
 		return false;
@@ -375,7 +379,7 @@ bool read_texel(CardSet s, uint card, uint size, ivec2 texel_in_card, ivec2 texe
 	t.albedo = texelFetch(albedo_atlas, texel, 0).rgb;
 	vec3 n_cam = normalize(texelFetch(normal_atlas, texel, 0).rgb * 2.0 - 1.0);
 	t.emission = texelFetch(emission_atlas, texel, 0).rgb;
-	vec2 uv01 = (vec2(texel_in_card) + 0.5) / float(size);
+	vec2 uv01 = (vec2(texel_in_card) + 0.5) / vec2(dims);
 	vec3 local_pos = card_local_point(s, card, uv01, depth);
 	vec3 axis, u, v;
 	card_basis(card, axis, u, v);
@@ -556,32 +560,48 @@ void main() {
 	}
 	uint set = active_sets.list[entry];
 	CardSet s = sets.data[set];
-	uint size = uint(s.card_size);
-	if (size < 8u) {
+	if (s.card_size < 8.0) {
 		return;
 	}
 	// A workgroup covers 8x8 texels, one per thread, or with the bounce ray
 	// shared 16x16, a 2x2 quad per thread: the quad's one ray keeps every
 	// lane of the group tracing, which is what makes the fourfold fewer rays
 	// cost a quarter of the time (rays idle in a lane still cost its group).
+	// The cards differ in size, so the group finds its card by walking the
+	// cards' block counts.
 	bool quad_mode = bool(params.flags & FLAG_SHARED_BOUNCE_RAY);
 	uint tile = quad_mode ? 16u : 8u;
-	uint n = max(size / tile, 1u);
-	uint blocks_per_card = n * n;
-	uint card = gl_WorkGroupID.x / blocks_per_card;
+	uint card = SURFACE_CACHE_CARDS;
+	uint block = gl_WorkGroupID.x;
+	ivec2 dims = ivec2(0);
+	uvec2 n = uvec2(1u);
+	uint card_packed = 0u;
+	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
+		uint packed = sets.data[set].cards[k];
+		ivec2 kd = card_dims_packed(packed);
+		uvec2 kn = max(uvec2(kd) / tile, uvec2(1u));
+		uint blocks = kn.x * kn.y;
+		if (block < blocks) {
+			card = k;
+			dims = kd;
+			n = kn;
+			card_packed = packed;
+			break;
+		}
+		block -= blocks;
+	}
 	if (card >= SURFACE_CACHE_CARDS) {
 		return;
 	}
-	uint block = gl_WorkGroupID.x % blocks_per_card;
-	ivec2 block_origin = ivec2(int(block % n), int(block / n)) * int(tile);
-	ivec2 origin_texel = card_origin(s, card);
+	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
+	ivec2 origin_texel = card_origin_packed(card_packed);
 	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
 
 	if (!quad_mode) {
 		ivec2 texel_in_card = block_origin + ivec2(gl_LocalInvocationID.xy);
 		ivec2 texel = origin_texel + texel_in_card;
 		Texel t;
-		if (!read_texel(s, card, size, texel_in_card, texel, t)) {
+		if (!read_texel(s, card, dims, texel_in_card, texel, t)) {
 			return; // Nothing captured here.
 		}
 		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
@@ -595,15 +615,15 @@ void main() {
 	}
 
 	ivec2 quad_in_card = block_origin + ivec2(gl_LocalInvocationID.xy) * 2;
-	if (quad_in_card.x >= int(size) || quad_in_card.y >= int(size)) {
-		return; // An 8-texel card fills a quarter of the tile.
+	if (any(greaterThanEqual(quad_in_card, dims))) {
+		return; // An 8-texel edge fills half of the tile.
 	}
 	Texel t[4];
 	bool valid[4];
 	uint valid_count = 0u;
 	for (uint k = 0u; k < 4u; k++) {
 		ivec2 texel_in_card = quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
-		valid[k] = read_texel(s, card, size, texel_in_card, origin_texel + texel_in_card, t[k]);
+		valid[k] = read_texel(s, card, dims, texel_in_card, origin_texel + texel_in_card, t[k]);
 		valid_count += valid[k] ? 1u : 0u;
 	}
 	if (valid_count == 0u) {

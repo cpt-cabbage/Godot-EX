@@ -21,7 +21,7 @@ struct CardSet {
 	uint pad2;
 	uint pad3;
 	uint pad4;
-	uint cards[8]; // Atlas texel origin, x | y << 16; six used.
+	uint cards[8]; // Per card: origin x (13 bits) | log2(width) - 2 (3 bits) | origin y << 16 (13 bits) | log2(height) - 2 << 29; six used.
 };
 
 struct CardInstance {
@@ -40,9 +40,24 @@ void card_basis(uint p_card, out vec3 r_axis, out vec3 r_u, out vec3 r_v) {
 	r_u = cross(r_v, r_axis);
 }
 
+// The packed forms take the card's word read straight from the set buffer
+// (sets.data[set].cards[k]): indexing the copied struct's array with a loop
+// variable spills the whole record to thread-private memory.
+ivec2 card_origin_packed(uint packed) {
+	return ivec2(int(packed & 0x1FFFu), int((packed >> 16u) & 0x1FFFu));
+}
+
+// A card's texels: width along u, height along v (each a power of two).
+ivec2 card_dims_packed(uint packed) {
+	return ivec2(4 << ((packed >> 13u) & 7u), 4 << ((packed >> 29u) & 7u));
+}
+
 ivec2 card_origin(CardSet s, uint p_card) {
-	uint packed = s.cards[p_card];
-	return ivec2(int(packed & 0xFFFFu), int(packed >> 16u));
+	return card_origin_packed(s.cards[p_card]);
+}
+
+ivec2 card_dims(CardSet s, uint p_card) {
+	return card_dims_packed(s.cards[p_card]);
 }
 
 // The half extents of the capture box, margin included, along a card's axes.

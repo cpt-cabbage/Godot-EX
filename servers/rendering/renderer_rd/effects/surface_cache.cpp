@@ -102,7 +102,7 @@ void SurfaceCache::set_settings(const Settings &p_settings) {
 	bool resize = p_settings.atlas_size != settings.atlas_size;
 	settings = p_settings;
 	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 4u, PAGE_SIZE);
-	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, PAGE_SIZE);
+	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, MAX_CARD_EDGE);
 	if (resize) {
 		_free_atlases();
 		_create_atlases();
@@ -113,7 +113,7 @@ void SurfaceCache::_create_atlases() {
 	RD *rd = RD::get_singleton();
 	settings.atlas_size = CLAMP(Math::next_power_of_2(settings.atlas_size), 256u, 8192u);
 	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 4u, PAGE_SIZE);
-	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, PAGE_SIZE);
+	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, MAX_CARD_EDGE);
 
 	RD::TextureFormat tf;
 	tf.width = settings.atlas_size;
@@ -140,8 +140,8 @@ void SurfaceCache::_create_atlases() {
 	// Scratch framebuffer, the same layout the lightmapper's material bake
 	// uses so the material pass pipelines are shared.
 	RD::TextureFormat sf;
-	sf.width = PAGE_SIZE;
-	sf.height = PAGE_SIZE;
+	sf.width = MAX_CARD_EDGE;
+	sf.height = MAX_CARD_EDGE;
 	sf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 	sf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 	scratch_albedo = rd->texture_create(sf, RD::TextureView());
@@ -238,8 +238,98 @@ bool SurfaceCache::_alloc_slot(uint32_t p_size_class, Slot &r_slot) {
 	return _alloc_slot(p_size_class, r_slot);
 }
 
+// A block of p_run_x by p_run_y free pages, for a card larger than a page:
+// the page grid scanned for a free rectangle, its pages taken out of the
+// free pool and marked as the block's.
+bool SurfaceCache::_alloc_block(uint32_t p_run_x, uint32_t p_run_y, Slot &r_slot) {
+	if (p_run_x > pages_per_row || p_run_y > pages_per_row) {
+		return false;
+	}
+	for (uint32_t py = 0; py + p_run_y <= pages_per_row; py++) {
+		for (uint32_t px = 0; px + p_run_x <= pages_per_row; px++) {
+			bool free = true;
+			for (uint32_t y = 0; y < p_run_y && free; y++) {
+				for (uint32_t x = 0; x < p_run_x && free; x++) {
+					free = pages[(py + y) * pages_per_row + px + x].size_class == INVALID_ID;
+				}
+			}
+			if (!free) {
+				continue;
+			}
+			for (uint32_t y = 0; y < p_run_y; y++) {
+				for (uint32_t x = 0; x < p_run_x; x++) {
+					uint32_t page = (py + y) * pages_per_row + px + x;
+					pages[page].size_class = PAGE_CLASS_BLOCK;
+					pages[page].used = 1;
+					pages[page].used_count = 1;
+					for (uint32_t i = 0; i < free_pages.size(); i++) {
+						if (free_pages[i] == page) {
+							free_pages.remove_at_unordered(i);
+							break;
+						}
+					}
+				}
+			}
+			r_slot.page = py * pages_per_row + px;
+			r_slot.index = 0;
+			r_slot.run_x = p_run_x;
+			r_slot.run_y = p_run_y;
+			return true;
+		}
+	}
+	return false;
+}
+
+// A slot for a card of p_dims texels: a square slot of the longer edge's
+// class within a page, or a block of pages past it.
+bool SurfaceCache::_alloc_card(const Vector2i &p_dims, uint32_t p_set_edge, Slot &r_slot) {
+	if (p_set_edge <= PAGE_SIZE) {
+		// A square slot of the set's longest edge for every card, whatever
+		// the card's own dims: the set's six cards then share a page, which
+		// the hit lookup's probing of up to six of them per hit rewards (per-
+		// card slots scattered them and cost the gather 2 ms on the game
+		// project). The unused part of a thin card's slot is the price.
+		return _alloc_slot(_size_class_for(p_set_edge), r_slot);
+	}
+	return _alloc_block(Math::division_round_up(uint32_t(p_dims.x), PAGE_SIZE), Math::division_round_up(uint32_t(p_dims.y), PAGE_SIZE), r_slot);
+}
+
+// A card's texels from its own extents: the box's half extents (margin
+// included) along the card's u and v, at the set's texel density, each
+// edge a power of two capped by p_edge, the longer one reaching it.
+Vector2i SurfaceCache::_card_dims(const CardSet &p_set, uint32_t p_card, uint32_t p_edge) const {
+	Vector3 axis, u, v;
+	_card_basis(p_card, axis, u, v);
+	const AABB &box = p_set.local_aabb;
+	float margin = box.get_longest_axis_size() * CAPTURE_MARGIN_FRACTION + CAPTURE_MARGIN_MIN;
+	Vector3 half = box.size * 0.5f + Vector3(margin, margin, margin);
+	Vector3 scale = p_set.transform.basis.get_scale_abs();
+	Vector3 world_half = half * scale;
+	float hu = Math::abs(world_half.dot(u));
+	float hv = Math::abs(world_half.dot(v));
+	float longest = MAX(hu, hv);
+	// The longer edge is p_edge; the shorter follows its ratio, floored at the smallest card.
+	uint32_t w = uint32_t(Math::ceil(float(p_edge) * (longest > 0.0f ? hu / longest : 1.0f)));
+	uint32_t h = uint32_t(Math::ceil(float(p_edge) * (longest > 0.0f ? hv / longest : 1.0f)));
+	w = CLAMP(Math::next_power_of_2(MAX(w, 1u)), settings.min_card_size, p_edge);
+	h = CLAMP(Math::next_power_of_2(MAX(h, 1u)), settings.min_card_size, p_edge);
+	return Vector2i(int(w), int(h));
+}
+
 void SurfaceCache::_free_slot(const Slot &p_slot) {
 	if (p_slot.page == INVALID_ID) {
+		return;
+	}
+	if (p_slot.run_x > 1 || p_slot.run_y > 1) {
+		for (uint32_t y = 0; y < p_slot.run_y; y++) {
+			for (uint32_t x = 0; x < p_slot.run_x; x++) {
+				uint32_t page = p_slot.page + y * pages_per_row + x;
+				pages[page].size_class = INVALID_ID;
+				pages[page].used = 0;
+				pages[page].used_count = 0;
+				free_pages.push_back(page);
+			}
+		}
 		return;
 	}
 	Page &p = pages[p_slot.page];
@@ -273,10 +363,14 @@ void SurfaceCache::_free_set_slots(CardSet &p_set) {
 	p_set.size_class = INVALID_ID;
 }
 
-Vector2i SurfaceCache::_slot_origin(const Slot &p_slot, uint32_t p_size_class) const {
-	uint32_t slots_per_side = 1u << p_size_class;
-	uint32_t slot_size = PAGE_SIZE >> p_size_class;
+Vector2i SurfaceCache::_slot_origin(const Slot &p_slot) const {
 	Vector2i page_origin(int(p_slot.page % pages_per_row) * PAGE_SIZE, int(p_slot.page / pages_per_row) * PAGE_SIZE);
+	if (p_slot.run_x > 1 || p_slot.run_y > 1) {
+		return page_origin;
+	}
+	uint32_t size_class = pages[p_slot.page].size_class;
+	uint32_t slots_per_side = 1u << size_class;
+	uint32_t slot_size = PAGE_SIZE >> size_class;
 	return page_origin + Vector2i(int(p_slot.index % slots_per_side) * slot_size, int(p_slot.index / slots_per_side) * slot_size);
 }
 
@@ -335,6 +429,7 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 	const AABB local_aabb = p_instance->data->aabb;
 	const uint64_t key = _material_key(p_instance);
 	bool needs_capture = !s->captured && !s->pending_capture;
+	bool d_box_changed = false;
 	if (s->captured || s->pending_capture) {
 		if (key != s->material_key) {
 			needs_capture = true;
@@ -346,6 +441,7 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		// recapture is the pose's, on the period below, not the box's.
 		if (d.x + d.y + d.z > extent * 0.02f && (!p_skinned || !s->captured || frame - s->captured_frame >= settings.skinned_recapture_period)) {
 			needs_capture = true;
+			d_box_changed = true;
 		}
 		// A skinned instance is recaptured when its pose has changed since
 		// the capture, at most once per recapture period: a running animation
@@ -362,22 +458,24 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		float world_extent = MAX(MAX(local_aabb.size.x * scale.x, local_aabb.size.y * scale.y), local_aabb.size.z * scale.z);
 		uint32_t size = uint32_t(Math::ceil(world_extent * settings.texels_per_meter));
 		size = CLAMP(Math::next_power_of_2(MAX(size, 1u)), settings.min_card_size, settings.max_card_size);
-		uint32_t size_class = _size_class_for(size);
-		if (size_class != s->size_class) {
+		// The set's slots are re-allocated when its longest edge changes (or
+		// its box, which shapes the cards); each card's own edges follow its
+		// extents. When the atlas has no room at this size, a smaller card is
+		// worth more than none: the edge halves down to the smallest before
+		// the instance falls back to the coarse cache at hits.
+		if (size != s->size || d_box_changed) {
 			_free_set_slots(*s);
-			// When the atlas has no room at this size, a smaller card is worth
-			// more than none: try each size down to the smallest before the
-			// instance falls back to the coarse cache at hits.
-			const uint32_t smallest_class = _size_class_for(settings.min_card_size);
+			s->local_aabb = local_aabb;
 			bool ok = false;
-			for (uint32_t try_class = size_class; try_class <= smallest_class && !ok; try_class++) {
+			for (uint32_t edge = size; edge >= settings.min_card_size && !ok; edge >>= 1) {
 				ok = true;
 				for (uint32_t c = 0; c < CARDS_PER_SET && ok; c++) {
-					ok = _alloc_slot(try_class, s->slots[c]);
+					s->dims[c] = _card_dims(*s, c, edge);
+					ok = _alloc_card(s->dims[c], edge, s->slots[c]);
 				}
 				if (ok) {
-					s->size = PAGE_SIZE >> try_class;
-					s->size_class = try_class;
+					s->size = edge;
+					s->size_class = edge;
 				} else {
 					_free_set_slots(*s);
 				}
@@ -491,6 +589,7 @@ bool SurfaceCache::next_capture(CaptureJob &r_job) {
 		r_job.instance = s.owner;
 		r_job.size = s.size;
 		for (uint32_t c = 0; c < CARDS_PER_SET; c++) {
+			r_job.dims[c] = s.dims[c];
 			_card_camera(s, c, r_job.camera[c], r_job.projection[c]);
 		}
 		return true;
@@ -501,10 +600,10 @@ bool SurfaceCache::next_capture(CaptureJob &r_job) {
 void SurfaceCache::commit_capture(const CaptureJob &p_job, uint32_t p_card) {
 	RD *rd = RD::get_singleton();
 	const CardSet &s = sets[p_job.set];
-	Vector2i origin = _slot_origin(s.slots[p_card], s.size_class);
+	Vector2i origin = _slot_origin(s.slots[p_card]);
 	Vector3 from(0, 0, 0);
 	Vector3 to(origin.x, origin.y, 0);
-	Vector3 size(p_job.size, p_job.size, 1);
+	Vector3 size(p_job.dims[p_card].x, p_job.dims[p_card].y, 1);
 	rd->texture_copy(scratch_albedo, albedo_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_normal, normal_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_emission, emission_atlas, from, to, size, 0, 0, 0, 0);
@@ -517,7 +616,7 @@ void SurfaceCache::finish_capture(const CaptureJob &p_job) {
 	s.captured = true;
 	s.reset = true;
 	s.captured_frame = frame;
-	print_verbose(vformat("Surface cache: captured set %d at %d texels (frame %d%s).", p_job.set, s.size, frame, s.skinned ? ", skinned" : ""));
+	print_verbose(vformat("Surface cache: captured set %d, longest edge %d texels (frame %d%s).", p_job.set, s.size, frame, s.skinned ? ", skinned" : ""));
 }
 
 void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
@@ -563,8 +662,11 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		s.reset = false;
 		for (uint32_t c = 0; c < CARDS_PER_SET; c++) {
 			if (s.size > 0) {
-				Vector2i o = _slot_origin(s.slots[c], s.size_class);
-				r.cards[c] = uint32_t(o.x) | (uint32_t(o.y) << 16);
+				// Origin and log2 dims packed: x | (log2 w - 2) << 13 | y << 16 | (log2 h - 2) << 29.
+				Vector2i o = _slot_origin(s.slots[c]);
+				uint32_t lw = uint32_t(Math::get_shift_from_power_of_2(uint32_t(s.dims[c].x))) - 2;
+				uint32_t lh = uint32_t(Math::get_shift_from_power_of_2(uint32_t(s.dims[c].y))) - 2;
+				r.cards[c] = (uint32_t(o.x) & 0x1FFFu) | (lw << 13) | ((uint32_t(o.y) & 0x1FFFu) << 16) | (lh << 29);
 			}
 		}
 	}
@@ -647,7 +749,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
 	// shared per 2x2 quad (see surface_cache_light.glsl).
 	const uint32_t tile = settings.shared_bounce_ray ? 16 : 8;
-	const uint32_t max_blocks_per_set = CARDS_PER_SET * MAX(settings.max_card_size / tile, 1u) * MAX(settings.max_card_size / tile, 1u);
+	const uint32_t max_blocks_per_set = CARDS_PER_SET * MAX(settings.max_card_size / tile, 1u) * MAX(settings.max_card_size / tile, 1u); // The longest edge squared: an upper bound, most groups of a smaller card exit at once.
 
 	PreparePushConstant push = {};
 	push.set_count = sets.size();

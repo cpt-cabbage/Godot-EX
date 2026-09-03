@@ -3796,6 +3796,8 @@ void RenderingServer::init() {
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/atlas_size", PROPERTY_HINT_ENUM, "1024,2048,4096"), 2048);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/texels_per_meter", PROPERTY_HINT_RANGE, "1.0,64.0,1.0"), 16.0);
+	// The longest edge of a card in texels; a card spans several 64-texel atlas pages past 64, and its two edges follow the instance's extents.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/max_card_size", PROPERTY_HINT_ENUM, "64,128,256"), 128);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);

@@ -616,11 +616,10 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	}
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
 	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
-	float size = s.card_size;
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	vec2 best_uv = vec2(0.0);
-	uint best_card = 0u;
+	uint best_packed = 0u;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -634,13 +633,18 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
 			continue;
 		}
-		ivec2 texel = card_origin(s, k) + clamp(ivec2(uv01 * size), ivec2(0), ivec2(int(size) - 1));
+		uint packed = card_sets.data[inst.set].cards[k];
+		ivec2 dims = card_dims_packed(packed);
+		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
 		float stored = texelFetch(card_depth_atlas, texel, 0).r;
 		if (stored <= 0.0) {
 			continue;
 		}
 		// Two texels of the card's own footprint, or a slice of the box.
-		float texel_world = (longest + 2.0 * s.margin) / size;
+		// The box's longest extent over the card's longer edge, as when the
+		// cards were square: a card's own (shorter) texel made the tolerance
+		// reject grazing hits that then paid for the probe fallback.
+		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
 		float tolerance = max(2.0 * texel_world, 0.02 * longest);
 		if (abs(stored - depth) > tolerance) {
 			continue;
@@ -648,14 +652,15 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		if (facing > best_w) {
 			best_w = facing;
 			best_uv = uv01;
-			best_card = k;
+			best_packed = packed;
 		}
 	}
 	if (best_w <= 0.0) {
 		return false;
 	}
 	// Bilinear inside the card, never across its border.
-	vec2 atlas_texel = vec2(card_origin(s, best_card)) + clamp(best_uv * size, vec2(0.5), vec2(size - 0.5));
+	vec2 best_dims = vec2(card_dims_packed(best_packed));
+	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(0.5), best_dims - 0.5);
 	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), 0.0).rgb;
 	pixel_change = max(pixel_change, texelFetch(card_change_atlas, ivec2(atlas_texel), 0).g);
 	r_set = inst.set;
