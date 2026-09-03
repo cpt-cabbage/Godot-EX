@@ -132,6 +132,9 @@ void SurfaceCache::_create_atlases() {
 	rd->texture_clear(lighting_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	indirect_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(indirect_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	tf.format = RD::DATA_FORMAT_R16G16_SFLOAT;
+	change_atlas = rd->texture_create(tf, RD::TextureView());
+	rd->texture_clear(change_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 
 	// Scratch framebuffer, the same layout the lightmapper's material bake
 	// uses so the material pass pipelines are shared.
@@ -181,7 +184,7 @@ void SurfaceCache::_create_atlases() {
 
 void SurfaceCache::_free_atlases() {
 	RD *rd = RD::get_singleton();
-	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -681,12 +684,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 18, Vector<RID>({ instances_buffer }));
 	RD::Uniform l_indirect(RD::UNIFORM_TYPE_IMAGE, 19, Vector<RID>({ indirect_atlas }));
 	RD::Uniform l_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ requests_buffer }));
+	RD::Uniform l_change(RD::UNIFORM_TYPE_IMAGE, 21, Vector<RID>({ change_atlas }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

@@ -195,6 +195,17 @@ card_requests;
 
 layout(set = 0, binding = 21) uniform sampler2D card_lighting_atlas;
 layout(set = 0, binding = 22) uniform sampler2D card_depth_atlas;
+// g: how much the card's lighting changed at its last relight (see
+// surface_cache_light.glsl), the temporal gradient a hit hands its pixel.
+layout(set = 0, binding = 23) uniform sampler2D card_change_atlas;
+// Last frame's GI temporal output, whose alpha carries a pixel's change mark
+// with its decay: an on-screen hit reads last frame's colour, so it inherits
+// that pixel's mark and a restart propagates through the screen bounces.
+layout(set = 0, binding = 24) uniform sampler2D prev_gi_history;
+
+// Set per pixel in main(): the largest lighting change a ray of this pixel
+// landed on. The temporal pass restarts the history in proportion.
+float pixel_change = 0.0;
 
 // Set per pixel in main(): this pixel's hits contribute to the calibration.
 bool calibrate_pixel = false;
@@ -546,6 +557,9 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		return cache_radiance;
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
+	// Weaker by a quarter per bounce: two pixels whose rays keep landing on
+	// each other would otherwise hand the mark back and forth forever.
+	pixel_change = max(pixel_change, textureLod(prev_gi_history, prev_uv, 0.0).a - 0.25);
 	float l = luminance(col);
 	// Both tiers for the same point: what the calibration is made of. The raw
 	// cache value, not the scaled one, or the estimate would chase itself.
@@ -643,6 +657,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	// Bilinear inside the card, never across its border.
 	vec2 atlas_texel = vec2(card_origin(s, best_card)) + clamp(best_uv * size, vec2(0.5), vec2(size - 0.5));
 	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), 0.0).rgb;
+	pixel_change = max(pixel_change, texelFetch(card_change_atlas, ivec2(atlas_texel), 0).g);
 	r_set = inst.set;
 	return true;
 }
@@ -931,7 +946,7 @@ void main() {
 		virtual_view_depth = -view_pos.z * (1.0 + min(spec_t_hit, 1e4) / view_len);
 	}
 
-	imageStore(out_ambient, pixel, vec4(irradiance, 0.0));
+	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
 	imageStore(out_directional, pixel, vec4(moment, visibility));

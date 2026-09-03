@@ -281,7 +281,9 @@ void main() {
 		return;
 	}
 
-	vec3 current_diffuse = texelFetch(in_diffuse, pixel, 0).rgb;
+	vec4 current_diffuse4 = texelFetch(in_diffuse, pixel, 0);
+	vec3 current_diffuse = current_diffuse4.rgb;
+	float change_age = current_diffuse4.a; // GI only; see the restart below.
 	vec4 current_specular4 = texelFetch(in_specular, pixel, 0);
 	vec3 current_specular = current_specular4.rgb;
 #ifdef HAS_DIRECTIONAL
@@ -526,6 +528,23 @@ void main() {
 				frames_d = min(frames_d, BORROW_FRAMES);
 				frames_s = min(frames_s, BORROW_FRAMES);
 			}
+#ifdef HAS_DIRECTIONAL
+			// The gather hands each pixel the largest lighting change its
+			// rays landed on (the raw buffer's alpha; the cards measure it as
+			// the relative change of their deterministic direct term, the
+			// temporal gradient A-SVGF re-shades for). A history that
+			// describes lighting that has since changed by a fraction c is
+			// worth about 1 / c frames of the new one (alpha = max(alpha, c)),
+			// so it restarts to that many. The mark decays in the history's
+			// alpha over eight frames, where the gather's on-screen hits read
+			// it, so a change propagates through the screen bounces.
+			change_age = max(change_age, hist_d4.a - 0.125);
+			if (change_age > 0.02) {
+				float keep = max(1.0, 1.0 / change_age);
+				frames_d = min(frames_d, keep);
+				frames_s = min(frames_s, keep);
+			}
+#endif
 			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
 			float alpha_s = max(1.0 / frames_s, params.blend_alpha);
 
@@ -557,7 +576,11 @@ void main() {
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	}
 
+#ifdef HAS_DIRECTIONAL
+	imageStore(out_diffuse, pixel, vec4(result_diffuse, clamp(change_age, 0.0, 1.0)));
+#else
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));
+#endif
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
 	imageStore(out_moments, pixel, moments);
 	imageStore(out_meta, pixel, vec4(frames_d / 64.0, frames_s / 64.0, dominance, reveal));

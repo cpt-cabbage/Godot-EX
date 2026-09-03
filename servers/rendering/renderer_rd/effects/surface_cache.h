@@ -128,6 +128,12 @@ private:
 	RID depth_atlas; // R32F, distance from the card's near plane; 0 = empty.
 	RID lighting_atlas; // RGBA16F, outgoing radiance; alpha = accumulated frames / 64.
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
+	// RG16F: r the unshadowed direct luminance (plus emission) at the last
+	// relight, g its relative change since the relight before. The direct
+	// term is deterministic, so that change is the lighting's temporal
+	// gradient (A-SVGF), free: the lighting pass scales its own restart by
+	// it and the GI gather reads it at hits to restart the pixel's history.
+	RID change_atlas;
 
 	// Scratch framebuffer the material pass renders one card into.
 	RID scratch_albedo, scratch_normal, scratch_orm, scratch_emission, scratch_depth_out, scratch_depth;
@@ -301,6 +307,7 @@ public:
 	RID get_requests_buffer() const { return requests_buffer; }
 	RID get_lighting_atlas() const { return lighting_atlas; }
 	RID get_depth_atlas() const { return depth_atlas; }
+	RID get_change_atlas() const { return change_atlas; }
 	uint32_t get_set_count() const { return sets.size(); }
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
 	bool is_ready() const { return sets_buffer.is_valid() && instances_buffer.is_valid(); }

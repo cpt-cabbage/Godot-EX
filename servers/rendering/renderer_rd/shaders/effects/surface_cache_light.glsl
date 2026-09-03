@@ -155,6 +155,13 @@ layout(set = 0, binding = 20, std430) restrict writeonly buffer CardRequests {
 }
 card_requests;
 
+// r: the unshadowed direct luminance (plus emission) at the last relight,
+// g: its relative change since the relight before. The direct term is
+// deterministic, so a change in it is a change in the lights, not noise:
+// A-SVGF's temporal gradient with the relight as the re-shade. It scales the
+// restart of the accumulations below, and the GI gather reads it at hits.
+layout(set = 0, binding = 21, rg16f) uniform restrict image2D change_atlas;
+
 uint pcg_hash(uint v) {
 	uint state = v * 747796405u + 2891336453u;
 	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
@@ -274,9 +281,10 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup),
 // over this pass's own bindings: nearest texel of the lit atlas.
-bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
+bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
+	r_change = 0.0;
 	if (p_instance_id == SURFACE_CACHE_INVALID) {
 		return false;
 	}
@@ -327,6 +335,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		return false;
 	}
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
+	r_change = imageLoad(change_atlas, best_texel).g;
 	return true;
 }
 
@@ -388,6 +397,7 @@ void main() {
 	uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 
 	vec3 direct = vec3(0.0);
+	vec3 direct_unshadowed = vec3(0.0);
 
 	// Directional lights.
 	for (uint i = 0u; i < params.directional_light_count; i++) {
@@ -402,6 +412,7 @@ void main() {
 			vis = mix(1.0, occluded(origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
 		}
 		direct += dl.color * dl.energy * (ndotl * (1.0 / M_PI) * vis);
+		direct_unshadowed += dl.color * dl.energy * (ndotl * (1.0 / M_PI));
 	}
 
 	// Omni and spot lights overlapping the set's box: the full analytic sum,
@@ -447,6 +458,7 @@ void main() {
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
 		}
 	}
+	direct_unshadowed += sum;
 	if (selected) {
 		float vis = 1.0;
 		if (sel_opacity > 0.001 && sel_mask != 0u) {
@@ -471,6 +483,7 @@ void main() {
 	float r1 = hash_to_float(seed);
 	vec3 ray_dir = basis_around(n_world, vec2(r0, r1));
 	vec3 indirect_sample = probe_fallback;
+	float bounce_change = 0.0;
 	{
 		rayQueryEXT rq;
 		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 0.0, ray_dir, 1e4);
@@ -481,9 +494,14 @@ void main() {
 			uint hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			vec3 card_radiance;
 			uint hit_set;
-			if (card_lookup(hit_instance, origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set)) {
+			float hit_change;
+			if (card_lookup(hit_instance, origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set, hit_change)) {
 				indirect_sample = card_radiance;
 				card_requests.frame[hit_set] = params.frame;
+				// The bounce carries the change of the card it came from,
+				// weaker by a quarter per bounce, so lighting that reaches
+				// this texel only indirectly restarts it too.
+				bounce_change = hit_change - 0.25;
 			}
 		} else {
 			indirect_sample = sky_eval(ray_dir);
@@ -492,18 +510,38 @@ void main() {
 
 	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
 
+	// The temporal gradient: how much the deterministic part of this texel's
+	// lighting moved since the last relight, relative to itself. Static
+	// lights give exactly zero (the numbers are recomputed from the same
+	// inputs); a fresh capture has nothing to compare with.
+	// A texel never lit since its capture (no frames accumulated) has nothing
+	// to compare with either: the capture's reset flag is raised on the frame
+	// its record is built, which is not always the frame it is first lit.
+	vec4 old = imageLoad(lighting_atlas, texel);
+	float lum_unshadowed = luminance(albedo * direct_unshadowed + emission);
+	vec2 prev_change = imageLoad(change_atlas, texel).rg;
+	float change = (reset || old.a <= 0.0) ? 0.0 : abs(lum_unshadowed - prev_change.x) / max(max(lum_unshadowed, prev_change.x), 1e-4);
+	// The change outlives the relight that found it, fading over eight: the
+	// gather's one ray per pixel lands on a given card only now and then,
+	// and a change seen for one frame would restart almost no pixel.
+	change = max(change, max(prev_change.y - 0.125, bounce_change));
+	imageStore(change_atlas, texel, vec4(lum_unshadowed, change, 0.0, 0.0));
+	// The accumulations restart to the frame count the change leaves credible
+	// (A-SVGF: alpha = max(alpha, gradient)); a small change barely touches
+	// them, a light switching costs them all their frames but one.
+	float keep_frames = change > 0.02 ? max(1.0, 1.0 / change) : 64.0;
+
 	// The indirect estimate accumulates on its own: one ray per frame is far
 	// noisier than the direct term's one shadow ray.
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
-	float ind_frames = reset ? 0.0 : old_indirect.a * 64.0;
+	float ind_frames = reset ? 0.0 : min(old_indirect.a * 64.0, keep_frames);
 	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / float(params.temporal_frames));
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
 	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
 
 	vec3 radiance = max(albedo * (direct + indirect) + emission, vec3(0.0));
 
-	vec4 old = imageLoad(lighting_atlas, texel);
-	float frames = reset ? 0.0 : old.a * 64.0;
+	float frames = reset ? 0.0 : min(old.a * 64.0, keep_frames);
 	float alpha = max(1.0 / (frames + 1.0), 1.0 / float(params.temporal_frames));
 	vec3 accum = frames <= 0.0 ? radiance : mix(old.rgb, radiance, alpha);
 	imageStore(lighting_atlas, texel, vec4(accum, min(frames + 1.0, 64.0) / 64.0));
