@@ -32,6 +32,8 @@
 
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+#include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/storage/utilities.h"
 
 using namespace RendererRD;
 
@@ -626,6 +628,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ p_inputs.spot_light_buffer }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 7, Vector<RID>({ params_ubo }));
 
+	RENDER_TIMESTAMP("Surface Cache Prepare");
+	rd->draw_command_begin_label("Surface Cache Prepare");
 	RD::ComputeListID list = rd->compute_list_begin();
 	// Selection: two passes so the sets hits asked for come before the
 	// round-robin slice when the budget runs short.
@@ -645,6 +649,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// The indirect arguments the cull pass wrote are read as such by the
 	// lighting dispatch, which the tracker only allows across lists.
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 
 	// Lighting.
 	RID light_rid = light_shader.version_get_shader(light_shader_version, 0);
@@ -677,9 +682,12 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect(RD::UNIFORM_TYPE_IMAGE, 19, Vector<RID>({ indirect_atlas }));
 	RD::Uniform l_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ requests_buffer }));
 
+	RENDER_TIMESTAMP("Surface Cache Lighting");
+	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
 	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 }

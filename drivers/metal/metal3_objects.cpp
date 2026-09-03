@@ -50,6 +50,8 @@
 
 #include "metal3_objects.h"
 
+#include "core/os/os.h"
+
 #include "drivers/metal/metal_utils.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_device_driver_metal3.h"
@@ -79,15 +81,103 @@ MDCommandBuffer::MDCommandBuffer(MTL::CommandQueue *p_queue, ::RenderingDeviceDr
 void MDCommandBuffer::begin_label(const char *p_label_name, const Color &p_color) {
 	NS::SharedPtr<NS::String> s = NS::TransferPtr(NS::String::alloc()->init(p_label_name, NS::UTF8StringEncoding));
 	command_buffer()->pushDebugGroup(s.get());
+	if (_profile_encoders()) {
+		label_stack.push_back(s);
+		_end_current_encoder();
+	}
 }
 
 void MDCommandBuffer::end_label() {
 	command_buffer()->popDebugGroup();
+	if (_profile_encoders()) {
+		if (!label_stack.is_empty()) {
+			label_stack.remove_at(label_stack.size() - 1);
+		}
+		_end_current_encoder();
+	}
+}
+
+bool MDCommandBuffer::_profile_encoders() {
+	static const bool enabled = OS::get_singleton() != nullptr && OS::get_singleton()->get_environment("GODOT_METAL_PROFILE_ENCODERS") == "1";
+	return enabled;
+}
+
+void MDCommandBuffer::_end_current_encoder() {
+	// A render pass keeps its encoder: labels never begin inside one, and a
+	// render encoder is already one per pass.
+	switch (type) {
+		case MDCommandBufferStateType::Compute:
+			_end_compute_dispatch();
+			break;
+		case MDCommandBufferStateType::Blit:
+			_end_blit();
+			break;
+		case MDCommandBufferStateType::AccelerationStructure:
+			_end_accel();
+			break;
+		default:
+			break;
+	}
+}
+
+void MDCommandBuffer::_label_new_encoder(MTL::CommandEncoder *p_enc) {
+	if (_profile_encoders() && !label_stack.is_empty()) {
+		p_enc->setLabel(label_stack[label_stack.size() - 1].get());
+	}
+}
+
+void MDCommandBuffer::timestamp_write(MTL::CounterSampleBuffer *p_buffer, uint32_t p_index, uint8_t *r_sampled) {
+	// The capture becomes the start of the next encoder, so the current one
+	// ends here and holds exactly the work recorded before the capture.
+	_end_current_encoder();
+	pending_timestamp.buffer = p_buffer;
+	pending_timestamp.index = p_index;
+	pending_timestamp.sampled = r_sampled;
+}
+
+void MDCommandBuffer::_take_pending_timestamp() {
+	if (pending_timestamp.sampled != nullptr) {
+		*pending_timestamp.sampled = 1;
+	}
+	pending_timestamp.buffer = nullptr;
+	pending_timestamp.sampled = nullptr;
+}
+
+void MDCommandBuffer::_attach_pending_timestamp(MTL::RenderPassDescriptor *p_desc) {
+	if (pending_timestamp.buffer == nullptr) {
+		return;
+	}
+	MTL::RenderPassSampleBufferAttachmentDescriptor *a = p_desc->sampleBufferAttachments()->object(0);
+	a->setSampleBuffer(pending_timestamp.buffer);
+	a->setStartOfVertexSampleIndex(pending_timestamp.index);
+	a->setEndOfVertexSampleIndex(MTL::CounterDontSample);
+	a->setStartOfFragmentSampleIndex(MTL::CounterDontSample);
+	a->setEndOfFragmentSampleIndex(MTL::CounterDontSample);
+	_take_pending_timestamp();
+}
+
+void MDCommandBuffer::_flush_pending_timestamp() {
+	if (pending_timestamp.buffer == nullptr) {
+		return;
+	}
+	// Nothing follows the capture in this command buffer: an empty blit
+	// encoder carries the sample.
+	NS::SharedPtr<MTL::BlitPassDescriptor> desc = NS::TransferPtr(MTL::BlitPassDescriptor::alloc()->init());
+	MTL::BlitPassSampleBufferAttachmentDescriptor *a = desc->sampleBufferAttachments()->object(0);
+	a->setSampleBuffer(pending_timestamp.buffer);
+	a->setStartOfEncoderSampleIndex(pending_timestamp.index);
+	a->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+	_take_pending_timestamp();
+	MTL::BlitCommandEncoder *enc = command_buffer()->blitCommandEncoder(desc.get());
+	enc->endEncoding();
 }
 
 void MDCommandBuffer::begin() {
 	DEV_ASSERT(commandBuffer.get() == nullptr && !state_begin);
 	state_begin = true;
+	// The graph ends a command buffer's last label only implicitly.
+	label_stack.clear();
+	pending_timestamp.buffer = nullptr;
 	bzero(pending_after_stages, sizeof(pending_after_stages));
 	bzero(pending_before_queue_stages, sizeof(pending_before_queue_stages));
 	binding_cache.clear();
@@ -116,6 +206,7 @@ void MDCommandBuffer::end() {
 
 void MDCommandBuffer::commit() {
 	end();
+	_flush_pending_timestamp();
 	if (use_barriers) {
 		if (_scratch.is_changed()) {
 			Span<MTL::Buffer *const> bufs = _scratch.get_buffers();
@@ -247,7 +338,9 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 			// and is due to the SUPPORTS_FRAGMENT_SHADER_WITH_ONLY_SIDE_EFFECTS flag.
 			render.desc->setDefaultRasterSampleCount(static_cast<NS::UInteger>(rp->sample_count));
 
+			_attach_pending_timestamp(render.desc.get());
 			render.encoder = NS::RetainPtr(command_buffer()->renderCommandEncoder(render.desc.get()));
+			_label_new_encoder(render.encoder.get());
 			_encode_barrier(render.encoder.get());
 		}
 
@@ -314,7 +407,18 @@ MTL::BlitCommandEncoder *MDCommandBuffer::_ensure_blit_encoder() {
 	}
 
 	type = MDCommandBufferStateType::Blit;
-	blit.encoder = NS::RetainPtr(command_buffer()->blitCommandEncoder());
+	if (pending_timestamp.buffer != nullptr) {
+		NS::SharedPtr<MTL::BlitPassDescriptor> desc = NS::TransferPtr(MTL::BlitPassDescriptor::alloc()->init());
+		MTL::BlitPassSampleBufferAttachmentDescriptor *a = desc->sampleBufferAttachments()->object(0);
+		a->setSampleBuffer(pending_timestamp.buffer);
+		a->setStartOfEncoderSampleIndex(pending_timestamp.index);
+		a->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+		_take_pending_timestamp();
+		blit.encoder = NS::RetainPtr(command_buffer()->blitCommandEncoder(desc.get()));
+	} else {
+		blit.encoder = NS::RetainPtr(command_buffer()->blitCommandEncoder());
+	}
+	_label_new_encoder(blit.encoder.get());
 	_encode_barrier(blit.encoder.get());
 
 	return blit.encoder.get();
@@ -338,7 +442,18 @@ MTL::AccelerationStructureCommandEncoder *MDCommandBuffer::_ensure_accel_encoder
 	}
 
 	type = MDCommandBufferStateType::AccelerationStructure;
-	accel.encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	if (pending_timestamp.buffer != nullptr) {
+		NS::SharedPtr<MTL::AccelerationStructurePassDescriptor> desc = NS::TransferPtr(MTL::AccelerationStructurePassDescriptor::alloc()->init());
+		MTL::AccelerationStructurePassSampleBufferAttachmentDescriptor *a = desc->sampleBufferAttachments()->object(0);
+		a->setSampleBuffer(pending_timestamp.buffer);
+		a->setStartOfEncoderSampleIndex(pending_timestamp.index);
+		a->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+		_take_pending_timestamp();
+		accel.encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder(desc.get()));
+	} else {
+		accel.encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	}
+	_label_new_encoder(accel.encoder.get());
 	_encode_barrier(accel.encoder.get());
 
 	return accel.encoder.get();
@@ -795,7 +910,9 @@ MTL::RenderCommandEncoder *MDCommandBuffer::get_new_render_encoder_with_descript
 			break;
 	}
 
+	_attach_pending_timestamp(p_desc);
 	MTL::RenderCommandEncoder *enc = command_buffer()->renderCommandEncoder(p_desc);
+	_label_new_encoder(enc);
 	_encode_barrier(enc);
 	return enc;
 }
@@ -1266,7 +1383,9 @@ void MDCommandBuffer::render_next_subpass() {
 		// the defaultRasterSampleCount from the pipeline's sample count.
 		render.desc = desc;
 	} else {
+		_attach_pending_timestamp(desc.get());
 		render.encoder = NS::RetainPtr(command_buffer()->renderCommandEncoder(desc.get()));
+		_label_new_encoder(render.encoder.get());
 		_encode_barrier(render.encoder.get());
 
 		if (!render.is_rendering_entire_area) {
@@ -1477,7 +1596,19 @@ void MDCommandBuffer::ComputeState::end_encoding() {
 
 void MDCommandBuffer::_compute_set_dirty_state() {
 	if (compute.dirty.has_flag(ComputeState::DIRTY_PIPELINE)) {
-		compute.encoder = NS::RetainPtr(command_buffer()->computeCommandEncoder(MTL::DispatchTypeConcurrent));
+		if (pending_timestamp.buffer != nullptr) {
+			NS::SharedPtr<MTL::ComputePassDescriptor> desc = NS::TransferPtr(MTL::ComputePassDescriptor::alloc()->init());
+			desc->setDispatchType(MTL::DispatchTypeConcurrent);
+			MTL::ComputePassSampleBufferAttachmentDescriptor *a = desc->sampleBufferAttachments()->object(0);
+			a->setSampleBuffer(pending_timestamp.buffer);
+			a->setStartOfEncoderSampleIndex(pending_timestamp.index);
+			a->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+			_take_pending_timestamp();
+			compute.encoder = NS::RetainPtr(command_buffer()->computeCommandEncoder(desc.get()));
+		} else {
+			compute.encoder = NS::RetainPtr(command_buffer()->computeCommandEncoder(MTL::DispatchTypeConcurrent));
+		}
+		_label_new_encoder(compute.encoder.get());
 		_encode_barrier(compute.encoder.get());
 		compute.encoder->setComputePipelineState(compute.pipeline->state.get());
 	}

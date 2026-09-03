@@ -2561,26 +2561,148 @@ void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer
 
 // ----- TIMESTAMP -----
 
+// Apple GPUs sample their timestamp counter at encoder boundaries only, so a
+// RenderingDevice capture becomes the start-of-encoder sample of the encoder
+// that follows it (MDCommandBufferBase::timestamp_write). One counter sample
+// buffer per query pool. The GPU tick is calibrated against the CPU clock the
+// device reports alongside it in sampleTimestamps(), nanoseconds on Apple
+// silicon, so the results convert to the nanoseconds RenderingDevice expects.
+// A device without the timestamp counter set gets the dummy pool (id 1) and
+// reads back zeros, as before.
+namespace {
+struct TimestampQueryPool {
+	NS::SharedPtr<MTL::CounterSampleBuffer> buffer;
+	uint32_t count = 0;
+	LocalVector<uint8_t> sampled; // Per index: attached to an encoder since the last reset.
+};
+constexpr uint64_t TIMESTAMP_DUMMY_POOL = 1;
+NS::SharedPtr<MTL::CounterSet> timestamp_counter_set;
+bool timestamp_counter_set_searched = false;
+MTL::Timestamp timestamp_calibration_cpu = 0;
+MTL::Timestamp timestamp_calibration_gpu = 0;
+double gpu_timestamp_to_ns = 1.0;
+} // namespace
+
 RDD::QueryPoolID RenderingDeviceDriverMetal::timestamp_query_pool_create(uint32_t p_query_count) {
-	return QueryPoolID(1);
+	if (!timestamp_counter_set_searched) {
+		timestamp_counter_set_searched = true;
+		if (device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)) {
+			NS::Array *sets = device->counterSets();
+			for (NS::UInteger i = 0; sets != nullptr && i < sets->count(); i++) {
+				MTL::CounterSet *set = sets->object<MTL::CounterSet>(i);
+				if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
+					timestamp_counter_set = NS::RetainPtr(set);
+					break;
+				}
+			}
+		}
+		device->sampleTimestamps(&timestamp_calibration_cpu, &timestamp_calibration_gpu);
+	}
+	if (!timestamp_counter_set) {
+		return QueryPoolID(TIMESTAMP_DUMMY_POOL);
+	}
+	NS::SharedPtr<MTL::CounterSampleBufferDescriptor> desc = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
+	desc->setCounterSet(timestamp_counter_set.get());
+	desc->setSampleCount(p_query_count);
+	desc->setStorageMode(MTL::StorageModeShared);
+	desc->setLabel(MTLSTR("Timestamp Query Pool"));
+	NS::Error *error = nullptr;
+	MTL::CounterSampleBuffer *buffer = device->newCounterSampleBuffer(desc.get(), &error);
+	if (buffer == nullptr) {
+		ERR_PRINT(vformat("Metal: could not create the timestamp counter sample buffer: %s", error != nullptr ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
+		return QueryPoolID(TIMESTAMP_DUMMY_POOL);
+	}
+	TimestampQueryPool *pool = memnew(TimestampQueryPool);
+	pool->buffer = NS::TransferPtr(buffer);
+	pool->count = p_query_count;
+	pool->sampled.resize_initialized(p_query_count);
+	return QueryPoolID(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_free(QueryPoolID p_pool_id) {
+	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
+		return;
+	}
+	memdelete((TimestampQueryPool *)p_pool_id.id);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
-	// Metal doesn't support timestamp queries, so we just clear the buffer.
 	bzero(r_results, p_query_count * sizeof(uint64_t));
+	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
+		return;
+	}
+	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
+	uint32_t count = MIN(p_query_count, pool->count);
+	// resolveCounterRange() hands back an autoreleased NSData.
+	NS::AutoreleasePool *autorelease_pool = NS::AutoreleasePool::alloc()->init();
+	NS::Data *data = pool->buffer->resolveCounterRange(NS::Range::Make(0, count));
+	if (data != nullptr) {
+		const MTL::CounterResultTimestamp *samples = (const MTL::CounterResultTimestamp *)data->mutableBytes();
+		count = MIN(count, uint32_t(data->length() / sizeof(MTL::CounterResultTimestamp)));
+		// Captures recorded with no GPU work between them collapse onto the
+		// last of the run (MDCommandBuffer::timestamp_write), so one that was
+		// never sampled takes the value of the next one that was: the same
+		// GPU instant. A trailing unsampled capture takes the previous one.
+		uint64_t next_valid = 0;
+		bool has_next = false;
+		for (int32_t i = int32_t(count) - 1; i >= 0; i--) {
+			uint64_t v = samples[i].timestamp;
+			if (pool->sampled[i] != 0 && v != MTL::CounterErrorValue && v != 0) {
+				next_valid = v;
+				has_next = true;
+				r_results[i] = v;
+			} else {
+				r_results[i] = has_next ? next_valid : 0;
+			}
+		}
+		// A trailing unsampled capture takes the previous one, and the
+		// sequence is kept monotonic: the GPU starts a render pass's vertex
+		// phase before an earlier encoder's fragment or compute work has
+		// finished when nothing it reads depends on it (resources are
+		// untracked here, with explicit barriers), and such an overlap is
+		// charged to the earlier pass rather than shown as time going back.
+		uint64_t prev = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			if (r_results[i] < prev) {
+				r_results[i] = prev;
+			}
+			prev = r_results[i];
+		}
+	}
+	autorelease_pool->release();
+
+	// Refresh the tick calibration; the baseline only lengthens.
+	MTL::Timestamp cpu = 0;
+	MTL::Timestamp gpu = 0;
+	device->sampleTimestamps(&cpu, &gpu);
+	if (gpu > timestamp_calibration_gpu && cpu > timestamp_calibration_cpu) {
+		gpu_timestamp_to_ns = double(cpu - timestamp_calibration_cpu) / double(gpu - timestamp_calibration_gpu);
+	}
 }
 
 uint64_t RenderingDeviceDriverMetal::timestamp_query_result_to_time(uint64_t p_result) {
-	return p_result;
+	return uint64_t(double(p_result) * gpu_timestamp_to_ns);
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
+	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
+		return;
+	}
+	// Samples are overwritten in place; only the attachment record resets.
+	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
+	memset(pool->sampled.ptr(), 0, pool->sampled.size());
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
+	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
+		return;
+	}
+	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
+	if (p_index >= pool->count) {
+		return;
+	}
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	cb->timestamp_write(pool->buffer.get(), p_index, &pool->sampled[p_index]);
 }
 
 #pragma mark - Labels

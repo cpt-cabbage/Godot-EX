@@ -65,7 +65,10 @@ RenderingContextDriverMetal::~RenderingContextDriverMetal() {
 }
 
 Error RenderingContextDriverMetal::initialize() {
-	if (OS::get_singleton()->get_environment("MTL_CAPTURE_ENABLED") == "1" || OS::get_singleton()->get_environment("MTLCAPTURE_DESTINATION_DEVELOPER_TOOLS_ENABLE") == "1") {
+	// GODOT_METAL_PROFILE_ENCODERS also turns the RenderingDevice debug labels
+	// on, which is_debug_utils_enabled() gates: MDCommandBuffer names and
+	// splits its encoders at those labels for a Metal System Trace.
+	if (OS::get_singleton()->get_environment("MTL_CAPTURE_ENABLED") == "1" || OS::get_singleton()->get_environment("MTLCAPTURE_DESTINATION_DEVELOPER_TOOLS_ENABLE") == "1" || OS::get_singleton()->get_environment("GODOT_METAL_PROFILE_ENCODERS") == "1") {
 		capture_available = true;
 	}
 

@@ -590,6 +590,36 @@ public:
 	void begin_label(const char *p_label_name, const Color &p_color) override;
 	void end_label() override;
 
+private:
+	// Profiling aid, on with GODOT_METAL_PROFILE_ENCODERS=1: every
+	// RenderingDevice debug label ends the current compute, blit or
+	// acceleration-structure encoder and names the next one after the label,
+	// so a Metal System Trace (xctrace) shows the passes by name instead of
+	// the one merged compute encoder consecutive compute lists otherwise
+	// share. Costs an encoder switch per label; never on by default.
+	static bool _profile_encoders();
+	LocalVector<NS::SharedPtr<NS::String>> label_stack;
+	void _end_current_encoder();
+	void _label_new_encoder(MTL::CommandEncoder *p_enc);
+
+	// A timestamp capture waiting for the next encoder: Apple GPUs sample the
+	// timestamp counter at stage boundaries only, so the capture is attached
+	// to the pass descriptor of whatever encoder is created next (or to an
+	// empty blit encoder at commit when nothing follows it).
+	// Captures recorded back to back with no GPU work between them collapse
+	// onto the last one; the driver fills the others from it on read-back.
+	struct PendingTimestamp {
+		MTL::CounterSampleBuffer *buffer = nullptr;
+		uint32_t index = 0;
+		uint8_t *sampled = nullptr;
+	} pending_timestamp;
+	void _take_pending_timestamp();
+	void _attach_pending_timestamp(MTL::RenderPassDescriptor *p_desc);
+	void _flush_pending_timestamp();
+
+public:
+	void timestamp_write(MTL::CounterSampleBuffer *p_buffer, uint32_t p_index, uint8_t *r_sampled) override;
+
 	MDCommandBuffer(MTL::CommandQueue *p_queue, ::RenderingDeviceDriverMetal *p_device_driver);
 	MDCommandBuffer() = default;
 };

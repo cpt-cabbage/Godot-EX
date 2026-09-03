@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+#include "servers/rendering/storage/utilities.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
 
 using namespace RendererRD;
@@ -238,12 +239,15 @@ RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t
 	RD::Uniform u_src(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ p_source_buffer }));
 	RD::Uniform u_dst(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ decoded }));
 
+	RENDER_TIMESTAMP("RT Mesh Decode");
+	rd->draw_command_begin_label("RT Mesh Decode");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, decode_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(decode_shader_rid, 0, u_src, u_dst), 0);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(DecodePushConstant));
 	rd->compute_list_dispatch_threads(compute_list, p_vertex_count, 1, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 
 	return decoded;
 }
@@ -486,10 +490,16 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 				for (const DecodeJob &job : entry->decode_jobs) {
 					_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
 				}
+				RENDER_TIMESTAMP("RT BLAS Build");
+				rd->draw_command_begin_label("RT BLAS Build");
 				rd->blas_build(entry->blas);
+				rd->draw_command_end_label();
 				entry->built = true;
 			} else if (!entry->built) {
+				RENDER_TIMESTAMP("RT BLAS Build");
+				rd->draw_command_begin_label("RT BLAS Build");
 				rd->blas_build(entry->blas);
+				rd->draw_command_end_label();
 				entry->built = true;
 			}
 
@@ -556,7 +566,11 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		ERR_FAIL_COND_V(tlas.is_null(), false);
 	}
 
-	return rd->tlas_build(tlas, as_instances) == OK;
+	RENDER_TIMESTAMP("RT TLAS Build");
+	rd->draw_command_begin_label("RT TLAS Build");
+	bool built = rd->tlas_build(tlas, as_instances) == OK;
+	rd->draw_command_end_label();
+	return built;
 }
 
 void RenderBuffersRT::RtGiCacheCalibration::on_readback(const Vector<uint8_t> &p_data) {
@@ -759,6 +773,8 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ trace_target }));
 
+	RENDER_TIMESTAMP("RT Sun Shadows Trace");
+	rd->draw_command_begin_label("RT Sun Shadows Trace");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth), 0);
@@ -766,6 +782,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 
 	if (soft) {
 		// Spatial denoise: raw -> blurred.
@@ -781,6 +798,8 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_blur_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 		RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ blurred_slice }));
 
+		RENDER_TIMESTAMP("RT Sun Shadows Blur");
+		rd->draw_command_begin_label("RT Sun Shadows Blur");
 		RD::ComputeListID blur_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(blur_list, blur_pipeline);
 		rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 0, u_blur_src, u_blur_depth), 0);
@@ -788,6 +807,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
 		rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 
 		// Temporal accumulation: blurred + reprojected history -> mask (+ new history).
 		const StringName &history_read_name = rb_state->history_parity ? RB_RT_SHADOW_HISTORY_1 : RB_RT_SHADOW_HISTORY_0;
@@ -824,6 +844,8 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_temporal_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
 		RD::Uniform u_temporal_history_out(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ history_write }));
 
+		RENDER_TIMESTAMP("RT Sun Shadows Temporal");
+		rd->draw_command_begin_label("RT Sun Shadows Temporal");
 		RD::ComputeListID temporal_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(temporal_list, temporal_pipeline);
 		rd->compute_list_bind_uniform_set(temporal_list, uniform_set_cache->get_cache(temporal_shader_rid, 0, u_temporal_current, u_temporal_history, u_temporal_depth, u_temporal_velocity, u_temporal_reproject), 0);
@@ -831,6 +853,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->compute_list_set_push_constant(temporal_list, &temporal_push_constant, sizeof(TemporalPushConstant));
 		rd->compute_list_dispatch_threads(temporal_list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 	}
 }
 
@@ -881,6 +904,8 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_slice }));
 
+	RENDER_TIMESTAMP("RT Area Shadows Trace");
+	rd->draw_command_begin_label("RT Area Shadows Trace");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, area_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 0, u_tlas, u_depth), 0);
@@ -888,6 +913,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 
 	// Spatial denoise into the final area mask.
 	BlurPushConstant blur_push_constant = {};
@@ -900,6 +926,8 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RD::Uniform u_blur_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_blur_dst(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ mask_slice }));
 
+	RENDER_TIMESTAMP("RT Area Shadows Blur");
+	rd->draw_command_begin_label("RT Area Shadows Blur");
 	RD::ComputeListID blur_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(blur_list, blur_pipeline);
 	rd->compute_list_bind_uniform_set(blur_list, uniform_set_cache->get_cache(blur_shader_rid, 0, u_blur_src, u_blur_depth), 0);
@@ -907,6 +935,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->compute_list_set_push_constant(blur_list, &blur_push_constant, sizeof(BlurPushConstant));
 	rd->compute_list_dispatch_threads(blur_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 }
 
 void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
@@ -1105,12 +1134,15 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	static const bool force_area_pipeline = OS::get_singleton()->get_environment("RT_LAB_FORCE_AREA_PIPELINE") == "1";
 	RID pipeline = (p_area_light_count > 0 || force_area_pipeline) ? stochastic_pipeline : stochastic_pipeline_no_area;
 
+	RENDER_TIMESTAMP("Stochastic Sampling");
+	rd->draw_command_begin_label("Stochastic Sampling");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 
 	// Gather the lights that were actually visible into this frame's tile
 	// lists, which the next frame's sampling pass will use for guidance.
@@ -1124,6 +1156,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::Uniform u_visible_in(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ visible_light }));
 		RD::Uniform u_list_out(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ list_write }));
 
+		RENDER_TIMESTAMP("Stochastic Light Lists");
+		rd->draw_command_begin_label("Stochastic Light Lists");
 		RD::ComputeListID list_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list_list, light_list_pipeline);
 		rd->compute_list_bind_uniform_set(list_list, uniform_set_cache->get_cache(list_shader_rid, 0, u_visible_in), 0);
@@ -1131,6 +1165,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		rd->compute_list_set_push_constant(list_list, &list_push_constant, sizeof(LightListPushConstant));
 		rd->compute_list_dispatch(list_list, tiles.x, tiles.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 	}
 
 	// Denoise: temporal accumulation of lighting and luminance moments, then a
@@ -1206,6 +1241,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::Uniform u_out_meta(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ meta_write }));
 		RD::Uniform u_reproject(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 4, Vector<RID>({ reproject_ubo }));
 
+		RENDER_TIMESTAMP("Stochastic Temporal");
+		rd->draw_command_begin_label("Stochastic Temporal");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_d, u_raw_s, u_dn_depth, u_hist_d, u_hist_s, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth), 0);
@@ -1213,6 +1250,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 	}
 
 	// Spatial pass, iterated a-trous style: each iteration reuses the same 5x5
@@ -1270,6 +1308,8 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ out_diffuse }));
 		RD::Uniform u_out_s(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_specular }));
 
+		RENDER_TIMESTAMP("Stochastic Spatial");
+		rd->draw_command_begin_label("Stochastic Spatial");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_d, u_in_s, u_dn_depth, u_moments, u_normal, u_meta, u_analytic_d, u_analytic_s), 0);
@@ -1282,6 +1322,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 
 		in_diffuse = out_diffuse;
 		in_specular = out_specular;
@@ -1525,12 +1566,15 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	if (calibrate) {
 		rd->buffer_clear(calibration.buffer, 0, 32);
 	}
+	RENDER_TIMESTAMP("RT GI Gather");
+	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
 	// One readback in flight at a time; the sums land a few frames later and
 	// feed the next dispatches' cache_scale.
 	if (calibrate && !calibration.state->pending) {
@@ -1604,6 +1648,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_reproject(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 4, Vector<RID>({ reproject_ubo }));
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ hist_write_d }));
 
+		RENDER_TIMESTAMP("RT GI Temporal");
+		rd->draw_command_begin_label("RT GI Temporal");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL_VALIDATE]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal), 0);
@@ -1611,6 +1657,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 	}
 
 	// Iterated exactly like the direct path's spatial filter (see there for the
@@ -1653,6 +1700,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_reflection }));
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ out_directional }));
 
+		RENDER_TIMESTAMP("RT GI Spatial");
+		rd->draw_command_begin_label("RT GI Spatial");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d), 0);
@@ -1665,6 +1714,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
+		rd->draw_command_end_label();
 
 		in_ambient = out_ambient;
 		in_reflection = out_reflection;

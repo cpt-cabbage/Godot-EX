@@ -804,6 +804,13 @@ public:
 
 	virtual void begin_label(const char *p_label_name, const Color &p_color) = 0;
 	virtual void end_label() = 0;
+
+#pragma mark - Queries
+
+	// RenderingDevice::capture_timestamp: sample p_index of p_buffer at the
+	// GPU's next opportunity (the start of the next encoder on Apple GPUs);
+	// *r_sampled is set once the sample is attached to an encoder.
+	virtual void timestamp_write(MTL::CounterSampleBuffer *p_buffer, uint32_t p_index, uint8_t *r_sampled) {}
 };
 
 #pragma mark - Uniform Types
