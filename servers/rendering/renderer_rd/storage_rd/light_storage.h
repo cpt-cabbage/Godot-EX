@@ -194,6 +194,17 @@ private:
 	RID spot_light_buffer;
 	RID area_light_buffer;
 
+	// The surface cache's light population: the scene's omni and spot lights
+	// within a radius of the camera, in the view or not, in the same LightData
+	// layout (shadow atlas fields empty: the cards trace their shadows).
+	LocalVector<LightData> card_omni_lights;
+	LocalVector<LightData> card_spot_lights;
+	RID card_omni_light_buffer;
+	RID card_spot_light_buffer;
+	uint32_t card_light_buffer_capacity = 0;
+	bool card_lights_valid = false;
+	void _fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const;
+
 	ForwardIDType _light_type_to_forward_id_type(RSE::LightType p_type);
 
 	/* DIRECTIONAL LIGHT DATA */
@@ -835,6 +846,16 @@ public:
 	void set_max_lights(const uint32_t p_max_lights);
 	RID get_omni_light_buffer() { return omni_light_buffer; }
 	RID get_spot_light_buffer() { return spot_light_buffer; }
+
+	// The card population (see card_omni_lights): p_lights are light instances,
+	// kept when within p_radius plus their range of the camera. With no list
+	// or a zero radius the cards use the frame's buffers instead.
+	void update_card_light_buffers(const RID *p_lights, uint32_t p_light_count, const Transform3D &p_camera_transform, RID p_camera_attributes, float p_radius);
+	bool card_lights_are_valid() const { return card_lights_valid; }
+	RID get_card_omni_light_buffer() const { return card_omni_light_buffer; }
+	RID get_card_spot_light_buffer() const { return card_spot_light_buffer; }
+	uint32_t get_card_omni_light_count() const { return card_omni_lights.size(); }
+	uint32_t get_card_spot_light_count() const { return card_spot_lights.size(); }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_directional_light_buffer() { return directional_light_buffer; }
 	uint32_t get_omni_light_count() const { return omni_light_count; }

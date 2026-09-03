@@ -641,6 +641,14 @@ void LightStorage::free_light_data() {
 
 	if (omni_light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(omni_light_buffer);
+		if (card_omni_light_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(card_omni_light_buffer);
+			card_omni_light_buffer = RID();
+		}
+		if (card_spot_light_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(card_spot_light_buffer);
+			card_spot_light_buffer = RID();
+		}
 		omni_light_buffer = RID();
 	}
 
@@ -710,6 +718,112 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 	uint32_t directional_light_buffer_size = max_directional_lights * sizeof(DirectionalLightData);
 	directional_lights = memnew_arr(DirectionalLightData, max_directional_lights);
 	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size);
+}
+
+// The fields of update_light_buffers' positional fill that the card lighting
+// reads (surface_cache_light.glsl): kept in step with it by hand.
+void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const {
+	r_data = LightData();
+	const Transform3D light_transform = p_light_instance->transform;
+	const float sign = p_light->negative ? -1 : 1;
+	const Color linear_col = ColorManagement::authored_to_working(p_light->color);
+	r_data.attenuation = p_light->param[RSE::LIGHT_PARAM_ATTENUATION];
+
+	float fade = 1.0;
+	float shadow_opacity_fade = 1.0;
+	if (p_light->distance_fade) {
+		if (p_distance > p_light->distance_fade_begin) {
+			fade = Math::smoothstep(0.0f, 1.0f, 1.0f - float(p_distance - p_light->distance_fade_begin) / p_light->distance_fade_length);
+		}
+		if (p_distance > p_light->distance_fade_shadow) {
+			shadow_opacity_fade = Math::smoothstep(0.0f, 1.0f, 1.0f - float(p_distance - p_light->distance_fade_shadow) / p_light->distance_fade_length);
+		}
+	}
+
+	float energy = sign * p_light->param[RSE::LIGHT_PARAM_ENERGY] * fade;
+	if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
+		energy *= p_light->param[RSE::LIGHT_PARAM_INTENSITY];
+		energy *= (p_type == RSE::LIGHT_OMNI) ? 1.0 / (Math::PI * 4.0) : 1.0 / Math::PI;
+	} else {
+		energy *= Math::PI;
+	}
+	if (p_camera_attributes.is_valid()) {
+		energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
+	}
+	r_data.color[0] = linear_col.r * energy;
+	r_data.color[1] = linear_col.g * energy;
+	r_data.color[2] = linear_col.b * energy;
+	r_data.specular_amount = p_light->param[RSE::LIGHT_PARAM_SPECULAR] * 2.0;
+	r_data.volumetric_fog_energy = p_light->param[RSE::LIGHT_PARAM_VOLUMETRIC_FOG_ENERGY];
+	r_data.bake_mode = p_light->bake_mode;
+
+	const float radius = MAX(0.001, p_light->param[RSE::LIGHT_PARAM_RANGE]);
+	r_data.inv_radius = 1.0 / radius;
+	const Vector3 pos = p_inverse_transform.xform(light_transform.origin);
+	r_data.position[0] = pos.x;
+	r_data.position[1] = pos.y;
+	r_data.position[2] = pos.z;
+	const Vector3 direction = p_inverse_transform.basis.xform(light_transform.basis.xform(Vector3(0, 0, -1))).normalized();
+	r_data.direction[0] = direction.x;
+	r_data.direction[1] = direction.y;
+	r_data.direction[2] = direction.z;
+	r_data.size = p_light->param[RSE::LIGHT_PARAM_SIZE];
+	r_data.inv_spot_attenuation = 1.0f / p_light->param[RSE::LIGHT_PARAM_SPOT_ATTENUATION];
+	r_data.cos_spot_angle = Math::cos(Math::deg_to_rad(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
+	r_data.mask = p_light->cull_mask;
+	{
+		const uint32_t caster = p_light->shadow_caster_mask;
+		r_data.shadow_caster_mask = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
+	}
+	r_data.shadow_opacity = p_light->shadow ? p_light->param[RSE::LIGHT_PARAM_SHADOW_OPACITY] * shadow_opacity_fade : 0.0;
+}
+
+void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_light_count, const Transform3D &p_camera_transform, RID p_camera_attributes, float p_radius) {
+	card_omni_lights.clear();
+	card_spot_lights.clear();
+	card_lights_valid = p_lights != nullptr && p_radius > 0.0f;
+	if (!card_lights_valid) {
+		return;
+	}
+	const Transform3D inverse_transform = p_camera_transform.affine_inverse();
+	for (uint32_t i = 0; i < p_light_count; i++) {
+		const LightInstance *light_instance = light_instance_owner.get_or_null(p_lights[i]);
+		if (light_instance == nullptr) {
+			continue;
+		}
+		const Light *light = light_owner.get_or_null(light_instance->light);
+		if (light == nullptr || (light->type != RSE::LIGHT_OMNI && light->type != RSE::LIGHT_SPOT)) {
+			continue;
+		}
+		const float distance = p_camera_transform.origin.distance_to(light_instance->transform.origin);
+		if (distance > p_radius + light->param[RSE::LIGHT_PARAM_RANGE]) {
+			continue;
+		}
+		LightData data;
+		_fill_card_light_data(data, light->type, light, light_instance, inverse_transform, distance, p_camera_attributes);
+		if (light->type == RSE::LIGHT_OMNI) {
+			card_omni_lights.push_back(data);
+		} else {
+			card_spot_lights.push_back(data);
+		}
+	}
+
+	const uint32_t needed = MAX(card_omni_lights.size(), card_spot_lights.size());
+	if (needed > card_light_buffer_capacity || card_omni_light_buffer.is_null()) {
+		if (card_omni_light_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(card_omni_light_buffer);
+			RD::get_singleton()->free_rid(card_spot_light_buffer);
+		}
+		card_light_buffer_capacity = MAX(64u, Math::next_power_of_2(needed));
+		card_omni_light_buffer = RD::get_singleton()->storage_buffer_create(card_light_buffer_capacity * sizeof(LightData));
+		card_spot_light_buffer = RD::get_singleton()->storage_buffer_create(card_light_buffer_capacity * sizeof(LightData));
+	}
+	if (card_omni_lights.size() > 0) {
+		RD::get_singleton()->buffer_update(card_omni_light_buffer, 0, sizeof(LightData) * card_omni_lights.size(), card_omni_lights.ptr());
+	}
+	if (card_spot_lights.size() > 0) {
+		RD::get_singleton()->buffer_update(card_spot_light_buffer, 0, sizeof(LightData) * card_spot_lights.size(), card_spot_lights.ptr());
+	}
 }
 
 void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows) {

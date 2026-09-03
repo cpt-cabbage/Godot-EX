@@ -2007,6 +2007,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
 	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));
 	surface_cache_settings.shared_bounce_ray = GLOBAL_GET("rendering/ray_tracing/surface_cache/shared_bounce_ray");
+	surface_cache_light_radius = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_radius");
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
@@ -2778,6 +2779,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				// Cards first (the material pass draws them), then their
 				// lighting, so the gather below reads this frame's radiance.
 				_surface_cache_capture(p_render_data);
+				light_storage->update_card_light_buffers(p_render_data->scene_lights, p_render_data->scene_light_count, p_render_data->scene_data->get_cam_transform(), p_render_data->camera_attributes, surface_cache_light_radius);
 				rt_shadows->update_surface_cache_lighting(p_render_data->scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), p_render_data->directional_light_count, stochastic_quality.ray_bias, gi_cascades, gi_sky);
 			}
 

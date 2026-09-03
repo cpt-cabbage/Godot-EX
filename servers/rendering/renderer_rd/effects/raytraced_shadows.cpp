@@ -653,11 +653,20 @@ void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	SurfaceCache::LightingInputs in;
 	in.tlas = tlas;
-	in.omni_light_buffer = light_storage->get_omni_light_buffer();
-	in.spot_light_buffer = light_storage->get_spot_light_buffer();
+	// The scene's lights near the camera when the cull provided them (see
+	// LightStorage::update_card_light_buffers), else the view's.
+	if (light_storage->card_lights_are_valid()) {
+		in.omni_light_buffer = light_storage->get_card_omni_light_buffer();
+		in.spot_light_buffer = light_storage->get_card_spot_light_buffer();
+		in.omni_light_count = light_storage->get_card_omni_light_count();
+		in.spot_light_count = light_storage->get_card_spot_light_count();
+	} else {
+		in.omni_light_buffer = light_storage->get_omni_light_buffer();
+		in.spot_light_buffer = light_storage->get_spot_light_buffer();
+		in.omni_light_count = p_omni_light_count;
+		in.spot_light_count = p_spot_light_count;
+	}
 	in.directional_light_buffer = light_storage->get_directional_light_buffer();
-	in.omni_light_count = p_omni_light_count;
-	in.spot_light_count = p_spot_light_count;
 	in.directional_light_count = p_directional_light_count;
 	in.world_from_view = p_world_from_view;
 	in.frame = scene_frame;

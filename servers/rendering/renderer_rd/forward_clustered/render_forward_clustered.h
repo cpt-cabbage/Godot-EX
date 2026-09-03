@@ -790,6 +790,7 @@ private:
 	// Transparent-pass shadow rays (RT_TRANSPARENT_SHADOWS in the scene
 	// shader): on the frames the traced paths own a light's shadow, the
 	// transparent pass has no shadow map to sample and traces per fragment.
+	float surface_cache_light_radius = 64.0f; // The cards' light population: the scene's lights within this distance of the camera.
 	bool use_stochastic_transparent_shadows = true;
 	uint32_t stochastic_transparent_max_rays = 4;
 	// Profiling aids for the transparent pass, read once from the environment

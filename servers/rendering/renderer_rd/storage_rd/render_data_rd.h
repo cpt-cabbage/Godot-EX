@@ -95,6 +95,10 @@ public:
 	const RendererSceneRender::RenderSDFGIData *render_sdfgi_regions = nullptr;
 	int render_sdfgi_region_count = 0;
 	const RendererSceneRender::RenderSDFGIUpdateData *sdfgi_update_data = nullptr;
+	// The scene's positional lights within the surface cache's light radius of
+	// the camera, frustum or not, for the card lighting.
+	const RID *scene_lights = nullptr;
+	uint32_t scene_light_count = 0;
 
 	uint32_t voxel_gi_count = 0;
 };

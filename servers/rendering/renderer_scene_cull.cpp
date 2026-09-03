@@ -3362,6 +3362,29 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	cull.frustum = Frustum(planes);
 
 	Vector<RID> directional_lights;
+	// The positional lights the surface cache lights its cards with: every
+	// visible one within the configured radius of the camera, in view or not
+	// (a lamp behind the camera lights a wall the camera sees only through a
+	// bounce). The per-set box cull in the card prepare pass narrows it.
+	LocalVector<RID> scene_lights;
+	if (p_reflection_probe.is_null()) {
+		const float radius = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_radius");
+		if (radius > 0.0f) {
+			struct CullSceneLights {
+				LocalVector<RID> *lights = nullptr;
+				_FORCE_INLINE_ bool operator()(void *p_data) {
+					Instance *ins = (Instance *)p_data;
+					if (ins->visible && ins->base_type == RSE::INSTANCE_LIGHT && RSG::light_storage->light_get_type(ins->base) != RSE::LIGHT_DIRECTIONAL) {
+						lights->push_back(static_cast<InstanceLightData *>(ins->base_data)->instance);
+					}
+					return false;
+				}
+			} cull_scene_lights;
+			cull_scene_lights.lights = &scene_lights;
+			const Vector3 origin = p_camera_data->main_transform.origin;
+			scenario->indexers[Scenario::INDEXER_VOLUMES].aabb_query(AABB(origin - Vector3(radius, radius, radius), Vector3(radius, radius, radius) * 2.0f), cull_scene_lights);
+		}
+	}
 	// directional lights
 	{
 		cull.shadow_count = 0;
@@ -3731,7 +3754,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		scene_render->update_ray_tracing_scene(rt_geometry_instances);
 	}
 
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, scene_lights.ptr(), scene_lights.size());
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);

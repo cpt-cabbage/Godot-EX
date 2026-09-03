@@ -3803,6 +3803,9 @@ void RenderingServer::init() {
 	// Card lighting ray budget: one bounce ray per 2x2 texels, shared by the
 	// quad (a thread per quad, so the fewer rays cost fewer SIMD groups).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/shared_bounce_ray"), true);
+	// The cards are lit by every positional light within this distance of the
+	// camera, in the view or not; 0 falls back to the view's lights.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/light_radius", PROPERTY_HINT_RANGE, "0.0,1000.0,1.0"), 64.0);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
