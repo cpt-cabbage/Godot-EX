@@ -3800,6 +3800,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/mirror_reflections"), true);
+	// Card lighting ray budget: one bounce ray per 2x2 texels, shared by the
+	// quad (a thread per quad, so the fewer rays cost fewer SIMD groups).
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/shared_bounce_ray"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

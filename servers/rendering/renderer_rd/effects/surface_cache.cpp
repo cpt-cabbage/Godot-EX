@@ -30,6 +30,7 @@
 
 #include "surface_cache.h"
 
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -603,11 +604,31 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		params.sky_quat_or_color[1] = p_inputs.sky_color.g;
 		params.sky_quat_or_color[2] = p_inputs.sky_color.b;
 	}
+	if (settings.shared_bounce_ray) {
+		params.flags |= 16;
+	}
 	params.temporal_frames = MAX(settings.temporal_frames, 1u);
 	params.atlas_size = settings.atlas_size;
+	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun switches parts of
+	// the texel shading off, read once.
+	static const uint32_t ablate = []() {
+		uint32_t bits = 0;
+		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
+			const String name = part.strip_edges().to_lower();
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : 0;
+		}
+		if (bits != 0) {
+			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
+		}
+		return bits;
+	}();
+	params.debug = ablate;
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
-	const uint32_t max_blocks_per_set = CARDS_PER_SET * (settings.max_card_size / 8) * (settings.max_card_size / 8);
+	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
+	// shared per 2x2 quad (see surface_cache_light.glsl).
+	const uint32_t tile = settings.shared_bounce_ray ? 16 : 8;
+	const uint32_t max_blocks_per_set = CARDS_PER_SET * MAX(settings.max_card_size / tile, 1u) * MAX(settings.max_card_size / tile, 1u);
 
 	PreparePushConstant push = {};
 	push.set_count = sets.size();

@@ -2006,6 +2006,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/captures_per_frame"));
 	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
 	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));
+	surface_cache_settings.shared_bounce_ray = GLOBAL_GET("rendering/ray_tracing/surface_cache/shared_bounce_ray");
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;

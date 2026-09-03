@@ -75,13 +75,14 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint flags;
 	uint temporal_frames;
 	uint atlas_size;
-	uint pad;
+	uint debug; // Profiling ablations: 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
 }
 params;
 
 #define FLAG_SDFGI 1u
 #define FLAG_SKY_MODE_SKY 2u
 #define FLAG_SKY_MODE_COLOR 4u
+#define FLAG_SHARED_BOUNCE_RAY 16u // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -356,83 +357,79 @@ bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-void main() {
-	uint entry = gl_WorkGroupID.y;
-	if (entry >= active_sets.count) {
-		return;
-	}
-	uint set = active_sets.list[entry];
-	CardSet s = sets.data[set];
-	uint size = uint(s.card_size);
-	if (size < 8u) {
-		return;
-	}
-	uint n = size / 8u;
-	uint blocks_per_card = n * n;
-	uint card = gl_WorkGroupID.x / blocks_per_card;
-	if (card >= SURFACE_CACHE_CARDS) {
-		return;
-	}
-	uint block = gl_WorkGroupID.x % blocks_per_card;
-	ivec2 texel_in_card = ivec2(int(block % n), int(block / n)) * 8 + ivec2(gl_LocalInvocationID.xy);
-	ivec2 texel = card_origin(s, card) + texel_in_card;
+struct Texel {
+	vec3 world_pos;
+	vec3 n_world;
+	vec3 origin;
+	vec3 albedo;
+	vec3 emission;
+};
 
+// The texel's position, normal and material back out of the capture. False
+// where nothing was captured.
+bool read_texel(CardSet s, uint card, uint size, ivec2 texel_in_card, ivec2 texel, out Texel t) {
 	float depth = texelFetch(depth_atlas, texel, 0).r;
 	if (depth <= 0.0) {
-		return; // Nothing captured here.
+		return false;
 	}
-	vec3 albedo = texelFetch(albedo_atlas, texel, 0).rgb;
+	t.albedo = texelFetch(albedo_atlas, texel, 0).rgb;
 	vec3 n_cam = normalize(texelFetch(normal_atlas, texel, 0).rgb * 2.0 - 1.0);
-	vec3 emission = texelFetch(emission_atlas, texel, 0).rgb;
-
+	t.emission = texelFetch(emission_atlas, texel, 0).rgb;
 	vec2 uv01 = (vec2(texel_in_card) + 0.5) / float(size);
 	vec3 local_pos = card_local_point(s, card, uv01, depth);
 	vec3 axis, u, v;
 	card_basis(card, axis, u, v);
 	vec3 n_local = u * n_cam.x + v * n_cam.y + axis * n_cam.z;
-	vec3 world_pos = (s.world_from_local * vec4(local_pos, 1.0)).xyz;
-	vec3 n_world = normalize(mat3(s.world_from_local) * n_local);
-	vec3 origin = world_pos + n_world * params.ray_bias;
+	t.world_pos = (s.world_from_local * vec4(local_pos, 1.0)).xyz;
+	t.n_world = normalize(mat3(s.world_from_local) * n_local);
+	t.origin = t.world_pos + t.n_world * params.ray_bias;
+	return true;
+}
 
-	uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
+// Direct light at the texel: the sun, and the lights culled to the set's box.
+void shade_direct(uint entry, Texel t, inout uint seed, out vec3 direct, out vec3 direct_unshadowed) {
+	direct = vec3(0.0);
+	direct_unshadowed = vec3(0.0);
 
-	vec3 direct = vec3(0.0);
-	vec3 direct_unshadowed = vec3(0.0);
-
-	// Directional lights.
-	for (uint i = 0u; i < params.directional_light_count; i++) {
+	// Directional lights: a shadow ray each. (Folding the sun into the
+	// estimator below was measured to save nothing: its ray is cheap.)
+	uint directional_count = (params.debug & 8u) != 0u ? 0u : params.directional_light_count;
+	for (uint i = 0u; i < directional_count; i++) {
 		DirectionalLightData dl = directional_lights.data[i];
 		vec3 l = normalize(mat3(params.world_from_view) * dl.direction);
-		float ndotl = dot(n_world, l);
+		float ndotl = dot(t.n_world, l);
 		if (ndotl <= 0.0) {
 			continue;
 		}
-		float vis = 1.0;
-		if (dl.shadow_opacity > 0.001) {
-			vis = mix(1.0, occluded(origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
+		vec3 c = dl.color * dl.energy * (ndotl * (1.0 / M_PI));
+		direct_unshadowed += c;
+		if (dl.shadow_opacity <= 0.001 || (params.debug & 2u) != 0u) {
+			direct += c;
+			continue;
 		}
-		direct += dl.color * dl.energy * (ndotl * (1.0 / M_PI) * vis);
-		direct_unshadowed += dl.color * dl.energy * (ndotl * (1.0 / M_PI));
+		float vis = mix(1.0, occluded(t.origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
+		direct += c * vis;
 	}
 
 	// Omni and spot lights overlapping the set's box: the full analytic sum,
 	// times the visibility of one light drawn in proportion to its
 	// contribution. With the weights equal to the contributions the ratio is
 	// the drawn light's visibility, as in the direct pass.
-	uint base = entry * (1u + MAX_LIGHTS_PER_SET);
-	uint light_count = min(set_lights.data[base], MAX_LIGHTS_PER_SET);
 	vec3 sum = vec3(0.0);
 	float weight_sum = 0.0;
 	vec3 sel_pos = vec3(0.0);
 	float sel_opacity = 0.0;
 	uint sel_mask = 0u;
 	bool selected = false;
+
+	uint base = entry * (1u + MAX_LIGHTS_PER_SET);
+	uint light_count = (params.debug & 4u) != 0u ? 0u : min(set_lights.data[base], MAX_LIGHTS_PER_SET);
 	for (uint j = 0u; j < light_count; j++) {
 		uint idx = set_lights.data[base + 1u + j];
 		bool is_spot = idx >= params.omni_light_count;
 		LightData ld = is_spot ? spot_lights.data[idx - params.omni_light_count] : omni_lights.data[idx];
 		vec3 pos = (params.world_from_view * vec4(ld.position, 1.0)).xyz;
-		vec3 rel = pos - world_pos;
+		vec3 rel = pos - t.world_pos;
 		float len = length(rel);
 		float attenuation = get_omni_attenuation(len, ld.inv_radius, ld.attenuation);
 		vec3 l = rel / max(len, 1e-5);
@@ -442,7 +439,7 @@ void main() {
 			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
 			attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
 		}
-		float ndotl = max(dot(n_world, l), 0.0);
+		float ndotl = max(dot(t.n_world, l), 0.0);
 		vec3 c = ld.color * (ndotl * attenuation * (1.0 / M_PI));
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
@@ -461,32 +458,33 @@ void main() {
 	direct_unshadowed += sum;
 	if (selected) {
 		float vis = 1.0;
-		if (sel_opacity > 0.001 && sel_mask != 0u) {
-			vec3 to_light = sel_pos - origin;
+		if (sel_opacity > 0.001 && sel_mask != 0u && (params.debug & 2u) == 0u) {
+			vec3 to_light = sel_pos - t.origin;
 			float dist = length(to_light);
-			vis = mix(1.0, occluded(origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask) ? 0.0 : 1.0, sel_opacity);
+			vis = mix(1.0, occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask) ? 0.0 : 1.0, sel_opacity);
 		}
 		direct += sum * vis;
 	}
 
-	// Indirect: one cosine ray into the scene. A card at the hit gives the
-	// bounce at texture resolution and one frame late (the cache reading
-	// itself, which converges because albedo is below one); anything else
-	// falls back to the lightprobes at this texel, or the sky.
-	vec3 probe_fallback;
-	if (!sdfgi_probe_irradiance(world_pos - params.camera_origin.xyz, n_world, probe_fallback)) {
-		probe_fallback = sky_eval(n_world);
-	}
-	seed = pcg_hash(seed);
-	float r0 = hash_to_float(seed);
-	seed = pcg_hash(seed);
-	float r1 = hash_to_float(seed);
-	vec3 ray_dir = basis_around(n_world, vec2(r0, r1));
-	vec3 indirect_sample = probe_fallback;
-	float bounce_change = 0.0;
-	{
+}
+
+// The indirect term: one cosine ray into the scene (see main).
+void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float bounce_change) {
+	indirect_sample = vec3(0.0);
+	bounce_change = 0.0;
+	if ((params.debug & 1u) != 0u) {
+		// Ablated: the probes or the sky stand in for the ray.
+		if (!sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
+			indirect_sample = sky_eval(t.n_world);
+		}
+	} else {
+		seed = pcg_hash(seed);
+		float r0 = hash_to_float(seed);
+		seed = pcg_hash(seed);
+		float r1 = hash_to_float(seed);
+		vec3 ray_dir = basis_around(t.n_world, vec2(r0, r1));
 		rayQueryEXT rq;
-		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 0.0, ray_dir, 1e4);
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, t.origin, 0.0, ray_dir, 1e4);
 		while (rayQueryProceedEXT(rq)) {
 		}
 		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
@@ -495,20 +493,24 @@ void main() {
 			vec3 card_radiance;
 			uint hit_set;
 			float hit_change;
-			if (card_lookup(hit_instance, origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set, hit_change)) {
+			if (card_lookup(hit_instance, t.origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set, hit_change)) {
 				indirect_sample = card_radiance;
 				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
 				// weaker by a quarter per bounce, so lighting that reaches
 				// this texel only indirectly restarts it too.
 				bounce_change = hit_change - 0.25;
+			} else if (!sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
+				indirect_sample = sky_eval(t.n_world);
 			}
 		} else {
 			indirect_sample = sky_eval(ray_dir);
 		}
 	}
+}
 
-	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
+// The temporal gradient and the two accumulations, into the atlases.
+void accumulate(ivec2 texel, Texel t, bool reset, vec3 direct, vec3 direct_unshadowed, vec3 indirect_sample, float bounce_change) {
 
 	// The temporal gradient: how much the deterministic part of this texel's
 	// lighting moved since the last relight, relative to itself. Static
@@ -518,7 +520,7 @@ void main() {
 	// to compare with either: the capture's reset flag is raised on the frame
 	// its record is built, which is not always the frame it is first lit.
 	vec4 old = imageLoad(lighting_atlas, texel);
-	float lum_unshadowed = luminance(albedo * direct_unshadowed + emission);
+	float lum_unshadowed = luminance(t.albedo * direct_unshadowed + t.emission);
 	vec2 prev_change = imageLoad(change_atlas, texel).rg;
 	float change = (reset || old.a <= 0.0) ? 0.0 : abs(lum_unshadowed - prev_change.x) / max(max(lum_unshadowed, prev_change.x), 1e-4);
 	// The change outlives the relight that found it, fading over eight: the
@@ -539,10 +541,97 @@ void main() {
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
 	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
 
-	vec3 radiance = max(albedo * (direct + indirect) + emission, vec3(0.0));
+	vec3 radiance = max(t.albedo * (direct + indirect) + t.emission, vec3(0.0));
 
 	float frames = reset ? 0.0 : min(old.a * 64.0, keep_frames);
 	float alpha = max(1.0 / (frames + 1.0), 1.0 / float(params.temporal_frames));
 	vec3 accum = frames <= 0.0 ? radiance : mix(old.rgb, radiance, alpha);
 	imageStore(lighting_atlas, texel, vec4(accum, min(frames + 1.0, 64.0) / 64.0));
+}
+
+void main() {
+	uint entry = gl_WorkGroupID.y;
+	if (entry >= active_sets.count) {
+		return;
+	}
+	uint set = active_sets.list[entry];
+	CardSet s = sets.data[set];
+	uint size = uint(s.card_size);
+	if (size < 8u) {
+		return;
+	}
+	// A workgroup covers 8x8 texels, one per thread, or with the bounce ray
+	// shared 16x16, a 2x2 quad per thread: the quad's one ray keeps every
+	// lane of the group tracing, which is what makes the fourfold fewer rays
+	// cost a quarter of the time (rays idle in a lane still cost its group).
+	bool quad_mode = bool(params.flags & FLAG_SHARED_BOUNCE_RAY);
+	uint tile = quad_mode ? 16u : 8u;
+	uint n = max(size / tile, 1u);
+	uint blocks_per_card = n * n;
+	uint card = gl_WorkGroupID.x / blocks_per_card;
+	if (card >= SURFACE_CACHE_CARDS) {
+		return;
+	}
+	uint block = gl_WorkGroupID.x % blocks_per_card;
+	ivec2 block_origin = ivec2(int(block % n), int(block / n)) * int(tile);
+	ivec2 origin_texel = card_origin(s, card);
+	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
+
+	if (!quad_mode) {
+		ivec2 texel_in_card = block_origin + ivec2(gl_LocalInvocationID.xy);
+		ivec2 texel = origin_texel + texel_in_card;
+		Texel t;
+		if (!read_texel(s, card, size, texel_in_card, texel, t)) {
+			return; // Nothing captured here.
+		}
+		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
+		vec3 direct, direct_unshadowed;
+		shade_direct(entry, t, seed, direct, direct_unshadowed);
+		vec3 indirect_sample;
+		float bounce_change;
+		trace_bounce(t, seed, indirect_sample, bounce_change);
+		accumulate(texel, t, reset, direct, direct_unshadowed, indirect_sample, bounce_change);
+		return;
+	}
+
+	ivec2 quad_in_card = block_origin + ivec2(gl_LocalInvocationID.xy) * 2;
+	if (quad_in_card.x >= int(size) || quad_in_card.y >= int(size)) {
+		return; // An 8-texel card fills a quarter of the tile.
+	}
+	Texel t[4];
+	bool valid[4];
+	uint valid_count = 0u;
+	for (uint k = 0u; k < 4u; k++) {
+		ivec2 texel_in_card = quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
+		valid[k] = read_texel(s, card, size, texel_in_card, origin_texel + texel_in_card, t[k]);
+		valid_count += valid[k] ? 1u : 0u;
+	}
+	if (valid_count == 0u) {
+		return;
+	}
+	// The ray leaves a different texel of the quad each frame, skipping the
+	// uncaptured ones.
+	uint tracer = 0u;
+	for (uint j = 0u; j < 4u; j++) {
+		uint k = (params.frame + j) & 3u;
+		if (valid[k]) {
+			tracer = k;
+			break;
+		}
+	}
+	ivec2 tracer_texel = origin_texel + quad_in_card + ivec2(int(tracer & 1u), int(tracer >> 1u));
+	uint seed = pcg_hash(uint(tracer_texel.x) + pcg_hash(uint(tracer_texel.y) + pcg_hash(params.frame)));
+	vec3 indirect_sample;
+	float bounce_change;
+	trace_bounce(t[tracer], seed, indirect_sample, bounce_change);
+	for (uint k = 0u; k < 4u; k++) {
+		if (!valid[k]) {
+			continue;
+		}
+		ivec2 texel = origin_texel + quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
+		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
+		vec3 direct, direct_unshadowed;
+		shade_direct(entry, t[k], seed_k, direct, direct_unshadowed);
+		accumulate(texel, t[k], reset, direct, direct_unshadowed, indirect_sample, bounce_change);
+	}
 }

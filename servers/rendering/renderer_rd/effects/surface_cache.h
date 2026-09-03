@@ -76,6 +76,7 @@ public:
 		uint32_t temporal_frames = 16;
 		uint32_t round_robin_period = 64; // Every set is relit at least once per this many frames.
 		uint32_t skinned_recapture_period = 16;
+		bool shared_bounce_ray = true; // One bounce ray per 2x2 texel quad (a thread per quad), its sample shared by the four.
 	};
 
 	// One capture the renderer has to draw: six orthographic views of one
@@ -261,7 +262,7 @@ private:
 		uint32_t flags;
 		uint32_t temporal_frames;
 		uint32_t atlas_size;
-		uint32_t pad;
+		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
 	};
 
 	void _create_atlases();
