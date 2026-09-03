@@ -248,6 +248,7 @@ private:
 		bool use_directional_soft_shadow = false;
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 		bool use_material_feedback = false;
+		uint32_t debug_ablate = 0; // TransparentAblate bits, applied to every pipeline of the list.
 
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}, bool p_use_material_feedback = false) {
 			elements = p_elements;
@@ -338,6 +339,9 @@ private:
 			float rt_ray_bias; // Origin offset / t_min for those rays, shared with the stochastic pass.
 			uint32_t rt_transparent_max_rays; // Local-light rays a fragment may trace; lights past the budget stay unshadowed.
 			uint32_t rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
+
+			uint32_t transparent_debug; // TransparentAblate bits the shader reads (transparent pass only, profiling).
+			uint32_t pad_transparent_debug[3];
 		};
 
 		struct PushConstantUbershader {
@@ -788,6 +792,27 @@ private:
 	// transparent pass has no shadow map to sample and traces per fragment.
 	bool use_stochastic_transparent_shadows = true;
 	uint32_t stochastic_transparent_max_rays = 4;
+	// Profiling aids for the transparent pass, read once from the environment
+	// (see _transparent_debug_init): GODOT_TRANSPARENT_SPLIT=N draws the
+	// transparent list as N chunks with a timestamp each, so --gpu-profile
+	// attributes the pass to its surfaces; GODOT_TRANSPARENT_ABLATE=sun,cluster,
+	// gi,soft,rays switches those parts of the transparent shading off.
+	enum TransparentAblate {
+		TRANSPARENT_ABLATE_SUN = 1, // No directional lights (and no sun ray).
+		TRANSPARENT_ABLATE_CLUSTER = 2, // An empty cluster: no omni/spot/area lights, reflection probes or decals.
+		TRANSPARENT_ABLATE_GI = 4, // No per-fragment SDFGI/VoxelGI.
+		TRANSPARENT_ABLATE_SOFT = 8, // Hard shadow-map filtering for local and directional lights.
+		TRANSPARENT_ABLATE_RAYS = 16, // No shadow rays from transparent fragments.
+		TRANSPARENT_ABLATE_CORE = 32, // Depth-pre-pass surfaces drop the fragments the pre-pass wrote (alpha >= 0.99).
+		TRANSPARENT_ABLATE_FRINGE = 64, // ... or the rest.
+	};
+	uint32_t transparent_debug_split = 1;
+	uint32_t transparent_debug_ablate = 0;
+	bool transparent_debug_ablating = false; // True while _setup_environment runs for the transparent pass.
+	RID transparent_debug_empty_cluster;
+	uint32_t transparent_debug_empty_cluster_size = 0;
+	void _transparent_debug_init();
+	RID _transparent_debug_get_empty_cluster(uint32_t p_size);
 	// The scene shader declares the TLAS binding whenever the device can trace,
 	// so the binding needs an acceleration structure on every frame, including
 	// the ones before any traced pass has built the real one: a one-triangle

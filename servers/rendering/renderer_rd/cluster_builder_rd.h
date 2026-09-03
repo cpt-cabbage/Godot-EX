@@ -424,6 +424,7 @@ public:
 	void debug(ElementType p_element);
 
 	RID get_cluster_buffer() const;
+	uint32_t get_cluster_buffer_size() const;
 	uint32_t get_cluster_size() const;
 	uint32_t get_max_cluster_elements() const;
 

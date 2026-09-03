@@ -574,6 +574,10 @@ RID ClusterBuilderRD::get_cluster_buffer() const {
 	return cluster_buffer;
 }
 
+uint32_t ClusterBuilderRD::get_cluster_buffer_size() const {
+	return cluster_buffer_size;
+}
+
 uint32_t ClusterBuilderRD::get_cluster_size() const {
 	return cluster_size;
 }

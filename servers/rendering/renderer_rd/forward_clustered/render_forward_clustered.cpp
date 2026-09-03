@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -451,6 +452,16 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 					pipeline_specialization.use_forward_gi = element_info.uses_forward_gi;
 				}
 
+				if (p_params->debug_ablate != 0) {
+					if (p_params->debug_ablate & TRANSPARENT_ABLATE_GI) {
+						pipeline_specialization.use_forward_gi = false;
+					}
+					if (p_params->debug_ablate & TRANSPARENT_ABLATE_SOFT) {
+						pipeline_specialization.use_light_soft_shadows = false;
+						pipeline_specialization.use_directional_soft_shadows = false;
+					}
+				}
+
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_SPECULAR) != 0) {
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_SEPARATE_SPECULAR;
 				}
@@ -782,7 +793,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 				sun_caster_mask = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
 			}
 		}
+		if (transparent_debug_ablating && (transparent_debug_ablate & TRANSPARENT_ABLATE_RAYS)) {
+			flags = 0;
+		}
 		scene_state.ubo.rt_transparent_shadows = flags;
+		scene_state.ubo.transparent_debug = transparent_debug_ablating ? transparent_debug_ablate : 0;
 		scene_state.ubo.rt_ray_bias = stochastic_quality.ray_bias;
 		scene_state.ubo.rt_transparent_max_rays = stochastic_transparent_max_rays;
 		scene_state.ubo.rt_sun_caster_mask = sun_caster_mask;
@@ -3042,9 +3057,28 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
+	// Profiling ablations (GODOT_TRANSPARENT_ABLATE): the sun goes out of the
+	// scene UBO this pass writes, the cluster binding is swapped for an empty
+	// one, and the shadow-ray flags are dropped inside _setup_environment.
+	// Both overrides are restored once the pass's uniform set holds them.
+	const uint32_t transparent_ablate = is_reflection_probe ? 0 : transparent_debug_ablate;
+	const uint32_t saved_directional_light_count = p_render_data->scene_data->directional_light_count;
+	const RID saved_cluster_buffer = p_render_data->cluster_buffer;
+	if (transparent_ablate & TRANSPARENT_ABLATE_SUN) {
+		p_render_data->scene_data->directional_light_count = 0;
+	}
+	if ((transparent_ablate & TRANSPARENT_ABLATE_CLUSTER) && current_cluster_builder != nullptr) {
+		p_render_data->cluster_buffer = _transparent_debug_get_empty_cluster(current_cluster_builder->get_cluster_buffer_size());
+	}
+	transparent_debug_ablating = transparent_ablate != 0;
+
 	uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+
+	transparent_debug_ablating = false;
+	p_render_data->scene_data->directional_light_count = saved_directional_light_count;
+	p_render_data->cluster_buffer = saved_cluster_buffer;
 
 	uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 	// Motion vectors should not be overwritten by transparent objects.
@@ -3052,9 +3086,32 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 
-	{
+	if (transparent_debug_split > 1 && !is_reflection_probe && alpha_overlay_from > 0) {
+		// GODOT_TRANSPARENT_SPLIT: the list in its sorted order, cut into
+		// chunks that each get a draw list and a timestamp of their own. Each
+		// chunk loads what the previous one stored, so the buckets are sharp.
+		const uint32_t chunks = MIN(transparent_debug_split, alpha_overlay_from);
+		static bool printed = false;
+		if (!printed) {
+			printed = true;
+			print_line(vformat("Transparent pass: %d surfaces in %d chunks.", alpha_overlay_from, chunks));
+			for (uint32_t i = 0; i < alpha_overlay_from; i++) {
+				const GeometryInstanceSurfaceDataCache *surf = render_list[RENDER_LIST_ALPHA].elements[i];
+				print_line(vformat("  element %d: aabb %s", i, surf->owner->transformed_aabb));
+			}
+		}
+		for (uint32_t c = 0; c < chunks; c++) {
+			const uint32_t from = alpha_overlay_from * c / chunks;
+			const uint32_t to = alpha_overlay_from * (c + 1) / chunks;
+			RENDER_TIMESTAMP(vformat("Transparent chunk %d (%d-%d)", c, from, to));
+			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr() + from, render_list[RENDER_LIST_ALPHA].element_info.ptr() + from, to - from, reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, from, base_specialization, !is_reflection_probe);
+			render_list_params.debug_ablate = transparent_ablate;
+			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		}
+	} else {
 		// Editor overlay surfaces at the tail of the list draw later, after the SSR/SSIL frame copy.
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), alpha_overlay_from, reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization, !is_reflection_probe);
+		render_list_params.debug_ablate = transparent_ablate;
 		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 	}
 
@@ -6065,6 +6122,55 @@ RenderForwardClustered::RenderForwardClustered() {
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
+
+	_transparent_debug_init();
+}
+
+void RenderForwardClustered::_transparent_debug_init() {
+	const String split = OS::get_singleton()->get_environment("GODOT_TRANSPARENT_SPLIT");
+	if (split.is_valid_int()) {
+		transparent_debug_split = MAX(1, split.to_int());
+	}
+	const String ablate = OS::get_singleton()->get_environment("GODOT_TRANSPARENT_ABLATE");
+	for (const String &part : ablate.split(",", false)) {
+		const String name = part.strip_edges().to_lower();
+		if (name == "sun") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_SUN;
+		} else if (name == "cluster") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_CLUSTER;
+		} else if (name == "gi") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_GI;
+		} else if (name == "soft") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_SOFT;
+		} else if (name == "rays") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_RAYS;
+		} else if (name == "core") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_CORE;
+		} else if (name == "fringe") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_FRINGE;
+		} else if (name == "all") {
+			transparent_debug_ablate = TRANSPARENT_ABLATE_SUN | TRANSPARENT_ABLATE_CLUSTER | TRANSPARENT_ABLATE_GI | TRANSPARENT_ABLATE_SOFT | TRANSPARENT_ABLATE_RAYS;
+		} else {
+			WARN_PRINT(vformat("GODOT_TRANSPARENT_ABLATE: unknown part \"%s\" (sun, cluster, gi, soft, rays, core, fringe, all).", part));
+		}
+	}
+	if (transparent_debug_split > 1 || transparent_debug_ablate != 0) {
+		print_line(vformat("Transparent pass profiling: split %d, ablate 0x%x.", transparent_debug_split, transparent_debug_ablate));
+	}
+}
+
+RID RenderForwardClustered::_transparent_debug_get_empty_cluster(uint32_t p_size) {
+	if (transparent_debug_empty_cluster.is_valid() && transparent_debug_empty_cluster_size != p_size) {
+		RD::get_singleton()->free_rid(transparent_debug_empty_cluster);
+		transparent_debug_empty_cluster = RID();
+	}
+	if (transparent_debug_empty_cluster.is_null()) {
+		Vector<uint8_t> zeros;
+		zeros.resize_initialized(p_size);
+		transparent_debug_empty_cluster = RD::get_singleton()->storage_buffer_create(p_size, zeros);
+		transparent_debug_empty_cluster_size = p_size;
+	}
+	return transparent_debug_empty_cluster;
 }
 
 RenderForwardClustered::~RenderForwardClustered() {
@@ -6074,7 +6180,7 @@ RenderForwardClustered::~RenderForwardClustered() {
 	}
 	// The placeholder TLAS depends on its BLAS, which depends on the buffers;
 	// free from the top so nothing is freed twice by the dependency cascade.
-	for (RID *rid : { &rt_dummy_tlas, &rt_dummy_blas, &rt_dummy_vertex_buffer, &rt_dummy_index_buffer }) {
+	for (RID *rid : { &rt_dummy_tlas, &rt_dummy_blas, &rt_dummy_vertex_buffer, &rt_dummy_index_buffer, &transparent_debug_empty_cluster }) {
 		if (rid->is_valid()) {
 			RD::get_singleton()->free_rid(*rid);
 			*rid = RID();

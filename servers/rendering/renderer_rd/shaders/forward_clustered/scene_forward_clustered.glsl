@@ -1546,6 +1546,31 @@ void fragment_shader(in SceneData scene_data) {
 	alpha = compute_alpha_antialiasing_edge(alpha, alpha_texture_coordinate, alpha_antialiasing_edge);
 #endif // ALPHA_ANTIALIASING_EDGE_USED
 
+#if defined(ALPHA_USED) && !defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL) && !defined(ALPHA_SCISSOR_USED) && !defined(ALPHA_HASH_USED) && !defined(ALPHA_ANTIALIASING_EDGE_USED) && !defined(BLEND_MUL_USED) && !defined(BLEND_PREMUL_ALPHA_USED) && !defined(DEPTH_DRAW_ALWAYS_USED) && !defined(STENCIL_WRITE_USED) && !defined(DEPTH_USED)
+	// A fragment of a blended material whose alpha came out zero contributes
+	// nothing (mix, add and subtract all scale the source by it) and, in this
+	// pass, writes neither depth nor stencil: it ends here rather than shading
+	// every light for nothing. Content ships alpha-zero helper meshes, and one
+	// filling the screen cost as much as the rest of the frame.
+	if (alpha <= 0.0) {
+		discard;
+	}
+#endif
+
+#if defined(USE_OPAQUE_PREPASS) && !defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL)
+	// Profiling (GODOT_TRANSPARENT_ABLATE=core / fringe): a depth-pre-pass
+	// surface drops the fragments its pre-pass wrote (the 0.99 threshold of
+	// the pre-pass), or the rest, so each part's cost can be timed.
+	if (implementation_data.transparent_debug != 0u) {
+		if ((implementation_data.transparent_debug & 32u) != 0u && alpha >= 0.99) {
+			discard;
+		}
+		if ((implementation_data.transparent_debug & 64u) != 0u && alpha < 0.99) {
+			discard;
+		}
+	}
+#endif
+
 #ifdef MODE_RENDER_DEPTH
 #if defined(USE_OPAQUE_PREPASS) || defined(ALPHA_ANTIALIASING_EDGE_USED)
 	if (alpha < scene_data.opaque_prepass_threshold) {

@@ -363,6 +363,11 @@ struct ImplementationData {
 	float rt_ray_bias; // Origin offset / t_min for those rays, shared with the stochastic pass.
 	uint rt_transparent_max_rays; // Local-light rays a fragment may trace; lights past the budget stay unshadowed.
 	uint rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
+
+	uint transparent_debug; // Profiling ablations for the transparent pass (RenderForwardClustered::TransparentAblate), zero otherwise.
+	uint pad_transparent_debug_0; // Scalars, not an array: std140 would stride an array by 16 bytes.
+	uint pad_transparent_debug_1;
+	uint pad_transparent_debug_2;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
