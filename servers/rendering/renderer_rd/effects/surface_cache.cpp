@@ -75,6 +75,15 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 		light_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 0));
 	}
 
+	{
+		Vector<String> modes;
+		modes.push_back("");
+		grid_shader.initialize(modes);
+		grid_shader_version = grid_shader.version_create();
+		grid_pipeline = rd->compute_pipeline_create(grid_shader.version_get_shader(grid_shader_version, 0));
+		grid_buffer = rd->storage_buffer_create(GRID_N * GRID_N * GRID_N * (1 + GRID_CAP) * sizeof(uint32_t));
+	}
+
 	requests_buffer = rd->storage_buffer_create(MAX_SETS * sizeof(uint32_t));
 	rd->buffer_clear(requests_buffer, 0, MAX_SETS * sizeof(uint32_t));
 	active_buffer = rd->storage_buffer_create((1 + MAX_SETS) * sizeof(uint32_t));
@@ -96,6 +105,10 @@ SurfaceCache::~SurfaceCache() {
 	}
 	prepare_shader.version_free(prepare_shader_version);
 	light_shader.version_free(light_shader_version);
+	grid_shader.version_free(grid_shader_version);
+	if (grid_buffer.is_valid()) {
+		rd->free_rid(grid_buffer);
+	}
 }
 
 void SurfaceCache::set_settings(const Settings &p_settings) {
@@ -730,6 +743,23 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 	params.temporal_frames = MAX(settings.temporal_frames, 1u);
 	params.atlas_size = settings.atlas_size;
+	// The world light grid: GRID_N cells across twice the light radius,
+	// snapped to the cell about the camera, built below when in use.
+	const bool use_grid = settings.light_grid && p_inputs.light_radius > 0.0f && p_inputs.omni_light_buffer.is_valid() && p_inputs.spot_light_buffer.is_valid();
+	Vector3 grid_origin;
+	float grid_cell = 0.0f;
+	if (use_grid) {
+		grid_cell = 2.0f * p_inputs.light_radius / float(GRID_N);
+		Vector3 cam = p_inputs.world_from_view.origin;
+		grid_origin = Vector3(Math::floor(cam.x / grid_cell), Math::floor(cam.y / grid_cell), Math::floor(cam.z / grid_cell)) * grid_cell - Vector3(1, 1, 1) * (grid_cell * float(GRID_N / 2));
+		params.flags |= 32;
+	}
+	params.grid_origin[0] = grid_origin.x;
+	params.grid_origin[1] = grid_origin.y;
+	params.grid_origin[2] = grid_origin.z;
+	params.grid_cell = grid_cell;
+	params.grid_n = GRID_N;
+	params.grid_cap = GRID_CAP;
 	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun switches parts of
 	// the texel shading off, read once.
 	static const uint32_t ablate = []() {
@@ -772,6 +802,36 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ p_inputs.omni_light_buffer }));
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ p_inputs.spot_light_buffer }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 7, Vector<RID>({ params_ubo }));
+
+	if (use_grid) {
+		RENDER_TIMESTAMP("Surface Cache Light Grid");
+		rd->draw_command_begin_label("Surface Cache Light Grid");
+		GridPushConstant gp = {};
+		for (int col = 0; col < 4; col++) {
+			for (int row = 0; row < 4; row++) {
+				gp.world_from_view[col * 4 + row] = world_from_view.columns[col][row];
+			}
+		}
+		gp.origin[0] = grid_origin.x;
+		gp.origin[1] = grid_origin.y;
+		gp.origin[2] = grid_origin.z;
+		gp.cell = grid_cell;
+		gp.n = GRID_N;
+		gp.cap = GRID_CAP;
+		gp.omni_light_count = p_inputs.omni_light_count;
+		gp.spot_light_count = p_inputs.spot_light_count;
+		RID grid_rid = grid_shader.version_get_shader(grid_shader_version, 0);
+		RD::Uniform g_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ p_inputs.omni_light_buffer }));
+		RD::Uniform g_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ p_inputs.spot_light_buffer }));
+		RD::Uniform g_grid(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ grid_buffer }));
+		RD::ComputeListID grid_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(grid_list, grid_pipeline);
+		rd->compute_list_bind_uniform_set(grid_list, uniform_set_cache->get_cache(grid_rid, 0, g_omni, g_spot, g_grid), 0);
+		rd->compute_list_set_push_constant(grid_list, &gp, sizeof(GridPushConstant));
+		rd->compute_list_dispatch_threads(grid_list, GRID_N * GRID_N * GRID_N, 1, 1);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+	}
 
 	RENDER_TIMESTAMP("Surface Cache Prepare");
 	rd->draw_command_begin_label("Surface Cache Prepare");
@@ -827,12 +887,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect(RD::UNIFORM_TYPE_IMAGE, 19, Vector<RID>({ indirect_atlas }));
 	RD::Uniform l_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ requests_buffer }));
 	RD::Uniform l_change(RD::UNIFORM_TYPE_IMAGE, 21, Vector<RID>({ change_atlas }));
+	RD::Uniform l_grid(RD::UNIFORM_TYPE_STORAGE_BUFFER, 22, Vector<RID>({ grid_buffer }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

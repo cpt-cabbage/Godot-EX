@@ -3808,6 +3808,8 @@ void RenderingServer::init() {
 	// The cards are lit by every positional light within this distance of the
 	// camera, in the view or not; 0 falls back to the view's lights.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/light_radius", PROPERTY_HINT_RANGE, "0.0,1000.0,1.0"), 64.0);
+	// The card lighting reads each texel's cell of a world light grid (32 cells across twice the radius) rather than the first 32 lights overlapping its set's box.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/light_grid"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

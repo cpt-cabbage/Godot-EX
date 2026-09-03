@@ -550,7 +550,7 @@ public:
 	SurfaceCache *get_surface_cache() const { return surface_cache; }
 
 	// Lights the surface cache for this frame; call before process_rt_gi.
-	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, const GiCascades &p_cascades, const GiSky &p_sky);
+	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky);
 
 	// p_sky_use_octmap_array selects the sky radiance octmap layout the GI
 	// gather shader compiles against (must match the sky renderer's).

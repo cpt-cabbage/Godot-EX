@@ -76,13 +76,20 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint temporal_frames;
 	uint atlas_size;
 	uint debug; // Profiling ablations: 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
+	vec3 grid_origin; // The world light grid, when FLAG_GRID: its corner, cell size, cells per edge, entries per cell.
+	float grid_cell;
+	uint grid_n;
+	uint grid_cap;
+	uint pad_grid0;
+	uint pad_grid1;
 }
 params;
 
 #define FLAG_SDFGI 1u
 #define FLAG_SKY_MODE_SKY 2u
 #define FLAG_SKY_MODE_COLOR 4u
-#define FLAG_SHARED_BOUNCE_RAY 16u // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
+#define FLAG_SHARED_BOUNCE_RAY 16u
+#define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights. // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -162,6 +169,14 @@ card_requests;
 // A-SVGF's temporal gradient with the relight as the re-shade. It scales the
 // restart of the accumulations below, and the GI gather reads it at hits.
 layout(set = 0, binding = 21, rg16f) uniform restrict image2D change_atlas;
+
+// The world light grid: per cell, a count then grid_cap entries (a light
+// index, bit 31 set for a spot). See surface_cache_grid.glsl.
+layout(set = 0, binding = 22, std430) restrict readonly buffer LightGrid {
+	uint data[];
+}
+light_grid;
+#define GRID_SPOT_BIT 0x80000000u
 
 uint pcg_hash(uint v) {
 	uint state = v * 747796405u + 2891336453u;
@@ -490,12 +505,33 @@ void shade_direct(uint entry, Texel t, inout uint seed, out vec3 direct, out vec
 	uint sel_mask = 0u;
 	bool selected = false;
 
+	// The lights: the texel's cell of the world light grid (every light
+	// that reaches the texel), or the set's list (the first 32 overlapping
+	// its box) where the grid is off or the texel lies outside it.
 	uint base = entry * (1u + MAX_LIGHTS_PER_SET);
-	uint light_count = (params.debug & 4u) != 0u ? 0u : min(set_lights.data[base], MAX_LIGHTS_PER_SET);
+	uint light_count = min(set_lights.data[base], MAX_LIGHTS_PER_SET);
+	bool from_grid = false;
+	if (bool(params.flags & FLAG_GRID)) {
+		vec3 rel = (t.world_pos - params.grid_origin) / params.grid_cell;
+		if (all(greaterThanEqual(rel, vec3(0.0))) && all(lessThan(rel, vec3(float(params.grid_n))))) {
+			uvec3 c = uvec3(rel);
+			base = (c.x + params.grid_n * (c.y + params.grid_n * c.z)) * (1u + params.grid_cap);
+			light_count = min(light_grid.data[base], params.grid_cap);
+			from_grid = true;
+		}
+	}
+	if ((params.debug & 4u) != 0u) {
+		light_count = 0u;
+	}
 	for (uint j = 0u; j < light_count; j++) {
-		uint idx = set_lights.data[base + 1u + j];
-		bool is_spot = idx >= params.omni_light_count;
-		LightData ld = is_spot ? spot_lights.data[idx - params.omni_light_count] : omni_lights.data[idx];
+		uint idx = from_grid ? light_grid.data[base + 1u + j] : set_lights.data[base + 1u + j];
+		bool is_spot = from_grid ? (idx & GRID_SPOT_BIT) != 0u : idx >= params.omni_light_count;
+		if (from_grid) {
+			idx &= ~GRID_SPOT_BIT;
+		} else if (is_spot) {
+			idx -= params.omni_light_count;
+		}
+		LightData ld = is_spot ? spot_lights.data[idx] : omni_lights.data[idx];
 		vec3 pos = (params.world_from_view * vec4(ld.position, 1.0)).xyz;
 		vec3 rel = pos - t.world_pos;
 		float len = length(rel);

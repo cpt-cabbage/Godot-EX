@@ -33,6 +33,7 @@
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_geometry_instance.h"
+#include "servers/rendering/renderer_rd/shaders/effects/surface_cache_grid.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_light.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_prepare.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -66,6 +67,9 @@ public:
 	static constexpr uint32_t MAX_LIGHTS_PER_SET = 32;
 	static constexpr uint32_t PAGE_SIZE = 64; // Atlas pages; a card within one is a square slot, a larger one a block of pages.
 	static constexpr uint32_t MAX_CARD_EDGE = 256; // Four pages: the largest card edge a setting may ask for.
+	// The world light grid (surface_cache_grid.glsl): cells per edge, and lights per cell.
+	static constexpr uint32_t GRID_N = 32;
+	static constexpr uint32_t GRID_CAP = 64; // Lights per cell: twice the per-set list, at 8.5 MB for the grid; a packed scene can still saturate a 4 m cell.
 
 	struct Settings {
 		uint32_t atlas_size = 2048;
@@ -78,6 +82,7 @@ public:
 		uint32_t round_robin_period = 64; // Every set is relit at least once per this many frames.
 		uint32_t skinned_recapture_period = 16;
 		bool shared_bounce_ray = true; // One bounce ray per 2x2 texel quad (a thread per quad), its sample shared by the four.
+		bool light_grid = true; // The card lighting reads a texel's cell of the world light grid instead of its set's capped list.
 	};
 
 	// One capture the renderer has to draw: six orthographic views of one
@@ -104,6 +109,7 @@ public:
 		Transform3D world_from_view; // Camera transform: the light buffers are view space.
 		uint32_t frame = 0;
 		float ray_bias = 0.08f;
+		float light_radius = 0.0f; // The light population's radius about the camera: the grid spans twice it.
 		// Indirect term: the SDFGI lightprobes (camera-relative positions).
 		bool sdfgi_active = false;
 		RID sdfgi_ubo;
@@ -241,6 +247,11 @@ private:
 	};
 	RID prepare_pipelines[PREPARE_VARIANT_MAX];
 
+	SurfaceCacheGridShaderRD grid_shader;
+	RID grid_shader_version;
+	RID grid_pipeline;
+	RID grid_buffer; // GRID_N^3 cells of 1 + GRID_CAP uints.
+
 	SurfaceCacheLightShaderRD light_shader;
 	RID light_shader_version;
 	RID light_pipeline;
@@ -271,6 +282,21 @@ private:
 		uint32_t temporal_frames;
 		uint32_t atlas_size;
 		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
+		float grid_origin[3]; // The world light grid (flags bit 32 when built this frame).
+		float grid_cell;
+		uint32_t grid_n;
+		uint32_t grid_cap;
+		uint32_t pad_grid[2];
+	};
+
+	struct GridPushConstant {
+		float world_from_view[16];
+		float origin[3];
+		float cell;
+		uint32_t n;
+		uint32_t cap;
+		uint32_t omni_light_count;
+		uint32_t spot_light_count;
 	};
 
 	void _create_atlases();

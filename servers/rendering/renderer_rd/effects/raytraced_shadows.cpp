@@ -447,8 +447,16 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		// Surface cache cards for this instance (one set per geometry
 		// instance; a multimesh's sub-instances share none, they fall back to
 		// the coarse cache at hits).
+		// A multimesh gets one set too: the capture is of the whole multimesh
+		// in the instance's local space (the material pass draws every
+		// sub-instance), and every sub-instance's record maps the world into
+		// that space, so a hit on any of them reads the shared cards. Coarse
+		// for a field, right for a room's worth of chairs; before this the
+		// sub-instances had no cards at all (GODOT_CARD_NO_MULTIMESH=1 keeps
+		// that, for the comparison).
+		static const bool no_multimesh_cards = OS::get_singleton()->get_environment("GODOT_CARD_NO_MULTIMESH") == "1";
 		uint32_t card_set = SurfaceCache::INVALID_ID;
-		if (surface_cache != nullptr && !is_multimesh) {
+		if (surface_cache != nullptr && !(is_multimesh && no_multimesh_cards)) {
 			card_set = surface_cache->add_instance(inst, is_skinned, is_skinned ? mesh_storage->mesh_instance_get_skeleton_version(inst->mesh_instance) : 0);
 		}
 
@@ -536,7 +544,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 				as_instance.flags = facing.flags;
 				// The custom index a ray query hands back: the cache's record
 				// for this TLAS instance, or none.
-				as_instance.id = (surface_cache != nullptr && card_set != SurfaceCache::INVALID_ID) ? surface_cache->add_instance_record(card_set, p_transform) : SurfaceCache::INVALID_ID;
+				as_instance.id = (surface_cache != nullptr && card_set != SurfaceCache::INVALID_ID) ? surface_cache->add_instance_record(card_set, is_multimesh ? inst->transform : p_transform) : SurfaceCache::INVALID_ID;
 				as_instances.push_back(as_instance);
 			};
 
@@ -660,7 +668,7 @@ void RaytracedShadows::set_surface_cache_enabled(bool p_enabled, const SurfaceCa
 	}
 }
 
-void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, const GiCascades &p_cascades, const GiSky &p_sky) {
+void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
 	if (surface_cache == nullptr || tlas.is_null()) {
 		return;
 	}
@@ -697,6 +705,7 @@ void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_
 	in.sky_color = p_sky.color;
 	in.sky_energy = p_sky.energy;
 	in.sky_border = p_sky.border_size;
+	in.light_radius = light_storage->card_lights_are_valid() ? p_light_radius : 0.0f;
 	surface_cache->update_lighting(in);
 }
 
