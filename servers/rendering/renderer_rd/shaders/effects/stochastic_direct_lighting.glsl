@@ -774,6 +774,15 @@ void main() {
 		candidate_count++;
 	}
 	uint guided_count = candidate_count;
+	// The guided keys again, in an array only ever indexed by constants: the
+	// candidate arrays are indexed dynamically and so live in thread-private
+	// memory, and the cell walk below compares every cell light against the
+	// guided list, which at hundreds of overlapping lights was a memory read
+	// per compare. A constant-bound loop over this copy unrolls into registers.
+	uint guided_keys[MAX_GUIDED_CANDIDATES];
+	for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
+		guided_keys[j] = j < guided_count ? (candidate_entries[j] & ENTRY_KEY_MASK) : INVALID_LIGHT;
+	}
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
 	// newly visible lights are still found, at a per-pixel cost that does not
@@ -886,11 +895,8 @@ void main() {
 
 					// Skip lights already on the guided list.
 					bool listed = false;
-					for (uint j = 0u; j < guided_count; j++) {
-						if ((candidate_entries[j] & ENTRY_KEY_MASK) == entry) {
-							listed = true;
-							break;
-						}
+					for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
+						listed = listed || (guided_keys[j] == entry);
 					}
 					if (listed || candidate_count >= MAX_CANDIDATES) {
 						continue;

@@ -152,6 +152,7 @@ private:
 	LocalVector<uint32_t> free_pages;
 	uint32_t pages_per_row = 0;
 	bool atlas_full_warned = false;
+	bool atlas_degraded_warned = false;
 
 	struct Slot {
 		uint32_t page = INVALID_ID;
@@ -200,6 +201,7 @@ private:
 		bool pending_capture = false;
 		bool reset = false;
 		bool skinned = false;
+		uint64_t skeleton_version = 0; // The skeleton's version the cards were captured with (skinned instances).
 		uint32_t last_seen_frame = 0;
 		uint32_t captured_frame = 0;
 		bool in_use = false;
@@ -287,7 +289,8 @@ public:
 	// add_instance_record per TLAS instance (returning the id the ray query
 	// hands back), then end_frame.
 	void begin_frame(uint32_t p_frame);
-	uint32_t add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned);
+	// p_skeleton_version: the skeleton's version for a skinned instance (0 otherwise); a changed pose recaptures.
+	uint32_t add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned, uint64_t p_skeleton_version);
 	uint32_t add_instance_record(uint32_t p_set, const Transform3D &p_world_from_local);
 	void end_frame();
 

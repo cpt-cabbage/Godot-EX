@@ -304,7 +304,7 @@ static uint64_t _material_key(RenderGeometryInstanceBase *p_instance) {
 	return hash_fmix32(h);
 }
 
-uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned) {
+uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned, uint64_t p_skeleton_version) {
 	uint32_t set_index;
 	CardSet *s;
 	if (HashMap<RenderGeometryInstance *, uint32_t>::Iterator it = set_by_instance.find(p_instance); it) {
@@ -342,13 +342,19 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		// The capture is in local space, so only the box it is framed by matters.
 		Vector3 d = (local_aabb.size - s->local_aabb.size).abs() + (local_aabb.position - s->local_aabb.position).abs();
 		float extent = MAX(local_aabb.get_longest_axis_size(), 1e-4f);
-		if (d.x + d.y + d.z > extent * 0.02f) {
+		// A skinned instance's box moves with its pose every frame; its
+		// recapture is the pose's, on the period below, not the box's.
+		if (d.x + d.y + d.z > extent * 0.02f && (!p_skinned || !s->captured || frame - s->captured_frame >= settings.skinned_recapture_period)) {
 			needs_capture = true;
 		}
-		if (p_skinned && s->captured && frame - s->captured_frame >= settings.skinned_recapture_period) {
+		// A skinned instance is recaptured when its pose has changed since
+		// the capture, at most once per recapture period: a running animation
+		// refreshes on the period, an idle one never.
+		if (p_skinned && s->captured && p_skeleton_version != s->skeleton_version && frame - s->captured_frame >= settings.skinned_recapture_period) {
 			needs_capture = true;
 		}
 	}
+	s->skeleton_version = p_skeleton_version;
 
 	if (needs_capture) {
 		// Card resolution from the world-space extent.
@@ -359,19 +365,31 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		uint32_t size_class = _size_class_for(size);
 		if (size_class != s->size_class) {
 			_free_set_slots(*s);
-			bool ok = true;
-			for (uint32_t c = 0; c < CARDS_PER_SET && ok; c++) {
-				ok = _alloc_slot(size_class, s->slots[c]);
+			// When the atlas has no room at this size, a smaller card is worth
+			// more than none: try each size down to the smallest before the
+			// instance falls back to the coarse cache at hits.
+			const uint32_t smallest_class = _size_class_for(settings.min_card_size);
+			bool ok = false;
+			for (uint32_t try_class = size_class; try_class <= smallest_class && !ok; try_class++) {
+				ok = true;
+				for (uint32_t c = 0; c < CARDS_PER_SET && ok; c++) {
+					ok = _alloc_slot(try_class, s->slots[c]);
+				}
+				if (ok) {
+					s->size = PAGE_SIZE >> try_class;
+					s->size_class = try_class;
+				} else {
+					_free_set_slots(*s);
+				}
 			}
 			if (!ok) {
-				_free_set_slots(*s);
 				if (!atlas_full_warned) {
 					WARN_PRINT("Surface cache atlas is full; some instances will shade ray hits from the coarse cache. Raise rendering/ray_tracing/surface_cache/atlas_size or lower texels_per_meter.");
 					atlas_full_warned = true;
 				}
-			} else {
-				s->size = size;
-				s->size_class = size_class;
+			} else if (s->size < size && !atlas_degraded_warned) {
+				print_verbose("Surface cache atlas is short of room; some cards are captured below their texels_per_meter resolution.");
+				atlas_degraded_warned = true;
 			}
 		}
 		s->local_aabb = local_aabb;
@@ -499,6 +517,7 @@ void SurfaceCache::finish_capture(const CaptureJob &p_job) {
 	s.captured = true;
 	s.reset = true;
 	s.captured_frame = frame;
+	print_verbose(vformat("Surface cache: captured set %d at %d texels (frame %d%s).", p_job.set, s.size, frame, s.skinned ? ", skinned" : ""));
 }
 
 void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {

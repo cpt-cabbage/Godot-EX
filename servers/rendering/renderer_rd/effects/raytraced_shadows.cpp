@@ -448,7 +448,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 		// the coarse cache at hits).
 		uint32_t card_set = SurfaceCache::INVALID_ID;
 		if (surface_cache != nullptr && !is_multimesh) {
-			card_set = surface_cache->add_instance(inst, is_skinned);
+			card_set = surface_cache->add_instance(inst, is_skinned, is_skinned ? mesh_storage->mesh_instance_get_skeleton_version(inst->mesh_instance) : 0);
 		}
 
 		// Shadow rays cull front faces so that, like shadow maps, a surface

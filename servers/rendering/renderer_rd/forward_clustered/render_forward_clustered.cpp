@@ -2063,7 +2063,8 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 			break;
 		}
 		if (!labelled) {
-			RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
+			RENDER_TIMESTAMP("Surface Cache Capture");
+	RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
 			labelled = true;
 		}
 		surface_cache_capture_list.clear();

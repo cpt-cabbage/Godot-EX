@@ -1070,6 +1070,15 @@ void MeshStorage::mesh_instance_free(RID p_rid) {
 	mesh_instance_owner.free(p_rid);
 }
 
+uint64_t MeshStorage::mesh_instance_get_skeleton_version(RID p_mesh_instance) const {
+	const MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
+	if (mi == nullptr || mi->skeleton.is_null()) {
+		return 0;
+	}
+	const Skeleton *skeleton = skeleton_owner.get_or_null(mi->skeleton);
+	return skeleton != nullptr ? skeleton->version : 0;
+}
+
 void MeshStorage::mesh_instance_set_skeleton(RID p_mesh_instance, RID p_skeleton) {
 	MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
 	if (mi->skeleton == p_skeleton) {
