@@ -76,7 +76,7 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint depth_scale;
 	uint reservoir_count; // Rays per pixel, 1..MAX_RESERVOIRS.
 	uint flags; // FLAG_*.
-	uint pad0;
+	float cluster_z0; // Nonzero: exponential depth slices from this depth (see ClusterBuilderRD).
 }
 params;
 
@@ -802,7 +802,13 @@ void main() {
 	{
 		uvec2 cluster_pos = uvec2(full_pixel) >> params.cluster_shift;
 		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
-		uint cluster_z = uint(clamp((-view_pos.z / params.z_far) * 32.0, 0.0, 31.0));
+		// The cluster the pass reads has exponential depth slices when the
+		// compute cull built it (cells of the linear slicing are z_far / 32
+		// deep and, with a far plane of kilometres, hold every light).
+		float cluster_depth = -view_pos.z;
+		uint cluster_z = params.cluster_z0 > 0.0
+				? uint(clamp(log(max(cluster_depth, params.cluster_z0) / params.cluster_z0) / log(params.z_far / params.cluster_z0) * 32.0, 0.0, 31.0))
+				: uint(clamp((cluster_depth / params.z_far) * 32.0, 0.0, 31.0));
 
 		// First pass: count the candidates in the cell (omni, spot, area).
 		const uint type_count = sc_has_area_lights ? 3u : 2u;

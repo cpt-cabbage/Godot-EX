@@ -2814,7 +2814,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_stochastic) {
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
-							current_cluster_builder->get_cluster_buffer(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_near, scene_data->z_far, stochastic_quality, velocity);
+							current_cluster_builder->get_cluster_buffer_log(), current_cluster_builder->get_cluster_log_z0(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_near, scene_data->z_far, stochastic_quality, velocity);
 				}
 				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;

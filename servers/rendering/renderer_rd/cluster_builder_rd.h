@@ -218,6 +218,18 @@ private:
 	RID cluster_store_uniform_set;
 	RID cluster_cull_uniform_set;
 
+	// A second cluster from the compute cull with exponential depth slices,
+	// for the stochastic sampling pass: the linear slices reach z_far in 32
+	// steps, so with a far plane of kilometres a cell is over a hundred metres
+	// deep and holds every light in the scene, and the pass sums each cell's
+	// lights exactly. Slice s spans log_z0 * (z_far / log_z0)^(s / 32) to the
+	// next, slice 0 from the camera. Same layout, same store pass.
+	RID cluster_render_buffer_log;
+	RID cluster_buffer_log;
+	RID cluster_store_log_uniform_set;
+	float log_z0 = 0.0f;
+	bool log_valid = false;
+
 	// Persistent data.
 
 	void _clear();
@@ -243,7 +255,7 @@ private:
 		float z_far;
 		uint32_t cluster_screen_height;
 		uint32_t render_element_count;
-		uint32_t pad3;
+		float log_z0;
 	};
 
 	RID state_uniform;
@@ -447,6 +459,10 @@ public:
 
 	RID get_cluster_buffer() const;
 	uint32_t get_cluster_buffer_size() const;
+	// The exponential-depth cluster when the compute cull built it this frame
+	// (its z0 nonzero), else the linear one (z0 zero).
+	RID get_cluster_buffer_log() const;
+	float get_cluster_log_z0() const;
 	uint32_t get_cluster_size() const;
 	uint32_t get_max_cluster_elements() const;
 

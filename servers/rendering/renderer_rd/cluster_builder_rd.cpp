@@ -270,6 +270,8 @@ void ClusterBuilderRD::_clear() {
 
 	RD::get_singleton()->free_rid(cluster_buffer);
 	RD::get_singleton()->free_rid(cluster_render_buffer);
+	RD::get_singleton()->free_rid(cluster_buffer_log);
+	RD::get_singleton()->free_rid(cluster_render_buffer_log);
 	RD::get_singleton()->free_rid(element_buffer);
 	cluster_buffer = RID();
 	cluster_render_buffer = RID();
@@ -287,6 +289,8 @@ void ClusterBuilderRD::_clear() {
 	cluster_render_uniform_set = RID();
 	cluster_store_uniform_set = RID();
 	cluster_cull_uniform_set = RID();
+	cluster_store_log_uniform_set = RID();
+	log_valid = false;
 }
 
 void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID p_depth_buffer, RID p_depth_buffer_sampler, RID p_color_buffer) {
@@ -317,6 +321,8 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID 
 
 	cluster_render_buffer = RD::get_singleton()->storage_buffer_create(cluster_render_buffer_size);
 	cluster_buffer = RD::get_singleton()->storage_buffer_create(cluster_buffer_size);
+	cluster_render_buffer_log = RD::get_singleton()->storage_buffer_create(cluster_render_buffer_size);
+	cluster_buffer_log = RD::get_singleton()->storage_buffer_create(cluster_buffer_size);
 
 	render_elements = static_cast<RenderElementData *>(memalloc(sizeof(RenderElementData) * render_element_max));
 	render_element_count = 0;
@@ -384,6 +390,31 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID 
 
 		cluster_store_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_store.shader, 0);
 	}
+	{
+		Vector<RD::Uniform> uniforms;
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 1;
+			u.append_id(cluster_render_buffer_log);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 2;
+			u.append_id(cluster_buffer_log);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 3;
+			u.append_id(element_buffer);
+			uniforms.push_back(u);
+		}
+		cluster_store_log_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_store.shader, 0);
+	}
 
 	{
 		Vector<RD::Uniform> uniforms;
@@ -406,6 +437,13 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID 
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.binding = 3;
 			u.append_id(cluster_render_buffer);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 4;
+			u.append_id(cluster_render_buffer_log);
 			uniforms.push_back(u);
 		}
 		cluster_cull_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_cull.shader, 0);
@@ -479,6 +517,7 @@ void ClusterBuilderRD::bake_cluster() {
 
 	// Clear cluster buffer.
 	RD::get_singleton()->buffer_clear(cluster_buffer, 0, cluster_buffer_size);
+	log_valid = false;
 
 	if (render_element_count > 0) {
 		// Clear render buffer.
@@ -508,6 +547,11 @@ void ClusterBuilderRD::bake_cluster() {
 			state.z_far = z_far;
 			state.cluster_screen_height = cluster_screen_size.y;
 			state.render_element_count = render_element_count;
+			// The exponential slices: 32 from log_z0 to z_far, a quarter metre or
+			// z_far / 8192 at the least, so a 100 m far plane steps by 1.21 and a
+			// 4 km one by 1.33.
+			log_z0 = MAX(0.25f, z_far / 8192.0f);
+			state.log_z0 = log_z0;
 
 			RD::get_singleton()->buffer_update(state_uniform, 0, sizeof(StateUniform), &state);
 		}
@@ -521,6 +565,9 @@ void ClusterBuilderRD::bake_cluster() {
 		// The compute cull (cluster_cull.glsl), or the proxy rasterisation.
 		const bool compute_cull = GLOBAL_GET("rendering/limits/cluster_builder/compute_cull");
 		if (compute_cull) {
+			RD::get_singleton()->buffer_clear(cluster_render_buffer_log, 0, cluster_render_buffer_size);
+			RD::get_singleton()->buffer_clear(cluster_buffer_log, 0, cluster_buffer_size);
+			log_valid = true;
 			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, shared->cluster_cull.shader_pipeline);
 			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, cluster_cull_uniform_set, 0);
@@ -594,6 +641,14 @@ void ClusterBuilderRD::bake_cluster() {
 
 			RD::get_singleton()->compute_list_dispatch_threads(compute_list, cluster_screen_size.x, cluster_screen_size.y, 1);
 
+			if (log_valid) {
+				// The exponential-depth cluster, the same pass over the second tile buffer.
+				RD::get_singleton()->compute_list_add_barrier(compute_list);
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, cluster_store_log_uniform_set, 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(ClusterBuilderSharedDataRD::ClusterStore::PushConstant));
+				RD::get_singleton()->compute_list_dispatch_threads(compute_list, cluster_screen_size.x, cluster_screen_size.y, 1);
+			}
+
 			RD::get_singleton()->compute_list_end();
 		}
 	}
@@ -628,6 +683,14 @@ void ClusterBuilderRD::debug(ElementType p_element) {
 
 RID ClusterBuilderRD::get_cluster_buffer() const {
 	return cluster_buffer;
+}
+
+RID ClusterBuilderRD::get_cluster_buffer_log() const {
+	return log_valid ? cluster_buffer_log : cluster_buffer;
+}
+
+float ClusterBuilderRD::get_cluster_log_z0() const {
+	return log_valid ? log_z0 : 0.0f;
 }
 
 uint32_t ClusterBuilderRD::get_cluster_buffer_size() const {

@@ -296,7 +296,7 @@ private:
 		uint32_t depth_scale;
 		uint32_t reservoir_count;
 		uint32_t flags; // 1: light guiding, 2: screen traces.
-		uint32_t pad0;
+		float cluster_z0; // Nonzero: the cluster's depth slices are exponential from this depth (see ClusterBuilderRD).
 	};
 	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
 	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;
@@ -524,7 +524,7 @@ public:
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
-	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
+	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
 
 	// Call once per frame, per render buffer, before that buffer's per-view
 	// process() calls. Selects the viewport's own temporal state (creating it

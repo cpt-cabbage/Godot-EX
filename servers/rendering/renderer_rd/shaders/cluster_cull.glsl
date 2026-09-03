@@ -40,7 +40,7 @@ layout(set = 0, binding = 1, std140) uniform State {
 	float z_far;
 	uint cluster_screen_height;
 	uint render_element_count;
-	uint pad3;
+	float log_z0; // The exponential slices' first bound (see cluster_render_log).
 }
 state;
 
@@ -64,8 +64,17 @@ layout(set = 0, binding = 3, std430) buffer restrict ClusterRender {
 }
 cluster_render;
 
+// The same tile buffer with exponential depth slices, for the stochastic
+// sampling pass: slice s from log_z0 * (z_far / log_z0)^(s / 32) to the next
+// bound, slice 0 from the camera.
+layout(set = 0, binding = 4, std430) buffer restrict ClusterRenderLog {
+	uint data[];
+}
+cluster_render_log;
+
 #define CHUNK 256u
 shared uint masks[CHUNK];
+shared uint masks_log[CHUNK];
 
 vec3 unproject(vec2 ndc, float depth01) {
 	vec4 p = state.inv_projection * vec4(ndc, depth01, 1.0);
@@ -191,27 +200,43 @@ void main() {
 	}
 	planes[4] = vec4(0.0, 0.0, 1.0, d1); // z >= -d1
 	planes[5] = vec4(0.0, 0.0, -1.0, -d0); // z <= -d0
+	float log_ratio = log(state.z_far / state.log_z0) / 32.0;
+	float l0 = slice == 0u ? 0.0 : state.log_z0 * exp(float(slice) * log_ratio);
+	float l1 = state.log_z0 * exp(float(slice + 1u) * log_ratio);
+	vec4 planes_log[6] = planes;
+	planes_log[4] = vec4(0.0, 0.0, 1.0, l1);
+	planes_log[5] = vec4(0.0, 0.0, -1.0, -l0);
 
 	uint cluster_offset = (tile.x + state.cluster_screen_width * tile.y) * state.cluster_data_size;
 	uint count = state.render_element_count;
 	for (uint chunk = 0u; chunk < count; chunk += CHUNK) {
 		for (uint i = slice; i < CHUNK; i += 32u) {
 			masks[i] = 0u;
+			masks_log[i] = 0u;
 		}
 		barrier();
 		uint chunk_count = min(CHUNK, count - chunk);
 		for (uint j = 0u; j < chunk_count; j++) {
-			if (intersects(render_elements.data[chunk + j], planes)) {
+			RenderElement e = render_elements.data[chunk + j];
+			if (intersects(e, planes)) {
 				atomicOr(masks[j], 1u << slice);
+			}
+			if (intersects(e, planes_log)) {
+				atomicOr(masks_log[j], 1u << slice);
 			}
 		}
 		barrier();
 		for (uint j = slice; j < chunk_count; j += 32u) {
+			uint index = chunk + j;
 			uint m = masks[j];
 			if (m != 0u) {
-				uint index = chunk + j;
 				atomicOr(cluster_render.data[cluster_offset + (index >> 5u)], 1u << (index & 31u));
 				cluster_render.data[cluster_offset + state.cluster_depth_offset + index] = m;
+			}
+			uint ml = masks_log[j];
+			if (ml != 0u) {
+				atomicOr(cluster_render_log.data[cluster_offset + (index >> 5u)], 1u << (index & 31u));
+				cluster_render_log.data[cluster_offset + state.cluster_depth_offset + index] = ml;
 			}
 		}
 		barrier();
