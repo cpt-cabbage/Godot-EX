@@ -3941,6 +3941,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/spatial_indexer/threaded_cull_minimum_instances", PROPERTY_HINT_RANGE, "32,65536,1"), 1000);
 
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
+	// The cluster bake as a compute cull (a froxel against every element)
+	// rather than rasterised proxies, whose cost grows with their screen area.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/limits/cluster_builder/compute_cull"), true);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/shaders/cluster_debug.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/cluster_render.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/cluster_cull.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/cluster_store.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 
@@ -104,6 +105,15 @@ class ClusterBuilderSharedDataRD {
 		RID shader;
 		RID shader_pipeline;
 	} cluster_store;
+
+	// The bake as a compute cull instead of the proxy rasterisation (see
+	// cluster_cull.glsl); writes what cluster_render.glsl writes.
+	struct ClusterCull {
+		ClusterCullShaderRD cluster_cull_shader;
+		RID shader_version;
+		RID shader;
+		RID shader_pipeline;
+	} cluster_cull;
 
 	struct ClusterDebug {
 		struct PushConstant {
@@ -206,6 +216,7 @@ private:
 
 	RID cluster_render_uniform_set;
 	RID cluster_store_uniform_set;
+	RID cluster_cull_uniform_set;
 
 	// Persistent data.
 
@@ -222,6 +233,17 @@ private:
 		uint32_t pad0;
 		uint32_t pad1;
 		uint32_t pad2;
+
+		// The compute cull's fields (cluster_cull.glsl); the raster shaders
+		// declare the block without them.
+		float inv_projection[16];
+		float screen_size[2];
+		uint32_t cluster_size;
+		uint32_t camera_orthogonal;
+		float z_far;
+		uint32_t cluster_screen_height;
+		uint32_t render_element_count;
+		uint32_t pad3;
 	};
 
 	RID state_uniform;

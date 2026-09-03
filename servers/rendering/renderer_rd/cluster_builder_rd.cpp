@@ -30,6 +30,7 @@
 
 #include "cluster_builder_rd.h"
 
+#include "core/config/project_settings.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_globals.h" // IWYU pragma: keep. RENDER_TIMESTAMP macro uses RSG.
 
@@ -100,6 +101,14 @@ ClusterBuilderSharedDataRD::ClusterBuilderSharedDataRD() {
 		cluster_store.shader_version = cluster_store.cluster_store_shader.version_create();
 		cluster_store.shader = cluster_store.cluster_store_shader.version_get_shader(cluster_store.shader_version, 0);
 		cluster_store.shader_pipeline = RD::get_singleton()->compute_pipeline_create(cluster_store.shader);
+	}
+	{
+		Vector<String> versions;
+		versions.push_back("");
+		cluster_cull.cluster_cull_shader.initialize(versions);
+		cluster_cull.shader_version = cluster_cull.cluster_cull_shader.version_create();
+		cluster_cull.shader = cluster_cull.cluster_cull_shader.version_get_shader(cluster_cull.shader_version, 0);
+		cluster_cull.shader_pipeline = RD::get_singleton()->compute_pipeline_create(cluster_cull.shader);
 	}
 	{
 		Vector<String> versions;
@@ -248,6 +257,7 @@ ClusterBuilderSharedDataRD::~ClusterBuilderSharedDataRD() {
 
 	cluster_render.cluster_render_shader.version_free(cluster_render.shader_version);
 	cluster_store.cluster_store_shader.version_free(cluster_store.shader_version);
+	cluster_cull.cluster_cull_shader.version_free(cluster_cull.shader_version);
 	cluster_debug.cluster_debug_shader.version_free(cluster_debug.shader_version);
 }
 
@@ -276,6 +286,7 @@ void ClusterBuilderRD::_clear() {
 
 	cluster_render_uniform_set = RID();
 	cluster_store_uniform_set = RID();
+	cluster_cull_uniform_set = RID();
 }
 
 void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID p_depth_buffer, RID p_depth_buffer_sampler, RID p_color_buffer) {
@@ -374,6 +385,32 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID 
 		cluster_store_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_store.shader, 0);
 	}
 
+	{
+		Vector<RD::Uniform> uniforms;
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+			u.binding = 1;
+			u.append_id(state_uniform);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 2;
+			u.append_id(element_buffer);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 3;
+			u.append_id(cluster_render_buffer);
+			uniforms.push_back(u);
+		}
+		cluster_cull_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_cull.shader, 0);
+	}
+
 	if (p_color_buffer.is_valid()) {
 		Vector<RD::Uniform> uniforms;
 		{
@@ -460,6 +497,18 @@ void ClusterBuilderRD::bake_cluster() {
 			state.cluster_depth_offset = (render_element_max / 32);
 			state.cluster_data_size = state.cluster_depth_offset + render_element_max;
 
+			// The plain projection, not the adjusted one: that one has an infinite
+			// far plane (its near pushed to 0.0001 so the proxies never clip), and
+			// the cull unprojects the far plane.
+			RendererRD::MaterialStorage::store_camera(projection.inverse(), state.inv_projection);
+			state.screen_size[0] = screen_size.x;
+			state.screen_size[1] = screen_size.y;
+			state.cluster_size = cluster_size;
+			state.camera_orthogonal = camera_orthogonal ? 1 : 0;
+			state.z_far = z_far;
+			state.cluster_screen_height = cluster_screen_size.y;
+			state.render_element_count = render_element_count;
+
 			RD::get_singleton()->buffer_update(state_uniform, 0, sizeof(StateUniform), &state);
 		}
 
@@ -469,8 +518,15 @@ void ClusterBuilderRD::bake_cluster() {
 
 		RENDER_TIMESTAMP("Render 3D Cluster Elements");
 
-		// Render elements.
-		{
+		// The compute cull (cluster_cull.glsl), or the proxy rasterisation.
+		const bool compute_cull = GLOBAL_GET("rendering/limits/cluster_builder/compute_cull");
+		if (compute_cull) {
+			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, shared->cluster_cull.shader_pipeline);
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, cluster_cull_uniform_set, 0);
+			RD::get_singleton()->compute_list_dispatch(compute_list, cluster_screen_size.x, cluster_screen_size.y, 1);
+			RD::get_singleton()->compute_list_end();
+		} else {
 			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(framebuffer);
 			ClusterBuilderSharedDataRD::ClusterRender::PushConstant push_constant = {};
 
