@@ -368,6 +368,19 @@ struct ImplementationData {
 	uint pad_transparent_debug_0; // Scalars, not an array: std140 would stride an array by 16 bytes.
 	uint pad_transparent_debug_1;
 	uint pad_transparent_debug_2;
+
+	// The translucency lighting volume (RaytracedShadows::process_translucency_volume):
+	// bit 0, blended fragments read it for their direct light in place of the
+	// light loops and the shadow rays; bit 1, the fragments an alpha depth
+	// pre-pass wrote read it too. tv_size froxels, tv_length the view depth
+	// it reaches with slices exponential in tv_spread, tv_inv_proj_xy the
+	// frustum's half extents per unit of depth.
+	uint translucency_volume;
+	float tv_length;
+	float tv_spread;
+	float tv_pad;
+	ivec4 tv_size;
+	vec4 tv_inv_proj_xy;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -531,7 +544,13 @@ layout(set = 1, binding = 43) uniform texture2D rt_gi_ambient_buffer;
 layout(set = 1, binding = 44) uniform texture2D rt_gi_reflection_buffer;
 layout(set = 1, binding = 45) uniform texture2D rt_gi_depth_buffer;
 layout(set = 1, binding = 46) uniform texture2D rt_gi_directional_buffer;
-#endif // USE_MULTIVIEW
+#endif
+
+// The translucency lighting volume: A, and B per axis (see translucency_volume.glsl).
+layout(set = 1, binding = 48) uniform texture3D translucency_volume_a;
+layout(set = 1, binding = 49) uniform texture3D translucency_volume_bx;
+layout(set = 1, binding = 50) uniform texture3D translucency_volume_by;
+layout(set = 1, binding = 51) uniform texture3D translucency_volume_bz; // USE_MULTIVIEW
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 
 #endif

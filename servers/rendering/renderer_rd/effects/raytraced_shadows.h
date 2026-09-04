@@ -42,6 +42,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/translucency_volume.glsl.gen.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -146,6 +147,23 @@ public:
 
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
+
+	// The translucency lighting volume (see process_translucency_volume):
+	// its ping-ponged textures and what last frame's mapping was, for the
+	// history lookup.
+	struct TranslucencyState {
+		RID ubo;
+		RID textures[2][4]; // [parity][A, Bx, By, Bz].
+		Vector3i size;
+		Transform3D prev_cam;
+		Vector2 prev_inv_proj;
+		float prev_length = 0.0f;
+		float prev_spread = 1.0f;
+		bool history_valid = false;
+		bool parity = false;
+		bool ready = false; // Written this frame.
+	};
+	LocalVector<TranslucencyState> translucency; // Per view.
 
 	// Calibration of the gather's radiance cache tier against its screen tier.
 	// A hit that lands on screen is shaded from last frame's rendered colour; one
@@ -624,6 +642,37 @@ private:
 	SurfaceCache::LightingInputs hit_lighting;
 	bool hit_lighting_valid = false;
 
+	TranslucencyVolumeShaderRD translucency_shader;
+	RID translucency_shader_version;
+	RID translucency_pipeline;
+
+	struct TranslucencyParamsUBO {
+		float world_from_view[16];
+		float prev_view_from_world[16];
+		float inv_proj_xy[4];
+		int32_t size[4];
+		int32_t screen_size[2];
+		uint32_t cluster_shift;
+		uint32_t cluster_width;
+		uint32_t max_cluster_element_count_div_32;
+		uint32_t cluster_type_size;
+		float cluster_z0;
+		float z_far;
+		float length;
+		float spread;
+		float prev_length;
+		float prev_spread;
+		uint32_t omni_light_count;
+		uint32_t spot_light_count;
+		uint32_t directional_light_count;
+		uint32_t frame;
+		float ray_bias;
+		float temporal_alpha;
+		uint32_t sun_caster_mask;
+		uint32_t flags;
+	};
+	static_assert(sizeof(TranslucencyParamsUBO) == 240, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
+
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
 	void _build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance);
 	void _free_hit_geometry(MeshBlas &r_entry);
@@ -747,6 +796,27 @@ public:
 	// ray-traced-visible samples into demodulated diffuse/specular buffers
 	// (RB_RT_STOCHASTIC_*).
 	void process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity);
+
+	// The translucency lighting volume (MegaLights' translucency): a froxel
+	// grid of the shadowed direct light, as a first-order spherical-harmonic
+	// sum, that the transparent pass reads for its blended fragments in
+	// place of the light loops and the per-fragment shadow rays.
+	struct TranslucencyQuality {
+		bool enabled = true;
+		bool core = false; // The fragments an alpha depth pre-pass wrote (alpha at the threshold) read it too.
+		int32_t size = 64; // Froxels across the frustum; the height follows the aspect.
+		int32_t depth = 64;
+		float length = 64.0f; // View depth the volume reaches, and the exponent of its slices.
+		float spread = 2.0f;
+		uint32_t temporal_frames = 8;
+		float ray_bias = 0.08f;
+		bool shadow_rays = true;
+	};
+	void process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_projection, const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, uint32_t p_sun_caster_mask, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const TranslucencyQuality &p_quality);
+	// The volume written this frame for the view (null when none): 0 A, 1 Bx, 2 By, 3 Bz.
+	RID get_translucency_volume_texture(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, int p_index) const;
+	// Its mapping for the scene shader; false when none was written.
+	bool get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj) const;
 
 	// Call once per frame, per render buffer, before that buffer's per-view
 	// process() calls. Selects the viewport's own temporal state (creating it

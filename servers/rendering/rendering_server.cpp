@@ -3724,6 +3724,18 @@ void RenderingServer::init() {
 	// unshadowed). The ray-traced sun is traced the same way there.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays", PROPERTY_HINT_RANGE, "1,16,1"), 4);
+	// The translucency lighting volume: blended surfaces read their direct
+	// light (shadowed, as a first-order spherical-harmonic sum) from a froxel
+	// grid traced once per frame instead of running the light loops and the
+	// shadow rays above per fragment. The fragments an alpha depth pre-pass
+	// wrote keep the per-fragment shading unless translucency_volume_core.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_core"), false);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_size", PROPERTY_HINT_RANGE, "16,256,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_depth", PROPERTY_HINT_RANGE, "16,256,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_length", PROPERTY_HINT_RANGE, "4.0,1000.0,1.0"), 64.0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread", PROPERTY_HINT_RANGE, "0.5,6.0,0.1"), 2.0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 8);
 	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
 	// available, i.e. any other ray tracing feature is on or SDFGI is active).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);

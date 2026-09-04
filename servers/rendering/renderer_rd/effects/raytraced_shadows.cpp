@@ -84,6 +84,12 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 		hit_index_pool.element_size = sizeof(uint32_t);
 		hit_record_pool.element_size = 0; // CPU-side indices only.
 		rt_gi_dummy_buffer = RD::get_singleton()->storage_buffer_create(256);
+
+		Vector<String> translucency_modes;
+		translucency_modes.push_back("");
+		translucency_shader.initialize(translucency_modes);
+		translucency_shader_version = translucency_shader.version_create();
+		translucency_pipeline = RD::get_singleton()->compute_pipeline_create(translucency_shader.version_get_shader(translucency_shader_version, 0));
 	}
 
 	Vector<String> blur_modes;
@@ -229,6 +235,7 @@ RaytracedShadows::~RaytracedShadows() {
 	}
 	hit_unpack_shader.version_free(hit_unpack_shader_version);
 	hit_bin_shader.version_free(hit_bin_shader_version);
+	translucency_shader.version_free(translucency_shader_version);
 	RD::get_singleton()->free_rid(sampler);
 	RD::get_singleton()->free_rid(stbn_texture);
 	RD::get_singleton()->free_rid(ltc_lut1_texture);
@@ -748,6 +755,19 @@ void RenderBuffersRT::free_data() {
 		rd->free_rid(c.buffer);
 	}
 	rt_gi_calibration.clear();
+	for (const TranslucencyState &t : translucency) {
+		if (t.ubo.is_valid()) {
+			rd->free_rid(t.ubo);
+		}
+		for (int p = 0; p < 2; p++) {
+			for (int i = 0; i < 4; i++) {
+				if (t.textures[p][i].is_valid()) {
+					rd->free_rid(t.textures[p][i]);
+				}
+			}
+		}
+	}
+	translucency.clear();
 	for (const ReprojectHistory &h : reproject_history) {
 		if (h.ubo.is_valid()) {
 			rd->free_rid(h.ubo);
@@ -2439,6 +2459,156 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	if (debug_counts && (scene_frame % 60) == 0) {
 		rd->buffer_get_data_async(hit_counts, callable_mp_static(&RaytracedShadows::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 4) * sizeof(uint32_t));
 	}
+}
+
+/* Translucency lighting volume */
+
+void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_projection, const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, uint32_t p_sun_caster_mask, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const TranslucencyQuality &p_quality) {
+	ERR_FAIL_NULL(rb_state);
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+
+	while (rb_state->translucency.size() <= p_view) {
+		rb_state->translucency.push_back(RenderBuffersRT::TranslucencyState());
+	}
+	RenderBuffersRT::TranslucencyState &st = rb_state->translucency[p_view];
+	st.ready = false;
+	if (!p_quality.enabled || tlas.is_null() || p_cluster_buffer.is_null()) {
+		return;
+	}
+
+	Size2i full_size = p_render_buffers->get_internal_size();
+	Vector3i size(MAX(p_quality.size, 4), MAX(int(Math::round(float(p_quality.size) * float(full_size.y) / float(MAX(full_size.x, 1)))), 4), MAX(p_quality.depth, 4));
+	if (st.size != size || st.textures[0][0].is_null()) {
+		for (int p = 0; p < 2; p++) {
+			for (int i = 0; i < 4; i++) {
+				if (st.textures[p][i].is_valid()) {
+					rd->free_rid(st.textures[p][i]);
+				}
+				RD::TextureFormat tf;
+				tf.texture_type = RD::TEXTURE_TYPE_3D;
+				tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+				tf.width = size.x;
+				tf.height = size.y;
+				tf.depth = size.z;
+				tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+				st.textures[p][i] = rd->texture_create(tf, RD::TextureView());
+			}
+		}
+		st.size = size;
+		st.history_valid = false;
+	}
+	if (st.ubo.is_null()) {
+		st.ubo = rd->uniform_buffer_create(sizeof(TranslucencyParamsUBO));
+	}
+	st.parity = !st.parity;
+	const int write = st.parity ? 1 : 0;
+	const int read = 1 - write;
+
+	TranslucencyParamsUBO params = {};
+	Projection world_from_view = Projection(p_world_from_view);
+	Projection prev_view_from_world = Projection(st.prev_cam.affine_inverse());
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			params.world_from_view[col * 4 + row] = world_from_view.columns[col][row];
+			params.prev_view_from_world[col * 4 + row] = prev_view_from_world.columns[col][row];
+		}
+	}
+	Vector2 inv_proj(p_projection.columns[0][0] != 0.0f ? 1.0f / p_projection.columns[0][0] : 1.0f, p_projection.columns[1][1] != 0.0f ? 1.0f / p_projection.columns[1][1] : 1.0f);
+	params.inv_proj_xy[0] = inv_proj.x;
+	params.inv_proj_xy[1] = inv_proj.y;
+	params.inv_proj_xy[2] = st.prev_inv_proj.x;
+	params.inv_proj_xy[3] = st.prev_inv_proj.y;
+	params.size[0] = size.x;
+	params.size[1] = size.y;
+	params.size[2] = size.z;
+	params.screen_size[0] = full_size.x;
+	params.screen_size[1] = full_size.y;
+	params.cluster_shift = Math::get_shift_from_power_of_2(p_cluster_size);
+	params.cluster_z0 = p_cluster_z0;
+	params.max_cluster_element_count_div_32 = p_max_cluster_elements / 32;
+	{
+		uint32_t cluster_screen_width = Math::division_round_up((uint32_t)full_size.x, p_cluster_size);
+		uint32_t cluster_screen_height = Math::division_round_up((uint32_t)full_size.y, p_cluster_size);
+		params.cluster_type_size = cluster_screen_width * cluster_screen_height * (params.max_cluster_element_count_div_32 + 32);
+		params.cluster_width = cluster_screen_width;
+	}
+	params.z_far = p_z_far;
+	params.length = MAX(p_quality.length, 1.0f);
+	params.spread = MAX(p_quality.spread, 0.1f);
+	params.prev_length = st.prev_length;
+	params.prev_spread = st.prev_spread;
+	params.omni_light_count = p_omni_light_count;
+	params.spot_light_count = p_spot_light_count;
+	params.directional_light_count = MIN(p_directional_light_count, 8u);
+	params.frame = rb_state->frame_index;
+	params.ray_bias = p_quality.ray_bias;
+	params.temporal_alpha = 1.0f / float(MAX(p_quality.temporal_frames, 1u));
+	params.sun_caster_mask = p_sun_caster_mask;
+	params.flags = (st.history_valid ? 1 : 0) | (p_quality.shadow_rays ? 0 : 2);
+	rd->buffer_update(st.ubo, 0, sizeof(TranslucencyParamsUBO), &params);
+
+	RID shader_rid = translucency_shader.version_get_shader(translucency_shader_version, 0);
+	RD::Uniform t_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform t_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ light_storage->get_omni_light_buffer() }));
+	RD::Uniform t_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ light_storage->get_spot_light_buffer() }));
+	RD::Uniform t_directional(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ light_storage->get_directional_light_buffer() }));
+	RD::Uniform t_cluster(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ p_cluster_buffer }));
+	RD::Uniform t_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, Vector<RID>({ st.ubo }));
+	RD::Uniform t_hist_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ material_sampler, st.textures[read][0] }));
+	RD::Uniform t_hist_bx(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ material_sampler, st.textures[read][1] }));
+	RD::Uniform t_hist_by(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ material_sampler, st.textures[read][2] }));
+	RD::Uniform t_hist_bz(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ material_sampler, st.textures[read][3] }));
+	RD::Uniform t_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ st.textures[write][0] }));
+	RD::Uniform t_out_bx(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ st.textures[write][1] }));
+	RD::Uniform t_out_by(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ st.textures[write][2] }));
+	RD::Uniform t_out_bz(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ st.textures[write][3] }));
+
+	RENDER_TIMESTAMP("Translucency Volume");
+	rd->draw_command_begin_label("Translucency Volume");
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, translucency_pipeline);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 0, t_tlas, t_omni, t_spot, t_directional, t_cluster, t_params, t_hist_a, t_hist_bx, t_hist_by, t_hist_bz), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 1, t_out_a, t_out_bx, t_out_by, t_out_bz), 1);
+	rd->compute_list_dispatch_threads(list, size.x, size.y, size.z);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+
+	st.prev_cam = p_world_from_view;
+	st.prev_inv_proj = inv_proj;
+	st.prev_length = params.length;
+	st.prev_spread = params.spread;
+	st.history_valid = true;
+	st.ready = true;
+}
+
+RID RaytracedShadows::get_translucency_volume_texture(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, int p_index) const {
+	if (p_render_buffers.is_null() || !p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
+		return RID();
+	}
+	Ref<RenderBuffersRT> state = p_render_buffers->get_custom_data(RB_SCOPE_RT_STATE);
+	if (state.is_null() || p_view >= state->translucency.size() || !state->translucency[p_view].ready) {
+		return RID();
+	}
+	const RenderBuffersRT::TranslucencyState &st = state->translucency[p_view];
+	return st.textures[st.parity ? 1 : 0][CLAMP(p_index, 0, 3)];
+}
+
+bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj) const {
+	if (p_render_buffers.is_null() || !p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
+		return false;
+	}
+	Ref<RenderBuffersRT> state = p_render_buffers->get_custom_data(RB_SCOPE_RT_STATE);
+	if (state.is_null() || p_view >= state->translucency.size() || !state->translucency[p_view].ready) {
+		return false;
+	}
+	const RenderBuffersRT::TranslucencyState &st = state->translucency[p_view];
+	r_size = st.size;
+	r_length = st.prev_length; // What this frame's pass used (stored after it ran).
+	r_spread = st.prev_spread;
+	r_inv_proj = st.prev_inv_proj;
+	return true;
 }
 
 void RaytracedShadows::_hit_counts_readback(const Vector<uint8_t> &p_data) {

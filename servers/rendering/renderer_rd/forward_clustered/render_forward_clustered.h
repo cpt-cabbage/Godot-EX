@@ -342,6 +342,15 @@ private:
 
 			uint32_t transparent_debug; // TransparentAblate bits the shader reads (transparent pass only, profiling).
 			uint32_t pad_transparent_debug[3];
+
+			// The translucency lighting volume (transparent pass only): bit 0
+			// on, bit 1 the depth-pre-pass core too; its froxel mapping.
+			uint32_t translucency_volume;
+			float tv_length;
+			float tv_spread;
+			float tv_pad;
+			int32_t tv_size[4];
+			float tv_inv_proj_xy[4];
 		};
 
 		struct PushConstantUbershader {
@@ -806,6 +815,7 @@ private:
 		TRANSPARENT_ABLATE_RAYS = 16, // No shadow rays from transparent fragments.
 		TRANSPARENT_ABLATE_CORE = 32, // Depth-pre-pass surfaces drop the fragments the pre-pass wrote (alpha >= 0.99).
 		TRANSPARENT_ABLATE_FRINGE = 64, // ... or the rest.
+		TRANSPARENT_ABLATE_VOLUME = 128, // No translucency lighting volume: the per-fragment loops and rays.
 	};
 	uint32_t transparent_debug_split = 1;
 	uint32_t transparent_debug_ablate = 0;
@@ -860,6 +870,8 @@ private:
 	// material pass each frame.
 	bool use_surface_cache = false;
 	bool use_surface_cache_mirror = true;
+	// The translucency lighting volume for the transparent pass.
+	RendererRD::RaytracedShadows::TranslucencyQuality translucency_quality;
 	// Deferred hit shading: 0 off, 1 the hits the cards cannot shade, 2 every hit.
 	uint32_t rt_gi_hit_shading = 1;
 	bool rt_gi_hit_mirror = true;

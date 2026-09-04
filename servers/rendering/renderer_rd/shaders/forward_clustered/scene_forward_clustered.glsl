@@ -2755,6 +2755,73 @@ void fragment_shader(in SceneData scene_data) {
 	direct_specular_light += specular_light_interp.rgb * f0;
 #endif
 
+	// The translucency lighting volume (transparent pass): a blended
+	// fragment reads its direct light from the froxel grid the ray tracer
+	// filled this frame (RaytracedShadows::process_translucency_volume) in
+	// place of the light loops and shadow rays below. The fragments an alpha
+	// depth pre-pass wrote keep the per-fragment shading unless the flag's
+	// second bit says otherwise: they are the surface's opaque core, where
+	// the shadow detail shows; the fringe is what the blend hides. The
+	// diffuse term is the L1 irradiance for the fragment's normal; the
+	// specular one treats the volume's dominant direction as a directional
+	// light of the fraction of the light that comes from it.
+	bool tv_active = false;
+#ifndef USE_VERTEX_LIGHTING
+	if (implementation_data.translucency_volume != 0u) {
+		bool tv_core_fragment = false;
+#ifdef USE_OPAQUE_PREPASS
+		tv_core_fragment = alpha >= 0.99; // The pre-pass's threshold (scene_data's is zero in this pass).
+#endif
+		if (!tv_core_fragment || (implementation_data.translucency_volume & 2u) != 0u) {
+			float tv_d = -vertex.z;
+			if (tv_d > 0.0 && tv_d < implementation_data.tv_length) {
+				vec3 tv_unit;
+				tv_unit.xy = (vertex.xy / (tv_d * implementation_data.tv_inv_proj_xy.xy)) * 0.5 + 0.5;
+				tv_unit.z = pow(tv_d / implementation_data.tv_length, 1.0 / implementation_data.tv_spread);
+				if (all(greaterThanEqual(tv_unit, vec3(0.0))) && all(lessThanEqual(tv_unit, vec3(1.0)))) {
+					tv_active = true;
+					vec3 tv_a = textureLod(sampler3D(translucency_volume_a, SAMPLER_LINEAR_CLAMP), tv_unit, 0.0).rgb;
+					vec3 tv_bx = textureLod(sampler3D(translucency_volume_bx, SAMPLER_LINEAR_CLAMP), tv_unit, 0.0).rgb;
+					vec3 tv_by = textureLod(sampler3D(translucency_volume_by, SAMPLER_LINEAR_CLAMP), tv_unit, 0.0).rgb;
+					vec3 tv_bz = textureLod(sampler3D(translucency_volume_bz, SAMPLER_LINEAR_CLAMP), tv_unit, 0.0).rgb;
+					vec3 tv_e = max(0.25 * tv_a + 0.5 * (tv_bx * normal.x + tv_by * normal.y + tv_bz * normal.z), vec3(0.0));
+					diffuse_light += tv_e * (1.0 / M_PI);
+					const vec3 tv_lum = vec3(0.2126, 0.7152, 0.0722);
+					vec3 tv_dom = vec3(dot(tv_bx, tv_lum), dot(tv_by, tv_lum), dot(tv_bz, tv_lum));
+					float tv_dom_len = length(tv_dom);
+					float tv_a_lum = dot(tv_a, tv_lum);
+					if (tv_dom_len > 1e-5 && tv_a_lum > 1e-5) {
+						float tv_fraction = clamp(tv_dom_len / tv_a_lum, 0.0, 1.0);
+						vec3 tv_diffuse_unused = vec3(0.0);
+						light_compute(normal, tv_dom / tv_dom_len, normalize(view), 0.0, tv_a * tv_fraction, true, 1.0, f0, roughness, metallic, 0.5, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+								backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+								transmittance_color,
+								transmittance_depth,
+								transmittance_boost,
+								transmittance_depth,
+#endif
+#ifdef LIGHT_RIM_USED
+								rim, rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+								clearcoat, clearcoat_roughness, geo_normal,
+#endif // LIGHT_CLEARCOAT_USED
+#ifdef LIGHT_ANISOTROPY_USED
+								binormal,
+								tangent, anisotropy,
+#endif
+								tv_diffuse_unused,
+								direct_specular_light);
+					}
+				}
+			}
+		}
+	}
+#endif // !USE_VERTEX_LIGHTING
+
 	{ // Directional light.
 
 		// Do shadow and lighting in two passes to reduce register pressure.
@@ -3038,7 +3105,7 @@ void fragment_shader(in SceneData scene_data) {
 
 #ifndef USE_VERTEX_LIGHTING
 
-		for (uint i = 0; i < 8; i++) {
+		for (uint i = 0; i < 8 && !tv_active; i++) {
 			if (i >= scene_data.directional_light_count) {
 				break;
 			}
@@ -3201,7 +3268,7 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 
 #ifndef USE_VERTEX_LIGHTING
-	if (implementation_data.stochastic_direct_lights == 0u) { //omni lights
+	if (implementation_data.stochastic_direct_lights == 0u && !tv_active) { //omni lights
 
 		uint cluster_omni_offset = cluster_offset;
 
@@ -3262,7 +3329,7 @@ void fragment_shader(in SceneData scene_data) {
 		}
 	}
 
-	if (implementation_data.stochastic_direct_lights == 0u) { //spot lights
+	if (implementation_data.stochastic_direct_lights == 0u && !tv_active) { //spot lights
 
 		uint cluster_spot_offset = cluster_offset + implementation_data.cluster_type_size;
 
@@ -3324,7 +3391,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 
 	// Area lights are owned by the stochastic pass when it is active.
-	if (sc_cluster_has_area_light() && implementation_data.stochastic_direct_lights == 0u) { // area lights
+	if (sc_cluster_has_area_light() && implementation_data.stochastic_direct_lights == 0u && !tv_active) { // area lights
 
 		uint cluster_area_offset = cluster_offset + implementation_data.cluster_type_size * 2;
 

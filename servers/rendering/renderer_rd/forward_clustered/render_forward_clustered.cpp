@@ -801,6 +801,25 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 		scene_state.ubo.rt_ray_bias = stochastic_quality.ray_bias;
 		scene_state.ubo.rt_transparent_max_rays = stochastic_transparent_max_rays;
 		scene_state.ubo.rt_sun_caster_mask = sun_caster_mask;
+
+		// The translucency lighting volume written this frame, for the
+		// transparent pass's blended fragments (one view only).
+		scene_state.ubo.translucency_volume = 0;
+		Vector3i tv_size;
+		float tv_length = 0.0f;
+		float tv_spread = 1.0f;
+		Vector2 tv_inv_proj;
+		const bool tv_ablated = transparent_debug_ablating && (transparent_debug_ablate & TRANSPARENT_ABLATE_VOLUME);
+		if (rt_shadows != nullptr && !p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && !tv_ablated && rd.is_valid() && rd->get_view_count() == 1 && rt_shadows->get_translucency_volume_mapping(rd, 0, tv_size, tv_length, tv_spread, tv_inv_proj)) {
+			scene_state.ubo.translucency_volume = 1 | (translucency_quality.core ? 2 : 0);
+			scene_state.ubo.tv_length = tv_length;
+			scene_state.ubo.tv_spread = tv_spread;
+			scene_state.ubo.tv_size[0] = tv_size.x;
+			scene_state.ubo.tv_size[1] = tv_size.y;
+			scene_state.ubo.tv_size[2] = tv_size.z;
+			scene_state.ubo.tv_inv_proj_xy[0] = tv_inv_proj.x;
+			scene_state.ubo.tv_inv_proj_xy[1] = tv_inv_proj.y;
+		}
 	}
 
 	if (rd.is_valid()) {
@@ -1998,6 +2017,14 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps");
 	use_stochastic_transparent_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows");
 	stochastic_transparent_max_rays = CLAMP(int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays")), 1, 16);
+	translucency_quality.enabled = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume");
+	translucency_quality.core = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_core");
+	translucency_quality.size = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_size"));
+	translucency_quality.depth = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_depth"));
+	translucency_quality.length = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_length");
+	translucency_quality.spread = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread");
+	translucency_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames"));
+	translucency_quality.ray_bias = stochastic_quality.ray_bias;
 	if (scene_shader_ray_query) {
 		// Outside any draw list, which is where an acceleration structure
 		// may be built; the scene shader's TLAS binding reads it later.
@@ -2866,6 +2893,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					rt_shadows->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
 							current_cluster_builder->get_cluster_buffer_log(), current_cluster_builder->get_cluster_log_z0(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_near, scene_data->z_far, stochastic_quality, velocity);
+				}
+				// The translucency lighting volume the transparent pass reads
+				// in place of its per-fragment loops and rays; one view only.
+				if (scene_shader_ray_query && use_stochastic_transparent_shadows && v == 0 && rb->get_view_count() == 1 && p_render_data->reflection_probe.is_null()) {
+					uint32_t tv_sun_mask = 0;
+					RID tv_sun = _get_rt_sun_base(p_render_data);
+					if (tv_sun.is_valid()) {
+						uint32_t caster = light_storage->light_get_shadow_caster_mask(tv_sun);
+						tv_sun_mask = caster == 0 ? 0 : (((caster & 0xFF) != 0) ? (caster & 0xFF) : 0xFF);
+					}
+					RID tv_cluster = current_cluster_builder->get_cluster_buffer_log().is_valid() ? current_cluster_builder->get_cluster_buffer_log() : current_cluster_builder->get_cluster_buffer();
+					float tv_z0 = current_cluster_builder->get_cluster_buffer_log().is_valid() ? current_cluster_builder->get_cluster_log_z0() : 0.0f;
+					rt_shadows->process_translucency_volume(rb, v, scene_data->cam_projection, scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), p_render_data->directional_light_count, tv_sun_mask,
+							tv_cluster, tv_z0, current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, translucency_quality);
 				}
 				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;
@@ -4643,6 +4684,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 
+	for (uint32_t i = 0; i < 4; i++) {
+		// The translucency lighting volume (A, Bx, By, Bz); a black volume
+		// when none was written, which the ubo flag keeps unread anyway.
+		RD::Uniform u;
+		u.binding = 48 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID volume = (rt_shadows != nullptr && rb.is_valid() && !is_multiview) ? rt_shadows->get_translucency_volume_texture(rb, 0, i) : RID();
+		u.append_id(volume.is_valid() ? volume : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_BLACK));
+		uniforms.push_back(u);
+	}
+
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.get_default_shader_rd(is_multiview), RENDER_PASS_UNIFORM_SET, uniforms);
 }
 
@@ -6206,6 +6258,8 @@ void RenderForwardClustered::_transparent_debug_init() {
 			transparent_debug_ablate |= TRANSPARENT_ABLATE_CORE;
 		} else if (name == "fringe") {
 			transparent_debug_ablate |= TRANSPARENT_ABLATE_FRINGE;
+		} else if (name == "volume") {
+			transparent_debug_ablate |= TRANSPARENT_ABLATE_VOLUME;
 		} else if (name == "all") {
 			transparent_debug_ablate = TRANSPARENT_ABLATE_SUN | TRANSPARENT_ABLATE_CLUSTER | TRANSPARENT_ABLATE_GI | TRANSPARENT_ABLATE_SOFT | TRANSPARENT_ABLATE_RAYS;
 		} else {
