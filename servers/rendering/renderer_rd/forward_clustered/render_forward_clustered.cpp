@@ -1870,6 +1870,34 @@ void RenderForwardClustered::update_ray_tracing_scene(const PagedArray<RenderGeo
 	rt_scene_ready = rt_shadows != nullptr && rt_shadows->update_scene(p_instances);
 }
 
+bool RenderForwardClustered::HitMaterialResolver::resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracedShadows::HitMaterial &r_material) {
+	GeometryInstanceForwardClustered *ginstance = static_cast<GeometryInstanceForwardClustered *>(p_instance);
+	// The surface list is prepended to as materials are added, so the base
+	// material of a surface (before its next passes and the overlay) is the
+	// last entry with its index.
+	SceneShaderForwardClustered::MaterialData *material = nullptr;
+	for (GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf != nullptr; surf = surf->next) {
+		if (surf->surface_index == p_surface && surf->material != nullptr) {
+			material = surf->material;
+		}
+	}
+	if (material == nullptr || material->shader_data == nullptr) {
+		return false;
+	}
+	RID shader_rid, pipeline;
+	if (!material->shader_data->hit_shader_ready(shader_rid, pipeline)) {
+		return false;
+	}
+	const bool needs_set = material->shader_data->ubo_size > 0 || !material->shader_data->texture_uniforms.is_empty();
+	if (needs_set && (material->hit_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(material->hit_uniform_set))) {
+		return false; // Not built yet (the material's next update makes it).
+	}
+	r_material.shader = shader_rid;
+	r_material.pipeline = pipeline;
+	r_material.uniform_set = needs_set ? material->hit_uniform_set : RID();
+	return true;
+}
+
 RID RenderForwardClustered::get_ray_tracing_tlas() const {
 	if (rt_shadows == nullptr || !rt_scene_ready || !use_rt_sdfgi_probes) {
 		return RID();
@@ -2001,6 +2029,10 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directionality");
 	use_surface_cache = GLOBAL_GET("rendering/ray_tracing/surface_cache/enabled");
 	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
+	rt_gi_hit_shading = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading"));
+	rt_gi_hit_mirror = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_mirror");
+	rt_gi_hit_lod_bias = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_lod_bias");
+	rt_gi_hit_debug = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_debug"));
 	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/atlas_size"));
 	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/texels_per_meter");
 	surface_cache_settings.max_card_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/max_card_size"));
@@ -2029,6 +2061,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	}
 	if (rt_shadows != nullptr) {
 		rt_shadows->set_surface_cache_enabled(use_rt_gi && use_surface_cache, surface_cache_settings, use_surface_cache_mirror);
+		rt_shadows->set_hit_shading(use_rt_gi && use_surface_cache ? rt_gi_hit_shading : 0, &hit_material_resolver);
 	}
 }
 
@@ -2773,6 +2806,21 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.spatial_stride = rt_gi_spatial_stride;
 				gi_quality.spatial_iterations = rt_gi_spatial_iterations;
 				gi_quality.variance_threshold = rt_gi_variance_threshold;
+				gi_quality.hit_shading_mirror = rt_gi_hit_mirror;
+				gi_quality.hit_lod_bias = rt_gi_hit_lod_bias;
+				gi_quality.hit_debug = rt_gi_hit_debug;
+				{
+					// A diffuse ray's footprint: the gather pixel's angle,
+					// widened fourfold for the cosine lobe it stands for.
+					const Projection &proj = p_render_data->scene_data->cam_projection;
+					float tan_half_fov = proj.columns[1][1] != 0.0f ? 1.0f / Math::abs(proj.columns[1][1]) : 1.0f;
+					float gather_height = float(MAX(rb->get_internal_size().y / (use_rt_gi_half_res ? 2 : 1), 1));
+					gi_quality.hit_cone_scale = 2.0f * tan_half_fov / gather_height * 4.0f;
+					gi_quality.emissive_exposure_normalization = 1.0f;
+					if (p_render_data->camera_attributes.is_valid()) {
+						gi_quality.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+					}
+				}
 				if (run_rt_gi && !gi_cascades.active && gi_cascades.voxel_gi_count == 0) {
 					WARN_PRINT_ONCE("Ray-traced GI is enabled but the scene has neither SDFGI nor a VoxelGI to shade ray hits from: off-screen hits return black, so interiors go dark. Enable SDFGI on the WorldEnvironment (or add a VoxelGI).");
 				}

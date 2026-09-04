@@ -24,12 +24,18 @@ struct CardSet {
 	uint cards[8]; // Per card: origin x (13 bits) | log2(width) - 2 (3 bits) | origin y << 16 (13 bits) | log2(height) - 2 << 29; six used.
 };
 
+// One TLAS instance: the ray query's custom index names a record. The cards
+// half is the set; the hit shading half is where the instance's geometry
+// and materials live (rt_hit_inc.glsl), for hits the cards cannot shade.
 struct CardInstance {
 	mat4 local_from_world;
 	uint set;
-	uint pad0;
-	uint pad1;
-	uint pad2;
+	uint geometry_base; // The BLAS's first geometry record, or SURFACE_CACHE_INVALID.
+	uint material_base; // Its per-geometry material slots in the hit material table.
+	int instance_uniforms_ofs; // The instance's shader uniforms, -1 for none.
+	vec4 world_from_local_x; // The basis columns (w unused): the hit's tangent frame into the world.
+	vec4 world_from_local_y;
+	vec4 world_from_local_z;
 };
 
 // A card looks along -axis from outside the box, with view basis (u, v, axis).

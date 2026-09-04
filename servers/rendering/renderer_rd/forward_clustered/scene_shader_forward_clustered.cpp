@@ -233,6 +233,32 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 #endif
 	SceneShaderForwardClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
+	// The hit shading variant: the fragment code in the compute template,
+	// with the fragment stage's built-ins the template stands in for
+	// renamed to its own. Materials that read the screen have nothing to
+	// read at a hit and are left out; the rest compile on first use.
+	{
+		if (hit_pipeline.is_valid()) {
+			RD::get_singleton()->free_rid(hit_pipeline);
+			hit_pipeline = RID();
+		}
+		hit_state = HIT_UNTRIED;
+		const bool hit_shadable = !uses_screen_texture && !uses_depth_texture && !uses_normal_texture && !uses_particle_trails && !uses_point_size && !wireframe && gen_code.code.has("fragment");
+		if (hit_shadable) {
+			HashMap<String, String> hit_code;
+			String fragment = gen_code.code["fragment"];
+			fragment = fragment.replace("gl_FragCoord", "hit_fragcoord").replace("gl_FrontFacing", "hit_front_facing").replace("gl_FragDepth", "hit_fragdepth");
+			hit_code["fragment"] = fragment;
+			if (hit_version.is_null()) {
+				hit_version = SceneShaderForwardClustered::singleton->hit_shader.version_create(false);
+			}
+			SceneShaderForwardClustered::singleton->hit_shader.version_set_compute_code(hit_version, hit_code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
+		} else if (hit_version.is_valid()) {
+			SceneShaderForwardClustered::singleton->hit_shader.version_free(hit_version);
+			hit_version = RID();
+		}
+	}
+
 	ubo_size = gen_code.uniform_total_size;
 	ubo_offsets = gen_code.uniform_offsets;
 	texture_uniforms = gen_code.texture_uniforms;
@@ -570,10 +596,40 @@ SceneShaderForwardClustered::ShaderData::ShaderData() :
 SceneShaderForwardClustered::ShaderData::~ShaderData() {
 	pipeline_hash_map.clear_pipelines();
 
+	if (hit_pipeline.is_valid()) {
+		RD::get_singleton()->free_rid(hit_pipeline);
+	}
+	if (hit_version.is_valid()) {
+		ERR_FAIL_NULL(SceneShaderForwardClustered::singleton);
+		SceneShaderForwardClustered::singleton->hit_shader.version_free(hit_version);
+	}
 	if (version.is_valid()) {
 		ERR_FAIL_NULL(SceneShaderForwardClustered::singleton);
 		SceneShaderForwardClustered::singleton->shader.version_free(version);
 	}
+}
+
+bool SceneShaderForwardClustered::ShaderData::hit_shader_ready(RID &r_shader, RID &r_pipeline) {
+	if (hit_version.is_null()) {
+		return false;
+	}
+	if (hit_state == HIT_UNTRIED) {
+		// The first use compiles it; a failure is final until the code changes.
+		if (SceneShaderForwardClustered::singleton->hit_shader.version_is_valid(hit_version)) {
+			RID shader_rid = SceneShaderForwardClustered::singleton->hit_shader.version_get_shader(hit_version, 0);
+			hit_pipeline = RD::get_singleton()->compute_pipeline_create(shader_rid);
+			hit_state = hit_pipeline.is_valid() ? HIT_READY : HIT_FAILED;
+		} else {
+			hit_state = HIT_FAILED;
+			WARN_PRINT(vformat("Ray-traced hit shading: the material shader %s cannot run at a ray hit; its hits fall back to the probes.", path.is_empty() ? String("(unnamed)") : path));
+		}
+	}
+	if (hit_state != HIT_READY) {
+		return false;
+	}
+	r_shader = SceneShaderForwardClustered::singleton->hit_shader.version_get_shader(hit_version, 0);
+	r_pipeline = hit_pipeline;
+	return true;
 }
 
 RendererRD::MaterialStorage::ShaderData *SceneShaderForwardClustered::_create_shader_func() {
@@ -596,7 +652,19 @@ bool SceneShaderForwardClustered::MaterialData::update_parameters(const HashMap<
 		RID shader_rid = SceneShaderForwardClustered::singleton->shader.version_get_shader(shader_data->version, 0);
 
 		MutexLock lock(SceneShaderForwardClustered::singleton_mutex);
-		return update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, shader_rid, RenderForwardClustered::MATERIAL_UNIFORM_SET, true, true);
+		bool changed = update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, shader_rid, RenderForwardClustered::MATERIAL_UNIFORM_SET, true, true);
+		// The hit shading variant gets the same uniforms in its own set
+		// (a compute stage's layout differs from the fragment's), remade
+		// whenever the main set was, or when a texture it held went away.
+		if (shader_data->hit_version.is_valid() && (shader_data->ubo_size > 0 || !shader_data->texture_uniforms.is_empty())) {
+			bool remake = changed || hit_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(hit_uniform_set);
+			RID hit_shader_rid, hit_pipeline;
+			if (remake && shader_data->hit_shader_ready(hit_shader_rid, hit_pipeline)) {
+				free_parameters_uniform_set(hit_uniform_set);
+				hit_uniform_set = create_secondary_uniform_set(hit_shader_rid, RenderForwardClustered::MATERIAL_UNIFORM_SET, shader_data->ubo_size, shader_data->texture_uniforms, true);
+			}
+		}
+		return changed;
 	} else {
 		return false;
 	}
@@ -604,6 +672,7 @@ bool SceneShaderForwardClustered::MaterialData::update_parameters(const HashMap<
 
 SceneShaderForwardClustered::MaterialData::~MaterialData() {
 	free_parameters_uniform_set(uniform_set);
+	free_parameters_uniform_set(hit_uniform_set);
 }
 
 RendererRD::MaterialStorage::MaterialData *SceneShaderForwardClustered::_create_material_func(ShaderData *p_shader) {
@@ -697,6 +766,12 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		if (RendererCompositorRD::get_singleton()->is_xr_enabled()) {
 			shader.enable_group(SHADER_GROUP_MULTIVIEW);
 		}
+
+		// The hit shading variant shares the scene defines (the material
+		// set index, the sky's octmap layout).
+		Vector<ShaderRD::VariantDefine> hit_versions;
+		hit_versions.push_back(ShaderRD::VariantDefine(SHADER_GROUP_BASE, "", true));
+		hit_shader.initialize(hit_versions, p_defines);
 	}
 
 	material_storage->shader_set_data_request_function(RendererRD::MaterialStorage::SHADER_TYPE_3D, _create_shader_funcs);

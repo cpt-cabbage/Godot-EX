@@ -3810,6 +3810,18 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/light_radius", PROPERTY_HINT_RANGE, "0.0,1000.0,1.0"), 64.0);
 	// The card lighting reads each texel's cell of a world light grid (32 cells across twice the radius) rather than the first 32 lights overlapping its set's box.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/light_grid"), true);
+	// Deferred hit shading: the gather's hits the cards cannot shade (a
+	// multimesh's interior, an uncaptured or overflowed set, a grazing miss)
+	// are handed to their materials, run in compute at the hit and lit like a
+	// card texel. "All Hits" shades every hit that way, the cards then only
+	// feeding the card lighting's own bounce.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading", PROPERTY_HINT_ENUM, "Off,Card Misses,All Hits"), 1);
+	// The mirror ray's hits always go to the material: a card's texel cannot carry the detail a mirror shows.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/hit_shading_mirror"), true);
+	// Added to the texture level the ray cone picks at a hit (positive is blurrier).
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/hit_shading_lod_bias", PROPERTY_HINT_RANGE, "-4.0,4.0,0.1"), 0.0);
+	// Bits: 1 albedo, 2 normal, 4 uv (the shaded hits show the value instead of radiance); 8 no shadow rays, 16 no indirect, 32 no direct.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading_debug", PROPERTY_HINT_RANGE, "0,63,1"), 0);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);

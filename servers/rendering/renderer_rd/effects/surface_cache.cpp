@@ -514,12 +514,22 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 	return set_index;
 }
 
-uint32_t SurfaceCache::add_instance_record(uint32_t p_set, const Transform3D &p_world_from_local) {
-	if (p_set == INVALID_ID || instance_records.size() >= MAX_INSTANCE_RECORDS) {
+uint32_t SurfaceCache::add_instance_record(uint32_t p_set, const Transform3D &p_world_from_local, uint32_t p_geometry_base, uint32_t p_material_base, int32_t p_instance_uniforms_ofs) {
+	if ((p_set == INVALID_ID && p_geometry_base == INVALID_ID) || instance_records.size() >= MAX_INSTANCE_RECORDS) {
 		return INVALID_ID;
 	}
 	InstanceRecord rec;
 	Transform3D inv = p_world_from_local.affine_inverse();
+	for (int col = 0; col < 3; col++) {
+		Vector3 c = p_world_from_local.basis.get_column(col);
+		rec.world_from_local[col * 4 + 0] = c.x;
+		rec.world_from_local[col * 4 + 1] = c.y;
+		rec.world_from_local[col * 4 + 2] = c.z;
+		rec.world_from_local[col * 4 + 3] = 0.0f;
+	}
+	rec.geometry_base = p_geometry_base;
+	rec.material_base = p_material_base;
+	rec.instance_uniforms_ofs = p_instance_uniforms_ofs;
 	// Column-major mat4.
 	for (int col = 0; col < 3; col++) {
 		Vector3 c = inv.basis.get_column(col);
@@ -533,7 +543,6 @@ uint32_t SurfaceCache::add_instance_record(uint32_t p_set, const Transform3D &p_
 	rec.local_from_world[14] = inv.origin.z;
 	rec.local_from_world[15] = 1.0f;
 	rec.set = p_set;
-	rec.pad[0] = rec.pad[1] = rec.pad[2] = 0;
 	instance_records.push_back(rec);
 	return instance_records.size() - 1;
 }
@@ -560,6 +569,9 @@ void SurfaceCache::end_frame() {
 		// Keep a valid (dummy) record so the buffer always exists.
 		InstanceRecord rec = {};
 		rec.set = INVALID_ID;
+		rec.geometry_base = INVALID_ID;
+		rec.material_base = INVALID_ID;
+		rec.instance_uniforms_ofs = -1;
 		instance_records.push_back(rec);
 	}
 	uint32_t needed = instance_records.size();
@@ -760,6 +772,9 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.grid_cell = grid_cell;
 	params.grid_n = GRID_N;
 	params.grid_cap = GRID_CAP;
+	last_grid_built = use_grid;
+	last_grid_origin = grid_origin;
+	last_grid_cell = grid_cell;
 	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun switches parts of
 	// the texel shading off, read once.
 	static const uint32_t ablate = []() {

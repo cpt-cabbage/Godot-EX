@@ -36,6 +36,8 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_geometry_unpack.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
@@ -343,7 +345,7 @@ private:
 		float probe_scale; // Probe-tier hit radiance likewise.
 		uint32_t surface_cache_atlas_size;
 		uint32_t surface_cache_frame; // The cache's clock (update_scene count), for hit requests.
-		float pad;
+		uint32_t hit_capacity; // Packets the hit shading has room for this frame.
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -353,6 +355,7 @@ private:
 	uint32_t scene_frame = 0; // Counts update_scene() calls: the cache's clock.
 	uint32_t alpha_tested_instances = 0; // TLAS instances flagged non-opaque this frame (see update_scene).
 	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
+	RID rt_gi_dummy_rw_buffer; // The same for the buffers a shader writes.
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
@@ -398,12 +401,44 @@ private:
 		AABB aabb;
 	};
 
+	// One surface's unpack into the hit shading's geometry pool (see
+	// rt_geometry_unpack.glsl); re-run per frame for deforming geometry.
+	struct HitUnpackJob {
+		RID vertex_buffer;
+		RID attribute_buffer; // Null when the surface has no colour or uvs.
+		RID index_buffer; // Null when not indexed.
+		uint32_t vertex_count = 0;
+		uint32_t index_count = 0; // Three per triangle, indexed or not.
+		uint32_t position_stride = 0;
+		uint32_t normal_offset = 0;
+		uint32_t normal_stride = 0;
+		uint32_t attribute_stride = 0;
+		uint32_t uv_offset = 0;
+		uint32_t uv2_offset = 0;
+		uint32_t color_offset = 0;
+		uint32_t flags = 0;
+		uint32_t vertex_base = 0; // Pool offsets.
+		uint32_t index_base = 0;
+		AABB aabb;
+		Vector4 uv_scale;
+	};
+
 	struct MeshBlas {
 		RID blas; // Null if the mesh has no BLAS-eligible surfaces.
 		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
 		LocalVector<DecodeJob> decode_jobs; // Re-run per frame for deforming geometry.
 		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
 		bool built = false;
+		// The hit shading's view of the BLAS: its geometries (the casting
+		// surfaces, in the BLAS's order) as records over the pools.
+		LocalVector<uint32_t> geometry_surfaces; // The surface index of each geometry.
+		LocalVector<HitUnpackJob> unpack_jobs;
+		uint32_t geometry_base = 0xFFFFFFFF; // First record in hit_geometry_records, or none.
+		uint32_t pool_vertex_base = 0; // The pool ranges the geometries share.
+		uint32_t pool_vertex_count = 0;
+		uint32_t pool_index_base = 0;
+		uint32_t pool_index_count = 0;
+		bool unpacked = false;
 	};
 	// Variants per mesh: instances can exclude different surfaces from shadow
 	// casting (transparent glass being the classic case), and material
@@ -419,6 +454,182 @@ private:
 
 	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer = RID());
 	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance = RID());
+
+	// Hit shading: the gather defers the hits its cards cannot shade to
+	// their materials, run in compute (scene_hit_shade.glsl). The geometry
+	// they read comes out of the meshes once, into pools; the materials are
+	// per frame, from the renderer.
+public:
+	struct GiCascades;
+	struct GiSky;
+	struct GiQuality;
+	static constexpr uint32_t HIT_MAX_MATERIALS = 2048;
+	static constexpr uint32_t HIT_INVALID = 0xFFFFFFFFu;
+
+	// A material as the hit shading dispatches it: its shader's hit variant
+	// and its uniform set (null when the material has no uniforms).
+	struct HitMaterial {
+		RID shader;
+		RID pipeline;
+		RID uniform_set;
+	};
+
+	// The renderer answers which material an instance's surface is drawn
+	// with, when that material can be run at a hit.
+	class HitMaterialResolver {
+	public:
+		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, HitMaterial &r_material) = 0;
+		virtual ~HitMaterialResolver() {}
+	};
+
+	// Mode 0: off. 1: the hits the cards cannot shade. 2: every hit (the
+	// cards then only serve the card lighting's bounce).
+	void set_hit_shading(uint32_t p_mode, HitMaterialResolver *p_resolver);
+
+private:
+	struct HitGeometryRecord {
+		uint32_t vertex_base;
+		uint32_t index_base;
+		uint32_t triangle_count;
+		uint32_t flags;
+	};
+
+	// A range allocator over a growable storage buffer; growth copies.
+	struct HitPool {
+		RID buffer;
+		uint32_t element_size = 4;
+		uint32_t capacity = 0;
+		struct Range {
+			uint32_t offset;
+			uint32_t count;
+		};
+		LocalVector<Range> free_ranges;
+		bool alloc(uint32_t p_count, uint32_t &r_offset); // False when the buffer must grow first.
+		void free(uint32_t p_offset, uint32_t p_count);
+		void grow(uint32_t p_min_capacity);
+		void release();
+	};
+
+	uint32_t hit_shading_mode = 0;
+	HitMaterialResolver *hit_material_resolver = nullptr;
+	HitPool hit_vertex_pool; // RT_HIT_VERTEX_WORDS words per vertex.
+	HitPool hit_index_pool;
+	HitPool hit_record_pool; // Allocates record indices; the records live below.
+	LocalVector<HitGeometryRecord> hit_geometry_records;
+	RID hit_geometry_buffer;
+	uint32_t hit_geometry_buffer_capacity = 0;
+	bool hit_geometry_dirty = false;
+
+	// Per frame: the material slots the instances' surfaces resolved to, and
+	// the table of slots per instance geometry the records index.
+	LocalVector<HitMaterial> hit_material_slots;
+	HashMap<uint64_t, uint32_t> hit_material_dedupe;
+	LocalVector<uint32_t> hit_material_table;
+	RID hit_material_table_buffer;
+	uint32_t hit_material_table_capacity = 0;
+	uint32_t hit_materials_dropped = 0; // Slots past HIT_MAX_MATERIALS this frame.
+
+	// The frame's packets, their binning, and the result slots.
+	RID hit_packets;
+	RID hit_sorted;
+	uint32_t hit_packet_capacity = 0;
+	RID hit_results;
+	uint32_t hit_results_capacity = 0;
+	RID hit_counts;
+	RID hit_offsets;
+	RID hit_dispatch_args;
+	RID hit_params_ubo;
+
+	RtGeometryUnpackShaderRD hit_unpack_shader;
+	RID hit_unpack_shader_version;
+	RID hit_unpack_pipeline;
+	RtHitBinShaderRD hit_bin_shader;
+	RID hit_bin_shader_version;
+	enum HitBinVariant {
+		HIT_BIN_SCAN,
+		HIT_BIN_SCATTER,
+		HIT_BIN_RESOLVE,
+		HIT_BIN_MAX,
+	};
+	RID hit_bin_pipelines[HIT_BIN_MAX];
+
+	struct HitUnpackPushConstant {
+		float aabb_position[4];
+		float aabb_size[4];
+		float uv_scale[4];
+		uint32_t vertex_count;
+		uint32_t index_count;
+		uint32_t position_stride;
+		uint32_t normal_offset;
+		uint32_t normal_stride;
+		uint32_t attribute_stride;
+		uint32_t uv_offset;
+		uint32_t uv2_offset;
+		uint32_t color_offset;
+		uint32_t flags;
+		uint32_t vertex_base;
+		uint32_t index_base;
+	};
+
+	struct HitBinPushConstant {
+		int32_t screen_size[2];
+		uint32_t capacity;
+		uint32_t slots;
+		uint32_t ray_count;
+		uint32_t pad[3];
+	};
+
+	struct HitDispatchPushConstant {
+		uint32_t packet_base; // Unused: the shader reads its offsets.
+		uint32_t packet_count;
+		uint32_t material_slot;
+		uint32_t pad;
+	};
+
+	struct HitParamsUBO {
+		float world_from_view[16];
+		float view_from_world[16];
+		float ndc_from_view[16]; // For the screen radiance boost, as the gather has them.
+		float view_from_ndc[16];
+		float reproject[16];
+		float camera_origin[4];
+		float sky_quat_or_color[4];
+		int32_t screen_size[2];
+		uint32_t ray_count;
+		uint32_t flags;
+		uint32_t omni_light_count;
+		uint32_t spot_light_count;
+		uint32_t directional_light_count;
+		uint32_t frame;
+		float ray_bias;
+		float sky_energy;
+		float sky_border[2];
+		float time;
+		float emissive_exposure_normalization;
+		float lod_bias;
+		float cone_scale;
+		float grid_origin[3];
+		float grid_cell;
+		uint32_t grid_n;
+		uint32_t grid_cap;
+		float probe_floor;
+		float probe_scale; // The gather's calibration of the probe tier, applied to the hits' indirect term.
+		float screen_radiance_clamp;
+		float screen_radiance_border_fade;
+		float pad[2];
+	};
+	static_assert(sizeof(HitParamsUBO) == 464, "HitParamsUBO layout must match scene_hit_shade.glsl.");
+
+	// The lighting the card pass ran with this frame, kept for the hits.
+	SurfaceCache::LightingInputs hit_lighting;
+	bool hit_lighting_valid = false;
+
+	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
+	void _build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance);
+	void _free_hit_geometry(MeshBlas &r_entry);
+	void _unpack_hit_geometry(MeshBlas &r_entry);
+	uint32_t _hit_material_slot(const HitMaterial &p_material);
+	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
 	// Finds (or creates) the cached BLAS variant for a mesh + surface mask,
 	// healing stale cache entries whose buffers were freed behind our back.
 	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
@@ -484,6 +695,16 @@ public:
 		int32_t spatial_iterations = 2;
 		float variance_threshold = 0.02f;
 		float ao_range = 3.0f; // Distance the near-field visibility term saturates at.
+		// Deferred hit shading (set_hit_shading gives the mode): mirror rays
+		// take it for every hit, cards or not, when hit_shading_mirror is on;
+		// hit_lod_bias offsets the ray cone's texture level; hit_debug bits:
+		// 1 albedo, 2 normal, 4 uv (the shaded hits show the value instead),
+		// 8 no shadow rays, 16 no indirect, 32 no direct.
+		bool hit_shading_mirror = true;
+		float hit_lod_bias = 0.0f;
+		uint32_t hit_debug = 0;
+		float hit_cone_scale = 0.01f; // A diffuse ray's footprint per unit of distance (the renderer derives it from the view).
+		float emissive_exposure_normalization = 1.0f; // The camera's, for the materials' emission at hits.
 	};
 
 	// The radiance caches handed to the gather: SDFGI cascades preferred,

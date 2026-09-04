@@ -1274,6 +1274,49 @@ bool MaterialStorage::MaterialData::update_parameters_uniform_set(const HashMap<
 	return true;
 }
 
+RID MaterialStorage::MaterialData::create_secondary_uniform_set(RID p_shader, uint32_t p_shader_uniform_set, uint32_t p_ubo_size, const Vector<ShaderCompiler::GeneratedCode::Texture> &p_texture_uniforms, bool p_use_linear_color) {
+	if (p_ubo_size == 0 && p_texture_uniforms.is_empty()) {
+		return RID();
+	}
+	uint32_t tex_uniform_count = 0U;
+	for (int i = 0; i < p_texture_uniforms.size(); i++) {
+		tex_uniform_count += uint32_t(p_texture_uniforms[i].array_size > 0 ? p_texture_uniforms[i].array_size : 1);
+	}
+	if ((p_ubo_size > 0 && uniform_buffer[p_use_linear_color].is_null()) || (uint32_t)texture_cache.size() != tex_uniform_count) {
+		return RID(); // Not built yet; the next update comes back here.
+	}
+
+	Vector<RD::Uniform> uniforms;
+	if (p_ubo_size) {
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+		u.binding = 0;
+		u.append_id(uniform_buffer[p_use_linear_color]);
+		uniforms.push_back(u);
+	}
+	const RID *textures = texture_cache.ptrw();
+	for (int i = 0, k = 0; i < p_texture_uniforms.size(); i++) {
+		const int array_size = p_texture_uniforms[i].array_size;
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 1 + k;
+		if (array_size > 0) {
+			for (int j = 0; j < array_size; j++) {
+				u.append_id(textures[k++]);
+			}
+		} else {
+			u.append_id(textures[k++]);
+		}
+		uniforms.push_back(u);
+	}
+
+	RID set = RD::get_singleton()->uniform_set_create(uniforms, p_shader, p_shader_uniform_set);
+	if (set.is_valid()) {
+		RD::get_singleton()->uniform_set_set_invalidation_callback(set, MaterialStorage::_material_uniform_set_erased, &self);
+	}
+	return set;
+}
+
 void MaterialStorage::MaterialData::set_as_used() {
 	for (int i = 0; i < render_target_cache.size(); i++) {
 		render_target_cache[i]->was_used = true;

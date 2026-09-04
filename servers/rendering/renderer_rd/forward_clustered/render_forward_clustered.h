@@ -860,6 +860,20 @@ private:
 	// material pass each frame.
 	bool use_surface_cache = false;
 	bool use_surface_cache_mirror = true;
+	// Deferred hit shading: 0 off, 1 the hits the cards cannot shade, 2 every hit.
+	uint32_t rt_gi_hit_shading = 1;
+	bool rt_gi_hit_mirror = true;
+	float rt_gi_hit_lod_bias = 0.0f;
+	uint32_t rt_gi_hit_debug = 0;
+
+	// Answers the ray tracer's question of which material an instance's
+	// surface is drawn with: the base material's (not a next pass or an
+	// overlay), when its shader compiled for a hit.
+	class HitMaterialResolver : public RendererRD::RaytracedShadows::HitMaterialResolver {
+	public:
+		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracedShadows::HitMaterial &r_material) override;
+	};
+	HitMaterialResolver hit_material_resolver;
 	RendererRD::SurfaceCache::Settings surface_cache_settings;
 	PagedArrayPool<RenderGeometryInstance *> surface_cache_capture_pool;
 	PagedArray<RenderGeometryInstance *> surface_cache_capture_list;

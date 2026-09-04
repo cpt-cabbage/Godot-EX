@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/forward_clustered/scene_hit_shade.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/rendering_server_types.h"
 
@@ -222,6 +223,21 @@ public:
 
 		RID version;
 
+		// The material's fragment code as a compute shader, for the
+		// ray-traced GI's deferred hit shading (scene_hit_shade.glsl).
+		// Compiled with the scene shader when the code can run at a hit;
+		// its pipeline is made on first use, and a compile that fails
+		// (derivatives, say) leaves the material's hits to the probes.
+		RID hit_version;
+		RID hit_pipeline;
+		enum HitState {
+			HIT_UNTRIED,
+			HIT_READY,
+			HIT_FAILED,
+		};
+		HitState hit_state = HIT_UNTRIED;
+		bool hit_shader_ready(RID &r_shader, RID &r_pipeline);
+
 		static const uint32_t VERTEX_INPUT_MASKS_SIZE = ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT;
 		std::atomic<uint64_t> vertex_input_masks[VERTEX_INPUT_MASKS_SIZE] = {};
 
@@ -331,6 +347,7 @@ public:
 	struct MaterialData : public RendererRD::MaterialStorage::MaterialData {
 		ShaderData *shader_data = nullptr;
 		RID uniform_set;
+		RID hit_uniform_set; // The same uniforms against the hit shading variant's layout.
 		uint64_t last_pass = 0;
 		uint32_t index = 0;
 		RID next_pass;
@@ -347,6 +364,7 @@ public:
 	}
 
 	SceneForwardClusteredShaderRD shader;
+	SceneHitShadeShaderRD hit_shader;
 	ShaderCompiler compiler;
 	bool emulate_point_size = false;
 	bool depth_prepass_enabled = false;

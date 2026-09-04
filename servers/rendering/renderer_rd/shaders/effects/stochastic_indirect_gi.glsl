@@ -18,6 +18,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../oct_inc.glsl"
+#include "rt_hit_inc.glsl"
 #include "surface_cache_inc.glsl"
 
 #define SDFGI_MAX_CASCADES 8
@@ -52,7 +53,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float probe_scale; // Multiplies the probe tier.
 	uint surface_cache_atlas_size;
 	uint surface_cache_frame; // The cache's own clock, stamped on the sets hits reach.
-	float pad2;
+	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
 }
 params;
 
@@ -67,6 +68,10 @@ params;
 #define FLAG_CALIBRATE_CACHE 256u
 #define FLAG_SURFACE_CACHE 512u // Hits read the surface cache's lit cards where one covers them.
 #define FLAG_MIRROR 1024u // Smooth surfaces trace a mirror ray instead of leaving reflections to probes.
+#define FLAG_HIT_SHADING 2048u // Hits without a card are deferred to their materials (scene_hit_shade.glsl).
+#define FLAG_HIT_ALL 4096u // Every hit is, cards or not.
+#define FLAG_HIT_MIRROR 8192u // The mirror ray's hits are, cards or not.
+#define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -203,6 +208,39 @@ layout(set = 0, binding = 23) uniform sampler2D card_change_atlas;
 // with its decay: an on-screen hit reads last frame's colour, so it inherits
 // that pixel's mark and a restart propagates through the screen bounces.
 layout(set = 0, binding = 24) uniform sampler2D prev_gi_history;
+
+// Deferred hit shading (see rt_hit_inc.glsl): the material slot of every
+// instance geometry, the packets this pass appends for the hits it hands
+// to the materials, their per-slot counts, and the pixel's result slots the
+// resolve pass folds back after the materials ran. Dummies without
+// FLAG_HIT_SHADING.
+layout(set = 0, binding = 25, std430) restrict readonly buffer HitMaterials {
+	uint data[];
+}
+hit_materials;
+
+layout(set = 0, binding = 26, std430) restrict writeonly buffer HitPackets {
+	uint data[];
+}
+hit_packets;
+
+layout(set = 0, binding = 27, std430) restrict buffer HitCounts {
+	uint data[];
+}
+hit_counts;
+
+layout(set = 0, binding = 28, std430) restrict writeonly buffer HitResults {
+	uvec4 data[];
+}
+hit_results;
+
+// Set per ray in main(): where a deferred hit's result goes (the specular
+// ray's to the reflection), and whether it is the mirror ray, whose hits go
+// to the material before the cards.
+ivec2 hit_pixel = ivec2(0);
+uint hit_slot = 0u;
+bool hit_specular = false;
+bool hit_mirror = false;
 
 // Set per pixel in main(): the largest lighting change a ray of this pixel
 // landed on. The temporal pass restarts the history in proportion.
@@ -821,12 +859,63 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 		vec3 view_hit = view_basis * rel_hit;
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-			vec3 card_radiance;
-			uint card_set;
-			if (surface_cache_lookup(instance_id, rel_hit + params.world_from_view[3].xyz, world_dir, card_radiance, card_set)) {
-				card_requests.frame[card_set] = params.surface_cache_frame;
-				cache_tier = CACHE_TIER_CARD;
-				return screen_radiance_boost(view_hit, card_radiance);
+			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
+			// The hit goes to its material rather than the cards: for every
+			// hit, for the mirror ray's (a card's texel cannot carry the
+			// detail a mirror shows), or, the usual case, for a hit the
+			// cards cannot shade.
+			bool defer_first = bool(params.flags & FLAG_HIT_ALL) || (hit_mirror && bool(params.flags & FLAG_HIT_MIRROR));
+			if (!defer_first) {
+				vec3 card_radiance;
+				uint card_set;
+				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
+					card_requests.frame[card_set] = params.surface_cache_frame;
+					cache_tier = CACHE_TIER_CARD;
+					return screen_radiance_boost(view_hit, card_radiance);
+				}
+			}
+			if (bool(params.flags & FLAG_HIT_SHADING) && instance_id != SURFACE_CACHE_INVALID) {
+				uint geometry_base = card_instances.data[instance_id].geometry_base;
+				uint material_base = card_instances.data[instance_id].material_base;
+				if (geometry_base != SURFACE_CACHE_INVALID && material_base != SURFACE_CACHE_INVALID) {
+					uint geometry_index = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+					uint slot = hit_materials.data[material_base + geometry_index];
+					if (slot != RT_HIT_INVALID && bool(params.flags & FLAG_HIT_DEBUG_CONSTANT)) {
+						return vec3(0.6);
+					}
+					if (slot != RT_HIT_INVALID) {
+						uint idx = atomicAdd(hit_counts.data[RT_HIT_COUNT_TOTAL], 1u);
+						if (idx < params.hit_capacity) {
+							atomicAdd(hit_counts.data[slot], 1u);
+							uint flags = (rayQueryGetIntersectionFrontFaceEXT(rq, true) ? RT_HIT_PACKET_FRONT_FACE : 0u) | (hit_specular ? RT_HIT_PACKET_MIRROR : 0u);
+							uint b = idx * RT_HIT_PACKET_WORDS;
+							hit_packets.data[b] = rt_hit_pack_pixel(hit_pixel, hit_slot, flags);
+							hit_packets.data[b + 1u] = instance_id;
+							hit_packets.data[b + 2u] = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+							hit_packets.data[b + 3u] = (slot & 0xFFFFu) | ((geometry_index & 0xFFu) << 16u);
+							hit_packets.data[b + 4u] = packHalf2x16(rayQueryGetIntersectionBarycentricsEXT(rq, true));
+							hit_packets.data[b + 5u] = rt_hit_pack_dir(world_dir);
+							hit_packets.data[b + 6u] = floatBitsToUint(world_hit.x);
+							hit_packets.data[b + 7u] = floatBitsToUint(world_hit.y);
+							hit_packets.data[b + 8u] = floatBitsToUint(world_hit.z);
+							hit_packets.data[b + 9u] = floatBitsToUint(t_hit);
+							hit_results.data[uint(hit_pixel.y * params.screen_size.x + hit_pixel.x) * (params.ray_count + 1u) + hit_slot] = uvec4(0u, 0u, rt_hit_pack_dir(world_dir), RT_HIT_RESULT_PENDING);
+							// Nothing now; the resolve adds the material's answer.
+							return vec3(0.0);
+						} else {
+							atomicAdd(hit_counts.data[RT_HIT_COUNT_OVERFLOW], 1u);
+						}
+					}
+				}
+			}
+			if (defer_first) {
+				vec3 card_radiance;
+				uint card_set;
+				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
+					card_requests.frame[card_set] = params.surface_cache_frame;
+					cache_tier = CACHE_TIER_CARD;
+					return screen_radiance_boost(view_hit, card_radiance);
+				}
 			}
 		}
 		return screen_radiance_boost(view_hit, sdfgi_cache_radiance(rel_hit, world_dir));
@@ -903,11 +992,15 @@ void main() {
 	// both free from the rays we already trace.
 	vec3 moment = vec3(0.0);
 	float visibility = 0.0;
+	hit_pixel = pixel;
+	hit_mirror = false;
+	hit_specular = false;
 	for (uint r = 0u; r < params.ray_count; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
 		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float t_hit;
+		hit_slot = r;
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
@@ -952,6 +1045,9 @@ void main() {
 		dir = fold_above(dir, world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float spec_t_hit;
+		hit_slot = params.ray_count;
+		hit_specular = true;
+		hit_mirror = mirror;
 		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
 		float view_len = max(length(view_pos), 1e-4);
 		virtual_view_depth = -view_pos.z * (1.0 + min(spec_t_hit, 1e4) / view_len);

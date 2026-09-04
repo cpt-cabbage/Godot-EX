@@ -190,9 +190,12 @@ private:
 	struct InstanceRecord {
 		float local_from_world[16];
 		uint32_t set;
-		uint32_t pad[3];
+		uint32_t geometry_base; // The instance's BLAS's first geometry record (hit shading), or INVALID_ID.
+		uint32_t material_base; // Its per-geometry material slots in the hit material table, or INVALID_ID.
+		int32_t instance_uniforms_ofs;
+		float world_from_local[12]; // Three basis columns, vec4 each.
 	};
-	static_assert(sizeof(InstanceRecord) == 80, "InstanceRecord layout must match the shaders.");
+	static_assert(sizeof(InstanceRecord) == 128, "InstanceRecord layout must match the shaders.");
 
 	enum SetFlags {
 		SET_FLAG_CAPTURED = 1, // Cards hold a capture; hits may read them.
@@ -251,6 +254,9 @@ private:
 	RID grid_shader_version;
 	RID grid_pipeline;
 	RID grid_buffer; // GRID_N^3 cells of 1 + GRID_CAP uints.
+	bool last_grid_built = false; // The grid's state after the last update_lighting, for the hit shading.
+	Vector3 last_grid_origin;
+	float last_grid_cell = 0.0f;
 
 	SurfaceCacheLightShaderRD light_shader;
 	RID light_shader_version;
@@ -326,7 +332,10 @@ public:
 	void begin_frame(uint32_t p_frame);
 	// p_skeleton_version: the skeleton's version for a skinned instance (0 otherwise); a changed pose recaptures.
 	uint32_t add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned, uint64_t p_skeleton_version);
-	uint32_t add_instance_record(uint32_t p_set, const Transform3D &p_world_from_local);
+	// A record per TLAS instance. A set of INVALID_ID is allowed when the hit
+	// shading has a geometry record for the instance: the gather then shades
+	// its hits from the material rather than from cards.
+	uint32_t add_instance_record(uint32_t p_set, const Transform3D &p_world_from_local, uint32_t p_geometry_base = INVALID_ID, uint32_t p_material_base = INVALID_ID, int32_t p_instance_uniforms_ofs = -1);
 	void end_frame();
 
 	// Captures pending this frame, in priority order; the renderer draws them.
@@ -348,6 +357,12 @@ public:
 	RID get_depth_atlas() const { return depth_atlas; }
 	RID get_albedo_atlas() const { return albedo_atlas; }
 	RID get_change_atlas() const { return change_atlas; }
+	// The world light grid as the last update_lighting left it (the hit
+	// shading reads it the way the card lighting does).
+	RID get_grid_buffer() const { return grid_buffer; }
+	bool is_grid_built() const { return last_grid_built; }
+	Vector3 get_grid_origin() const { return last_grid_origin; }
+	float get_grid_cell() const { return last_grid_cell; }
 	uint32_t get_set_count() const { return sets.size(); }
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
 	bool is_ready() const { return sets_buffer.is_valid() && instances_buffer.is_valid(); }
