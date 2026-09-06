@@ -18,6 +18,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_HAS_VELOCITY 1u // A real velocity buffer is bound (else the binding is a dummy and must not be fetched).
 #define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
 #define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
+#define FLAG_FALLBACK_ALL 32u // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
@@ -27,6 +28,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // neighbouring column, so it starts the accumulation and is then replaced by
 // the pixel's own samples over the next few frames.
 #define BORROW_FRAMES 4.0
+// Spatial pass (GI): frames of accumulation under which the pixel's
+// hit-distance term (a ray or two's worth) is not trusted to shape the
+// kernel, and the luminance stop stays off.
+#define YOUNG_FRAMES 8.0
 // Borrowed taps are compared against the depth of a surface point up to a
 // pan's width away, so a wall at a grazing angle needs more room than the
 // same-texel test; a different surface still fails.
@@ -153,6 +158,10 @@ layout(set = 0, binding = 6) uniform sampler2D analytic_diffuse;
 layout(set = 0, binding = 7) uniform sampler2D analytic_specular;
 #ifdef FILTER_DIRECTIONAL
 layout(set = 0, binding = 8) uniform sampler2D in_directional;
+// The gather's fallback for young pixels: the card's bounce irradiance
+// under the surface (rgb) and its relight count (a, / 64); see out_fallback
+// there.
+layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
 #endif
 
 // The spatial pass writes the final buffers, which stay packed on both paths:
@@ -376,6 +385,24 @@ void main() {
 				}
 			}
 		}
+#ifdef HAS_DIRECTIONAL
+		// Where the reflection's image reprojects to, at the virtual depth, run
+		// through the camera reprojection like the surface. Its distance from
+		// the surface's own reprojection is the parallax: how far the reflected
+		// image slid over the surface this frame. Zero under a pure rotation,
+		// and what a camera translation does to every glossy highlight.
+		vec2 prev_uv_virtual = prev_uv;
+		float parallax_px = 0.0;
+		float predicted_virtual_depth = 0.0;
+		if (virtual_view_depth > 0.0) {
+			vec4 prev_ndc_v = params.reproject * vec4(uv * 2.0 - 1.0, depth_from_linear(virtual_view_depth), 1.0);
+			if (prev_ndc_v.w > 0.0) {
+				prev_uv_virtual = (prev_ndc_v.xy / prev_ndc_v.w) * 0.5 + 0.5;
+				parallax_px = length((prev_uv_virtual - prev_uv) * vec2(params.screen_size));
+				predicted_virtual_depth = linearize_depth(prev_ndc_v.z / prev_ndc_v.w);
+			}
+		}
+#endif
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
 		// Frame-edge reveal: the pixel's history lies just off the previous
 		// frame. Rotating the camera sweeps a band of these along the entering
@@ -481,12 +508,9 @@ void main() {
 		// image was, and a reflection that reprojects off frame keeps the
 		// surface's history rather than restarting.
 		if (history_usable && virtual_weight > 0.0 && virtual_view_depth > 0.0) {
-			vec4 prev_ndc_v = params.reproject * vec4(uv * 2.0 - 1.0, depth_from_linear(virtual_view_depth), 1.0);
-			if (prev_ndc_v.w > 0.0) {
-				vec2 prev_uv_v = mix(prev_uv, (prev_ndc_v.xy / prev_ndc_v.w) * 0.5 + 0.5, virtual_weight);
-				if (all(greaterThanEqual(prev_uv_v, vec2(0.0))) && all(lessThanEqual(prev_uv_v, vec2(1.0)))) {
-					hist_s4 = textureLod(history_specular, prev_uv_v, 0.0);
-				}
+			vec2 prev_uv_v = mix(prev_uv, prev_uv_virtual, virtual_weight);
+			if (all(greaterThanEqual(prev_uv_v, vec2(0.0))) && all(lessThanEqual(prev_uv_v, vec2(1.0)))) {
+				hist_s4 = textureLod(history_specular, prev_uv_v, 0.0);
 			}
 		}
 #endif
@@ -538,11 +562,52 @@ void main() {
 			// so it restarts to that many. The mark decays in the history's
 			// alpha over eight frames, where the gather's on-screen hits read
 			// it, so a change propagates through the screen bounces.
+			//
+			// Measured and not kept (MEGALIGHTS_PLAN.md section 19): an
+			// accumulated drift in place of the decaying max, restarting to
+			// 1 / sqrt(c) under a steady change. It followed the slow ones
+			// closer (the game project's flashlight, a cycling hue) and made
+			// a fast flicker worse, an oscillation's swings counting as
+			// distance travelled.
 			change_age = max(change_age, hist_d4.a - 0.125);
 			if (change_age > 0.02) {
 				float keep = max(1.0, 1.0 / change_age);
 				frames_d = min(frames_d, keep);
 				frames_s = min(frames_s, keep);
+			}
+			// The reflection's history is fetched part way between the surface
+			// and its virtual image (virtual_weight), so the rest of the
+			// parallax is a smear: every frame the reflected image moves that
+			// many pixels over the surface while the history stays put. A
+			// history of N frames has smeared over N times that. A rough lobe
+			// blurs its image over many pixels anyway and hides a wider smear;
+			// a glossy one shows its highlight dragging along the surface
+			// (measured: a dolly through the game project's glossy room read
+			// 0.044 mean error at the stop against a 0.001 floor, and the
+			// whole of it was the highlights on the ceiling and walls). So the
+			// frames are capped where the smear would exceed what the lobe
+			// hides. Pure rotation has no parallax and keeps everything.
+			{
+				float smear_px = parallax_px * (1.0 - virtual_weight);
+				float allowed_px = 4.0 + 12.0 * clamp(nr_roughness, 0.0, 1.0);
+				if (smear_px > 1e-3) {
+					frames_s = min(frames_s, max(allowed_px / smear_px, 1.0));
+				}
+			}
+			// The reflection's own depth check, the counterpart of the surface
+			// depth validation above: the history recorded the view depth of
+			// the image it held; the image this frame's ray found is at a
+			// known depth in that frame too. Where the two disagree the
+			// reflected content changed -- an object moved into or out of
+			// the reflection -- and a history of the old content would trail
+			// behind it for the whole temporal window (there is no
+			// neighbourhood clamp on this path to catch it). Only the smooth
+			// end of the roughness range has a hit depth stable enough to
+			// compare; the rough end's lobe lands somewhere new every frame.
+			if (virtual_weight > 0.0 && predicted_virtual_depth > 0.0 && hist_s4.a > 0.0) {
+				float rel = abs(hist_s4.a - predicted_virtual_depth) / max(predicted_virtual_depth, 1.0);
+				float mismatch = smoothstep(0.1, 0.5, rel) * virtual_weight;
+				frames_s = min(frames_s, mix(frames_cap, 2.0, mismatch));
 			}
 #endif
 			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
@@ -581,7 +646,13 @@ void main() {
 #else
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));
 #endif
+#ifdef HAS_DIRECTIONAL
+	// The reflection's virtual view depth rides in the alpha for next frame's
+	// depth check (the spatial pass reads only the colour).
+	imageStore(out_specular, pixel, vec4(result_specular, min(virtual_view_depth, 30000.0)));
+#else
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
+#endif
 	imageStore(out_moments, pixel, moments);
 	imageStore(out_meta, pixel, vec4(frames_d / 64.0, frames_s / 64.0, dominance, reveal));
 #ifdef HAS_DIRECTIONAL
@@ -605,7 +676,20 @@ void main() {
 // cosine-weighted sampling) and the consumer sees a flat irradiance instead of
 // a wild reconstruction. Scaling the moment by a positive scalar is safe: it
 // scales the ratio by the same factor and cannot break its bound.
-void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
+//
+// The visibility in w gets no such ramp. It is a plain mean like the
+// irradiance beside it, filtered by the same kernel, and a young pixel's value
+// is as honest as its irradiance. Faded in from 1 it made the specular
+// occlusion arrive late everywhere the history had restarted: after every
+// camera move the reflections were unoccluded, then darkened over the next
+// dozen frames -- "dark patches slowly appearing".
+// p_fallback_weight (GI, last iteration only): how much of the card's
+// bounce irradiance under the surface stands in for the pixel's still-young
+// filtered history. This output is not fed back into the history (only
+// through the screen radiance the next gather reads, at a bounce's weight),
+// so the fade costs the convergence nothing; measured on
+// rt_lab/temporal_suite.sh game_fixed_flick (14 degrees a frame).
+void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, float p_fallback_weight) {
 	float spec_fresnel_weight = 0.0;
 	if ((params.flags & FLAG_MODULATE_ANALYTIC) != 0u) {
 		d *= texelFetch(analytic_diffuse, pixel, 0).rgb;
@@ -613,6 +697,18 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
 		s *= analytic_s.rgb;
 		spec_fresnel_weight = analytic_s.a;
 	}
+#if defined(FILTER_DIRECTIONAL) && !defined(SPATIAL_HDR_OUT)
+	if ((params.flags & FLAG_FALLBACK_ALL) != 0u) {
+		vec4 fb = texelFetch(fallback_texture, pixel, 0);
+		d = fb.a > 0.0 ? fb.rgb : vec3(0.0);
+	} else if (p_fallback_weight > 0.0) {
+		vec4 fb = texelFetch(fallback_texture, pixel, 0);
+		// The card's own accumulation counts too: a texel relit once is no
+		// better than the pixel's sample.
+		float w = p_fallback_weight * clamp(fb.a * 64.0 / 8.0, 0.0, 1.0);
+		d = mix(d, fb.rgb, w);
+	}
+#endif
 	imageStore(out_diffuse, pixel, vec4(d, 0.0));
 	imageStore(out_specular, pixel, vec4(s, spec_fresnel_weight));
 #if defined(FILTER_DIRECTIONAL) && defined(SPATIAL_HDR_OUT)
@@ -624,7 +720,7 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence) {
 	float len = length(dir.xyz);
 	float ratio = mix(2.0 / 3.0, len / l0, p_confidence);
 	dir.xyz = len > 1e-9 ? dir.xyz * (ratio * l0 / len) : vec3(0.0);
-	imageStore(out_directional, pixel, vec4(dir.xyz, mix(1.0, dir.w, p_confidence)));
+	imageStore(out_directional, pixel, vec4(dir.xyz, dir.w));
 #endif
 }
 
@@ -656,7 +752,7 @@ void main() {
 
 	// Denoiser disabled (sentinel threshold): pass the input through.
 	if (params.variance_threshold >= 1e5) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0, 0.0);
 #ifdef MOMENTS_OUTPUT
 		imageStore(out_moments, pixel, texelFetch(moments_texture, pixel, 0));
 #endif
@@ -690,12 +786,24 @@ void main() {
 	bool newly_revealed = meta.a > 0.25;
 	bool young_d = frames_d < 4.0;
 	bool young_s = frames_s < 4.0;
+	// A young GI pixel's hit-distance term is one or two rays' worth: it
+	// must not shape the kernel (below, the stride tightening and the tap
+	// weight both read it), or the entering band of a fast turn keeps its
+	// single samples as sparkle. The luminance stop stays off as long.
+#ifdef FILTER_DIRECTIONAL
+	float youth = clamp(1.0 - (frames_d - 1.0) / (YOUNG_FRAMES - 1.0), 0.0, 1.0);
+	young_d = young_d || youth > 0.0;
+#else
+	float youth = 0.0;
+#endif
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
 	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
 	// Ramp the directional term in over the first frames of accumulation.
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
+	// And the cards' stand-in out (GI only; see store_result).
+	float fallback_weight = youth;
 	if (!filter_d && !filter_s) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight);
 #ifdef MOMENTS_OUTPUT
 		// Nothing was filtered: the moments this pixel hands to the next
 		// iteration are still the ones that describe its signal.
@@ -725,7 +833,7 @@ void main() {
 	// short scale (the contact darkening under and beside objects), so a wide
 	// kernel would average that detail away. Tighten the footprint in
 	// proportion to how far the rays actually got.
-	stride = max(1, int(round(float(stride) * max(center_dir.w, 0.25))));
+	stride = max(1, int(round(float(stride) * mix(max(center_dir.w, 0.25), 1.0, youth))));
 	// The reflection's kernel follows roughness: a rough lobe is as wide as
 	// the diffuse one, a mirror's image must not be filtered at all.
 	{
@@ -741,7 +849,7 @@ void main() {
 		stride_s = max(1, int(round(float(stride_s) * spec_scale)));
 	}
 	if (!filter_d && !filter_s) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight);
 #ifdef MOMENTS_OUTPUT
 		imageStore(out_moments, pixel, moments);
 #endif
@@ -823,7 +931,7 @@ void main() {
 			// looking at a different part of the scene even where depth and
 			// normal agree, so they must not average together.
 			vec4 sdir = texelFetch(in_directional, sp, 0);
-			wd *= exp(-abs(sdir.w - center_dir.w) * 4.0);
+			wd *= exp(-abs(sdir.w - center_dir.w) * 4.0 * (1.0 - youth));
 #endif
 
 			sum_d += d * wd;
@@ -867,7 +975,7 @@ void main() {
 
 	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb,
 			filter_s ? sum_s / weight_s : center_s4.rgb,
-			filter_d ? sum_dir / weight_d : center_dir, dir_confidence);
+			filter_d ? sum_dir / weight_d : center_dir, dir_confidence, fallback_weight);
 }
 
 #endif

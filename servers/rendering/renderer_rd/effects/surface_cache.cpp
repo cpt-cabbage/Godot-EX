@@ -31,6 +31,7 @@
 #include "surface_cache.h"
 
 #include "core/os/os.h"
+#include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -87,6 +88,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	requests_buffer = rd->storage_buffer_create(MAX_SETS * sizeof(uint32_t));
 	rd->buffer_clear(requests_buffer, 0, MAX_SETS * sizeof(uint32_t));
 	active_buffer = rd->storage_buffer_create((1 + MAX_SETS) * sizeof(uint32_t));
+	relit_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
+	rd->buffer_clear(relit_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
 	dispatch_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t), {}, RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 	params_ubo = rd->uniform_buffer_create(sizeof(LightParamsUBO));
 
@@ -98,7 +101,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 SurfaceCache::~SurfaceCache() {
 	RD *rd = RD::get_singleton();
 	_free_atlases();
-	for (RID rid : { requests_buffer, active_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
+	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
 		if (rid.is_valid()) {
 			rd->free_rid(rid);
 		}
@@ -142,11 +145,16 @@ void SurfaceCache::_create_atlases() {
 	rd->texture_clear(depth_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	tf.mipmaps = LIGHTING_MIPS;
 	lighting_atlas = rd->texture_create(tf, RD::TextureView());
-	rd->texture_clear(lighting_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	rd->texture_clear(lighting_atlas, Color(0, 0, 0, 0), 0, LIGHTING_MIPS, 0, 1);
+	for (uint32_t i = 0; i < LIGHTING_MIPS; i++) {
+		lighting_atlas_mips[i] = rd->texture_create_shared_from_slice(RD::TextureView(), lighting_atlas, 0, i, 1, RD::TEXTURE_SLICE_2D);
+	}
+	tf.mipmaps = 1;
 	indirect_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(indirect_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
-	tf.format = RD::DATA_FORMAT_R16G16_SFLOAT;
+	tf.format = RD::DATA_FORMAT_R32G32B32A32_UINT; // Six packed halves; see the shader.
 	change_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(change_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 
@@ -198,6 +206,12 @@ void SurfaceCache::_create_atlases() {
 
 void SurfaceCache::_free_atlases() {
 	RD *rd = RD::get_singleton();
+	for (RID &rid : lighting_atlas_mips) {
+		if (rid.is_valid()) {
+			rd->free_rid(rid);
+			rid = RID();
+		}
+	}
 	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
@@ -395,9 +409,25 @@ void SurfaceCache::_release_set(uint32_t p_set) {
 	free_sets.push_back(p_set);
 }
 
-void SurfaceCache::begin_frame(uint32_t p_frame) {
+void SurfaceCache::begin_frame(uint32_t p_frame, const Vector3 &p_camera_position) {
 	frame = p_frame;
+	camera_position = p_camera_position;
 	instance_records.clear();
+}
+
+// The card edge an instance wants: its world extent at texels_per_meter, and
+// past density_distance from the camera that density falls off with the
+// distance (halving per doubling), quantized to the power-of-two edges the
+// atlas allocates. A distant object's cards are read by rays that have
+// travelled far and land coarsely anyway; what its full density costs is
+// atlas room, which is what fills up in a furnished level at 2048.
+uint32_t SurfaceCache::_wanted_size(float p_world_extent, float p_distance) const {
+	float density = settings.texels_per_meter;
+	if (settings.density_distance > 0.0f && p_distance > settings.density_distance) {
+		density *= settings.density_distance / p_distance;
+	}
+	uint32_t size = uint32_t(Math::ceil(p_world_extent * density));
+	return CLAMP(Math::next_power_of_2(MAX(size, 1u)), settings.min_card_size, settings.max_card_size);
 }
 
 static uint64_t _material_key(RenderGeometryInstanceBase *p_instance) {
@@ -465,12 +495,31 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 	}
 	s->skeleton_version = p_skeleton_version;
 
+	// Card resolution from the world-space extent and the distance to the
+	// camera (see _wanted_size). A captured set follows the distance with
+	// hysteresis -- it keeps its edge while the distance is within 25% of the
+	// boundary that would change it -- and at most once per round-robin
+	// period, since a new edge is new slots: a recapture and a restart of the
+	// cards' lighting history. It is compared against the edge the set asked
+	// for, not the one the atlas could give it, so a set the atlas shortened
+	// is not recaptured every period trying to grow.
+	Vector3 scale = p_instance->transform.basis.get_scale_abs();
+	float world_extent = MAX(MAX(local_aabb.size.x * scale.x, local_aabb.size.y * scale.y), local_aabb.size.z * scale.z);
+	Vector3 nearest = camera_position.clamp(s->world_aabb.position, s->world_aabb.position + s->world_aabb.size);
+	float distance = camera_position.distance_to(nearest);
+	uint32_t size = _wanted_size(world_extent, distance);
+	if (s->captured && s->size > 0 && size != s->wanted_size) {
+		uint32_t size_near = _wanted_size(world_extent, distance / 1.25f);
+		uint32_t size_far = _wanted_size(world_extent, distance * 1.25f);
+		if ((s->wanted_size >= size_far && s->wanted_size <= size_near) || frame - s->resized_frame < settings.round_robin_period) {
+			size = s->wanted_size;
+		} else {
+			needs_capture = true;
+			s->resized_frame = frame;
+		}
+	}
+
 	if (needs_capture) {
-		// Card resolution from the world-space extent.
-		Vector3 scale = p_instance->transform.basis.get_scale_abs();
-		float world_extent = MAX(MAX(local_aabb.size.x * scale.x, local_aabb.size.y * scale.y), local_aabb.size.z * scale.z);
-		uint32_t size = uint32_t(Math::ceil(world_extent * settings.texels_per_meter));
-		size = CLAMP(Math::next_power_of_2(MAX(size, 1u)), settings.min_card_size, settings.max_card_size);
 		// The set's slots are re-allocated when its longest edge changes (or
 		// its box, which shapes the cards); each card's own edges follow its
 		// extents. When the atlas has no room at this size, a smaller card is
@@ -489,6 +538,7 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 				if (ok) {
 					s->size = edge;
 					s->size_class = edge;
+					s->wanted_size = size;
 				} else {
 					_free_set_slots(*s);
 				}
@@ -775,13 +825,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	last_grid_built = use_grid;
 	last_grid_origin = grid_origin;
 	last_grid_cell = grid_cell;
-	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun switches parts of
-	// the texel shading off, read once.
+	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient switches
+	// parts of the texel shading off (gradient: the bounce ray re-traced for the
+	// temporal gradient), read once.
 	static const uint32_t ablate = []() {
 		uint32_t bits = 0;
 		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
 			const String name = part.strip_edges().to_lower();
-			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : 0;
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : 0;
 		}
 		if (bits != 0) {
 			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
@@ -800,7 +851,10 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	push.set_count = sets.size();
 	push.frame = p_inputs.frame;
 	push.budget = budget;
-	push.round_robin_period = MAX(settings.round_robin_period, 1u);
+	// Profiling: GODOT_CARD_RR=n overrides the round-robin period (1 relights
+	// every captured set every frame, within the budget).
+	static const uint32_t rr_override = OS::get_singleton()->get_environment("GODOT_CARD_RR").to_int();
+	push.round_robin_period = MAX(rr_override > 0 ? rr_override : settings.round_robin_period, 1u);
 	push.omni_light_count = p_inputs.omni_light_count;
 	push.spot_light_count = p_inputs.spot_light_count;
 	push.max_blocks_per_set = max_blocks_per_set;
@@ -817,6 +871,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ p_inputs.omni_light_buffer }));
 	RD::Uniform u_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ p_inputs.spot_light_buffer }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 7, Vector<RID>({ params_ubo }));
+	RD::Uniform u_relit(RD::UNIFORM_TYPE_STORAGE_BUFFER, 8, Vector<RID>({ relit_buffer }));
 
 	if (use_grid) {
 		RENDER_TIMESTAMP("Surface Cache Light Grid");
@@ -854,7 +909,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// Selection: two passes so the sets hits asked for come before the
 	// round-robin slice when the budget runs short.
 	rd->compute_list_bind_compute_pipeline(list, prepare_pipelines[PREPARE_VARIANT_SELECT]);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_select, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_select, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params, u_relit), 0);
 	for (uint32_t mode = 0; mode < 2; mode++) {
 		push.mode = mode;
 		rd->compute_list_set_push_constant(list, &push, sizeof(PreparePushConstant));
@@ -863,7 +918,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 	// Per active set: the lights overlapping its box, and the indirect args.
 	rd->compute_list_bind_compute_pipeline(list, prepare_pipelines[PREPARE_VARIANT_CULL_LIGHTS]);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_cull, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_cull, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params, u_relit), 0);
 	rd->compute_list_set_push_constant(list, &push, sizeof(PreparePushConstant));
 	rd->compute_list_dispatch(list, budget, 1, 1);
 	// The indirect arguments the cull pass wrote are read as such by the
@@ -892,7 +947,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_normal(RD::UNIFORM_TYPE_TEXTURE, 9, Vector<RID>({ normal_atlas }));
 	RD::Uniform l_emission(RD::UNIFORM_TYPE_TEXTURE, 10, Vector<RID>({ emission_atlas }));
 	RD::Uniform l_depth(RD::UNIFORM_TYPE_TEXTURE, 11, Vector<RID>({ depth_atlas }));
-	RD::Uniform l_lighting(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ lighting_atlas }));
+	RD::Uniform l_lighting(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ lighting_atlas_mips[0] }));
 	RD::Uniform l_sdfgi(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 13, Vector<RID>({ p_inputs.sdfgi_ubo }));
 	RD::Uniform l_lightprobe(RD::UNIFORM_TYPE_TEXTURE, 14, Vector<RID>({ lightprobe }));
 	RD::Uniform l_occlusion(RD::UNIFORM_TYPE_TEXTURE, 15, Vector<RID>({ occlusion }));
@@ -903,13 +958,25 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ requests_buffer }));
 	RD::Uniform l_change(RD::UNIFORM_TYPE_IMAGE, 21, Vector<RID>({ change_atlas }));
 	RD::Uniform l_grid(RD::UNIFORM_TYPE_STORAGE_BUFFER, 22, Vector<RID>({ grid_buffer }));
+	RD::Uniform l_relit(RD::UNIFORM_TYPE_STORAGE_BUFFER, 23, Vector<RID>({ relit_buffer }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
+	rd->draw_command_end_label();
+
+	// The lighting atlas's mip chain, for the gather's cone-filtered reads.
+	// The whole atlas, every frame: the relit cards are scattered through it.
+	RENDER_TIMESTAMP("Surface Cache Lighting Mips");
+	rd->draw_command_begin_label("Surface Cache Lighting Mips");
+	CopyEffects *copy_effects = CopyEffects::get_singleton();
+	for (uint32_t i = 1; i < LIGHTING_MIPS; i++) {
+		int32_t mip_size = int32_t(settings.atlas_size >> i);
+		copy_effects->make_mipmap(lighting_atlas_mips[i - 1], lighting_atlas_mips[i], Size2i(mip_size, mip_size));
+	}
 	rd->draw_command_end_label();
 }

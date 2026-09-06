@@ -3806,10 +3806,13 @@ void RenderingServer::init() {
 	// Surface cache: material cards per instance, lit on the GPU, that the
 	// ray-traced GI shades its hits from (in place of the coarse SDFGI cache).
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/enabled"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/atlas_size", PROPERTY_HINT_ENUM, "1024,2048,4096"), 2048);
+	// Explicit enum values: without them the editor stores the option index, which the renderer then read as a 2-pixel atlas.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/atlas_size", PROPERTY_HINT_ENUM, "1024:1024,2048:2048,4096:4096"), 2048);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/texels_per_meter", PROPERTY_HINT_RANGE, "1.0,64.0,1.0"), 16.0);
+	// Past this distance from the camera a card's texel density falls off with the distance (0 disables).
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/density_distance", PROPERTY_HINT_RANGE, "0.0,200.0,1.0"), 12.0);
 	// The longest edge of a card in texels; a card spans several 64-texel atlas pages past 64, and its two edges follow the instance's extents.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/max_card_size", PROPERTY_HINT_ENUM, "64,128,256"), 128);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/max_card_size", PROPERTY_HINT_ENUM, "64:64,128:128,256:256"), 128);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);

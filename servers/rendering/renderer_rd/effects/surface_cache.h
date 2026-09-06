@@ -74,6 +74,7 @@ public:
 	struct Settings {
 		uint32_t atlas_size = 2048;
 		float texels_per_meter = 16.0f;
+		float density_distance = 12.0f; // Beyond this distance from the camera a card's texel density falls with distance (0 = never).
 		uint32_t min_card_size = 8;
 		uint32_t max_card_size = 128; // The longest card edge in texels; a card's two edges follow its own extents.
 		uint32_t captures_per_frame = 8;
@@ -135,13 +136,23 @@ private:
 	RID normal_atlas; // RGBA8, best-fit encoded card-view-space normal.
 	RID emission_atlas; // RGBA16F.
 	RID depth_atlas; // R32F, distance from the card's near plane; 0 = empty.
-	RID lighting_atlas; // RGBA16F, outgoing radiance; alpha = accumulated frames / 64.
+	RID lighting_atlas; // RGBA16F, outgoing radiance, assembled at every relight from the exact direct term and the two accumulated factors below; alpha = the visibility ratio's frames / 64.
+	// The lighting atlas carries a mip chain, rebuilt after every relight
+	// pass: the GI gather reads a hit through the level its ray cone covers
+	// (a rough lobe or a hemisphere sample lands on an average of the region,
+	// not on one bright texel), one 2D view per level for the writers.
+	static const uint32_t LIGHTING_MIPS = 6;
+	RID lighting_atlas_mips[LIGHTING_MIPS];
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
-	// RG16F: r the unshadowed direct luminance (plus emission) at the last
-	// relight, g its relative change since the relight before. The direct
-	// term is deterministic, so that change is the lighting's temporal
-	// gradient (A-SVGF), free: the lighting pass scales its own restart by
-	// it and the GI gather reads it at hits to restart the pixel's history.
+	// RGBA32UI, six packed halves: the unshadowed direct radiance (in
+	// colour) at the last relight, its relative change since the relight
+	// before (the radiance gradient: the term is deterministic, so that
+	// change is the lighting's temporal gradient (A-SVGF), free; the GI
+	// gather reads it at hits to restart the pixel's history), the local
+	// lights' geometric sum, whose change restarts the visibility ratio, and
+	// the accumulated visibility ratio of the local lights (the ratio
+	// estimator: the unshadowed sum is exact every relight, only the shadow
+	// ray's answer is accumulated).
 	RID change_atlas;
 
 	// Scratch framebuffer the material pass renders one card into.
@@ -209,6 +220,7 @@ private:
 		Transform3D transform;
 		AABB world_aabb;
 		uint32_t size = 0; // The longest card edge in texels; 0 when the atlas had no room.
+		uint32_t wanted_size = 0; // The edge the set asked for (size is smaller when the atlas was short).
 		uint32_t size_class = INVALID_ID; // The class of that edge (a change re-allocates every card).
 		Vector2i dims[CARDS_PER_SET]; // Each card's texels.
 		Slot slots[CARDS_PER_SET];
@@ -219,6 +231,7 @@ private:
 		uint64_t skeleton_version = 0; // The skeleton's version the cards were captured with (skinned instances).
 		uint32_t last_seen_frame = 0;
 		uint32_t captured_frame = 0;
+		uint32_t resized_frame = 0; // The last frame the distance density changed this set's size.
 		bool in_use = false;
 	};
 	LocalVector<CardSet> sets;
@@ -235,11 +248,13 @@ private:
 	uint32_t sets_buffer_capacity = 0;
 	RID requests_buffer; // uint per set: frame index of the last gather hit.
 	RID active_buffer; // uint count, then the active set list.
+	RID relit_buffer; // Per set, two uints: the frame of the relight before the last, and of the last (the bounce gradient re-traces the previous relight's ray).
 	RID set_lights_buffer; // Per active slot: count + MAX_LIGHTS_PER_SET indices.
 	RID dispatch_buffer; // Indirect args for the lighting pass.
 	RID params_ubo;
 
 	uint32_t frame = 0;
+	Vector3 camera_position;
 
 	SurfaceCachePrepareShaderRD prepare_shader;
 	RID prepare_shader_version;
@@ -287,7 +302,7 @@ private:
 		uint32_t flags;
 		uint32_t temporal_frames;
 		uint32_t atlas_size;
-		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
+		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no bounce gradient.
 		float grid_origin[3]; // The world light grid (flags bit 32 when built this frame).
 		float grid_cell;
 		uint32_t grid_n;
@@ -317,6 +332,7 @@ private:
 	uint32_t _size_class_for(uint32_t p_size) const;
 	void _release_set(uint32_t p_set);
 	void _card_camera(const CardSet &p_set, uint32_t p_card, Transform3D &r_camera, Projection &r_projection) const;
+	uint32_t _wanted_size(float p_world_extent, float p_distance) const;
 
 public:
 	static constexpr float CAPTURE_MARGIN_FRACTION = 0.02f; // Of the largest extent, plus CAPTURE_MARGIN_MIN.
@@ -329,7 +345,7 @@ public:
 	// add_instance per geometry instance (returning the card set) and one
 	// add_instance_record per TLAS instance (returning the id the ray query
 	// hands back), then end_frame.
-	void begin_frame(uint32_t p_frame);
+	void begin_frame(uint32_t p_frame, const Vector3 &p_camera_position);
 	// p_skeleton_version: the skeleton's version for a skinned instance (0 otherwise); a changed pose recaptures.
 	uint32_t add_instance(RenderGeometryInstanceBase *p_instance, bool p_skinned, uint64_t p_skeleton_version);
 	// A record per TLAS instance. A set of INVALID_ID is allowed when the hit
@@ -354,9 +370,11 @@ public:
 	RID get_sets_buffer() const { return sets_buffer; }
 	RID get_requests_buffer() const { return requests_buffer; }
 	RID get_lighting_atlas() const { return lighting_atlas; }
+	uint32_t get_lighting_atlas_mips() const { return LIGHTING_MIPS; }
 	RID get_depth_atlas() const { return depth_atlas; }
 	RID get_albedo_atlas() const { return albedo_atlas; }
 	RID get_change_atlas() const { return change_atlas; }
+	RID get_indirect_atlas() const { return indirect_atlas; }
 	// The world light grid as the last update_lighting left it (the hit
 	// shading reads it the way the card lighting does).
 	RID get_grid_buffer() const { return grid_buffer; }

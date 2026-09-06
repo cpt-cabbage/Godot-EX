@@ -1885,8 +1885,8 @@ bool RenderForwardClustered::needs_ray_tracing_instances() {
 	return use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || (use_rt_sdfgi_probes && sdfgi_used_last_frame);
 }
 
-void RenderForwardClustered::update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
-	rt_scene_ready = rt_shadows != nullptr && rt_shadows->update_scene(p_instances);
+void RenderForwardClustered::update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {
+	rt_scene_ready = rt_shadows != nullptr && rt_shadows->update_scene(p_instances, p_camera_position);
 }
 
 bool RenderForwardClustered::HitMaterialResolver::resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracedShadows::HitMaterial &r_material) {
@@ -2061,8 +2061,16 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_gi_hit_lod_bias = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_lod_bias");
 	rt_gi_hit_debug = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_debug"));
 	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/atlas_size"));
+	if (surface_cache_settings.atlas_size < 64) {
+		// A project file written while the enum hint had no values holds the option index (0..2).
+		surface_cache_settings.atlas_size = 1024u << MIN(surface_cache_settings.atlas_size, 2u);
+	}
 	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/texels_per_meter");
+	surface_cache_settings.density_distance = GLOBAL_GET("rendering/ray_tracing/surface_cache/density_distance");
 	surface_cache_settings.max_card_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/max_card_size"));
+	if (surface_cache_settings.max_card_size < 16) {
+		surface_cache_settings.max_card_size = 64u << MIN(surface_cache_settings.max_card_size, 2u);
+	}
 	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/captures_per_frame"));
 	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
 	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));

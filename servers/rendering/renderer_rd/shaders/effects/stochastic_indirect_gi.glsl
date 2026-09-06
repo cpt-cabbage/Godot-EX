@@ -54,6 +54,10 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint surface_cache_atlas_size;
 	uint surface_cache_frame; // The cache's own clock, stamped on the sets hits reach.
 	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
+	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
+	uint pad0;
+	uint pad1;
+	uint pad2;
 }
 params;
 
@@ -72,6 +76,7 @@ params;
 #define FLAG_HIT_ALL 4096u // Every hit is, cards or not.
 #define FLAG_HIT_MIRROR 8192u // The mirror ray's hits are, cards or not.
 #define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
+#define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -203,7 +208,7 @@ layout(set = 0, binding = 21) uniform sampler2D card_lighting_atlas;
 layout(set = 0, binding = 22) uniform sampler2D card_depth_atlas;
 // g: how much the card's lighting changed at its last relight (see
 // surface_cache_light.glsl), the temporal gradient a hit hands its pixel.
-layout(set = 0, binding = 23) uniform sampler2D card_change_atlas;
+layout(set = 0, binding = 23) uniform usampler2D card_change_atlas; // Packed halves; the gradient is the second half of the second uint.
 // Last frame's GI temporal output, whose alpha carries a pixel's change mark
 // with its decay: an on-screen hit reads last frame's colour, so it inherits
 // that pixel's mark and a restart propagates through the screen bounces.
@@ -264,7 +269,20 @@ layout(set = 1, binding = 2, r16f) uniform restrict writeonly image2D out_view_d
 // w: mean hit distance normalized against ao_range (0 = contact, 1 = far or
 // sky). Serves as both the ambient visibility term and the denoiser's
 // hit-distance edge stop.
+// Last frame's temporal meta (r: history frames / 64), read at the pixel's
+// reprojection to tell a young pixel, and the cards' accumulated bounce
+// irradiance (a: relights / 64), the young pixel's stand-in (see the end of
+// main).
+layout(set = 0, binding = 29) uniform sampler2D prev_gi_meta;
+layout(set = 0, binding = 30) uniform sampler2D card_indirect_atlas;
+
 layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_directional;
+// The young pixel's fallback: the bounce irradiance of the card under its
+// own surface (rgb, the cards' convention, the gather's own) and the
+// card's relight count (a, / 64); zero where there is none.
+layout(set = 1, binding = 4, rgba16f) uniform restrict writeonly image2D out_fallback;
+// History frames under which the gather spends the primary ray on it.
+#define FALLBACK_FRAMES 8.0
 
 #define M_PI 3.14159265359
 
@@ -640,6 +658,23 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 // reading the card of the wall behind it. Among the valid cards the one
 // facing the ray most squarely wins.
 
+// The atlas position the last successful lookup read (bilinear, in texels),
+// and the card it lies in.
+vec2 card_atlas_texel = vec2(0.0);
+ivec2 card_atlas_origin = ivec2(0);
+ivec2 card_atlas_dims = ivec2(1);
+// The world radius of the ray's footprint at the hit, set by the caller: the
+// card is read through the mip level that footprint covers (never coarser
+// than a quarter of the card), so one sample of a rough lobe or of the
+// hemisphere lands on an average of the region rather than on whatever
+// bright texel it happened to touch.
+float card_lookup_footprint = 0.0;
+float specular_cone_tan = 0.0; // The reflection ray's, from the lobe (main).
+#define CARD_LIGHTING_MIPS 6.0
+// How squarely the chosen card faced the lookup direction, and how far
+// inside its depth tolerance the surface sat: the fallback's confidence.
+float card_lookup_confidence = 0.0;
+
 bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
@@ -660,6 +695,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float best_w = 0.0;
 	vec2 best_uv = vec2(0.0);
 	uint best_packed = 0u;
+	float best_mismatch = 0.0;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -693,16 +729,33 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 			best_w = facing;
 			best_uv = uv01;
 			best_packed = packed;
+			best_mismatch = abs(stored - depth) / tolerance;
 		}
 	}
 	if (best_w <= 0.0) {
 		return false;
 	}
-	// Bilinear inside the card, never across its border.
+	// Bilinear inside the card, never across its border, at the mip the
+	// footprint covers (its texels are wider, so the border margin is too).
 	vec2 best_dims = vec2(card_dims_packed(best_packed));
-	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(0.5), best_dims - 0.5);
-	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), 0.0).rgb;
-	pixel_change = max(pixel_change, texelFetch(card_change_atlas, ivec2(atlas_texel), 0).g);
+	float best_texel_world = (longest + 2.0 * s.margin) / max(best_dims.x, best_dims.y);
+	float lod = 0.0;
+	if (card_lookup_footprint > 0.0) {
+		float max_lod = min(CARD_LIGHTING_MIPS - 1.0, log2(min(best_dims.x, best_dims.y)) - 2.0);
+		lod = clamp(log2(max(card_lookup_footprint / best_texel_world, 1.0)), 0.0, max(max_lod, 0.0));
+	}
+	float margin = 0.5 * exp2(lod);
+	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
+	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), lod).rgb;
+	if (params.card_cone_tan < 0.0) {
+		// Diagnostics (GODOT_GI_CONE < 0): the level picked, as the radiance.
+		r_radiance = vec3(lod / 5.0, card_lookup_footprint, best_texel_world * 10.0);
+	}
+	pixel_change = max(pixel_change, unpackHalf2x16(texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y).y);
+	card_atlas_texel = atlas_texel;
+	card_atlas_origin = card_origin_packed(best_packed);
+	card_lookup_confidence = best_w * (1.0 - best_mismatch * best_mismatch);
+	card_atlas_dims = ivec2(best_dims);
 	r_set = inst.set;
 	return true;
 }
@@ -791,6 +844,30 @@ vec3 geometric_normal(ivec2 full_pixel, vec3 view_pos, vec3 p_fallback) {
 	return dot(n, view_pos) > 0.0 ? -n : n;
 }
 
+// The surface's curvature at a pixel from the depth buffer, per metre, the
+// larger of the two screen axes, convex only (concave reads as flat). For a
+// plane the second difference of the neighbours' positions lies in the
+// plane, so its component along the normal is zero exactly; for a convex
+// surface the neighbours fall behind the tangent plane by k |dP|^2 / 2 each,
+// which is what is read back. Axes that cross a silhouette (a neighbour far
+// off in depth) are skipped.
+float surface_curvature(ivec2 full_pixel, vec3 view_pos, vec3 geo_normal) {
+	float k = 0.0;
+	float tolerance = 0.05 * abs(view_pos.z) + 0.02;
+	for (int axis = 0; axis < 2; axis++) {
+		ivec2 o = axis == 0 ? ivec2(1, 0) : ivec2(0, 1);
+		vec3 pa = view_position_at(full_pixel + o);
+		vec3 pb = view_position_at(full_pixel - o);
+		if (pa == vec3(0.0) || pb == vec3(0.0) || abs(pa.z - view_pos.z) > tolerance || abs(pb.z - view_pos.z) > tolerance) {
+			continue;
+		}
+		vec3 d1 = 0.5 * (pa - pb);
+		vec3 d2 = pa - 2.0 * view_pos + pb;
+		k = max(k, -dot(d2, geo_normal) / max(dot(d1, d1), 1e-8));
+	}
+	return k;
+}
+
 // Keeps a sample direction on the surface's side of its geometric plane:
 // one drawn from a lobe around a normal-mapped shading normal can point into
 // the surface, and is folded across the plane rather than traced into it.
@@ -860,6 +937,9 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
+			// The ray's footprint at the hit: the diffuse cone, or the lobe's
+			// for the reflection ray (a mirror's is a point).
+			card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
 			// The hit goes to its material rather than the cards: for every
 			// hit, for the mirror ray's (a card's texel cannot carry the
 			// detail a mirror shows), or, the usual case, for a hit the
@@ -937,6 +1017,7 @@ void main() {
 		imageStore(out_view_depth, pixel, vec4(0.0));
 		// Sky: unoccluded, no directional bias.
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+		imageStore(out_fallback, pixel, vec4(0.0));
 		return;
 	}
 
@@ -1017,6 +1098,18 @@ void main() {
 	moment *= inv_rays;
 	visibility *= inv_rays;
 
+	// How young this pixel's screen history is (last frame's frame count at
+	// its reprojection, none off frame), for the fallback below.
+	float prev_frames = 0.0;
+	{
+		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
+		if (prev_ndc.w > 0.0) {
+			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
+			if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+				prev_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
+			}
+		}
+	}
 	vec3 reflection = vec3(0.0);
 	// Where the reflected image lives: the virtual point behind the surface,
 	// at the hit distance beyond it along the view ray, expressed as a view
@@ -1033,7 +1126,14 @@ void main() {
 		// GGX half-vector sampling around the mirror direction.
 		vec2 rnd = stbn_sample(pixel, 6u);
 		vec3 v = normalize(-(world_basis * view_pos));
+		// (Measured and not kept: narrowing a young pixel's lobe toward the
+		// mirror direction by its youth, against the entering band's
+		// one-sample sparkle. The sparkle went, but the sharp image it left
+		// in the history read 0.034 against 0.028 at the stop of the flick
+		// case and was still behind at stop + 16; a rough lobe's blur is
+		// what the eye expects there.)
 		float alpha = roughness * roughness;
+		specular_cone_tan = mirror ? 0.0 : min(2.0 * alpha, params.card_cone_tan);
 		float phi = rnd.x * 2.0 * M_PI;
 		float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
 		float st = sqrt(max(1.0 - ct * ct, 0.0));
@@ -1050,11 +1150,77 @@ void main() {
 		hit_mirror = mirror;
 		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
 		float view_len = max(length(view_pos), 1e-4);
-		virtual_view_depth = -view_pos.z * (1.0 + min(spec_t_hit, 1e4) / view_len);
+		// A curved mirror's image is not at the hit distance behind it: a
+		// convex surface of curvature k images a point at distance t at
+		// t / (1 + 2 k t) -- a pillar of 0.4 m radius images the far wall a
+		// fifth of a metre behind its surface, not four metres. Reprojected
+		// at the hit distance instead, the temporal filter fetched the
+		// pillar's reflection history from where the wall would have
+		// reprojected, and every highlight on it doubled and smeared under a
+		// dolly (rt_lab temporal_test MOTION=dolly, the pillar was the whole
+		// of the diff). Planes read zero curvature and keep the hit distance.
+		float curvature = surface_curvature(full_pixel, view_pos, geo_view_normal);
+		float t_image = min(spec_t_hit, 1e4);
+		t_image /= (1.0 + 2.0 * curvature * t_image);
+		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
 	}
 
 	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
 	imageStore(out_directional, pixel, vec4(moment, visibility));
+
+	// The young pixel's stand-in. A fast turn refreshes most of the screen
+	// within a few frames, and the entering band is one-sample pixels among
+	// one-sample pixels: no screen-space kernel averages that into a
+	// picture, and it sparkles for the thirty frames the history takes to
+	// converge. The cards under the surface hold the same estimate,
+	// accumulated over sixty-four relights (the bounce rays read the same
+	// cards these rays do, so the two agree where both are converged;
+	// the SDFGI probes, tried first, ran twice as bright and blue, and the
+	// screen radiance fed that back into the history). Only the surface's
+	// instance is missing, which the G-buffer does not carry: one short
+	// primary ray recovers it, spent only where the history is young.
+	vec4 fallback = vec4(0.0);
+	if (bool(params.flags & FLAG_SURFACE_CACHE)) {
+		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL)) {
+			float view_len = length(rel_pos);
+			vec3 eye_dir = rel_pos / max(view_len, 1e-4);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, params.world_from_view[3].xyz, 0.0, eye_dir, view_len * 1.02);
+			while (rayQueryProceedEXT(rq)) {
+			}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+				uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+				vec3 world_hit = params.world_from_view[3].xyz + eye_dir * rayQueryGetIntersectionTEXT(rq, true);
+				float change_before = pixel_change;
+				vec3 card_radiance;
+				uint card_set;
+				// Looked up along the surface's normal, not the eye ray: the
+				// card facing the surface is the one that holds it, and a
+				// wall at a grazing angle picked its neighbour's otherwise.
+				card_lookup_footprint = 0.0;
+				if (surface_cache_lookup(instance_id, world_hit, -world_normal, card_radiance, card_set)) {
+					card_requests.frame[card_set] = params.surface_cache_frame;
+					// A tent over the card's texels (never across its border):
+					// the card is coarse against the screen, and its texels
+					// would show as blocks at the fade's full weight.
+					vec2 t_min = vec2(card_atlas_origin) + 0.5;
+					vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
+					vec4 ind = vec4(0.0);
+					for (int dy = -1; dy <= 1; dy++) {
+						for (int dx = -1; dx <= 1; dx++) {
+							float w = (dx == 0 ? 2.0 : 1.0) * (dy == 0 ? 2.0 : 1.0);
+							vec2 t = clamp(card_atlas_texel + vec2(dx, dy) * 1.5, t_min, t_max);
+							ind += textureLod(card_indirect_atlas, t / float(params.surface_cache_atlas_size), 0.0) * w;
+						}
+					}
+					ind /= 16.0;
+					fallback = vec4(max(ind.rgb, vec3(0.0)), ind.a * card_lookup_confidence);
+				}
+				pixel_change = change_before;
+			}
+		}
+	}
+	imageStore(out_fallback, pixel, fallback);
 }

@@ -80,6 +80,14 @@ layout(set = 0, binding = 7, std140) uniform Params {
 }
 params;
 
+// Per set: the frame of the relight before the last, then of the last. The
+// lighting pass writes the last; selecting a set promotes it to the previous,
+// which the pass re-traces for its bounce gradient.
+layout(set = 0, binding = 8, std430) restrict buffer Relit {
+	uint frame[];
+}
+relit;
+
 layout(push_constant, std430) uniform Push {
 	uint set_count;
 	uint frame;
@@ -115,6 +123,7 @@ void main() {
 	if (!pick) {
 		return;
 	}
+	relit.frame[set * 2u] = relit.frame[set * 2u + 1u];
 	uint idx = atomicAdd(active_sets.count, 1u);
 	if (idx < push.budget) {
 		active_sets.list[idx] = set;

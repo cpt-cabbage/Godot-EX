@@ -283,7 +283,7 @@ public:
 	// Ray tracing wants the whole scene's geometry, not the frustum-culled
 	// subset: off-screen occluders must still block rays.
 	virtual bool needs_ray_tracing_instances() { return false; }
-	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {}
+	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {}
 	// The frame's scene acceleration structure (null when unavailable), for
 	// consumers like the SDFGI probe integrator.
 	virtual RID get_ray_tracing_tlas() const { return RID(); }

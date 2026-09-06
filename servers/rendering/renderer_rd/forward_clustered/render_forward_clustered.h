@@ -922,7 +922,7 @@ private:
 
 public:
 	virtual bool needs_ray_tracing_instances() override;
-	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances) override;
+	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) override;
 	virtual RID get_ray_tracing_tlas() const override;
 
 private:

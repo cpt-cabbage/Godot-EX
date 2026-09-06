@@ -68,7 +68,8 @@ layout(set = 0, binding = 1, std140) uniform Params {
 	float probe_scale; // The gather's calibration of its probe tier.
 	float screen_radiance_clamp;
 	float screen_radiance_border_fade;
-	vec2 pad;
+	float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
+	float pad;
 }
 params;
 
@@ -370,6 +371,9 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 	return false;
 }
 
+// The world radius of the bounce ray's footprint at its hit (see card_lookup).
+float card_lookup_footprint = 0.0;
+
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup)
 // over this pass's bindings: the nearest texel of the lit atlas.
 bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance) {
@@ -390,6 +394,8 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	ivec2 best_texel = ivec2(0);
+	vec2 best_uv = vec2(0.0);
+	uint best_packed = 0u;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -418,12 +424,27 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		if (facing > best_w) {
 			best_w = facing;
 			best_texel = texel;
+			best_uv = uv01;
+			best_packed = packed;
 		}
 	}
 	if (best_w <= 0.0) {
 		return false;
 	}
-	r_radiance = texelFetch(card_lighting_atlas, best_texel, 0).rgb;
+	// Through the mip the bounce ray's cone covers at the hit (as the
+	// gather reads its hits), bilinear inside the card, never across its
+	// border: one cosine ray per hit lands on an average of the region it
+	// stands for rather than on one bright texel.
+	vec2 best_dims = vec2(card_dims_packed(best_packed));
+	float best_texel_world = (longest + 2.0 * s.margin) / max(best_dims.x, best_dims.y);
+	float lod = 0.0;
+	if (card_lookup_footprint > 0.0) {
+		float max_lod = min(5.0, log2(min(best_dims.x, best_dims.y)) - 2.0);
+		lod = clamp(log2(max(card_lookup_footprint / best_texel_world, 1.0)), 0.0, max(max_lod, 0.0));
+	}
+	float margin = 0.5 * exp2(lod);
+	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
+	r_radiance = textureLod(sampler2D(card_lighting_atlas, linear_sampler_mipmaps), atlas_texel / params.card_atlas_size, lod).rgb;
 	return true;
 }
 
@@ -529,6 +550,9 @@ vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 		vec3 hit = origin + ray_dir * t_hit;
 		uint hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 		vec3 cache_radiance;
+		// The bounce's cone is the diffuse gather's (the pixel's own cone
+		// scale is a few pixels' worth, for texture detail at the hit).
+		card_lookup_footprint = t_hit * max(params.cone_scale, 0.5);
 		if (!card_lookup(hit_instance, hit, ray_dir, cache_radiance)) {
 			vec3 hit_n = hit_triangle_normal(hit_instance, rayQueryGetIntersectionGeometryIndexEXT(rq, true), rayQueryGetIntersectionPrimitiveIndexEXT(rq, true), ray_dir, -ray_dir);
 			vec3 irr;
@@ -672,6 +696,22 @@ void hit_write_discard() {
 }
 #define texture(s, c) textureLod(s, c, hit_lod(vec2(textureSize(s, 0))))
 #define discard { hit_discarded = true; hit_write_discard(); return; }
+// A hit has no neighbouring fragments, and compute has no screen-space
+// derivatives (the material code asks for them all the same:
+// StandardMaterial3D's MSDF text path divides by fwidth(uv), alpha
+// antialiasing and grid shaders too, and the variant failed to compile).
+// What they stand for at a hit is the ray's footprint, so that is what
+// they return: the same type as their argument, the footprint in every
+// component, never zero.
+#define dFdx(x) ((x) * 0.0 + hit_uv_footprint)
+#define dFdy(x) ((x) * 0.0 + hit_uv_footprint)
+#define dFdxCoarse(x) ((x) * 0.0 + hit_uv_footprint)
+#define dFdyCoarse(x) ((x) * 0.0 + hit_uv_footprint)
+#define dFdxFine(x) ((x) * 0.0 + hit_uv_footprint)
+#define dFdyFine(x) ((x) * 0.0 + hit_uv_footprint)
+#define fwidth(x) ((x) * 0.0 + 2.0 * hit_uv_footprint)
+#define fwidthCoarse(x) ((x) * 0.0 + 2.0 * hit_uv_footprint)
+#define fwidthFine(x) ((x) * 0.0 + 2.0 * hit_uv_footprint)
 
 // The scene shader's built-ins the compiler names, as much of them as a
 // hit has. FRAGCOORD, FRONT_FACING and DEPTH are rewritten to these by the

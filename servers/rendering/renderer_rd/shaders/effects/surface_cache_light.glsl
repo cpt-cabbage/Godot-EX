@@ -163,12 +163,83 @@ layout(set = 0, binding = 20, std430) restrict writeonly buffer CardRequests {
 }
 card_requests;
 
-// r: the unshadowed direct luminance (plus emission) at the last relight,
-// g: its relative change since the relight before. The direct term is
-// deterministic, so a change in it is a change in the lights, not noise:
-// A-SVGF's temporal gradient with the relight as the re-shade. It scales the
-// restart of the accumulations below, and the GI gather reads it at hits.
-layout(set = 0, binding = 21, rg16f) uniform restrict image2D change_atlas;
+// The direct term's temporal gradients and its accumulated visibility, six
+// halves packed in four uints (see change_load / change_store):
+// - the unshadowed direct radiance (times albedo, plus emission) at the
+//   last relight, in colour: a hue change at constant brightness is a
+//   change too;
+// - its relative change since the relight before, the radiance gradient.
+//   The unshadowed term is deterministic, so a change in it is a change in
+//   the lights, not noise: A-SVGF's temporal gradient with the relight as
+//   the re-shade. It restarts the bounce accumulation and the GI gather
+//   reads it at hits to restart the pixel's history;
+// - the local lights' geometric sum (attenuation times cosine, unit
+//   colour) at the last relight. Its change is the geometric gradient: a
+//   light that moved, appeared or vanished, which is what can change a
+//   texel's visibility; a light's colour or intensity changing does not,
+//   so it restarts the visibility ratio and nothing else;
+// - the accumulated visibility ratio of the local lights (the ratio
+//   estimator: the unshadowed sum is exact every relight, the shadow ray
+//   only measures what fraction of it arrives);
+// - what the last relight's bounce ray hit: the set (16 bits, 0xFFFF for
+//   none) and the distance (a half). The next relight traces that same ray
+//   again (its seed is the relight's frame, see Relit) and compares:
+//   A-SVGF's gradient sample for the bounce, on the hit's identity rather
+//   than its radiance. It is what catches a surface moving out of the ray's
+//   way -- an emissive box that swept past a floor and left, whose glow the
+//   accumulated bounce otherwise kept for the whole window (rt_lab
+//   temporal_test descend: 0.078 against the converged reference at the
+//   stop, still 0.035 thirty frames on); the radiance gradient above sees
+//   only a light changing. Comparing the radiance instead was measured and
+//   is a chain reaction: a restarted texel's radiance is one sample's, every
+//   texel whose re-traced ray lands on it reads that as a change and
+//   restarts too, and in the game project's dense room the cards never
+//   settled (the glossy floor flickered at 46 hot pixels per thousand at
+//   rest, 0.2 with the gradient off). What a ray hits is deterministic on a
+//   still scene, and a light's change already reaches the bounce through
+//   the hit card's own gradient.
+layout(set = 0, binding = 21, rgba32ui) uniform restrict uimage2D change_atlas;
+
+// Per set, two frames: the relight before the last and the last (the prepare
+// pass promotes the last to the previous when it selects the set).
+layout(set = 0, binding = 23, std430) restrict buffer Relit {
+	uint frame[];
+}
+relit;
+
+struct Change {
+	vec3 unshadowed;
+	float change;
+	float geom;
+	float vis;
+	uint bounce_set; // The last bounce ray's hit set, 0xFFFFu for none.
+	float bounce_t; // Its hit distance.
+};
+
+Change change_load(ivec2 texel) {
+	uvec4 p = imageLoad(change_atlas, texel);
+	Change c;
+	c.unshadowed.rg = unpackHalf2x16(p.x);
+	vec2 bc = unpackHalf2x16(p.y);
+	c.unshadowed.b = bc.x;
+	c.change = bc.y;
+	vec2 gv = unpackHalf2x16(p.z);
+	c.geom = gv.x;
+	c.vis = gv.y;
+	c.bounce_set = p.w >> 16u;
+	c.bounce_t = unpackHalf2x16(p.w).x;
+	return c;
+}
+
+void change_store(ivec2 texel, Change c) {
+	imageStore(change_atlas, texel, uvec4(packHalf2x16(c.unshadowed.rg), packHalf2x16(vec2(c.unshadowed.b, c.change)), packHalf2x16(vec2(c.geom, c.vis)), (packHalf2x16(vec2(c.bounce_t, 0.0)) & 0xFFFFu) | (c.bounce_set << 16u)));
+}
+
+// The radiance gradient as the GI gather reads it: the second half of the
+// second uint.
+float change_load_gradient(ivec2 texel) {
+	return unpackHalf2x16(imageLoad(change_atlas, texel).y).y;
+}
 
 // The world light grid: per cell, a count then grid_cap entries (a light
 // index, bit 31 set for a spot). See surface_cache_grid.glsl.
@@ -355,7 +426,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		return false;
 	}
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
-	r_change = imageLoad(change_atlas, best_texel).g;
+	r_change = change_load_gradient(best_texel);
 	return true;
 }
 
@@ -470,9 +541,27 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 }
 
 // Direct light at the texel: the sun, and the lights culled to the set's box.
-void shade_direct(uint entry, Texel t, inout uint seed, out vec3 direct, out vec3 direct_unshadowed) {
-	direct = vec3(0.0);
-	direct_unshadowed = vec3(0.0);
+// The direct term in its parts: the directional lights with their one hard
+// shadow ray each (deterministic: the same ray every relight, so exact, no
+// accumulation), the local lights' unshadowed analytic sum (exact) with its
+// geometric sum, and one visibility sample of a light drawn from them (the
+// only stochastic part, accumulated as a ratio by accumulate()). The whole
+// unshadowed term is returned for the radiance gradient.
+struct Direct {
+	vec3 exact; // The shadowed directional term.
+	vec3 unshadowed; // Every light, unshadowed.
+	vec3 local_sum; // The local lights, unshadowed.
+	float local_geom; // Their geometric sum.
+	float vis; // The drawn light's visibility, when one was drawn.
+	bool sampled;
+};
+
+void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
+	vec3 direct = vec3(0.0);
+	vec3 direct_unshadowed = vec3(0.0);
+	d.local_geom = 0.0;
+	d.vis = 1.0;
+	d.sampled = false;
 
 	// Directional lights: a shadow ray each. (Folding the sun into the
 	// estimator below was measured to save nothing: its ray is cheap.)
@@ -550,6 +639,7 @@ void shade_direct(uint entry, Texel t, inout uint seed, out vec3 direct, out vec
 			continue;
 		}
 		sum += c;
+		d.local_geom += ndotl * attenuation;
 		weight_sum += w;
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
@@ -567,15 +657,20 @@ void shade_direct(uint entry, Texel t, inout uint seed, out vec3 direct, out vec
 			float dist = length(to_light);
 			vis = mix(1.0, occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask) ? 0.0 : 1.0, sel_opacity);
 		}
-		direct += sum * vis;
+		d.vis = vis;
+		d.sampled = true;
 	}
-
+	d.exact = direct;
+	d.unshadowed = direct_unshadowed;
+	d.local_sum = sum;
 }
 
 // The indirect term: one cosine ray into the scene (see main).
-void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float bounce_change) {
+void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float bounce_change, out uint hit_set_id, out float hit_t) {
 	indirect_sample = vec3(0.0);
 	bounce_change = 0.0;
+	hit_set_id = 0xFFFFu;
+	hit_t = 0.0;
 	if ((params.debug & 1u) != 0u) {
 		// Ablated: the probes or the sky stand in for the ray.
 		if (!sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
@@ -600,7 +695,9 @@ void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float 
 			vec3 card_radiance;
 			uint hit_set;
 			float hit_change;
+			hit_t = t_hit;
 			if (card_lookup(hit_instance, t.origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set, hit_change)) {
+				hit_set_id = hit_set & 0xFFFFu;
 				indirect_sample = card_radiance;
 				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
@@ -616,44 +713,159 @@ void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float 
 	}
 }
 
-// The temporal gradient and the two accumulations, into the atlases.
-void accumulate(ivec2 texel, Texel t, bool reset, vec3 direct, vec3 direct_unshadowed, vec3 indirect_sample, float bounce_change) {
+// The bounce gradient: the previous relight's ray traced again from the same
+// texel with the same seed, what it hits now against what it hit then
+// (stored per texel): another set, or the same one at a distance changed by
+// more than a tenth, is a surface that moved into or out of the ray's way.
+// A ray that finds the same surface at the same distance gives nothing,
+// whatever its radiance did. Off for a fresh texel and when the set has no
+// previous relight.
+float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
+	if (!have_prev || (params.debug & 16u) != 0u) {
+		return -1.0;
+	}
+	Change prev = change_load(texel);
+	vec4 old_indirect = imageLoad(indirect_atlas, texel);
+	if (old_indirect.a <= 0.0) {
+		return -1.0;
+	}
+	vec3 again;
+	float unused_change;
+	uint set_now;
+	float t_now;
+	uint seed = prev_seed;
+	trace_bounce(t, seed, again, unused_change, set_now, t_now);
+	if (set_now != prev.bounce_set) {
+		return 1.0;
+	}
+	if (set_now == 0xFFFFu && (t_now <= 0.0 || prev.bounce_t <= 0.0)) {
+		return 0.0; // The sky both times.
+	}
+	float rel = abs(t_now - prev.bounce_t) / max(max(t_now, prev.bounce_t), 0.05);
+	return smoothstep(0.05, 0.3, rel);
+}
 
-	// The temporal gradient: how much the deterministic part of this texel's
-	// lighting moved since the last relight, relative to itself. Static
-	// lights give exactly zero (the numbers are recomputed from the same
-	// inputs); a fresh capture has nothing to compare with.
-	// A texel never lit since its capture (no frames accumulated) has nothing
-	// to compare with either: the capture's reset flag is raised on the frame
-	// its record is built, which is not always the frame it is first lit.
+// The temporal gradients and the accumulations, into the atlases. The card's
+// radiance is assembled here every relight from an exact direct term and two
+// accumulated factors, never accumulated itself: a light's colour or
+// intensity changing, or a light moving, shows in the cards the frame the
+// set is relit, and the histories hold only what is stochastic -- the local
+// lights' visibility ratio and the bounce.
+// bounce_gradient is the re-traced previous ray's relative change (or a
+// negative value when there was no previous ray to re-trace); card_min /
+// card_max bound the card, so the change read from the neighbours never
+// crosses into another card packed beside it in the atlas.
+void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
 	vec4 old = imageLoad(lighting_atlas, texel);
-	float lum_unshadowed = luminance(t.albedo * direct_unshadowed + t.emission);
-	vec2 prev_change = imageLoad(change_atlas, texel).rg;
-	float change = (reset || old.a <= 0.0) ? 0.0 : abs(lum_unshadowed - prev_change.x) / max(max(lum_unshadowed, prev_change.x), 1e-4);
+	Change prev = change_load(texel);
+	// A fresh capture has nothing to compare with, and neither has a texel
+	// never lit since its capture (no frames accumulated): the capture's
+	// reset flag is raised on the frame its record is built, which is not
+	// always the frame it is first lit.
+	bool fresh = reset || old.a <= 0.0;
+
+	// The radiance gradient: how much the deterministic part of this texel's
+	// lighting moved since the last relight, relative to itself, per channel
+	// and the largest taken (a hue turning at constant luminance is a change
+	// the eye sees, and a luminance gradient read it as nothing: the cards
+	// and the GI's history held the old hue for their whole window). Each
+	// channel is relative to its own size, floored at a quarter of the
+	// luminance so a channel that is nearly nothing cannot restart by
+	// doubling (and the denominator is not the luminance: on a red wall
+	// that read the red channel's move at five times its size, restarted
+	// every history to one frame at every relight, and the glossy floor's
+	// sparse reflections came out bright). Static lights give exactly zero
+	// (the numbers are recomputed from the same inputs).
+	vec3 unshadowed = t.albedo * d.unshadowed + t.emission;
+	vec3 delta = abs(unshadowed - prev.unshadowed);
+	float lum_floor = 0.25 * max(luminance(unshadowed), luminance(prev.unshadowed));
+	vec3 rel = delta / max(max(unshadowed, prev.unshadowed), vec3(max(lum_floor, 1e-4)));
+	float change = fresh ? 0.0 : max(max(rel.r, rel.g), rel.b);
 	// The change outlives the relight that found it, fading over eight: the
 	// gather's one ray per pixel lands on a given card only now and then,
 	// and a change seen for one frame would restart almost no pixel.
-	change = max(change, max(prev_change.y - 0.125, bounce_change));
-	imageStore(change_atlas, texel, vec4(lum_unshadowed, change, 0.0, 0.0));
-	// The accumulations restart to the frame count the change leaves credible
-	// (A-SVGF: alpha = max(alpha, gradient)); a small change barely touches
-	// them, a light switching costs them all their frames but one.
-	float keep_frames = change > 0.02 ? max(1.0, 1.0 / change) : 64.0;
+	change = max(change, max(prev.change - 0.125, bounce_change));
+	// The bounce gradient is one ray's verdict, so only the texels whose
+	// last ray happened to see what moved would restart on their own and
+	// the rest would hold the stale bounce beside them: the change spreads
+	// to the eight neighbours, a texel per relight, fading as it goes.
+	if (!fresh) {
+		change = max(change, bounce_gradient);
+		float spread = 0.0;
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				if (dx == 0 && dy == 0) {
+					continue;
+				}
+				ivec2 n = texel + ivec2(dx, dy);
+				if (any(lessThan(n, card_min)) || any(greaterThan(n, card_max))) {
+					continue;
+				}
+				spread = max(spread, change_load_gradient(n));
+			}
+		}
+		change = max(change, spread - 0.125);
+	}
 
-	// The indirect estimate accumulates on its own: one ray per frame is far
-	// noisier than the direct term's one shadow ray.
+	// The geometric gradient: the local lights' geometric sum against the
+	// last relight's. Only movement (or a light appearing or vanishing) can
+	// change a texel's visibility; a colour or intensity change leaves the
+	// ratio exactly right and is not a reason to lose its history.
+	float geom_change = fresh ? 0.0 : abs(d.local_geom - prev.geom) / max(max(d.local_geom, prev.geom), 1e-6);
+
+	// Two histories, each restarted to the frame count its gradient leaves
+	// credible (A-SVGF: alpha = max(alpha, gradient)); a small change barely
+	// touches them, a light switching costs them all their frames but one.
+	// The window is twice the setting: before the ratio, the composite was
+	// accumulated over the accumulated bounce, and the two cascaded windows
+	// smoothed as much as one of double the length.
+	float window = float(min(2u * params.temporal_frames, 64u));
+
+	// The visibility ratio.
+	float keep_vis = geom_change > 0.02 ? max(1.0, 1.0 / geom_change) : 64.0;
+	float frames = reset ? 0.0 : min(old.a * 64.0, keep_vis);
+	float vis = prev.vis;
+	if (d.sampled) {
+		float alpha = max(1.0 / (frames + 1.0), 1.0 / window);
+		vis = frames <= 0.0 ? d.vis : mix(prev.vis, d.vis, alpha);
+	} else if (frames <= 0.0) {
+		vis = 1.0; // No local light reaches this texel; the sum is zero anyway.
+	}
+	frames = min(frames + 1.0, 64.0);
+	Change now;
+	now.unshadowed = unshadowed;
+	now.change = change;
+	now.geom = d.local_geom;
+	now.vis = vis;
+	now.bounce_set = bounce_set;
+	now.bounce_t = bounce_t;
+	change_store(texel, now);
+
+	// The bounce, one ray per frame: restarted by the radiance gradient (a
+	// light that changed here changed at the texels this one bounces off,
+	// near enough) and by the change the ray's own hit carried.
+	// The restart is A-SVGF's, to 1 / change relights, for the gradient as
+	// for a light. Two softer forms were measured against rt_lab's moving
+	// box and neither kept: a quarter-strength change (a restart to four
+	// relights) left the descend at 0.058 eight frames after the stop, the
+	// same as no gradient, because the spread to the neighbours dies a
+	// texel out and the glow stays wherever no ray saw the box leave; and a
+	// floor of four relights on the bounce alone, with the change carried
+	// whole, cleared the glow as the full restart does and left the flicker
+	// at rest exactly where it was (0.0050 against 0.0051 under the box
+	// still sweeping) -- that flicker is the GI screen history restarting
+	// at the pixels whose rays hit the tracked texels, not the bounce's
+	// own sample count.
+	float keep_ind = change > 0.02 ? max(1.0, 1.0 / change) : 64.0;
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
-	float ind_frames = reset ? 0.0 : min(old_indirect.a * 64.0, keep_frames);
-	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / float(params.temporal_frames));
+	float ind_frames = reset ? 0.0 : min(old_indirect.a * 64.0, keep_ind);
+	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / window);
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
 	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
 
+	vec3 direct = d.exact + d.local_sum * vis;
 	vec3 radiance = max(t.albedo * (direct + indirect) + t.emission, vec3(0.0));
-
-	float frames = reset ? 0.0 : min(old.a * 64.0, keep_frames);
-	float alpha = max(1.0 / (frames + 1.0), 1.0 / float(params.temporal_frames));
-	vec3 accum = frames <= 0.0 ? radiance : mix(old.rgb, radiance, alpha);
-	imageStore(lighting_atlas, texel, vec4(accum, min(frames + 1.0, 64.0) / 64.0));
+	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
 }
 
 void main() {
@@ -699,6 +911,12 @@ void main() {
 	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
 	ivec2 origin_texel = card_origin_packed(card_packed);
 	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
+	ivec2 card_min = origin_texel;
+	ivec2 card_max = origin_texel + dims - ivec2(1);
+	// The relight before this one, whose bounce ray the gradient re-traces.
+	uint prev_frame = relit.frame[set * 2u];
+	bool have_prev = !reset && prev_frame != 0u && prev_frame < params.frame;
+	relit.frame[set * 2u + 1u] = params.frame;
 
 	if (!quad_mode) {
 		ivec2 texel_in_card = block_origin + ivec2(gl_LocalInvocationID.xy);
@@ -708,12 +926,20 @@ void main() {
 			return; // Nothing captured here.
 		}
 		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
-		vec3 direct, direct_unshadowed;
-		shade_direct(entry, t, seed, direct, direct_unshadowed);
+		// The bounce ray's seed is its own, not the direct term's advanced
+		// one: the previous relight's ray must be reproducible from its
+		// frame alone, without replaying that relight's light sampling.
+		uint bounce_seed = pcg_hash(seed ^ 0x9E3779B9u);
+		uint prev_seed = pcg_hash(pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(prev_frame))) ^ 0x9E3779B9u);
+		Direct d;
+		shade_direct(entry, t, seed, d);
+		float gradient = bounce_gradient(texel, t, prev_seed, have_prev);
 		vec3 indirect_sample;
 		float bounce_change;
-		trace_bounce(t, seed, indirect_sample, bounce_change);
-		accumulate(texel, t, reset, direct, direct_unshadowed, indirect_sample, bounce_change);
+		uint bounce_set;
+		float bounce_t;
+		trace_bounce(t, bounce_seed, indirect_sample, bounce_change, bounce_set, bounce_t);
+		accumulate(texel, t, reset, d, indirect_sample, bounce_change, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
 	}
 
@@ -744,17 +970,35 @@ void main() {
 	}
 	ivec2 tracer_texel = origin_texel + quad_in_card + ivec2(int(tracer & 1u), int(tracer >> 1u));
 	uint seed = pcg_hash(uint(tracer_texel.x) + pcg_hash(uint(tracer_texel.y) + pcg_hash(params.frame)));
+	// The previous relight's tracer and seed: the quad's ray left the texel
+	// that frame chose, with the seed that frame gave it.
+	float gradient = -1.0;
+	if (have_prev) {
+		uint prev_tracer = 0u;
+		for (uint j = 0u; j < 4u; j++) {
+			uint k = (prev_frame + j) & 3u;
+			if (valid[k]) {
+				prev_tracer = k;
+				break;
+			}
+		}
+		ivec2 prev_tracer_texel = origin_texel + quad_in_card + ivec2(int(prev_tracer & 1u), int(prev_tracer >> 1u));
+		uint prev_seed = pcg_hash(uint(prev_tracer_texel.x) + pcg_hash(uint(prev_tracer_texel.y) + pcg_hash(prev_frame)));
+		gradient = bounce_gradient(prev_tracer_texel, t[prev_tracer], prev_seed, true);
+	}
 	vec3 indirect_sample;
 	float bounce_change;
-	trace_bounce(t[tracer], seed, indirect_sample, bounce_change);
+	uint bounce_set;
+	float bounce_t;
+	trace_bounce(t[tracer], seed, indirect_sample, bounce_change, bounce_set, bounce_t);
 	for (uint k = 0u; k < 4u; k++) {
 		if (!valid[k]) {
 			continue;
 		}
 		ivec2 texel = origin_texel + quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
-		vec3 direct, direct_unshadowed;
-		shade_direct(entry, t[k], seed_k, direct, direct_unshadowed);
-		accumulate(texel, t[k], reset, direct, direct_unshadowed, indirect_sample, bounce_change);
+		Direct d;
+		shade_direct(entry, t[k], seed_k, d);
+		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
 }

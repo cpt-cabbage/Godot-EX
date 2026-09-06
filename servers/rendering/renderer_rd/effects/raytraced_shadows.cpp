@@ -450,7 +450,7 @@ RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_skinned_blas(RID p_mesh_i
 	return entry;
 }
 
-bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances) {
+bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {
 	RD *rd = RD::get_singleton();
 
 	if (tlas.is_valid() && !rd->acceleration_structure_is_valid(tlas)) {
@@ -466,7 +466,7 @@ bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &
 	scene_frame++;
 	alpha_tested_instances = 0;
 	if (surface_cache != nullptr) {
-		surface_cache->begin_frame(scene_frame);
+		surface_cache->begin_frame(scene_frame, p_camera_position);
 	}
 	// The hit shading's per-frame tables: the materials the instances'
 	// surfaces resolve to, one slot per distinct (pipeline, uniform set).
@@ -1540,7 +1540,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		const StringName accum_names[] = {
 			RB_RT_GI_RAW_AMBIENT, RB_RT_GI_RAW_REFLECTION,
 			RB_RT_GI_HIST_AMBIENT_0, RB_RT_GI_HIST_AMBIENT_1,
-			RB_RT_GI_HIST_REFLECTION_0, RB_RT_GI_HIST_REFLECTION_1
+			RB_RT_GI_HIST_REFLECTION_0, RB_RT_GI_HIST_REFLECTION_1,
+			RB_RT_GI_FALLBACK
 		};
 		for (const StringName &name : accum_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
@@ -1579,6 +1580,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RID raw_ambient = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT, p_view, 0);
 	RID raw_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION, p_view, 0);
 	RID raw_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_DIRECTIONAL, p_view, 0);
+	RID raw_fallback = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_FALLBACK, p_view, 0);
 	// The gather writes this frame's parity; the temporal pass validates its
 	// history against the other one (last frame's).
 	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
@@ -1673,6 +1675,17 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
 	}
 	params.surface_cache_frame = scene_frame;
+	// Diagnostics: GODOT_GI_FALLBACK=all shows the cards' bounce fallback at
+	// every pixel in place of the gathered GI (its bias and coverage against
+	// a converged run).
+	static const bool fallback_all = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK") == "all";
+	// GODOT_GI_CONE=<tan>: the diffuse rays' cone (0 reads every hit at the
+	// cards' full resolution).
+	static const float card_cone_tan = OS::get_singleton()->get_environment("GODOT_GI_CONE") == "" ? 0.25f : float(OS::get_singleton()->get_environment("GODOT_GI_CONE").to_float());
+	params.card_cone_tan = use_cards ? card_cone_tan : 0.0f;
+	if (fallback_all && use_cards) {
+		params.flags |= 32768; // FLAG_FALLBACK_ALL
+	}
 	// Deferred hit shading: a packet per gather ray is the room (every hit
 	// can be deferred); the results hold a slot per diffuse ray and one for
 	// the specular ray.
@@ -1778,7 +1791,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_sc_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ sc_requests }));
 	RD::Uniform u_sc_lighting(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 21, Vector<RID>({ material_sampler, sc_lighting }));
 	RD::Uniform u_sc_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 22, Vector<RID>({ sampler, sc_depth }));
-	RID sc_change = use_cards ? surface_cache->get_change_atlas() : default_black;
+	RID sc_change = use_cards ? surface_cache->get_change_atlas() : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_UINT);
 	RD::Uniform u_sc_change(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 23, Vector<RID>({ sampler, sc_change }));
 	// Last frame's temporal output (the history this frame's temporal pass
 	// reads), for the change mark its alpha carries.
@@ -1795,10 +1808,18 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_hit_packets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 26, Vector<RID>({ hit_shading ? hit_packets : rt_gi_dummy_rw_buffer }));
 	RD::Uniform u_hit_counts(RD::UNIFORM_TYPE_STORAGE_BUFFER, 27, Vector<RID>({ hit_shading ? hit_counts : rt_gi_dummy_rw_buffer }));
 	RD::Uniform u_hit_results(RD::UNIFORM_TYPE_STORAGE_BUFFER, 28, Vector<RID>({ hit_shading ? hit_results : rt_gi_dummy_rw_buffer }));
+	// Last frame's history frame count, for the gather to know which pixels
+	// are young enough to want the cards' fallback, and the cards' bounce
+	// atlas it reads for them.
+	RID prev_meta = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_1 : RB_RT_GI_META_0, p_view, 0);
+	RD::Uniform u_prev_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 29, Vector<RID>({ sampler, prev_meta }));
+	RID sc_indirect = use_cards ? surface_cache->get_indirect_atlas() : default_black;
+	RD::Uniform u_sc_indirect(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 30, Vector<RID>({ material_sampler, sc_indirect }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
 	RD::Uniform u_out_directional(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ raw_directional }));
+	RD::Uniform u_out_fallback(RD::UNIFORM_TYPE_IMAGE, 4, Vector<RID>({ raw_fallback }));
 
 	if (calibrate) {
 		rd->buffer_clear(calibration.buffer, 0, 32);
@@ -1807,8 +1828,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional), 1);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1924,7 +1945,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 		// GI filters radiance directly: no analytic modulation, the bindings
 		// are dummies that are never fetched.
-		denoise_push_constant.flags = 0;
+		denoise_push_constant.flags = (fallback_all && use_cards) ? DENOISE_FLAG_FALLBACK_ALL : 0;
 		denoise_push_constant.stride = p_quality.spatial_stride << iteration;
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, variant);
 		RD::Uniform u_in_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_ambient }));
@@ -1936,6 +1957,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_analytic_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, default_black }));
 		RD::Uniform u_analytic_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler, default_black }));
 		RD::Uniform u_in_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, in_directional }));
+		// The cards' bounce irradiance the last iteration fades young pixels in from.
+		RD::Uniform u_fallback(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, raw_fallback }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ out_ambient }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_reflection }));
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ out_directional }));
@@ -1944,7 +1967,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->draw_command_begin_label("RT GI Spatial");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d, u_fallback), 0);
 		if (last) {
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d), 1);
 		} else {
@@ -2340,6 +2363,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	params.cone_scale = p_quality.hit_cone_scale;
 	params.probe_floor = MAX(p_quality.probe_floor, 0.0f);
 	params.probe_scale = p_probe_scale;
+	params.card_atlas_size = float(surface_cache->get_settings().atlas_size);
 	rd->buffer_update(hit_params_ubo, 0, sizeof(HitParamsUBO), &params);
 
 	HitBinPushConstant bin = {};

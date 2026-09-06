@@ -1951,6 +1951,13 @@ void fragment_shader(in SceneData scene_data) {
 	vec3 rt_gi_bent_normal = normal;
 	float rt_gi_visibility = 1.0;
 	bool rt_gi_occlusion_valid = false;
+	// The traced reflection is held back until the specular occlusion term
+	// has run: a ray that hits the nearby wall already returns the wall, so
+	// occluding it again by the same geometry darkens it twice. Only the
+	// untraced share (sky, probes) is occluded; the traced share is added
+	// after, scaled by how much of the pixel it owns.
+	float rt_gi_spec_traced = 0.0;
+	vec3 rt_gi_spec_traced_color = vec3(0.0);
 #ifndef AMBIENT_LIGHT_DISABLED
 #ifdef USE_LIGHTMAP
 
@@ -2403,27 +2410,31 @@ void fragment_shader(in SceneData scene_data) {
 				float gi_len = length(gi_l1);
 				if (gi_len > 1e-6 * gi_l0) {
 					vec3 gi_dir = gi_l1 / gi_len;
-					// The same rays give a real bent normal and a
-					// range-limited visibility, which the specular occlusion
-					// below uses in place of its luminance heuristic.
-					float gi_q = clamp(gi_len / gi_l0, 0.0, 1.0);
-					rt_gi_bent_normal = gi_dir;
-					rt_gi_visibility = clamp(rt_gi_directional.w, 0.0, 1.0);
-					// The guard above only asks that the moment be longer than
-					// nothing at all, which is much weaker than asking it to
-					// point somewhere. The bent normal IS that moment's
-					// direction, and by the reading below 2/3 is where the
-					// field stops being uniform: under it there is no direction
-					// to recover and gi_dir is the direction of rounding. The
-					// cone it aims then swings frame to frame, and the cone's
-					// own normalisation multiplies that swing.
+					// The same rays give a range-limited visibility, which the
+					// specular occlusion below uses in place of its luminance
+					// heuristic (a switch between the two was tried first and
+					// sparkled: a converged moment sits near 2/3 on any surface
+					// lit from all around, and its noise carried pixels back and
+					// forth over the threshold).
 					//
-					// Blending toward the luminance heuristic instead of
-					// switching was tried and is worse: the heuristic reads the
-					// ambient buffer, so mixing it in spreads that noise onto
-					// the pixels whose cone was fine (664 hot pixels a frame
-					// against 596 for the switch, on the game project).
-					rt_gi_occlusion_valid = bool(implementation_data.rt_gi & 16u) && gi_q > 2.0 / 3.0;
+					// The cone's axis is the surface normal, not the moment's
+					// direction. The moment is the first moment of the
+					// *radiance*: it points at the light, and where the light is
+					// has nothing to do with where the occluders are. Aimed by
+					// it, the cone occluded every reflection that did not look
+					// toward the brightest lamp -- a glossy floor beside a window
+					// went dark wherever it mirrored the room, and did so slowly,
+					// as the moment converged and swung the axis away from the
+					// normal. A bent normal would have to be the mean of the
+					// *unoccluded* directions, which these rays could give but the
+					// buffer has no room for; a visibility cone on the normal is
+					// the well-defined limit without one (occlusion by the
+					// range-limited visibility alone, no direction claimed), and
+					// it is what a bent normal map degenerates to as well.
+					float gi_q = clamp(gi_len / gi_l0, 0.0, 1.0);
+					rt_gi_bent_normal = normal;
+					rt_gi_visibility = clamp(rt_gi_directional.w, 0.0, 1.0);
+					rt_gi_occlusion_valid = bool(implementation_data.rt_gi & 16u);
 					// The useful range of this ratio is narrow and it is worth
 					// being exact about it. Under cosine-weighted sampling a
 					// uniform hemisphere yields 2/3, and a pure cosine lobe --
@@ -2449,7 +2460,12 @@ void fragment_shader(in SceneData scene_data) {
 				// smooth surfaces too, so the traced term covers every
 				// roughness; SSR still overrides it below where it hits.
 				float rt_gi_spec_blend = bool(implementation_data.rt_gi & 64u) ? 1.0 : smoothstep(0.2, 0.35, roughness);
-				indirect_specular_light = mix(indirect_specular_light, rt_gi_reflection, rt_gi_spec_blend);
+				// Composed after the specular occlusion term (see the
+				// declaration): the untraced share stays here to be occluded,
+				// the traced share waits.
+				rt_gi_spec_traced = rt_gi_spec_blend;
+				rt_gi_spec_traced_color = rt_gi_reflection;
+				indirect_specular_light *= 1.0 - rt_gi_spec_blend;
 			}
 		}
 	}
@@ -2551,6 +2567,9 @@ void fragment_shader(in SceneData scene_data) {
 
 		if (reflection_accum.a > 0.0) {
 			indirect_specular_light = reflection_accum.rgb;
+			// Probes keep owning indirect specular: the traced share yields
+			// to them exactly as the untraced share did above.
+			rt_gi_spec_traced *= 1.0 - min(reflection_accum.a, 1.0);
 		}
 
 #ifdef LIGHT_CLEARCOAT_USED
@@ -2648,6 +2667,8 @@ void fragment_shader(in SceneData scene_data) {
 		}
 		indirect_specular_light *= specular_occlusion;
 #endif // SPECULAR_OCCLUSION_DISABLED
+		// The traced reflection, occluded by its own ray and by nothing else.
+		indirect_specular_light += rt_gi_spec_traced_color * rt_gi_spec_traced;
 		ambient_light *= albedo.rgb;
 
 		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL)) {

@@ -101,6 +101,7 @@
 // xyz: luminance-weighted mean incoming direction, w: short-range visibility.
 #define RB_RT_GI_DIRECTIONAL SNAME("directional")
 #define RB_RT_GI_RAW_DIRECTIONAL SNAME("raw_directional")
+#define RB_RT_GI_FALLBACK SNAME("gi_fallback") // A young pixel's card bounce irradiance (rgb) and its relight count (a).
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
@@ -269,6 +270,7 @@ private:
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
 		DENOISE_FLAG_HAS_DIRECTIONAL = 8, // The GI directional buffer travels with the diffuse signal.
 		DENOISE_FLAG_HAS_HIT_DISTANCE = 16, // Spatial: hit distance joins the edge-stopping weights.
+		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -364,6 +366,10 @@ private:
 		uint32_t surface_cache_atlas_size;
 		uint32_t surface_cache_frame; // The cache's clock (update_scene count), for hit requests.
 		uint32_t hit_capacity; // Packets the hit shading has room for this frame.
+		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
+		uint32_t pad0;
+		uint32_t pad1;
+		uint32_t pad2;
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -634,7 +640,8 @@ private:
 		float probe_scale; // The gather's calibration of the probe tier, applied to the hits' indirect term.
 		float screen_radiance_clamp;
 		float screen_radiance_border_fade;
-		float pad[2];
+		float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
+		float pad;
 	};
 	static_assert(sizeof(HitParamsUBO) == 464, "HitParamsUBO layout must match scene_hit_shade.glsl.");
 
@@ -707,7 +714,7 @@ public:
 
 	// Rebuilds the TLAS from the frame's instances.
 	// Returns false if there is no geometry to trace against.
-	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances);
+	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position);
 
 	// Traces the shadow mask for one view into the RB_SCOPE_RT_SHADOWS texture.
 	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size,

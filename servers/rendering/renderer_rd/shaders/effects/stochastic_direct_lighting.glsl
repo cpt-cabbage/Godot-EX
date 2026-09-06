@@ -167,7 +167,6 @@ layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ana
 
 #define MAX_GUIDED_CANDIDATES 8u
 #define MAX_DISCOVERY_CANDIDATES 12u
-#define MAX_CANDIDATES 20u
 
 // The analytic (unshadowed) term bypasses the denoiser entirely -- it is the
 // factor the filtered visibility ratio is multiplied back into, and the whole
@@ -226,12 +225,12 @@ layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ana
 // samples in order to speedup new visible light discovery".
 //
 // The split moves but the total does not. Candidate evaluation, not tracing,
-// dominates this pass (~17 of the 20 slots are filled on a typical pixel) and
-// it is register-bound, so raising MAX_CANDIDATES to widen discovery would
-// cost occupancy on every pixel to fix a band at the frame edge. Re-splitting
-// the same 20 slots is free: the miss path fills exactly as many slots as the
-// hit path. (MAX_ANALYTIC_LIGHTS can push the number of entry_eval calls above
-// the slot count, but it adds no candidate slots and so no registers.)
+// dominates this pass (~17 candidates are evaluated on a typical pixel) and
+// it is register-bound, so widening discovery outright would cost every
+// pixel to fix a band at the frame edge. Re-splitting the same ~20
+// evaluations is free: the miss path evaluates as many lights as the hit
+// path. (The candidates are streamed into the reservoirs as they are
+// evaluated and never stored, so the budgets bound evaluations, not slots.)
 #define MISS_GUIDED_CANDIDATES 4u
 #define MISS_DISCOVERY_CANDIDATES 16u
 
@@ -294,27 +293,72 @@ float get_omni_attenuation(float dist, float inv_range, float decay) {
 }
 
 struct Reservoir {
-	uint candidate; // Index into the candidate arrays; 0xFFFFFFFF = none.
+	uint entry; // The selected light's list entry; INVALID_LIGHT = none.
 	float weight_sum;
 	float selected_weight;
+	float lum; // The selected light's unshadowed luminance, for culling.
 };
 
 // Streaming weighted reservoir sampling, warping the random variable back to
 // [0;1) after each decision so one variable drives the whole loop.
-void reservoir_update(inout Reservoir r, uint index, float w, inout float rng) {
+//
+// The candidates are never stored: each light is offered to the reservoirs as
+// it is evaluated and forgotten. The pass used to fill three arrays of twenty
+// (entry, weight, luminance) and run the reservoirs over them afterwards,
+// which is the same draw at the cost of sixty dynamically indexed dwords in
+// thread-private memory, written once and read back by every reservoir.
+// What the arrays existed for -- the hidden-light budget, a uniform scale on
+// the discovery weights known only once all of them are summed -- is done by
+// keeping the guided and discovery candidates in reservoirs of their own and
+// merging the pair with the scale applied to the discovery side's total: a
+// uniform scale changes nothing about which discovery light won, only how
+// the two sides weigh against each other, so the merged draw is the same
+// distribution the single scaled chain gave.
+void reservoir_update(inout Reservoir r, uint entry, float w, float lum, inout float rng) {
 	if (w <= 0.0) {
 		return;
 	}
 	r.weight_sum += w;
 	float p = w / r.weight_sum;
 	if (rng < p) {
-		r.candidate = index;
+		r.entry = entry;
 		r.selected_weight = w;
+		r.lum = lum;
 		rng = rng / p;
 	} else {
 		rng = (rng - p) / (1.0 - p);
 	}
 	rng = clamp(rng, 0.0, 0.9999999);
+}
+
+void reservoir_init(inout Reservoir r) {
+	r.entry = INVALID_LIGHT;
+	r.weight_sum = 0.0;
+	r.selected_weight = 0.0;
+	r.lum = 0.0;
+}
+
+// Merges the discovery reservoir into the guided one, its weights scaled by
+// p_scale (the hidden-light budget). Returns true when the discovery side won.
+bool reservoir_merge(inout Reservoir g, Reservoir h, float p_scale, inout float rng) {
+	float hw = h.weight_sum * p_scale;
+	if (hw <= 0.0 || h.entry == INVALID_LIGHT) {
+		return false;
+	}
+	float total = g.weight_sum + hw;
+	float p = hw / total;
+	bool take = rng < p;
+	if (take) {
+		g.entry = h.entry;
+		g.selected_weight = h.selected_weight * p_scale;
+		g.lum = h.lum;
+		rng = rng / p;
+	} else {
+		rng = (rng - p) / (1.0 - p);
+	}
+	g.weight_sum = total;
+	rng = clamp(rng, 0.0, 0.9999999);
+	return take;
 }
 
 float luminance(vec3 c) {
@@ -707,12 +751,6 @@ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
 	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, mask_width);
 }
 
-// Candidate set for this pixel's reservoir sampling.
-uint candidate_entries[MAX_CANDIDATES];
-float candidate_weights[MAX_CANDIDATES];
-float candidate_lum[MAX_CANDIDATES]; // Unshadowed luminance, for culling.
-uint candidate_count = 0u;
-
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
@@ -841,8 +879,33 @@ void main() {
 	// is 1. The estimator needs this to scale a subset's estimate up to the
 	// cell, which is the population the analytic denominator covers.
 	float discovery_mult = 1.0;
+	// The guided and discovery candidates each stream into reservoirs of their
+	// own (see reservoir_update), merged once the discovery total is known.
+	// Both banks are walked with constant trip counts so they stay in
+	// registers: a loop bounded by the uniform reservoir count would index them
+	// dynamically and spill them to memory in every light loop below.
+	Reservoir reservoirs[MAX_RESERVOIRS];
+	Reservoir discovery[MAX_RESERVOIRS];
+	float rngs[MAX_RESERVOIRS];
+	for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+		reservoir_init(reservoirs[r]);
+		reservoir_init(discovery[r]);
+		// One STBN value drives each reservoir's whole selection chain (the
+		// warping in reservoir_update stretches it back to [0;1) after every
+		// decision), so the blue noise property survives the loop.
+		rngs[r] = r < params.reservoir_count ? min(stbn_sample(pixel, r).r, 0.9999999) : 0.0;
+	}
+	// The guided keys, in an array only ever indexed by constants: the cell
+	// walk below compares every cell light against the guided list, which at
+	// hundreds of overlapping lights must be a register compare, not a memory
+	// read.
+	uint guided_keys[MAX_GUIDED_CANDIDATES];
+	for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
+		guided_keys[j] = INVALID_LIGHT;
+	}
+	uint guided_count = 0u;
 	uint guided_budget = guide_miss ? MISS_GUIDED_CANDIDATES : MAX_GUIDED_CANDIDATES;
-	for (uint i = 0u; i < visible_count && candidate_count < guided_budget; i++) {
+	for (uint i = 0u; i < visible_count && guided_count < guided_budget; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
 		vec4 ss_unused;
@@ -863,23 +926,21 @@ void main() {
 		if (w <= 0.0) {
 			continue;
 		}
-		candidate_entries[candidate_count] = entry;
-		candidate_weights[candidate_count] = w;
-		candidate_lum[candidate_count] = lum;
+		for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+			if (r < params.reservoir_count) {
+				reservoir_update(reservoirs[r], entry, w, lum, rngs[r]);
+			}
+		}
+		for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
+			if (j == guided_count) {
+				guided_keys[j] = entry & ENTRY_KEY_MASK;
+			}
+		}
 		guided_weight_sum += w;
 		total_lum += lum;
-		candidate_count++;
+		guided_count++;
 	}
-	uint guided_count = candidate_count;
-	// The guided keys again, in an array only ever indexed by constants: the
-	// candidate arrays are indexed dynamically and so live in thread-private
-	// memory, and the cell walk below compares every cell light against the
-	// guided list, which at hundreds of overlapping lights was a memory read
-	// per compare. A constant-bound loop over this copy unrolls into registers.
-	uint guided_keys[MAX_GUIDED_CANDIDATES];
-	for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
-		guided_keys[j] = j < guided_count ? (candidate_entries[j] & ENTRY_KEY_MASK) : INVALID_LIGHT;
-	}
+	float hidden_weight_sum = 0.0;
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
 	// newly visible lights are still found, at a per-pixel cost that does not
@@ -933,14 +994,22 @@ void main() {
 		// from the light grid cell" -- a shorter stride over the cell, paid for
 		// by the guided slots the miss just gave back.
 		uint discovery_budget = guide_miss ? MISS_DISCOVERY_CANDIDATES : MAX_DISCOVERY_CANDIDATES;
-		uint stride = max(1u, (cell_count + discovery_budget - 1u) / discovery_budget);
-		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
-		float stride_mult = float(stride);
-		discovery_mult = stride_mult;
-
 		// Small enough to sum the analytic term exactly, so it stops being an
 		// estimate at all.
 		bool analytic_exact = cell_count <= MAX_ANALYTIC_LIGHTS;
+		// Every light the analytic sum evaluates is a candidate for free: the
+		// reservoirs stream (see reservoir_update), so offering a light costs
+		// an update per reservoir and no storage, against the evaluation the
+		// sum already paid. So while the sum is exact the discovery proposal
+		// is the whole cell, weighted by each light's exact unshadowed
+		// luminance -- the proposal a big-tile reservoir (the STB lighting
+		// talk's two-stage sampling) can only approximate, and the reason
+		// one is not built here. The stride only exists past the exact cap,
+		// where evaluating every light is what the cap says is too expensive.
+		uint stride = analytic_exact ? 1u : max(1u, (cell_count + discovery_budget - 1u) / discovery_budget);
+		uint start = uint(stbn_sample(pixel, 5u).r * float(stride));
+		float stride_mult = float(stride);
+		discovery_mult = stride_mult;
 
 		uint cell_index = 0u;
 		for (uint type = 0u; type < type_count; type++) {
@@ -995,19 +1064,21 @@ void main() {
 					for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
 						listed = listed || (guided_keys[j] == entry);
 					}
-					if (listed || candidate_count >= MAX_CANDIDATES) {
+					if (listed) {
 						continue;
 					}
 					float lum = abs(luminance(f + s));
-					float w = light_weight(lum);
+					float w = light_weight(lum) * stride_mult;
 					if (w <= 0.0) {
 						continue;
 					}
-					candidate_entries[candidate_count] = entry;
-					candidate_weights[candidate_count] = w * stride_mult;
-					candidate_lum[candidate_count] = lum;
+					for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+						if (r < params.reservoir_count) {
+							reservoir_update(discovery[r], entry, w, lum, rngs[r]);
+						}
+					}
+					hidden_weight_sum += w;
 					total_lum += lum * stride_mult;
-					candidate_count++;
 				}
 			}
 		}
@@ -1015,39 +1086,19 @@ void main() {
 
 	// Hidden light budget: clamp discovery weights to a fixed share of the
 	// total, relaxed when the guided lights are dim so a brighter light that
-	// just became visible can still win quickly.
-	if (guided_count > 0u && candidate_count > guided_count) {
-		float hidden_weight_sum = 0.0;
-		for (uint i = guided_count; i < candidate_count; i++) {
-			hidden_weight_sum += candidate_weights[i];
-		}
-		if (hidden_weight_sum > 0.0) {
-			float share = guide_miss ? MISS_HIDDEN_WEIGHT_BUDGET : HIDDEN_WEIGHT_BUDGET;
-			float budget = (share / (1.0 - share)) * guided_weight_sum;
-			float scale = min(1.0, budget / hidden_weight_sum);
-			float relax = clamp(1.0 - guided_weight_sum / DIM_VISIBLE_WEIGHT, 0.0, 1.0);
-			scale = mix(scale, 1.0, relax);
-			for (uint i = guided_count; i < candidate_count; i++) {
-				candidate_weights[i] *= scale;
-			}
-		}
+	// just became visible can still win quickly. Applied as the discovery
+	// side's scale in the merge.
+	float hidden_scale = 1.0;
+	if (guided_count > 0u && hidden_weight_sum > 0.0) {
+		float share = guide_miss ? MISS_HIDDEN_WEIGHT_BUDGET : HIDDEN_WEIGHT_BUDGET;
+		float budget = (share / (1.0 - share)) * guided_weight_sum;
+		float scale = min(1.0, budget / hidden_weight_sum);
+		float relax = clamp(1.0 - guided_weight_sum / DIM_VISIBLE_WEIGHT, 0.0, 1.0);
+		hidden_scale = mix(scale, 1.0, relax);
 	}
-
-	Reservoir reservoirs[MAX_RESERVOIRS];
-	float rngs[MAX_RESERVOIRS];
-	for (uint r = 0u; r < params.reservoir_count; r++) {
-		reservoirs[r].candidate = INVALID_LIGHT;
-		reservoirs[r].weight_sum = 0.0;
-		reservoirs[r].selected_weight = 0.0;
-		// One STBN value drives each reservoir's whole selection chain (the
-		// warping in reservoir_update stretches it back to [0;1) after every
-		// decision), so the blue noise property survives the loop.
-		rngs[r] = min(stbn_sample(pixel, r).r, 0.9999999);
-	}
-	for (uint i = 0u; i < candidate_count; i++) {
-		for (uint r = 0u; r < params.reservoir_count; r++) {
-			reservoir_update(reservoirs[r], i, candidate_weights[i], rngs[r]);
-		}
+	bool selected_hidden[MAX_RESERVOIRS];
+	for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+		selected_hidden[r] = r < params.reservoir_count && reservoir_merge(reservoirs[r], discovery[r], hidden_scale, rngs[r]);
 	}
 
 	vec3 world_pos = (params.world_from_view * vec4(view_pos, 1.0)).xyz;
@@ -1055,7 +1106,7 @@ void main() {
 
 	// Trace each unique selected light once (reservoirs frequently agree when
 	// few lights dominate; duplicate rays would hit the same target).
-	uint traced_candidates[MAX_RESERVOIRS];
+	uint traced_keys[MAX_RESERVOIRS];
 	float traced_visibility[MAX_RESERVOIRS];
 	uint traced_quadrant[MAX_RESERVOIRS];
 	uint traced_count = 0u;
@@ -1086,12 +1137,15 @@ void main() {
 	}
 	uint chosen_visible_light = INVALID_LIGHT;
 	uint traced_found = 0u;
-	for (uint r = 0u; r < params.reservoir_count; r++) {
-		uint c = reservoirs[r].candidate;
-		if (c == INVALID_LIGHT) {
+	for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+		if (r >= params.reservoir_count) {
+			break;
+		}
+		uint entry = reservoirs[r].entry;
+		if (entry == INVALID_LIGHT) {
 			continue;
 		}
-		uint entry = candidate_entries[c];
+		uint key = entry & ENTRY_KEY_MASK;
 
 		// Exposure-relative culling: samples too dim to matter skip their ray.
 		// They can no longer drop out of the ratio the way they did when the
@@ -1100,7 +1154,7 @@ void main() {
 		// would read as fully shadowed. Count it unshadowed instead: it is
 		// below CULL_CONTRIBUTION_FRACTION of the pixel's luminance either way,
 		// which bounds the error at that threshold's own share.
-		bool culled = candidate_lum[c] < CULL_CONTRIBUTION_FRACTION * total_lum;
+		bool culled = reservoirs[r].lum < CULL_CONTRIBUTION_FRACTION * total_lum;
 
 		vec3 f, s;
 		vec4 ss_unused;
@@ -1111,7 +1165,7 @@ void main() {
 		uint slot = 0u;
 		bool found = false;
 		for (uint t = 0u; t < traced_count; t++) {
-			if (traced_candidates[t] == c) {
+			if (traced_keys[t] == key) {
 				visibility = traced_visibility[t];
 				quadrant = traced_quadrant[t];
 				slot = t;
@@ -1211,7 +1265,7 @@ void main() {
 				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			}
 			if (!found) {
-				traced_candidates[traced_count] = c;
+				traced_keys[traced_count] = key;
 				traced_visibility[traced_count] = visibility;
 				traced_quadrant[traced_count] = quadrant;
 				slot = traced_count;
@@ -1234,7 +1288,7 @@ void main() {
 		// reservoir picked a dim light. The ratio's own [0;1] clamp below is the
 		// bound now, and it is the one the denoiser was designed around.
 		float estimator = reservoirs[r].weight_sum / max(reservoirs[r].selected_weight, 1e-6);
-		estimator *= (c < guided_count) ? 1.0 : discovery_mult;
+		estimator *= selected_hidden[r] ? discovery_mult : 1.0;
 		estimator /= float(params.reservoir_count);
 		float lum_d = abs(luminance(f));
 		float lum_s = abs(luminance(s));
