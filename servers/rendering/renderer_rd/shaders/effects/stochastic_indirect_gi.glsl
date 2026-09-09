@@ -344,6 +344,11 @@ layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_dir
 // own surface (rgb, the cards' convention, the gather's own) and the
 // card's relight count (a, / 64); zero where there is none.
 layout(set = 1, binding = 4, rgba16f) uniform restrict writeonly image2D out_fallback;
+// The rough reflection ray, for the resolve before the temporal pass
+// (stochastic_reflection_resolve.glsl): xy its direction in view space
+// (octahedral), z the density it was drawn with (0: no rough ray, a
+// mirror's included), w the hit distance (1e4 and above: a miss).
+layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_spec_ray;
 // History frames under which the gather spends the primary ray on it.
 #define FALLBACK_FRAMES 8.0
 
@@ -1114,6 +1119,7 @@ void main() {
 	if (depth == 0.0) {
 		imageStore(out_ambient, pixel, vec4(0.0));
 		imageStore(out_reflection, pixel, vec4(0.0));
+		imageStore(out_spec_ray, pixel, vec4(0.0));
 		imageStore(out_view_depth, pixel, vec4(0.0));
 		// Sky: unoccluded, no directional bias.
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
@@ -1217,6 +1223,7 @@ void main() {
 	// than by the surface, which is what stops a glossy floor's reflection
 	// from smearing as the camera moves. Defaults to the surface itself.
 	float virtual_view_depth = -view_pos.z;
+	vec4 spec_ray = vec4(0.0);
 	// Smooth surfaces get a mirror ray only when the surface cache is there to
 	// give the hit a surface at texture resolution; otherwise the rough band
 	// alone, with sharp reflections left to SSR / probes, whose sharpness the
@@ -1249,6 +1256,17 @@ void main() {
 		hit_specular = true;
 		hit_mirror = mirror;
 		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
+		if (!mirror) {
+			// The density of the direction traced (after the folds), GGX
+			// over the half vector turned to directions, and the hit's
+			// distance, for the resolve.
+			vec3 h_final = normalize(v + dir);
+			float ndh = max(dot(world_normal, h_final), 0.0);
+			float vdh = max(dot(v, h_final), 1e-4);
+			float d = ndh * ndh * (alpha * alpha - 1.0) + 1.0;
+			float pdf = alpha * alpha / (M_PI * d * d) * ndh / (4.0 * vdh);
+			spec_ray = vec4(octahedron_encode(view_dir), max(pdf, 1e-6), min(spec_t_hit, 1e4));
+		}
 		float view_len = max(length(view_pos), 1e-4);
 		// A curved mirror's image is not at the hit distance behind it: a
 		// convex surface of curvature k images a point at distance t at
@@ -1267,6 +1285,7 @@ void main() {
 
 	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
+	imageStore(out_spec_ray, pixel, spec_ray);
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
 	imageStore(out_directional, pixel, vec4(moment, visibility));
 

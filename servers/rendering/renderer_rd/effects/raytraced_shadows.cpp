@@ -184,6 +184,12 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 		stochastic_denoise_pipelines[i] = RD::get_singleton()->compute_pipeline_create(stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, i));
 	}
 
+	Vector<String> reflection_resolve_modes;
+	reflection_resolve_modes.push_back("");
+	reflection_resolve_shader.initialize(reflection_resolve_modes);
+	reflection_resolve_shader_version = reflection_resolve_shader.version_create();
+	reflection_resolve_pipeline = RD::get_singleton()->compute_pipeline_create(reflection_resolve_shader.version_get_shader(reflection_resolve_shader_version, 0));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 
@@ -290,6 +296,7 @@ RaytracedShadows::~RaytracedShadows() {
 	temporal_shader.version_free(temporal_shader_version);
 	stochastic_shader.version_free(stochastic_shader_version);
 	stochastic_denoise_shader.version_free(stochastic_denoise_shader_version);
+	reflection_resolve_shader.version_free(reflection_resolve_shader_version);
 	light_list_shader.version_free(light_list_shader_version);
 }
 
@@ -1599,7 +1606,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 			RB_RT_GI_RAW_AMBIENT, RB_RT_GI_RAW_REFLECTION,
 			RB_RT_GI_HIST_AMBIENT_0, RB_RT_GI_HIST_AMBIENT_1,
 			RB_RT_GI_HIST_REFLECTION_0, RB_RT_GI_HIST_REFLECTION_1,
-			RB_RT_GI_FALLBACK_0, RB_RT_GI_FALLBACK_1
+			RB_RT_GI_FALLBACK_0, RB_RT_GI_FALLBACK_1,
+			RB_RT_GI_RAW_SPEC_RAY, RB_RT_GI_RESOLVED_REFLECTION
 		};
 		for (const StringName &name : accum_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
@@ -1637,6 +1645,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 	RID raw_ambient = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT, p_view, 0);
 	RID raw_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION, p_view, 0);
+	RID raw_spec_ray = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_SPEC_RAY, p_view, 0);
+	RID resolved_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RESOLVED_REFLECTION, p_view, 0);
 	RID raw_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_DIRECTIONAL, p_view, 0);
 	// The gather writes this frame's parity (as the view depth below); the
 	// temporal pass modulates the history by the change from the other.
@@ -1911,6 +1921,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
 	RD::Uniform u_out_directional(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ raw_directional }));
 	RD::Uniform u_out_fallback(RD::UNIFORM_TYPE_IMAGE, 4, Vector<RID>({ raw_fallback }));
+	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
 	if (calibrate) {
 		rd->buffer_clear(calibration.buffer, 0, 32);
@@ -1920,7 +1931,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback), 1);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1963,6 +1974,53 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	denoise_push_constant.screen_size[1] = size.y;
 	_set_luma_weights(denoise_push_constant.luma_weights);
 	denoise_push_constant.blend_alpha = p_quality.denoise ? 1.0f / float(MAX(p_quality.temporal_frames, 1u)) : 1.0f;
+
+	// The rough reflection's spatial resolve (MEGALIGHTS_PLAN.md section
+	// 28): the temporal pass accumulates the neighbourhood's hits weighted
+	// into each pixel's lobe rather than the pixel's one sample. Measured
+	// neutral against the restart-time resolve of the history fix (section
+	// 27) on the game flick and the mirror-floor strafe, so off by default:
+	// GODOT_GI_SPEC_RESOLVE=1 turns it on, GODOT_GI_SPEC_RESOLVE_RADIUS=
+	// <taps> (2: a 5x5), _MIN and _FULL the roughness it ramps in over (0.2
+	// .. 0.35), _CAP the most a neighbour's density ratio weighs (4).
+	static const bool spec_resolve = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE") == "1";
+	RID temporal_reflection = raw_reflection;
+	if (spec_resolve && p_quality.specular) {
+		static const int64_t resolve_radius = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS").to_int();
+		static const float resolve_min = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN") == "" ? 0.2f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN").to_float());
+		static const float resolve_full = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL") == "" ? 0.35f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL").to_float());
+		static const float resolve_cap = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_CAP") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_CAP").to_float());
+		ReflectionResolvePushConstant resolve_push = {};
+		for (int col = 0; col < 4; col++) {
+			for (int row = 0; row < 4; row++) {
+				resolve_push.view_from_ndc[col * 4 + row] = p_view_from_ndc.columns[col][row];
+			}
+		}
+		resolve_push.screen_size[0] = size.x;
+		resolve_push.screen_size[1] = size.y;
+		resolve_push.depth_scale = (int32_t)depth_scale;
+		resolve_push.radius = (int32_t)CLAMP(resolve_radius, 1, 4);
+		resolve_push.rough_min = resolve_min;
+		resolve_push.rough_full = MAX(resolve_full, resolve_min + 1e-3f);
+		resolve_push.weight_cap = resolve_cap;
+		RID resolve_rid = reflection_resolve_shader.version_get_shader(reflection_resolve_shader_version, 0);
+		RD::Uniform r_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_reflection }));
+		RD::Uniform r_ray(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_spec_ray }));
+		RD::Uniform r_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
+		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, p_normal_roughness }));
+		RD::Uniform r_out(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ resolved_reflection }));
+		RENDER_TIMESTAMP("RT GI Reflection Resolve");
+		rd->draw_command_begin_label("RT GI Reflection Resolve");
+		RD::ComputeListID resolve_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(resolve_list, reflection_resolve_pipeline);
+		rd->compute_list_bind_uniform_set(resolve_list, uniform_set_cache->get_cache(resolve_rid, 0, r_raw, r_ray, r_depth, r_nr), 0);
+		rd->compute_list_bind_uniform_set(resolve_list, uniform_set_cache->get_cache(resolve_rid, 1, r_out), 1);
+		rd->compute_list_set_push_constant(resolve_list, &resolve_push, sizeof(ReflectionResolvePushConstant));
+		rd->compute_list_dispatch_threads(resolve_list, size.x, size.y, 1);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+		temporal_reflection = resolved_reflection;
+	}
 	denoise_push_constant.depth_tolerance = 0.05f;
 	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
 	denoise_push_constant.depth_scale = (int32_t)depth_scale;
@@ -2015,7 +2073,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		}
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL_VALIDATE);
 		RD::Uniform u_raw_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_ambient }));
-		RD::Uniform u_raw_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_reflection }));
+		RD::Uniform u_raw_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, temporal_reflection }));
 		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
 		RD::Uniform u_hist_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, hist_read_a }));
 		RD::Uniform u_hist_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, hist_read_r }));

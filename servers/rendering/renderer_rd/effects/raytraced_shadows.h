@@ -42,6 +42,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/translucency_volume.glsl.gen.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
@@ -104,6 +105,9 @@
 // A young pixel's card bounce stand-in (rgb) and its confidence (a), ping-ponged: the temporal pass modulates the history by the change between the two.
 #define RB_RT_GI_FALLBACK_0 SNAME("gi_fallback_0")
 #define RB_RT_GI_FALLBACK_1 SNAME("gi_fallback_1")
+// The rough reflection ray's direction and density (the gather), and the reflection resolved over the neighbourhood's rays (the resolve pass, what the temporal pass accumulates).
+#define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
+#define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
@@ -405,6 +409,22 @@ private:
 	StochasticDenoiseShaderRD stochastic_denoise_shader;
 	RID stochastic_denoise_shader_version;
 	RID stochastic_denoise_pipelines[DENOISE_VARIANT_MAX];
+
+	// The rough reflection's spatial resolve before the temporal pass (see the shader).
+	StochasticReflectionResolveShaderRD reflection_resolve_shader;
+	RID reflection_resolve_shader_version;
+	RID reflection_resolve_pipeline;
+
+	struct ReflectionResolvePushConstant {
+		float view_from_ndc[16];
+		int32_t screen_size[2];
+		int32_t depth_scale;
+		int32_t radius;
+		float rough_min;
+		float rough_full;
+		float weight_cap;
+		float pad;
+	};
 
 	struct StochasticDenoisePushConstant {
 		float reproject[16];
