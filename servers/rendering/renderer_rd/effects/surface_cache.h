@@ -321,6 +321,7 @@ private:
 		float dynamic_motion; // The dynamic lights' motion this frame over GODOT_CARD_DYN_MOTION (0 at rest, 1 a full refresh).
 		float dynamic_window; // The most relights the dynamic histories accumulate (GODOT_CARD_DYN_WINDOW).
 		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
+		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 	};
 
 	// The dynamic lights, as the card lighting and the GI gather read them

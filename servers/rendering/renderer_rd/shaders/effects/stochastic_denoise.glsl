@@ -26,6 +26,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_NO_MISMATCH 256u
 #define FLAG_SPEC_PAINT 512u // Diagnostics (GODOT_GI_SPEC_ABLATE=paint): the reflection's frame count as a colour.
 #define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
+#define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
@@ -214,14 +215,32 @@ layout(push_constant, std430) uniform Params {
 	// Temporal (GI): the fewest frames the lighting-change mark may restart
 	// the reflection history to (0: no floor; GODOT_GI_SPEC_RESTART_MIN).
 	float spec_restart_min;
-	uint pad0;
-	uint pad1;
-	uint pad2;
+	// The working colour space's luminance weights (ColorManagement): the
+	// moments and the luminance stop measure radiance with these.
+	float luma_r;
+	float luma_g;
+	float luma_b;
 }
 params;
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, vec3(params.luma_r, params.luma_g, params.luma_b));
+}
+
+// The luminance the filter weights are measured in. FLAG_LUMA_COMPRESS
+// (GODOT_GI_LUMA_COMPRESS, an experiment) compresses it as l / (1 + l): the
+// accumulation itself stays linear (a compressed mean would darken), but the
+// moments, the variance-driven kernel width and the luminance stop then
+// weigh a bright sample by roughly what the display transform will show of
+// it, instead of letting one hot hit own its neighbourhood's variance.
+// Measured 2026-09-09 in the game project (ACEScg, the ACES SDR view; the
+// metric reads the tonemapped captures): the static flashlight, the combo
+// motion and the flashlight yaw all within run noise of linear (err 0.0034
+// vs 0.0035 at rest, 0.0074 vs 0.0074 at combo's stop + 8, flash 0.0162 vs
+// 0.0189). Off by default; kept as the knob to retest with.
+float weight_lum(vec3 c) {
+	float l = luminance(c);
+	return (params.flags & FLAG_LUMA_COMPRESS) != 0u ? l / (1.0 + l) : l;
 }
 
 // Depth buffer value -> view-space distance. Comparing raw buffer depths
@@ -691,8 +710,8 @@ void main() {
 			}
 #endif
 
-			float lum_d = luminance(current_diffuse);
-			float lum_s = luminance(current_specular);
+			float lum_d = weight_lum(current_diffuse);
+			float lum_s = weight_lum(current_specular);
 			result_diffuse = mix(hist_d, current_diffuse, alpha_d);
 			result_specular = mix(hist_s, current_specular, alpha_s);
 #ifdef HAS_DIRECTIONAL
@@ -714,8 +733,8 @@ void main() {
 		}
 	}
 	if (reveal == 1.0) {
-		float lum_d = luminance(current_diffuse);
-		float lum_s = luminance(current_specular);
+		float lum_d = weight_lum(current_diffuse);
+		float lum_s = weight_lum(current_specular);
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	}
 
@@ -1005,10 +1024,10 @@ void main() {
 			float wd = w_spatial;
 			float ws = w_spatial_s;
 			if (!newly_revealed && !young_d) {
-				wd *= exp(-abs(luminance(d) - moments.x) / sigma_d);
+				wd *= exp(-abs(weight_lum(d) - moments.x) / sigma_d);
 			}
 			if (!newly_revealed && !young_s) {
-				ws *= exp(-abs(luminance(s) - moments.z) / sigma_s);
+				ws *= exp(-abs(weight_lum(s) - moments.z) / sigma_s);
 			}
 #ifdef FILTER_DIRECTIONAL
 			// Neighbors whose rays travelled a very different distance are

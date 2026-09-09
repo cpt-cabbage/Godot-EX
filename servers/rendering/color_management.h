@@ -52,6 +52,7 @@ class ColorManagement {
 	static inline bool enabled = false;
 	static inline Basis rec709_to_working;
 	static inline Basis working_to_rec709;
+	static inline Vector3 luminance_weights = Vector3(0.2126f, 0.7152f, 0.0722f);
 
 public:
 	// Called by the OpenColorIO module whenever the active config changes.
@@ -61,6 +62,12 @@ public:
 	static bool is_enabled() { return enabled; }
 	static const Basis &get_rec709_to_working() { return rec709_to_working; }
 	static const Basis &get_working_to_rec709() { return working_to_rec709; }
+	// The Y row of the working space: dot a working-space colour with this for
+	// its luminance. Rec.709's (0.2126, 0.7152, 0.0722) when colour management
+	// is off; ACEScg's is about (0.272, 0.674, 0.054), a quarter off on saturated
+	// reds and blues, so a shader that keeps the Rec.709 constants measures the
+	// wrong scalar there.
+	static const Vector3 &get_luminance_weights() { return luminance_weights; }
 
 	// Linear Rec.709 -> working space. Identity when colour management is off.
 	static _FORCE_INLINE_ Color linear_to_working(const Color &p_color) {

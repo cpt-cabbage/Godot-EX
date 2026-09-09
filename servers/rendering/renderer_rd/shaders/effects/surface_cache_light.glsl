@@ -86,6 +86,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_motion; // How far the dynamic lights moved this frame, over the distance that refreshes their bounce whole (0 at rest, 1 and above a full refresh): caps the dynamic histories' length at its inverse (see accumulate).
 	float dynamic_window; // The most relights the dynamic histories accumulate.
 	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
+	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 }
 params;
 
@@ -309,7 +310,7 @@ float hash_to_float(uint h) {
 }
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, params.luma_weights.rgb);
 }
 
 float get_omni_attenuation(float dist, float inv_range, float decay) {

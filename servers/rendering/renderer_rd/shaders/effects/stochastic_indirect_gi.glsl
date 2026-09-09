@@ -59,6 +59,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float card_youth_lod; // The mip a texel relit once is read through (0 disables); a level less per doubling of its relights (see surface_cache_lookup).
 	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
 	uint pad2;
+	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 }
 params;
 
@@ -348,7 +349,7 @@ layout(set = 1, binding = 4, rgba16f) uniform restrict writeonly image2D out_fal
 #define M_PI 3.14159265359
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, params.luma_weights.rgb);
 }
 
 // STBN lookup, one stream per random decision (see stochastic_direct_lighting;

@@ -81,4 +81,6 @@ struct SceneData {
 	float IBL_exposure_normalization;
 	uint camera_visible_layers;
 	float pass_alpha_multiplier;
+
+	vec4 luminance_weights; // The working colour space's Y row (ColorManagement), rgb.
 };

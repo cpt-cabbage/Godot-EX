@@ -70,6 +70,7 @@ layout(set = 0, binding = 1, std140) uniform Params {
 	float screen_radiance_border_fade;
 	float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
 	float card_youth_lod; // The tent a young card texel's bounce is read through (see card_indirect); 0 reads the texel alone.
+	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 }
 params;
 
@@ -274,7 +275,7 @@ float hash_to_float(uint h) {
 }
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, params.luma_weights.rgb);
 }
 
 float get_omni_attenuation(float dist, float inv_range, float decay) {

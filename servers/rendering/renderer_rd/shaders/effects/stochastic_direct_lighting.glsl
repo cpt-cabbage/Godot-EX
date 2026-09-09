@@ -78,6 +78,7 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint reservoir_count; // Rays per pixel, 1..MAX_RESERVOIRS.
 	uint flags; // FLAG_*.
 	float cluster_z0; // Nonzero: exponential depth slices from this depth (see ClusterBuilderRD).
+	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 }
 params;
 
@@ -362,7 +363,7 @@ bool reservoir_merge(inout Reservoir g, Reservoir h, float p_scale, inout float 
 }
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, params.luma_weights.rgb);
 }
 
 // Selection weight. MegaLights compresses this perceptually (log2(lum + 1)) to

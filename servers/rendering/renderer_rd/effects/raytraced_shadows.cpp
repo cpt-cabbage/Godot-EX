@@ -32,6 +32,7 @@
 
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
+#include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/effects/stochastic_stbn_data.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
@@ -43,6 +44,26 @@
 #include "servers/rendering/storage/ltc_lut.gen.h"
 
 using namespace RendererRD;
+
+// The luminance weights of the working colour space (Rec.709's when colour
+// management is off), as every RT pass measures radiance: the denoiser's
+// moments and luminance stop, the gather's firefly ceiling and directional
+// moment, the hit binning and the hit shading all read them from their
+// params, so they agree with each other and with the scene shader's
+// reconstruction of the directional term.
+static void _set_luma_weights(float *p_out) {
+	const Vector3 w = ColorManagement::get_luminance_weights();
+	p_out[0] = w.x;
+	p_out[1] = w.y;
+	p_out[2] = w.z;
+}
+
+// GODOT_GI_LUMA_COMPRESS=1: the GI denoiser's filter weights measure a
+// compressed luminance (stochastic_denoise.glsl weight_lum). An experiment.
+static bool _luma_compress() {
+	static const bool compress = OS::get_singleton()->get_environment("GODOT_GI_LUMA_COMPRESS") != "";
+	return compress;
+}
 
 RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	Vector<String> shader_modes;
@@ -1204,6 +1225,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 
 	StochasticParamsUBO params = {};
+	_set_luma_weights(params.luma_weights);
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {
@@ -1364,6 +1386,7 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 	denoise_push_constant.screen_size[0] = size.x;
 	denoise_push_constant.screen_size[1] = size.y;
+	_set_luma_weights(denoise_push_constant.luma_weights);
 	denoise_push_constant.blend_alpha = 1.0f / float(MAX(p_quality.temporal_frames, 1u));
 	denoise_push_constant.depth_tolerance = 0.05f;
 	// A huge threshold is the denoiser-off sentinel: the temporal pass then
@@ -1599,6 +1622,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RenderBuffersRT::RtGiCalibration &calibration = rb_state->rt_gi_calibration[p_view];
 
 	RtGiParamsUBO params = {};
+	_set_luma_weights(params.luma_weights);
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	Projection world_from_view_proj = Projection(p_world_from_view);
 	for (int col = 0; col < 4; col++) {
@@ -1696,7 +1720,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	// bounce histories in the fallback (1 the static, 2 the dynamic lights'
 	// first bounce, 4 their later bounces; 0 all).
 	static const int64_t fallback_parts = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_PARTS").to_int();
-	params.pad1 = uint32_t(fallback_parts);
+	params.fallback_parts = uint32_t(fallback_parts);
 	if (fallback_all && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
 	}
@@ -1894,6 +1918,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	denoise_push_constant.screen_size[0] = size.x;
 	denoise_push_constant.screen_size[1] = size.y;
+	_set_luma_weights(denoise_push_constant.luma_weights);
 	denoise_push_constant.blend_alpha = p_quality.denoise ? 1.0f / float(MAX(p_quality.temporal_frames, 1u)) : 1.0f;
 	denoise_push_constant.depth_tolerance = 0.05f;
 	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
@@ -1912,6 +1937,9 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 	{
 		denoise_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
+		if (_luma_compress()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
+		}
 		// Diagnostics: GODOT_GI_SPEC_ABLATE=change,smear,mismatch (or all)
 		// switches the named restarts of the reflection history off; paint
 		// renders the reflection's frame count as a colour.
@@ -1994,6 +2022,9 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		// GI filters radiance directly: no analytic modulation, the bindings
 		// are dummies that are never fetched.
 		denoise_push_constant.flags = (fallback_all && use_cards) ? DENOISE_FLAG_FALLBACK_ALL : 0;
+		if (_luma_compress()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
+		}
 		// GODOT_GI_FALLBACK_RAMP=<relights>: the card accumulation at which
 		// the young pixel's stand-in reaches full weight.
 		static const float fallback_ramp = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP") == "" ? 8.0f : float(OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP").to_float());
@@ -2350,6 +2381,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	const uint32_t slots = p_ray_count + 1;
 
 	HitParamsUBO params = {};
+	_set_luma_weights(params.luma_weights);
 	Projection world_from_view = Projection(p_world_from_view);
 	Projection view_from_world = Projection(p_world_from_view.affine_inverse());
 	Projection ndc_from_view = p_view_from_ndc.inverse();
@@ -2424,6 +2456,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	rd->buffer_update(hit_params_ubo, 0, sizeof(HitParamsUBO), &params);
 
 	HitBinPushConstant bin = {};
+	_set_luma_weights(bin.luma_weights);
 	bin.screen_size[0] = p_size.x;
 	bin.screen_size[1] = p_size.y;
 	bin.capacity = hit_packet_capacity;

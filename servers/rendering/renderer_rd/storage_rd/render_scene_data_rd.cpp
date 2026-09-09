@@ -115,6 +115,13 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	ubo.taa_jitter[0] = taa_jitter.x;
 	ubo.taa_jitter[1] = taa_jitter.y;
 	ubo.taa_frame_count = taa_frame_count;
+	{
+		const Vector3 luma = ColorManagement::get_luminance_weights();
+		ubo.luminance_weights[0] = luma.x;
+		ubo.luminance_weights[1] = luma.y;
+		ubo.luminance_weights[2] = luma.z;
+		ubo.luminance_weights[3] = 0.0f;
+	}
 
 	ubo.z_far = z_far;
 	ubo.z_near = z_near;

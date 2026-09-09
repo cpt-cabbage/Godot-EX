@@ -71,9 +71,9 @@ layout(push_constant, std430) uniform Params {
 	uint capacity; // Packets there is room for.
 	uint slots; // Result slots per pixel: the diffuse rays, then the mirror ray.
 	uint ray_count;
-	uint pad0;
-	uint pad1;
-	uint pad2;
+	float luma_r; // The working colour space's luminance weights (ColorManagement).
+	float luma_g;
+	float luma_b;
 }
 params;
 
@@ -82,7 +82,7 @@ shared uint scan[1024];
 #endif
 
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, vec3(params.luma_r, params.luma_g, params.luma_b));
 }
 
 void main() {

@@ -31,6 +31,7 @@
 #include "surface_cache.h"
 
 #include "core/os/os.h"
+#include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -787,6 +788,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 
 	LightParamsUBO params = {};
+	{
+		// The working colour space's luminance weights (ColorManagement), as the
+		// card lighting weighs its samples and measures its lighting change.
+		const Vector3 luma = ColorManagement::get_luminance_weights();
+		params.luma_weights[0] = luma.x;
+		params.luma_weights[1] = luma.y;
+		params.luma_weights[2] = luma.z;
+	}
 	Projection world_from_view(p_inputs.world_from_view);
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {

@@ -2406,7 +2406,7 @@ void fragment_shader(in SceneData scene_data) {
 				// would lag by the camera's own rotation); rotate it here,
 				// where the normals live.
 				vec3 gi_l1 = transpose(mat3(scene_data.inv_view_matrix)) * rt_gi_directional.xyz;
-				float gi_l0 = max(dot(rt_gi_ambient, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+				float gi_l0 = max(dot(rt_gi_ambient, scene_data.luminance_weights.rgb), 1e-6);
 				float gi_len = length(gi_l1);
 				if (gi_len > 1e-6 * gi_l0) {
 					vec3 gi_dir = gi_l1 / gi_len;
@@ -2807,7 +2807,7 @@ void fragment_shader(in SceneData scene_data) {
 					vec3 tv_bz = textureLod(sampler3D(translucency_volume_bz, SAMPLER_LINEAR_CLAMP), tv_unit, 0.0).rgb;
 					vec3 tv_e = max(0.25 * tv_a + 0.5 * (tv_bx * normal.x + tv_by * normal.y + tv_bz * normal.z), vec3(0.0));
 					diffuse_light += tv_e * (1.0 / M_PI);
-					const vec3 tv_lum = vec3(0.2126, 0.7152, 0.0722);
+					const vec3 tv_lum = scene_data.luminance_weights.rgb;
 					vec3 tv_dom = vec3(dot(tv_bx, tv_lum), dot(tv_by, tv_lum), dot(tv_bz, tv_lum));
 					float tv_dom_len = length(tv_dom);
 					float tv_a_lum = dot(tv_a, tv_lum);

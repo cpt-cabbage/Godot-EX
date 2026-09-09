@@ -276,6 +276,7 @@ private:
 		DENOISE_FLAG_SPEC_NO_MISMATCH = 256, // ... nor restarted by the virtual depth mismatch.
 		DENOISE_FLAG_SPEC_PAINT = 512, // Temporal (GI, diagnostics): the reflection's frame count as a colour.
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
+		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -324,6 +325,7 @@ private:
 		uint32_t reservoir_count;
 		uint32_t flags; // 1: light guiding, 2: screen traces.
 		float cluster_z0; // Nonzero: the cluster's depth slices are exponential from this depth (see ClusterBuilderRD).
+		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 	};
 	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
 	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;
@@ -373,8 +375,9 @@ private:
 		uint32_t hit_capacity; // Packets the hit shading has room for this frame.
 		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
 		float card_youth_lod; // The mip a hit reads a card texel relit once through (0 disables); halves per doubling of the texel's relights.
-		uint32_t pad1;
+		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS).
 		uint32_t pad2;
+		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -414,7 +417,7 @@ private:
 		uint32_t flags; // DenoiseFlags.
 		float fallback_ramp; // Spatial (GI): card relights at which the young pixel's stand-in reaches full weight.
 		float spec_restart_min; // Temporal (GI): the fewest frames the change mark restarts the reflection to (0: none).
-		uint32_t pad[3];
+		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
 	};
 
 	struct DecodePushConstant {
@@ -607,7 +610,7 @@ private:
 		uint32_t capacity;
 		uint32_t slots;
 		uint32_t ray_count;
-		uint32_t pad[3];
+		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
 	};
 
 	struct HitDispatchPushConstant {
@@ -649,8 +652,9 @@ private:
 		float screen_radiance_border_fade;
 		float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
 		float card_youth_lod; // The tent a young card texel's bounce is read through at a hit (0: the texel alone).
+		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 	};
-	static_assert(sizeof(HitParamsUBO) == 464, "HitParamsUBO layout must match scene_hit_shade.glsl.");
+	static_assert(sizeof(HitParamsUBO) == 480, "HitParamsUBO layout must match scene_hit_shade.glsl.");
 
 	// The lighting the card pass ran with this frame, kept for the hits.
 	SurfaceCache::LightingInputs hit_lighting;

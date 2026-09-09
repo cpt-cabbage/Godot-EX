@@ -36,4 +36,6 @@ void ColorManagement::configure(bool p_enabled, const Basis &p_rec709_to_working
 	enabled = p_enabled && !p_rec709_to_working.is_equal_approx(Basis());
 	rec709_to_working = enabled ? p_rec709_to_working : Basis();
 	working_to_rec709 = enabled ? p_working_to_rec709 : Basis();
+	// Y_working = Y_709 . (working_to_rec709 . c) = (working_to_rec709^T . Y_709) . c.
+	luminance_weights = working_to_rec709.transposed().xform(Vector3(0.2126f, 0.7152f, 0.0722f));
 }
