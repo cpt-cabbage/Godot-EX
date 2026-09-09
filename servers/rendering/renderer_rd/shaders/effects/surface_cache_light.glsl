@@ -82,6 +82,10 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint grid_cap;
 	float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (see accumulate).
 	uint young_rays; // Extra bounce rays for a texel whose accumulation is young (see trace_bounce_young).
+	uint dynamic_rays; // Light rays per dynamic light per texel per relight (see trace_dynamic).
+	float dynamic_motion; // How far the dynamic lights moved this frame, over the distance that refreshes their bounce whole (0 at rest, 1 and above a full refresh): caps the dynamic histories' length at its inverse (see accumulate).
+	float dynamic_window; // The most relights the dynamic histories accumulate.
+	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
 }
 params;
 
@@ -89,6 +93,7 @@ params;
 #define FLAG_SKY_MODE_SKY 2u
 #define FLAG_SKY_MODE_COLOR 4u
 #define FLAG_SHARED_BOUNCE_RAY 16u
+#define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
 #define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights. // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
@@ -207,9 +212,47 @@ layout(set = 0, binding = 23, std430) restrict buffer Relit {
 }
 relit;
 
+// The dynamic lights' bounce (see trace_dynamic), its own history: rgb the
+// accumulated term, a the luminance of the dynamic lights' direct term at
+// the last relight (for the total change, see accumulate).
+layout(set = 0, binding = 24, rgba16f) uniform restrict image2D indirect_dyn_atlas;
+
+// The dynamic lights (see trace_dynamic): the lights that moved or changed
+// lately, in world space, with their weights (1 while a light changes,
+// fading to 0 once it has rested; LightStorage tracks them, surface_cache.cpp
+// uploads them). pad is 1 for a spot. The GI gather reads the same buffer:
+// their direct term is not in the lighting atlas (see accumulate), it is
+// added at the hits from the lights' current state.
+layout(set = 0, binding = 27, std430) restrict readonly buffer DynamicLights {
+	uint count;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+	vec4 weights[2];
+	LightData data[8];
+}
+dyn_lights;
+// Their bounces after the first, apart: the cosine rays' reading of both
+// histories at their hits (see trace_bounce); alpha its relights over 64.
+layout(set = 0, binding = 26, rgba16f) uniform restrict image2D indirect_dyn2_atlas;
+// The static lights' radiance alone (the lighting atlas less the dynamic
+// bounces), what the static cosine rays read at their hits, and in alpha
+// the visibility ratio for the dynamic lights' direct term at the gather's
+// hits. Subtracting the dynamic histories from the lighting atlas instead
+// read the two from different moments of the same dispatch.
+layout(set = 0, binding = 28, rgba16f) uniform restrict image2D static_atlas;
+
+// Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
+// (see trace_dynamic; surface_cache.cpp prints and clears it).
+layout(set = 0, binding = 25, std430) restrict buffer DynStats {
+	uint count[16];
+}
+dyn_stats;
+
 struct Change {
-	vec3 unshadowed;
-	float change;
+	vec3 unshadowed; // The static lights' unshadowed term (the dynamic lights' is in indirect_dyn_atlas.a).
+	float change; // The whole lighting's change, for the GI gather's screen history.
+	float change_static; // The static lights' change, for the bounce accumulation's restart.
 	float geom;
 	float vis;
 	uint bounce_set; // The last bounce ray's hit set, 0xFFFFu for none.
@@ -220,9 +263,9 @@ Change change_load(ivec2 texel) {
 	uvec4 p = imageLoad(change_atlas, texel);
 	Change c;
 	c.unshadowed.rg = unpackHalf2x16(p.x);
-	vec2 bc = unpackHalf2x16(p.y);
-	c.unshadowed.b = bc.x;
-	c.change = bc.y;
+	c.unshadowed.b = unpackHalf2x16(p.y & 0xFFFFu).x;
+	c.change = float((p.y >> 16u) & 0xFFu) / 255.0;
+	c.change_static = float((p.y >> 24u) & 0xFFu) / 255.0;
 	vec2 gv = unpackHalf2x16(p.z);
 	c.geom = gv.x;
 	c.vis = gv.y;
@@ -232,13 +275,19 @@ Change change_load(ivec2 texel) {
 }
 
 void change_store(ivec2 texel, Change c) {
-	imageStore(change_atlas, texel, uvec4(packHalf2x16(c.unshadowed.rg), packHalf2x16(vec2(c.unshadowed.b, c.change)), packHalf2x16(vec2(c.geom, c.vis)), (packHalf2x16(vec2(c.bounce_t, 0.0)) & 0xFFFFu) | (c.bounce_set << 16u)));
+	uint y = (packHalf2x16(vec2(c.unshadowed.b, 0.0)) & 0xFFFFu) | (uint(clamp(c.change, 0.0, 1.0) * 255.0 + 0.5) << 16u) | (uint(clamp(c.change_static, 0.0, 1.0) * 255.0 + 0.5) << 24u);
+	imageStore(change_atlas, texel, uvec4(packHalf2x16(c.unshadowed.rg), y, packHalf2x16(vec2(c.geom, c.vis)), (packHalf2x16(vec2(c.bounce_t, 0.0)) & 0xFFFFu) | (c.bounce_set << 16u)));
 }
 
-// The radiance gradient as the GI gather reads it: the second half of the
-// second uint.
+// The static lights' change (the bounce accumulation's restart), and the
+// whole lighting's (the GI gather's, which reads it the same way): the two
+// bytes above the second uint's half.
 float change_load_gradient(ivec2 texel) {
-	return unpackHalf2x16(imageLoad(change_atlas, texel).y).y;
+	return float((imageLoad(change_atlas, texel).y >> 24u) & 0xFFu) / 255.0;
+}
+
+float change_load_total(ivec2 texel) {
+	return float((imageLoad(change_atlas, texel).y >> 16u) & 0xFFu) / 255.0;
 }
 
 // The world light grid: per cell, a count then grid_cap entries (a light
@@ -368,10 +417,14 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup),
 // over this pass's own bindings: nearest texel of the lit atlas.
-bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change) {
+bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change, out float r_change_total, out vec3 r_n_world, out vec3 r_albedo, out ivec2 r_texel) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
 	r_change = 0.0;
+	r_change_total = 0.0;
+	r_n_world = vec3(0.0);
+	r_albedo = vec3(0.0);
+	r_texel = ivec2(0);
 	if (p_instance_id == SURFACE_CACHE_INVALID) {
 		return false;
 	}
@@ -389,6 +442,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	ivec2 best_texel = ivec2(0);
+	uint best_k = 0u;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -420,6 +474,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		if (facing > best_w) {
 			best_w = facing;
 			best_texel = texel;
+			best_k = k;
 		}
 	}
 	if (best_w <= 0.0) {
@@ -427,6 +482,15 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	}
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
 	r_change = change_load_gradient(best_texel);
+	r_change_total = change_load_total(best_texel);
+	r_albedo = texelFetch(albedo_atlas, best_texel, 0).rgb;
+	r_texel = best_texel;
+	// The captured normal, as read_texel decodes it: the dynamic bounce needs
+	// the surface's orientation at the hit for its geometry terms.
+	vec3 n_cam = normalize(texelFetch(normal_atlas, best_texel, 0).rgb * 2.0 - 1.0);
+	vec3 axis, u, v;
+	card_basis(best_k, axis, u, v);
+	r_n_world = normalize(mat3(s.world_from_local) * (u * n_cam.x + v * n_cam.y + axis * n_cam.z));
 	return true;
 }
 
@@ -511,6 +575,85 @@ bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
+// Occlusion as the bounce rays see it: everything opaque, the first hit ends
+// the query (the dynamic bounce's connection, see trace_dynamic).
+bool occluded_opaque(vec3 origin, vec3 dir, float t_max) {
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, origin, 0.0, dir, t_max);
+	while (rayQueryProceedEXT(rq)) {
+	}
+	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// The local lights that reach a point: its cell of the world light grid
+// (every light that reaches it), or the set's list (the first 32
+// overlapping its box) where the grid is off or the point lies outside it.
+void light_list(uint entry, vec3 world_pos, out uint r_base, out uint r_count, out bool r_from_grid) {
+	r_base = entry * (1u + MAX_LIGHTS_PER_SET);
+	r_count = min(set_lights.data[r_base], MAX_LIGHTS_PER_SET);
+	r_from_grid = false;
+	if (bool(params.flags & FLAG_GRID)) {
+		vec3 rel = (world_pos - params.grid_origin) / params.grid_cell;
+		if (all(greaterThanEqual(rel, vec3(0.0))) && all(lessThan(rel, vec3(float(params.grid_n))))) {
+			uvec3 c = uvec3(rel);
+			r_base = (c.x + params.grid_n * (c.y + params.grid_n * c.z)) * (1u + params.grid_cap);
+			r_count = min(light_grid.data[r_base], params.grid_cap);
+			r_from_grid = true;
+		}
+	}
+	if ((params.debug & 4u) != 0u) {
+		r_count = 0u;
+	}
+}
+
+LightData light_at(uint base, uint j, bool from_grid, out bool r_is_spot) {
+	uint idx = from_grid ? light_grid.data[base + 1u + j] : set_lights.data[base + 1u + j];
+	r_is_spot = from_grid ? (idx & GRID_SPOT_BIT) != 0u : idx >= params.omni_light_count;
+	if (from_grid) {
+		idx &= ~GRID_SPOT_BIT;
+	} else if (r_is_spot) {
+		idx -= params.omni_light_count;
+	}
+	return r_is_spot ? spot_lights.data[idx] : omni_lights.data[idx];
+}
+
+// A local light's unshadowed contribution at a point: its colour times the
+// cosine, the attenuation and the cone, over pi (the direct pass's terms).
+// r_pos is the light's world position, r_geom the geometric factor
+// (attenuation times cosine) the geometric gradient sums.
+vec3 light_contribution_world(LightData ld, bool is_spot, vec3 light_pos, vec3 spot_dir, vec3 world_pos, vec3 n, out float r_geom) {
+	vec3 rel = light_pos - world_pos;
+	float len = length(rel);
+	float attenuation = get_omni_attenuation(len, ld.inv_radius, ld.attenuation);
+	vec3 l = rel / max(len, 1e-5);
+	if (is_spot) {
+		float scos = max(dot(-l, spot_dir), ld.cone_angle);
+		float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
+		attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
+	}
+	float ndotl = max(dot(n, l), 0.0);
+	r_geom = ndotl * attenuation;
+	return ld.color * (r_geom * (1.0 / M_PI));
+}
+
+// The scene's light buffers hold view-space positions and directions.
+vec3 light_contribution(LightData ld, bool is_spot, vec3 world_pos, vec3 n, out vec3 r_pos, out float r_geom) {
+	r_pos = (params.world_from_view * vec4(ld.position, 1.0)).xyz;
+	vec3 spot_dir = is_spot ? normalize(mat3(params.world_from_view) * ld.direction) : vec3(0.0, -1.0, 0.0);
+	return light_contribution_world(ld, is_spot, r_pos, spot_dir, world_pos, n, r_geom);
+}
+
+// The dynamic lights' unshadowed direct term at a point, each by its weight.
+vec3 dynamic_direct(vec3 world_pos, vec3 n) {
+	vec3 sum = vec3(0.0);
+	for (uint i = 0u; i < dyn_lights.count; i++) {
+		LightData ld = dyn_lights.data[i];
+		float geom;
+		sum += light_contribution_world(ld, ld.pad > 0.5, ld.position, normalize(ld.direction), world_pos, n, geom) * dyn_lights.weights[i >> 2u][i & 3u];
+	}
+	return sum;
+}
+
 struct Texel {
 	vec3 world_pos;
 	vec3 n_world;
@@ -551,6 +694,7 @@ struct Direct {
 	vec3 exact; // The shadowed directional term.
 	vec3 unshadowed; // Every light, unshadowed.
 	vec3 local_sum; // The local lights, unshadowed.
+	vec3 dyn_sum; // The dynamic lights among them, unshadowed (a part of local_sum).
 	float local_geom; // Their geometric sum.
 	float vis; // The drawn light's visibility, when one was drawn.
 	bool sampled;
@@ -594,52 +738,22 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 	uint sel_mask = 0u;
 	bool selected = false;
 
-	// The lights: the texel's cell of the world light grid (every light
-	// that reaches the texel), or the set's list (the first 32 overlapping
-	// its box) where the grid is off or the texel lies outside it.
-	uint base = entry * (1u + MAX_LIGHTS_PER_SET);
-	uint light_count = min(set_lights.data[base], MAX_LIGHTS_PER_SET);
-	bool from_grid = false;
-	if (bool(params.flags & FLAG_GRID)) {
-		vec3 rel = (t.world_pos - params.grid_origin) / params.grid_cell;
-		if (all(greaterThanEqual(rel, vec3(0.0))) && all(lessThan(rel, vec3(float(params.grid_n))))) {
-			uvec3 c = uvec3(rel);
-			base = (c.x + params.grid_n * (c.y + params.grid_n * c.z)) * (1u + params.grid_cap);
-			light_count = min(light_grid.data[base], params.grid_cap);
-			from_grid = true;
-		}
-	}
-	if ((params.debug & 4u) != 0u) {
-		light_count = 0u;
-	}
+	uint base;
+	uint light_count;
+	bool from_grid;
+	light_list(entry, t.world_pos, base, light_count, from_grid);
 	for (uint j = 0u; j < light_count; j++) {
-		uint idx = from_grid ? light_grid.data[base + 1u + j] : set_lights.data[base + 1u + j];
-		bool is_spot = from_grid ? (idx & GRID_SPOT_BIT) != 0u : idx >= params.omni_light_count;
-		if (from_grid) {
-			idx &= ~GRID_SPOT_BIT;
-		} else if (is_spot) {
-			idx -= params.omni_light_count;
-		}
-		LightData ld = is_spot ? spot_lights.data[idx] : omni_lights.data[idx];
-		vec3 pos = (params.world_from_view * vec4(ld.position, 1.0)).xyz;
-		vec3 rel = pos - t.world_pos;
-		float len = length(rel);
-		float attenuation = get_omni_attenuation(len, ld.inv_radius, ld.attenuation);
-		vec3 l = rel / max(len, 1e-5);
-		if (is_spot) {
-			vec3 spot_dir = normalize(mat3(params.world_from_view) * ld.direction);
-			float scos = max(dot(-l, spot_dir), ld.cone_angle);
-			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
-			attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
-		}
-		float ndotl = max(dot(t.n_world, l), 0.0);
-		vec3 c = ld.color * (ndotl * attenuation * (1.0 / M_PI));
+		bool is_spot;
+		LightData ld = light_at(base, j, from_grid, is_spot);
+		vec3 pos;
+		float geom;
+		vec3 c = light_contribution(ld, is_spot, t.world_pos, t.n_world, pos, geom);
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
 			continue;
 		}
 		sum += c;
-		d.local_geom += ndotl * attenuation;
+		d.local_geom += geom;
 		weight_sum += w;
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
@@ -663,12 +777,158 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 	d.exact = direct;
 	d.unshadowed = direct_unshadowed;
 	d.local_sum = sum;
+	d.dyn_sum = dynamic_direct(t.world_pos, t.n_world);
 }
 
-// The indirect term: one cosine ray into the scene (see main).
-void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float bounce_change, out uint hit_set_id, out float hit_t) {
+// The dynamic lights' bounce. A flashlight's spot on the floor is small
+// and bright, and its bounce on the ceiling is what a cosine ray per texel
+// cannot estimate: one texel in a few lands a ray on the spot per relight,
+// and the field over the ceiling is a mottle of texels that saw it and
+// texels that did not -- coherent across every mip the hits read it
+// through, so no screen-space filter averages it -- that sixty-four
+// relights average out, which a light that keeps moving never gives them,
+// and that every move restarts (the change of a lit texel is carried by
+// the rays that hit it and restarts the readers to one sample, at random
+// relights over the eight the mark lasts; the static lamps' converged
+// bounce goes with it). So a light that moves or changes is estimated
+// apart, with a history of its own that follows the light's motion (see
+// accumulate) and needs no restart. Two strategies estimate its first
+// bounce, combined by the balance heuristic: rays from the light, uniform
+// over its cone (or the sphere), landing on the lit surface and connected
+// to the texel by a shadow ray (every texel sees the spot every relight,
+// the density known exactly); and the static cosine rays, whose hit
+// carries the light's direct term analytically (see trace_bounce) -- the
+// better strategy for a lamp lighting a whole wall, where a light ray is
+// one sample of a wide area. The lighting atlas holds no dynamic light's
+// direct term (see accumulate), so nothing is subtracted against a stale
+// state; the cosine rays read the static lights' radiance plus the
+// dynamic lights' bounces, and hand the first of those to the dynamic
+// term's second-bounce history, so it too follows the light closely; the
+// third and after stay with the static accumulation. A light is dynamic
+// while LightStorage has seen it change lately (GODOT_CARD_DYN_HOLD
+// frames), then its weight fades (GODOT_CARD_DYN_FADE) and the static
+// accumulation absorbs its bounce as slowly as the weight leaves.
+//
+// Directions come from the R2 sequence per texel, advanced per relight: the
+// samples of one texel's window tile the cone rather than clump. The
+// squared distance of the connection is softened by a centimetre.
+void dyn_stat(uint i, bool ceiling) {
+	if ((params.debug & 4096u) != 0u) {
+		atomicAdd(dyn_stats.count[i], 1u);
+		if (ceiling) {
+			atomicAdd(dyn_stats.count[i + 8u], 1u);
+		}
+	}
+}
+
+void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3 dyn_sample, out float landed, out float change_total) {
+	dyn_sample = vec3(0.0);
+	landed = 0.0;
+	change_total = 0.0;
+	bool ceiling = t.n_world.y < -0.7;
+	uint n_rays = uint(n_light);
+	if (dyn_lights.count == 0u || n_rays == 0u || (params.debug & 1u) != 0u) {
+		return;
+	}
+	uint h = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) ^ 0x2545F491u));
+	float o0 = hash_to_float(h);
+	float o1 = hash_to_float(pcg_hash(h));
+	float inv_rays = 1.0 / float(n_rays);
+	float share = inv_rays / float(dyn_lights.count);
+	for (uint i = 0u; i < dyn_lights.count; i++) {
+		LightData ld = dyn_lights.data[i];
+		bool is_spot = ld.pad > 0.5;
+		float weight = dyn_lights.weights[i >> 2u][i & 3u];
+		if (ld.inv_radius <= 0.0 || weight <= 0.0) {
+			continue;
+		}
+		vec3 pos = ld.position;
+		float range = 1.0 / ld.inv_radius;
+		vec3 axis = is_spot ? normalize(ld.direction) : vec3(0.0, 0.0, 1.0);
+		float cone_cos = is_spot ? clamp(ld.cone_angle, -1.0, 0.9999) : -1.0;
+		float pdf_dir = 1.0 / (2.0 * M_PI * (1.0 - cone_cos));
+		vec3 tng = abs(axis.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+		vec3 b1 = normalize(cross(axis, tng));
+		vec3 b2 = cross(axis, b1);
+		for (uint sidx = 0u; sidx < n_rays; sidx++) {
+			float k = float(((params.frame & 63u) * n_rays + sidx) * (i + 1u));
+			float r0 = fract(o0 + k * 0.7548776662);
+			float r1 = fract(o1 + k * 0.5698402910);
+			float phi = r1 * 2.0 * M_PI;
+			float ct = 1.0 - r0 * (1.0 - cone_cos);
+			float st = sqrt(max(1.0 - ct * ct, 0.0));
+			vec3 dir = normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, pos, 0.0, dir, range);
+			while (rayQueryProceedEXT(rq)) {
+			}
+			dyn_stat(0u, ceiling);
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+				continue;
+			}
+			dyn_stat(1u, ceiling);
+			float d_lp = rayQueryGetIntersectionTEXT(rq, true);
+			vec3 p = pos + dir * d_lp;
+			vec3 unused_radiance;
+			uint hit_set;
+			float unused_change;
+			float hit_change_total;
+			vec3 n_p;
+			vec3 albedo_p;
+			ivec2 texel_p;
+			if (!card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p)) {
+				continue;
+			}
+			dyn_stat(2u, ceiling);
+			float cos_pl = dot(n_p, -dir);
+			if (cos_pl <= 0.0 || d_lp < 1e-4) {
+				continue;
+			}
+			dyn_stat(3u, ceiling);
+			float unused_geom;
+			vec3 c_p = light_contribution_world(ld, is_spot, pos, axis, p, n_p, unused_geom);
+			// The landing's radiance from this light's direct term alone.
+			vec3 l_dyn = albedo_p * c_p * weight;
+			float pdf_area = pdf_dir * cos_pl / (d_lp * d_lp);
+			card_requests.frame[hit_set] = params.frame;
+			change_total = max(change_total, hit_change_total - 0.25);
+			// The texel connected to the landing. The estimator of the
+			// irradiance over pi is radiance * geom / (pi * pdf_area); its
+			// balance-heuristic weight against the cosine rays (n_cosine of
+			// them, density geom / pi per unit area at the landing) folds in
+			// as radiance * geom / (pi * rays * pdf_area + n_cosine * geom),
+			// which a landing beside the texel cannot blow up.
+			{
+				vec3 rel = p - t.origin;
+				float d = length(rel);
+				vec3 l = rel / max(d, 1e-4);
+				float cos_t = dot(t.n_world, l);
+				float cos_pt = dot(n_p, -l);
+				dyn_stat(4u, ceiling && cos_t > 0.0);
+				dyn_stat(5u, ceiling && cos_t > 0.0 && cos_pt > 0.0);
+				if (d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0 && !occluded_opaque(t.origin, l, max(d - params.ray_bias, 0.0))) {
+					dyn_stat(6u, ceiling);
+					float geom = cos_t * cos_pt / (d * d + 0.01);
+					dyn_sample += l_dyn * (geom / (M_PI * n_light * pdf_area + n_cosine * geom));
+					landed += share;
+				}
+			}
+		}
+	}
+}
+
+// Diagnostics (paint3): the dynamic term's share of the sample, see accumulate.
+
+// The indirect term of the static lights: one cosine ray into the scene
+// (see main), the card's radiance at its hit less the dynamic lights' part.
+// r_dyn1 / r_dyn2: the cosine ray's share of the dynamic lights' first and
+// second bounce (see trace_dynamic), n_cosine rays of it this relight.
+void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out vec3 indirect_sample, out vec3 r_dyn1, out vec3 r_dyn2, out float bounce_change, out float bounce_change_total, out uint hit_set_id, out float hit_t) {
 	indirect_sample = vec3(0.0);
+	r_dyn1 = vec3(0.0);
+	r_dyn2 = vec3(0.0);
 	bounce_change = 0.0;
+	bounce_change_total = 0.0;
 	hit_set_id = 0xFFFFu;
 	hit_t = 0.0;
 	if ((params.debug & 1u) != 0u) {
@@ -695,15 +955,68 @@ void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float 
 			vec3 card_radiance;
 			uint hit_set;
 			float hit_change;
+			float hit_change_total;
+			vec3 n_hit;
+			vec3 albedo_hit;
+			ivec2 texel_hit;
 			hit_t = t_hit;
-			if (card_lookup(hit_instance, t.origin + ray_dir * t_hit, ray_dir, card_radiance, hit_set, hit_change)) {
+			vec3 hit_pos = t.origin + ray_dir * t_hit;
+			if (card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
 				hit_set_id = hit_set & 0xFFFFu;
+				if (dyn_lights.count > 0u) {
+					// The atlas holds no dynamic light's direct term (see
+					// accumulate): the ray reads the static lights' radiance
+					// and the dynamic lights' bounces. The first of those is
+					// the second-bounce history's (r_dyn2); it comes out of
+					// the static sample, from the same relight as the
+					// radiance. The direct term at the hit, analytic, with
+					// the card's visibility ratio for its shadow, is this
+					// ray's estimate of the first bounce, weighted against
+					// the light rays by the balance heuristic (each light's
+					// density at the hit: its cone's, times the cosine over
+					// the distance squared, where the hit is in its cone and
+					// range and faces it).
+					// Both histories at the hit: the first bounce's and the
+					// later bounces', so this reading is the second bounce
+					// and, through the later history's own readings, every
+					// one after (a bounce of lag apiece); the static
+					// accumulation holds none of the dynamic lights' light.
+					vec3 dyn_hit = max(imageLoad(indirect_dyn_atlas, texel_hit).rgb, vec3(0.0)) + max(imageLoad(indirect_dyn2_atlas, texel_hit).rgb, vec3(0.0));
+					card_radiance = max(imageLoad(static_atlas, texel_hit).rgb, vec3(0.0));
+					r_dyn2 = albedo_hit * dyn_hit;
+					float vis_hit = imageLoad(static_atlas, texel_hit).a;
+					float cos_ht = max(dot(n_hit, -ray_dir), 0.0);
+					float p_cos = n_cosine * max(dot(t.n_world, ray_dir), 0.0) * cos_ht / (M_PI * max(t_hit * t_hit, 1e-4));
+					for (uint i = 0u; i < dyn_lights.count; i++) {
+						LightData ld = dyn_lights.data[i];
+						bool is_spot = ld.pad > 0.5;
+						vec3 axis = is_spot ? normalize(ld.direction) : vec3(0.0, 0.0, 1.0);
+						float geom_unused;
+						vec3 c = light_contribution_world(ld, is_spot, ld.position, axis, hit_pos, n_hit, geom_unused) * dyn_lights.weights[i >> 2u][i & 3u];
+						if (luminance(c) <= 0.0) {
+							continue;
+						}
+						float pdf_light = 0.0;
+						if (n_light > 0.0 && ld.inv_radius > 0.0) {
+							vec3 rel = ld.position - hit_pos;
+							float d = length(rel);
+							vec3 l = rel / max(d, 1e-4);
+							float cos_hl = dot(n_hit, l);
+							float cone_cos = is_spot ? clamp(ld.cone_angle, -1.0, 0.9999) : -1.0;
+							if (d < 1.0 / ld.inv_radius && cos_hl > 0.0 && (!is_spot || dot(-l, axis) > cone_cos)) {
+								pdf_light = cos_hl / (2.0 * M_PI * (1.0 - cone_cos) * d * d);
+							}
+						}
+						r_dyn1 += albedo_hit * c * vis_hit * (p_cos / (p_cos + n_light * pdf_light));
+					}
+				}
 				indirect_sample = card_radiance;
 				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
 				// weaker by a quarter per bounce, so lighting that reaches
 				// this texel only indirectly restarts it too.
 				bounce_change = hit_change - 0.25;
+				bounce_change_total = hit_change_total - 0.25;
 			} else if (!sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
 				indirect_sample = sky_eval(t.n_world);
 			}
@@ -718,29 +1031,57 @@ void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float 
 // one sample, then a few: every gather ray landing near it reads that same
 // sample, so its noise is not per pixel but a mottle over the whole surface,
 // which no screen-space filter averages and the cards' mip levels only
-// spread (a flashlight sweeping the room left the ceiling and walls blotched
-// for the cards' whole window; a softer restart traded the mottle for the
-// old beam's bounce lingering). More rays where the history is young buy
-// the samples back at the restart, and cost nothing where it is not.
+// spread. More rays where the history is young buy the samples back at the
+// restart, and cost nothing where it is not. (A moving light's bounce is
+// the dynamic term's now, see trace_dynamic; this is for the rest: a fresh
+// capture, a lamp switched, a surface moved.)
 #define YOUNG_RELIGHTS 8.0
-void trace_bounce_young(ivec2 texel, Texel t, inout uint seed, inout vec3 indirect_sample, inout float bounce_change) {
-	if (params.young_rays == 0u || (params.debug & 1u) != 0u) {
+bool texel_young(ivec2 texel) {
+	return imageLoad(indirect_atlas, texel).a * 64.0 < YOUNG_RELIGHTS;
+}
+
+// The dynamic histories under YOUNG_RELIGHTS (their age is the second one's
+// alpha, see accumulate): a light that moved, and the relights after it.
+bool texel_young_dynamic(ivec2 texel) {
+	return dyn_lights.count > 0u && imageLoad(indirect_dyn2_atlas, texel).a * 64.0 < YOUNG_RELIGHTS;
+}
+
+// The light rays this relight: two at least while the dynamic histories are young.
+float light_rays(bool young_dynamic) {
+	return float(params.dynamic_rays == 0u ? 0u : (young_dynamic ? max(params.dynamic_rays, 2u) : params.dynamic_rays));
+}
+
+// How many cosine rays the texel traces this relight (see trace_bounce_young):
+// the extra ones for a young accumulation, and while a dynamic light moves
+// (its histories are then a relight or two long, and the cosine rays are
+// the better half of its estimate wherever it lights a wide area).
+uint cosine_rays(bool young, bool young_dynamic) {
+	bool dynamic_young = (params.flags & FLAG_DYNAMIC_YOUNG) != 0u && young_dynamic;
+	return ((young || dynamic_young) && (params.debug & 1u) == 0u) ? params.young_rays + 1u : 1u;
+}
+
+void trace_bounce_young(uint n_cosine, float n_light, Texel t, inout uint seed, inout vec3 indirect_sample, inout vec3 dyn1, inout vec3 dyn2, inout float bounce_change, inout float bounce_change_total) {
+	if (n_cosine <= 1u) {
 		return;
 	}
-	float relights = imageLoad(indirect_atlas, texel).a * 64.0;
-	if (relights >= YOUNG_RELIGHTS) {
-		return;
-	}
-	for (uint r = 0u; r < params.young_rays; r++) {
+	for (uint r = 1u; r < n_cosine; r++) {
 		vec3 extra;
+		vec3 extra_dyn1;
+		vec3 extra_dyn2;
 		float extra_change;
+		float extra_total;
 		uint extra_set;
 		float extra_t;
-		trace_bounce(t, seed, extra, extra_change, extra_set, extra_t);
+		trace_bounce(t, seed, float(n_cosine), n_light, extra, extra_dyn1, extra_dyn2, extra_change, extra_total, extra_set, extra_t);
 		indirect_sample += extra;
+		dyn1 += extra_dyn1;
+		dyn2 += extra_dyn2;
 		bounce_change = max(bounce_change, extra_change);
+		bounce_change_total = max(bounce_change_total, extra_total);
 	}
-	indirect_sample /= float(params.young_rays + 1u);
+	indirect_sample /= float(n_cosine);
+	dyn1 /= float(n_cosine);
+	dyn2 /= float(n_cosine);
 }
 
 // The bounce gradient: the previous relight's ray traced again from the same
@@ -764,7 +1105,10 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 	uint set_now;
 	float t_now;
 	uint seed = prev_seed;
-	trace_bounce(t, seed, again, unused_change, set_now, t_now);
+	float unused_total;
+	vec3 unused_dyn1;
+	vec3 unused_dyn2;
+	trace_bounce(t, seed, 1.0, 0.0, again, unused_dyn1, unused_dyn2, unused_change, unused_total, set_now, t_now);
 	if (set_now != prev.bounce_set) {
 		return 1.0;
 	}
@@ -785,7 +1129,7 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 // negative value when there was no previous ray to re-trace); card_min /
 // card_max bound the card, so the change read from the neighbours never
 // crosses into another card packed beside it in the atlas.
-void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
+void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
 	vec4 old = imageLoad(lighting_atlas, texel);
 	Change prev = change_load(texel);
 	// A fresh capture has nothing to compare with, and neither has a texel
@@ -806,15 +1150,30 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// every history to one frame at every relight, and the glossy floor's
 	// sparse reflections came out bright). Static lights give exactly zero
 	// (the numbers are recomputed from the same inputs).
-	vec3 unshadowed = t.albedo * d.unshadowed + t.emission;
+	// The static lights' term: the dynamic lights (see trace_dynamic) are
+	// gradients of their own.
+	vec3 unshadowed = t.albedo * (d.unshadowed - d.dyn_sum) + t.emission;
+	float dyn_lum = luminance(t.albedo * d.dyn_sum);
+	vec4 dyn_old = imageLoad(indirect_dyn_atlas, texel);
 	vec3 delta = abs(unshadowed - prev.unshadowed);
 	float lum_floor = 0.25 * max(luminance(unshadowed), luminance(prev.unshadowed));
 	vec3 rel = delta / max(max(unshadowed, prev.unshadowed), vec3(max(lum_floor, 1e-4)));
 	float change = fresh ? 0.0 : max(max(rel.r, rel.g), rel.b);
+	// The whole lighting's change, for the GI gather's screen history: the
+	// static change, and the dynamic lights' direct term here against the
+	// last relight's (by luminance, floored at a quarter of the whole), and
+	// what the rays carried from their hits.
+	float total_lum = luminance(unshadowed) + dyn_lum;
+	float prev_total_lum = luminance(prev.unshadowed) + dyn_old.a;
+	float dyn_change = fresh ? 0.0 : abs(dyn_lum - dyn_old.a) / max(max(dyn_lum, dyn_old.a), max(0.25 * max(total_lum, prev_total_lum), 1e-4));
+	if (!fresh && dyn_lum > 0.05 * total_lum) {
+		dyn_change = max(dyn_change, params.dynamic_change);
+	}
+	float change_total = max(max(change, dyn_change), max(prev.change - 0.125, bounce_change_total));
 	// The change outlives the relight that found it, fading over eight: the
 	// gather's one ray per pixel lands on a given card only now and then,
 	// and a change seen for one frame would restart almost no pixel.
-	change = max(change, max(prev.change - 0.125, bounce_change));
+	change = max(change, max(prev.change_static - 0.125, bounce_change));
 	// The bounce gradient is one ray's verdict, so only the texels whose
 	// last ray happened to see what moved would restart on their own and
 	// the rest would hold the stale bounce beside them: the change spreads
@@ -836,6 +1195,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		}
 		change = max(change, spread - 0.125);
 	}
+	change_total = max(change_total, change);
 
 	// The geometric gradient: the local lights' geometric sum against the
 	// last relight's. Only movement (or a light appearing or vanishing) can
@@ -851,7 +1211,9 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// smoothed as much as one of double the length.
 	float window = float(min(2u * params.temporal_frames, 64u));
 
-	// The visibility ratio.
+	// The visibility ratio (one for every local light, dynamic or not; a
+	// ratio of the dynamic lights' own, drawn on alternate relights, was
+	// measured and changed nothing).
 	float keep_vis = (geom_change > 0.02 && (params.debug & 64u) == 0u) ? max(1.0, 1.0 / geom_change) : 64.0;
 	float frames = reset ? 0.0 : min(old.a * 64.0, keep_vis);
 	float vis = prev.vis;
@@ -861,10 +1223,12 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	} else if (frames <= 0.0) {
 		vis = 1.0; // No local light reaches this texel; the sum is zero anyway.
 	}
+	float vis_dyn = vis;
 	frames = min(frames + 1.0, 64.0);
 	Change now;
 	now.unshadowed = unshadowed;
-	now.change = change;
+	now.change = change_total;
+	now.change_static = change;
 	now.geom = d.local_geom;
 	now.vis = vis;
 	now.bounce_set = bounce_set;
@@ -912,10 +1276,55 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 			}
 		}
 	}
+	// The dynamic bounces: histories of their own, accumulated like the
+	// static one but never restarted by a change; instead the lights'
+	// motion caps their length (A-SVGF's alpha = max(alpha, gradient), the
+	// gradient being how far the lights moved this frame): a sweep keeps
+	// them at a frame or two, at rest they grow to the window.
+	vec3 dyn = vec3(0.0);
+	vec3 dyn2 = vec3(0.0);
+	float dyn_frames = 0.0;
+	if (dyn_lights.count > 0u) {
+		vec4 dyn2_old = imageLoad(indirect_dyn2_atlas, texel);
+		float keep_dyn = params.dynamic_motion > 0.0 ? max(1.0, 1.0 / params.dynamic_motion) : params.dynamic_window;
+		dyn_frames = fresh ? 0.0 : min(min(dyn2_old.a * 64.0, keep_dyn), params.dynamic_window);
+		float dyn_alpha = 1.0 / (dyn_frames + 1.0);
+		dyn = mix(max(dyn_old.rgb, vec3(0.0)), dyn_sample, dyn_alpha);
+		dyn2 = mix(max(dyn2_old.rgb, vec3(0.0)), dyn2_sample, dyn_alpha);
+		dyn_frames = min(dyn_frames + 1.0, 64.0);
+	}
+	if ((params.debug & 512u) != 0u) {
+		// (paint3) Whether any light is dynamic, the share of the dynamic
+		// rays that landed on a card and connected, and the dynamic term's
+		// share of the bounce.
+		indirect = vec3(dyn_lights.count > 0u ? 1.0 : 0.0, dyn_landed, luminance(dyn + dyn2) / max(luminance(indirect + dyn + dyn2), 1e-4));
+		dyn = vec3(0.0);
+		dyn2 = vec3(0.0);
+	} else if ((params.debug & 131072u) != 0u) {
+		// (paint8) The static lights' visibility ratio (r) and the dynamic lights' (g).
+		indirect = vec3(vis, vis_dyn, 0.0);
+		dyn = vec3(0.0);
+		dyn2 = vec3(0.0);
+	} else if ((params.debug & 2048u) != 0u) {
+		// (paint5) The share of the dynamic rays that landed and connected,
+		// as grey: a luminance readout (rt_lab/radiosity_box.gd prints it
+		// at its sample points).
+		indirect = vec3(dyn_landed);
+		dyn = vec3(0.0);
+		dyn2 = vec3(0.0);
+	}
+	imageStore(indirect_dyn_atlas, texel, vec4(dyn, dyn_lum));
+	imageStore(indirect_dyn2_atlas, texel, vec4(dyn2, dyn_frames / 64.0));
 	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
 
-	vec3 direct = d.exact + d.local_sum * vis;
-	vec3 radiance = max(t.albedo * (direct + indirect) + t.emission, vec3(0.0));
+	// The radiance the rays read: without the dynamic lights' direct term,
+	// which every reader adds from the lights' current state (the gather at
+	// its hits, the light rays at their landings): a card relit with the
+	// beam where it was a frame ago never hands that beam to a reader
+	// subtracting it where it is now.
+	vec3 direct = d.exact + max(d.local_sum - d.dyn_sum, vec3(0.0)) * vis;
+	vec3 radiance = max(t.albedo * (direct + indirect + dyn + dyn2) + t.emission, vec3(0.0));
+	imageStore(static_atlas, texel, vec4(max(t.albedo * (direct + indirect) + t.emission, vec3(0.0)), vis_dyn));
 	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
 }
 
@@ -987,11 +1396,23 @@ void main() {
 		float gradient = bounce_gradient(texel, t, prev_seed, have_prev);
 		vec3 indirect_sample;
 		float bounce_change;
+		float bounce_change_total;
 		uint bounce_set;
 		float bounce_t;
-		trace_bounce(t, bounce_seed, indirect_sample, bounce_change, bounce_set, bounce_t);
-		trace_bounce_young(texel, t, bounce_seed, indirect_sample, bounce_change);
-		accumulate(texel, t, reset, d, indirect_sample, bounce_change, gradient, bounce_set, bounce_t, card_min, card_max);
+		bool young_dynamic = texel_young_dynamic(texel);
+		uint n_cosine = cosine_rays(texel_young(texel), young_dynamic);
+		float n_light = light_rays(young_dynamic);
+		vec3 dyn_sample;
+		vec3 dyn2_sample;
+		trace_bounce(t, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+		trace_bounce_young(n_cosine, n_light, t, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+		vec3 dyn_light;
+		float dyn_landed;
+		float dyn_change_total;
+		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+		dyn_sample += dyn_light;
+		bounce_change_total = max(bounce_change_total, dyn_change_total);
+		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
 	}
 
@@ -1040,10 +1461,22 @@ void main() {
 	}
 	vec3 indirect_sample;
 	float bounce_change;
+	float bounce_change_total;
 	uint bounce_set;
 	float bounce_t;
-	trace_bounce(t[tracer], seed, indirect_sample, bounce_change, bounce_set, bounce_t);
-	trace_bounce_young(tracer_texel, t[tracer], seed, indirect_sample, bounce_change);
+	bool young_dynamic = texel_young_dynamic(tracer_texel);
+	uint n_cosine = cosine_rays(texel_young(tracer_texel), young_dynamic);
+	float n_light = light_rays(young_dynamic);
+	vec3 dyn_sample;
+	vec3 dyn2_sample;
+	trace_bounce(t[tracer], seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+	trace_bounce_young(n_cosine, n_light, t[tracer], seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+	vec3 dyn_light;
+	float dyn_landed;
+	float dyn_change_total;
+	trace_dynamic(tracer_texel, t[tracer], float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+	dyn_sample += dyn_light;
+	bounce_change_total = max(bounce_change_total, dyn_change_total);
 	for (uint k = 0u; k < 4u; k++) {
 		if (!valid[k]) {
 			continue;
@@ -1052,6 +1485,6 @@ void main() {
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		Direct d;
 		shade_direct(entry, t[k], seed_k, d);
-		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, gradient, bounce_set, bounce_t, card_min, card_max);
+		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
 }

@@ -218,6 +218,8 @@ layout(set = 0, binding = 24) uniform sampler2D screen_radiance_texture;
 // The cards' accumulated bounce irradiance (surface_cache_light.glsl
 // indirect_atlas), for the hit's own indirect term (card_indirect).
 layout(set = 0, binding = 25) uniform texture2D card_indirect_atlas;
+layout(set = 0, binding = 26) uniform texture2D card_indirect_dyn_atlas; // The dynamic lights' bounce, apart.
+layout(set = 0, binding = 27) uniform texture2D card_indirect_dyn2_atlas; // Their second bounce.
 
 /* Set 1: the material samplers, by the names the compiler emits. */
 
@@ -482,9 +484,21 @@ bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec
 	if (!card_lookup(p_instance_id, p_world_pos, -p_n_world, unused)) {
 		return false;
 	}
-	float relights = texelFetch(card_indirect_atlas, ivec2(card_hit_texel), 0).a * 64.0;
+	vec4 ind0 = texelFetch(card_indirect_atlas, ivec2(card_hit_texel), 0);
+	float relights = ind0.a * 64.0;
 	if (relights <= 0.0) {
 		return false;
+	}
+	// The dynamic lights' histories are the younger while a light moves
+	// (surface_cache_light.glsl accumulate; their age is the second one's
+	// alpha), counted by their share of the bounce here: the tent is a
+	// blur, and after any move every texel's dynamic history is young.
+	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, ivec2(card_hit_texel), 0);
+	if (dyn2.a > 0.0) {
+		vec3 dyn = max(texelFetch(card_indirect_dyn_atlas, ivec2(card_hit_texel), 0).rgb, vec3(0.0)) + max(dyn2.rgb, vec3(0.0));
+		float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
+		float share = dyn_lum / max(dyn_lum + dot(max(ind0.rgb, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+		relights = min(relights, dyn2.a * 64.0 / max(share, 0.05));
 	}
 	vec2 dims = vec2(card_hit_dims);
 	float spacing = 1.0;
@@ -498,7 +512,7 @@ bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec
 	for (int dy = 0; dy < 4; dy++) {
 		for (int dx = 0; dx < 4; dx++) {
 			vec2 t = clamp(card_hit_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
-			ind += textureLod(sampler2D(card_indirect_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb;
+			ind += textureLod(sampler2D(card_indirect_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb + max(textureLod(sampler2D(card_indirect_dyn_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb, vec3(0.0)) + max(textureLod(sampler2D(card_indirect_dyn2_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb, vec3(0.0));
 		}
 	}
 	r_indirect = max(ind / 16.0, vec3(0.0));

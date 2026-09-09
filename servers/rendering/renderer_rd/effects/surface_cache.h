@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_geometry_instance.h"
@@ -143,6 +144,9 @@ private:
 	// not on one bright texel), one 2D view per level for the writers.
 	static const uint32_t LIGHTING_MIPS = 6;
 	RID lighting_atlas_mips[LIGHTING_MIPS];
+	RID indirect_dyn_atlas; // RGBA16F, the dynamic lights' bounce (surface_cache_light.glsl trace_dynamic), alpha their direct term's luminance.
+	RID indirect_dyn2_atlas; // RGBA16F, their second bounce.
+	RID static_atlas; // RGBA16F, the static lights' radiance alone, for the static cosine rays (surface_cache_light.glsl static_atlas).
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
 	// RGBA32UI, six packed halves: the unshadowed direct radiance (in
 	// colour) at the last relight, its relative change since the relight
@@ -248,6 +252,10 @@ private:
 	uint32_t sets_buffer_capacity = 0;
 	RID requests_buffer; // uint per set: frame index of the last gather hit.
 	RID active_buffer; // uint count, then the active set list.
+	RID dyn_stats_buffer; // Diagnostics (GODOT_CARD_ABLATE=stats): 16 counters of the dynamic rays' fate.
+	RID dynamic_lights_buffer; // DynamicLightsBuffer, uploaded every lighting update.
+	uint32_t dynamic_light_count = 0;
+	uint32_t dynamic_generation = 0; // LightStorage::get_card_dynamic_generation as last seen; a change relights every set this frame.
 	RID relit_buffer; // Per set, two uints: the frame of the relight before the last, and of the last (the bounce gradient re-traces the previous relight's ray).
 	RID set_lights_buffer; // Per active slot: count + MAX_LIGHTS_PER_SET indices.
 	RID dispatch_buffer; // Indirect args for the lighting pass.
@@ -309,6 +317,20 @@ private:
 		uint32_t grid_cap;
 		float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (GODOT_CARD_BOUNCE_FLOOR).
 		uint32_t young_rays; // Extra bounce rays for a texel whose accumulation is under eight relights (GODOT_CARD_YOUNG_RAYS).
+		uint32_t dynamic_rays; // Light rays per dynamic light per texel per relight (GODOT_CARD_DYN_RAYS).
+		float dynamic_motion; // The dynamic lights' motion this frame over GODOT_CARD_DYN_MOTION (0 at rest, 1 a full refresh).
+		float dynamic_window; // The most relights the dynamic histories accumulate (GODOT_CARD_DYN_WINDOW).
+		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
+	};
+
+	// The dynamic lights, as the card lighting and the GI gather read them
+	// (surface_cache_light.glsl DynamicLights): LightStorage's world-space
+	// copies of the lights that changed lately, with their weights.
+	struct DynamicLightsBuffer {
+		uint32_t count;
+		uint32_t pad[3];
+		float weights[8];
+		LightStorage::LightData data[8];
 	};
 
 	struct GridPushConstant {
@@ -374,8 +396,14 @@ public:
 	uint32_t get_lighting_atlas_mips() const { return LIGHTING_MIPS; }
 	RID get_depth_atlas() const { return depth_atlas; }
 	RID get_albedo_atlas() const { return albedo_atlas; }
+	RID get_normal_atlas() const { return normal_atlas; }
 	RID get_change_atlas() const { return change_atlas; }
 	RID get_indirect_atlas() const { return indirect_atlas; }
+	RID get_indirect_dyn_atlas() const { return indirect_dyn_atlas; }
+	RID get_indirect_dyn2_atlas() const { return indirect_dyn2_atlas; }
+	RID get_dynamic_lights_buffer() const { return dynamic_lights_buffer; }
+	RID get_static_atlas() const { return static_atlas; }
+	uint32_t get_dynamic_light_count() const { return dynamic_light_count; }
 	// The world light grid as the last update_lighting left it (the hit
 	// shading reads it the way the card lighting does).
 	RID get_grid_buffer() const { return grid_buffer; }

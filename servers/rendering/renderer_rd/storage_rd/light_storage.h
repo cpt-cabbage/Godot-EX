@@ -136,6 +136,9 @@ private:
 
 	/* OMNI/SPOT LIGHT DATA */
 
+public:
+	// The GPU light record (the omni/spot buffers, and the surface cache's
+	// dynamic lights buffer, see SurfaceCache::DynamicLightsBuffer).
 	struct LightData {
 		float position[3];
 		float inv_radius;
@@ -171,6 +174,7 @@ private:
 		float projector_rect[4];
 	};
 
+private:
 	struct LightInstanceDepthSort {
 		float depth;
 		LightInstance *light_instance;
@@ -203,6 +207,27 @@ private:
 	RID card_spot_light_buffer;
 	uint32_t card_light_buffer_capacity = 0;
 	bool card_lights_valid = false;
+	// The lights that moved or changed lately: the surface cache estimates
+	// their bounce apart (surface_cache_light.glsl trace_dynamic). Per light
+	// instance, what it looked like when last seen and when it last changed;
+	// the list is this frame's card light indices (bit 31 for a spot) of
+	// those that changed within GODOT_CARD_DYN_HOLD frames (600).
+	struct CardLightTrack {
+		Transform3D transform;
+		Color color;
+		float param[RSE::LIGHT_PARAM_MAX];
+		uint64_t last_change = 0;
+		bool seen = false;
+		bool dynamic = false; // Weight above zero last frame.
+	};
+	HashMap<RID, CardLightTrack> card_light_tracks;
+	LocalVector<uint32_t> card_dynamic_lights;
+	LocalVector<LightData> card_dynamic_light_data; // The same lights in world space, pad 1 for a spot (the cards' DynamicLights buffer).
+	LocalVector<float> card_dynamic_weights; // Per entry: 1 within the hold, fading to 0 over GODOT_CARD_DYN_FADE frames after it.
+	float card_dynamic_motion = 0.0f; // The most any dynamic light moved this frame, in metres (its origin, and its axis three metres out).
+	float card_dynamic_change = 0.0f; // The most any light's intensity or colour changed this frame, relative (1 = whole).
+	uint32_t card_dynamic_generation = 0; // Counts the frames a light joined or left the dynamic set (the cards relight everything then).
+	uint64_t card_light_frame = 0;
 	void _fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const;
 
 	ForwardIDType _light_type_to_forward_id_type(RSE::LightType p_type);
@@ -852,6 +877,12 @@ public:
 	// or a zero radius the cards use the frame's buffers instead.
 	void update_card_light_buffers(const RID *p_lights, uint32_t p_light_count, const Transform3D &p_camera_transform, RID p_camera_attributes, float p_radius);
 	bool card_lights_are_valid() const { return card_lights_valid; }
+	const LocalVector<uint32_t> &get_card_dynamic_lights() const { return card_dynamic_lights; }
+	const LocalVector<float> &get_card_dynamic_weights() const { return card_dynamic_weights; }
+	const LocalVector<LightData> &get_card_dynamic_light_data() const { return card_dynamic_light_data; }
+	float get_card_dynamic_motion() const { return card_dynamic_motion; }
+	float get_card_dynamic_change() const { return card_dynamic_change; }
+	uint32_t get_card_dynamic_generation() const { return card_dynamic_generation; }
 	RID get_card_omni_light_buffer() const { return card_omni_light_buffer; }
 	RID get_card_spot_light_buffer() const { return card_spot_light_buffer; }
 	uint32_t get_card_omni_light_count() const { return card_omni_lights.size(); }

@@ -17,6 +17,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+#include "../light_data_inc.glsl"
 #include "../oct_inc.glsl"
 #include "rt_hit_inc.glsl"
 #include "surface_cache_inc.glsl"
@@ -56,7 +57,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
 	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
 	float card_youth_lod; // The mip a texel relit once is read through (0 disables); a level less per doubling of its relights (see surface_cache_lookup).
-	uint pad1;
+	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
 	uint pad2;
 }
 params;
@@ -276,6 +277,65 @@ layout(set = 1, binding = 2, r16f) uniform restrict writeonly image2D out_view_d
 // main).
 layout(set = 0, binding = 29) uniform sampler2D prev_gi_meta;
 layout(set = 0, binding = 30) uniform sampler2D card_indirect_atlas;
+layout(set = 0, binding = 31) uniform sampler2D card_indirect_dyn_atlas; // The dynamic lights' bounce, apart (surface_cache_light.glsl trace_dynamic).
+layout(set = 0, binding = 32) uniform sampler2D card_indirect_dyn2_atlas; // Their second bounce.
+// The cards' albedo and captured normal, and the dynamic lights (world
+// space, pad 1 for a spot, with their weights): the lighting atlas holds no
+// dynamic light's direct term (surface_cache_light.glsl accumulate), a hit
+// adds it from the light's current state.
+layout(set = 0, binding = 33) uniform sampler2D card_albedo_atlas;
+layout(set = 0, binding = 34) uniform sampler2D card_normal_atlas;
+layout(set = 0, binding = 36) uniform sampler2D card_static_atlas; // Alpha: the dynamic lights' visibility ratio.
+layout(set = 0, binding = 35, std430) restrict readonly buffer DynamicLights {
+	uint count;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+	vec4 weights[2];
+	LightData data[8];
+}
+dyn_lights;
+
+float card_omni_attenuation(float dist, float inv_range, float decay) {
+	float nd = dist * inv_range;
+	nd *= nd;
+	nd *= nd;
+	nd = max(1.0 - nd, 0.0);
+	nd *= nd;
+	return nd * pow(max(dist, 0.0001), -decay);
+}
+
+// The dynamic histories' age at a card texel, in relights, divided by their
+// share of the texel's bounce: a young dynamic term that is a tenth of the
+// light counts as ten times its age (the youth tent and level are blurs,
+// and after any move every texel's dynamic history is young).
+float card_dynamic_age(ivec2 tex0, vec3 static_bounce) {
+	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, tex0, 0);
+	vec3 dyn = max(texelFetch(card_indirect_dyn_atlas, tex0, 0).rgb, vec3(0.0)) + max(dyn2.rgb, vec3(0.0));
+	float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
+	float share = dyn_lum / max(dyn_lum + dot(max(static_bounce, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+	return dyn2.a * 64.0 / max(share, 0.05);
+}
+
+// The dynamic lights' unshadowed direct term at a point (the card lighting's
+// light_contribution_world, over pi).
+vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
+	vec3 sum = vec3(0.0);
+	for (uint i = 0u; i < dyn_lights.count; i++) {
+		LightData ld = dyn_lights.data[i];
+		vec3 rel = ld.position - world_pos;
+		float len = length(rel);
+		float attenuation = card_omni_attenuation(len, ld.inv_radius, ld.attenuation);
+		vec3 l = rel / max(len, 1e-5);
+		if (ld.pad > 0.5) {
+			float scos = max(dot(-l, normalize(ld.direction)), ld.cone_angle);
+			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
+			attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
+		}
+		sum += ld.color * (max(dot(n, l), 0.0) * attenuation * (1.0 / 3.14159265359)) * dyn_lights.weights[i >> 2u][i & 3u];
+	}
+	return sum;
+}
 
 layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_directional;
 // The young pixel's fallback: the bounce irradiance of the card under its
@@ -696,6 +756,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float best_w = 0.0;
 	vec2 best_uv = vec2(0.0);
 	uint best_packed = 0u;
+	uint best_k = 0u;
 	float best_mismatch = 0.0;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
@@ -730,6 +791,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 			best_w = facing;
 			best_uv = uv01;
 			best_packed = packed;
+			best_k = k;
 			best_mismatch = abs(stored - depth) / tolerance;
 		}
 	}
@@ -757,7 +819,11 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	// relights until the texel stands on its own at sixty-four.
 	if (params.card_youth_lod > 0.0) {
 		ivec2 tex0 = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
-		float relights = texelFetch(card_indirect_atlas, tex0, 0).a * 64.0;
+		vec4 ind0 = texelFetch(card_indirect_atlas, tex0, 0);
+		float relights = ind0.a * 64.0;
+		if (dyn_lights.count > 0u) {
+			relights = min(relights, card_dynamic_age(tex0, ind0.rgb));
+		}
 		if (relights > 0.0) {
 			float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
 			lod = clamp(max(lod, youth_lod), 0.0, max_lod);
@@ -766,11 +832,24 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float margin = 0.5 * exp2(lod);
 	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
 	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), lod).rgb;
+	if (dyn_lights.count > 0u) {
+		// The dynamic lights' direct term at the hit (see the buffer above):
+		// the card's albedo and normal at the texel, its accumulated
+		// visibility ratio for the shadow.
+		ivec2 tex0 = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
+		vec3 albedo = texelFetch(card_albedo_atlas, tex0, 0).rgb;
+		vec3 n_cam = normalize(texelFetch(card_normal_atlas, tex0, 0).rgb * 2.0 - 1.0);
+		vec3 axis, u, v;
+		card_basis(best_k, axis, u, v);
+		vec3 n_world = normalize(mat3(s.world_from_local) * (u * n_cam.x + v * n_cam.y + axis * n_cam.z));
+		float vis = texelFetch(card_static_atlas, tex0, 0).a;
+		r_radiance += albedo * card_dynamic_direct(p_world_hit, n_world) * vis;
+	}
 	if (params.card_cone_tan < 0.0) {
 		// Diagnostics (GODOT_GI_CONE < 0): the level picked, as the radiance.
 		r_radiance = vec3(lod / 5.0, card_lookup_footprint, best_texel_world * 10.0);
 	}
-	pixel_change = max(pixel_change, unpackHalf2x16(texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y).y);
+	pixel_change = max(pixel_change, float((texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y >> 16u) & 0xFFu) / 255.0);
 	card_atlas_texel = atlas_texel;
 	card_atlas_origin = card_origin_packed(best_packed);
 	card_lookup_confidence = best_w * (1.0 - best_mismatch * best_mismatch);
@@ -1232,7 +1311,15 @@ void main() {
 					// wider grid, eight apart, leaked light across the walls and
 					// flickered against the history it fades into), the spacing
 					// halving with every doubling of its relights.
-					float relights = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0).a * 64.0;
+					vec4 ind0 = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0);
+					float relights = ind0.a * 64.0;
+					if (dyn_lights.count > 0u) {
+						// And the dynamic histories' age, by their share:
+						// the stand-in is then as fresh as the pixel's own
+						// samples where a moving light is the light, and
+						// fades out like them.
+						relights = min(relights, card_dynamic_age(ivec2(card_atlas_texel), ind0.rgb));
+					}
 					vec2 dims = vec2(card_atlas_dims);
 					float spacing = 1.0;
 					if (params.card_youth_lod > 0.0 && relights > 0.0) {
@@ -1245,7 +1332,9 @@ void main() {
 					for (int dy = 0; dy < 4; dy++) {
 						for (int dx = 0; dx < 4; dx++) {
 							vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
-							ind += textureLod(card_indirect_atlas, t / float(params.surface_cache_atlas_size), 0.0).rgb;
+							vec2 uv = t / float(params.surface_cache_atlas_size);
+							uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
+							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0)) + ((parts & 2u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0)) + ((parts & 4u) != 0u ? max(textureLod(card_indirect_dyn2_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
 						}
 					}
 					ind /= 16.0;

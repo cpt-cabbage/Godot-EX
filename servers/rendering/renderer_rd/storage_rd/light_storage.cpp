@@ -781,10 +781,22 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_light_count, const Transform3D &p_camera_transform, RID p_camera_attributes, float p_radius) {
 	card_omni_lights.clear();
 	card_spot_lights.clear();
+	card_dynamic_lights.clear();
+	card_dynamic_light_data.clear();
+	card_dynamic_weights.clear();
+	card_dynamic_motion = 0.0f;
+	card_dynamic_change = 0.0f;
 	card_lights_valid = p_lights != nullptr && p_radius > 0.0f;
 	if (!card_lights_valid) {
 		return;
 	}
+	card_light_frame++;
+	static const uint64_t dynamic_hold = OS::get_singleton()->get_environment("GODOT_CARD_DYN_HOLD") == "" ? 600 : MAX(OS::get_singleton()->get_environment("GODOT_CARD_DYN_HOLD").to_int(), 1);
+	// After the hold, the light's weight fades to zero over this many frames:
+	// the cards' static accumulation absorbs its bounce as slowly as the
+	// weight leaves it, so nothing restarts and nothing dips (a snap back to
+	// static restarted the beam's bounce to one sample, the mottle again).
+	static const uint64_t dynamic_fade = OS::get_singleton()->get_environment("GODOT_CARD_DYN_FADE") == "" ? 600 : MAX(OS::get_singleton()->get_environment("GODOT_CARD_DYN_FADE").to_int(), 1);
 	const Transform3D inverse_transform = p_camera_transform.affine_inverse();
 	for (uint32_t i = 0; i < p_light_count; i++) {
 		const LightInstance *light_instance = light_instance_owner.get_or_null(p_lights[i]);
@@ -801,6 +813,72 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 		}
 		LightData data;
 		_fill_card_light_data(data, light->type, light, light_instance, inverse_transform, distance, p_camera_attributes);
+		// Dynamic: changed since last seen (a light seen for the first time
+		// is not a change), and within the hold.
+		CardLightTrack &track = card_light_tracks[p_lights[i]];
+		bool changed = false;
+		float motion = 0.0f;
+		if (track.seen) {
+			motion = track.transform.origin.distance_to(light_instance->transform.origin) + track.transform.basis.get_column(2).distance_to(light_instance->transform.basis.get_column(2)) * 3.0f;
+			// A change of intensity or colour is motion too: relative to
+			// the light's own, and a change of one is a full refresh.
+			const float e0 = track.param[RSE::LIGHT_PARAM_ENERGY] * track.param[RSE::LIGHT_PARAM_INTENSITY];
+			const float e1 = light->param[RSE::LIGHT_PARAM_ENERGY] * light->param[RSE::LIGHT_PARAM_INTENSITY];
+			float rel = Math::abs(e1 - e0) / MAX(MAX(Math::abs(e0), Math::abs(e1)), 1e-6f);
+			for (int ch = 0; ch < 3; ch++) {
+				rel = MAX(rel, Math::abs(light->color[ch] - track.color[ch]) / MAX(MAX(light->color[ch], track.color[ch]), 0.05f));
+			}
+			card_dynamic_change = MAX(card_dynamic_change, rel);
+			changed = !track.transform.is_equal_approx(light_instance->transform) || track.color != light->color;
+			for (int p = 0; p < RSE::LIGHT_PARAM_MAX && !changed; p++) {
+				changed = track.param[p] != light->param[p];
+			}
+		}
+		if (changed || !track.seen) {
+			track.transform = light_instance->transform;
+			track.color = light->color;
+			for (int p = 0; p < RSE::LIGHT_PARAM_MAX; p++) {
+				track.param[p] = light->param[p];
+			}
+			if (changed) {
+				track.last_change = card_light_frame;
+			}
+			track.seen = true;
+		}
+		// GODOT_CARD_DYN_FORCE=all|spot: every light (or every spot) dynamic,
+		// to measure the dynamic estimator against the cosine rays at rest.
+		static const String force = OS::get_singleton()->get_environment("GODOT_CARD_DYN_FORCE");
+		float weight = 0.0f;
+		if (track.last_change > 0) {
+			const uint64_t age = card_light_frame - track.last_change;
+			weight = age < dynamic_hold ? 1.0f : MAX(0.0f, 1.0f - float(age - dynamic_hold) / float(dynamic_fade));
+		}
+		if (force == "all" || (force == "spot" && light->type == RSE::LIGHT_SPOT)) {
+			weight = 1.0f;
+		}
+		if ((weight > 0.0f) != track.dynamic) {
+			// Joining or leaving the dynamic set: every card's static radiance
+			// changes (the light's direct term leaves it or returns), and the
+			// sets not relit soon would hand the stale one to the static rays
+			// for as long as the round robin takes (a room read bright for
+			// hundreds of frames after a flashlight's first move).
+			track.dynamic = weight > 0.0f;
+			card_dynamic_generation++;
+		}
+		// The card copy's pad marks a dynamic light (the cards' visibility
+		// ratio keeps the dynamic lights' apart, surface_cache_light.glsl
+		// shade_direct).
+		data.pad = 0.0f;
+		if (weight > 0.0f && card_dynamic_lights.size() < 8) {
+			data.pad = 1.0f;
+			card_dynamic_motion = MAX(card_dynamic_motion, motion);
+			card_dynamic_lights.push_back(light->type == RSE::LIGHT_OMNI ? card_omni_lights.size() : (card_spot_lights.size() | 0x80000000u));
+			card_dynamic_weights.push_back(weight);
+			LightData world;
+			_fill_card_light_data(world, light->type, light, light_instance, Transform3D(), distance, p_camera_attributes);
+			world.pad = light->type == RSE::LIGHT_SPOT ? 1.0f : 0.0f;
+			card_dynamic_light_data.push_back(world);
+		}
 		if (light->type == RSE::LIGHT_OMNI) {
 			card_omni_lights.push_back(data);
 		} else {
