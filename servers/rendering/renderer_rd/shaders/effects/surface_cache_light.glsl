@@ -86,6 +86,10 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_motion; // How far the dynamic lights moved this frame, over the distance that refreshes their bounce whole (0 at rest, 1 and above a full refresh): caps the dynamic histories' length at its inverse (see accumulate).
 	float dynamic_window; // The most relights the dynamic histories accumulate.
 	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
+	float dynamic_join; // On the frame a light joins the dynamic set (every set relit): the share of its bounce the static accumulation holds, which it sheds (see accumulate). 0 otherwise.
+	float pad_join0;
+	float pad_join1;
+	float pad_join2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 }
 params;
@@ -1037,6 +1041,22 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 // the dynamic term's now, see trace_dynamic; this is for the rest: a fresh
 // capture, a lamp switched, a surface moved.)
 #define YOUNG_RELIGHTS 8.0
+
+// The bounce atlas's alpha: the relights (whole, up to 64) over 64, and in
+// the half-relight under them the hand-over fraction of a light joining
+// the dynamic set (see accumulate), about five bits of it. Readers that
+// want a relight count take the alpha times 64 as it is: the fraction is
+// under half a relight.
+float ind_pack(float relights, float join) {
+	return (relights + 0.5 * clamp(join, 0.0, 1.0)) / 64.0;
+}
+
+vec2 ind_unpack(float a) {
+	float x = a * 64.0;
+	float relights = floor(x + 1e-3);
+	return vec2(relights, clamp((x - relights) * 2.0, 0.0, 1.0));
+}
+
 bool texel_young(ivec2 texel) {
 	return imageLoad(indirect_atlas, texel).a * 64.0 < YOUNG_RELIGHTS;
 }
@@ -1251,11 +1271,58 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// still sweeping) -- that flicker is the GI screen history restarting
 	// at the pixels whose rays hit the tracked texels, not the bounce's
 	// own sample count.
+	// The dynamic bounces: histories of their own, accumulated like the
+	// static one but never restarted by a change; instead the lights'
+	// motion caps their length (A-SVGF's alpha = max(alpha, gradient), the
+	// gradient being how far the lights moved this frame): a sweep keeps
+	// them at a frame or two, at rest they grow to the window.
+	vec3 dyn = vec3(0.0);
+	vec3 dyn2 = vec3(0.0);
+	float dyn_frames = 0.0;
+	vec4 dyn2_old = imageLoad(indirect_dyn2_atlas, texel);
+	if (dyn_lights.count > 0u) {
+		float keep_dyn = params.dynamic_motion > 0.0 ? max(1.0, 1.0 / params.dynamic_motion) : params.dynamic_window;
+		// A join (see below) starts them afresh: a light changing again while
+		// its weight fades had its histories at that weight.
+		dyn_frames = (fresh || params.dynamic_join > 0.0) ? 0.0 : min(min(dyn2_old.a * 64.0, keep_dyn), params.dynamic_window);
+		float dyn_alpha = 1.0 / (dyn_frames + 1.0);
+		dyn = mix(max(dyn_old.rgb, vec3(0.0)), dyn_sample, dyn_alpha);
+		dyn2 = mix(max(dyn2_old.rgb, vec3(0.0)), dyn2_sample, dyn_alpha);
+		dyn_frames = min(dyn_frames + 1.0, 64.0);
+	}
 	float keep_ind = (change > 0.02 && (params.debug & 32u) == 0u) ? max(params.bounce_floor, 1.0 / change) : 64.0;
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
-	float ind_frames = reset ? 0.0 : min(old_indirect.a * 64.0, keep_ind);
+	// The hand-over of a light joining the dynamic set (params.dynamic_join,
+	// the frame every set is relit). Until it moved, the light was one of
+	// the static lights: the accumulation holds its bounce, and from this
+	// relight the dynamic histories estimate the whole of it, so the room
+	// would read the beam's bounce twice, fading over the static window (a
+	// flashlight's first move brightened the ceiling by a tenth for half a
+	// second). Neither a restart nor a subtraction of the first relight's
+	// estimate answers it: one relight's light rays are a fraction of the
+	// bounce, and its second bounce is not in them at all. Instead the
+	// texel keeps the fraction of its pre-join content the accumulation
+	// still holds -- one at the join, times one less the blend weight every
+	// relight, so a restart clears it -- and stores the accumulation less
+	// that fraction of the dynamic histories: what the readers sum (this
+	// and the dynamic histories) is then the pre-join value exactly at the
+	// join, and moves to the static accumulation plus the dynamic estimate
+	// at the accumulation's own pace, unbiased at every relight, the
+	// estimate's noise entering only as fast as the accumulation forgets.
+	// The fraction rides in the alpha's half-relight (the relight count is
+	// whole; see ind_unpack).
+	vec2 ind_old = ind_unpack(old_indirect.a);
+	float join = 0.0;
+	if (dyn_lights.count > 0u && !fresh) {
+		// The stored value plus the fraction of the histories it was stored
+		// less: the accumulation itself.
+		old_indirect.rgb += ind_old.y * (max(dyn_old.rgb, vec3(0.0)) + max(dyn2_old.rgb, vec3(0.0)));
+		join = max(ind_old.y, params.dynamic_join);
+	}
+	float ind_frames = reset ? 0.0 : min(ind_old.x, keep_ind);
 	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / window);
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
+	join *= ind_frames <= 0.0 ? 0.0 : 1.0 - ind_alpha;
 	if ((params.debug & 128u) != 0u) {
 		// Diagnostics (GODOT_CARD_ABLATE=paint, seen through GODOT_GI_FALLBACK=all):
 		// the texel's own radiance gradient, the re-traced bounce gradient,
@@ -1276,23 +1343,6 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 				}
 			}
 		}
-	}
-	// The dynamic bounces: histories of their own, accumulated like the
-	// static one but never restarted by a change; instead the lights'
-	// motion caps their length (A-SVGF's alpha = max(alpha, gradient), the
-	// gradient being how far the lights moved this frame): a sweep keeps
-	// them at a frame or two, at rest they grow to the window.
-	vec3 dyn = vec3(0.0);
-	vec3 dyn2 = vec3(0.0);
-	float dyn_frames = 0.0;
-	if (dyn_lights.count > 0u) {
-		vec4 dyn2_old = imageLoad(indirect_dyn2_atlas, texel);
-		float keep_dyn = params.dynamic_motion > 0.0 ? max(1.0, 1.0 / params.dynamic_motion) : params.dynamic_window;
-		dyn_frames = fresh ? 0.0 : min(min(dyn2_old.a * 64.0, keep_dyn), params.dynamic_window);
-		float dyn_alpha = 1.0 / (dyn_frames + 1.0);
-		dyn = mix(max(dyn_old.rgb, vec3(0.0)), dyn_sample, dyn_alpha);
-		dyn2 = mix(max(dyn2_old.rgb, vec3(0.0)), dyn2_sample, dyn_alpha);
-		dyn_frames = min(dyn_frames + 1.0, 64.0);
 	}
 	if ((params.debug & 512u) != 0u) {
 		// (paint3) Whether any light is dynamic, the share of the dynamic
@@ -1316,7 +1366,10 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	}
 	imageStore(indirect_dyn_atlas, texel, vec4(dyn, dyn_lum));
 	imageStore(indirect_dyn2_atlas, texel, vec4(dyn2, dyn_frames / 64.0));
-	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
+	// The accumulation less the joining light's share of the dynamic
+	// histories (see the hand-over above); the readers add the histories.
+	vec3 indirect_stored = max(indirect - join * (dyn + dyn2), vec3(0.0));
+	imageStore(indirect_atlas, texel, vec4(indirect_stored, ind_pack(min(ind_frames + 1.0, 64.0), join)));
 
 	// The radiance the rays read: without the dynamic lights' direct term,
 	// which every reader adds from the lights' current state (the gather at
@@ -1324,8 +1377,8 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// beam where it was a frame ago never hands that beam to a reader
 	// subtracting it where it is now.
 	vec3 direct = d.exact + max(d.local_sum - d.dyn_sum, vec3(0.0)) * vis;
-	vec3 radiance = max(t.albedo * (direct + indirect + dyn + dyn2) + t.emission, vec3(0.0));
-	imageStore(static_atlas, texel, vec4(max(t.albedo * (direct + indirect) + t.emission, vec3(0.0)), vis_dyn));
+	vec3 radiance = max(t.albedo * (direct + indirect_stored + dyn + dyn2) + t.emission, vec3(0.0));
+	imageStore(static_atlas, texel, vec4(max(t.albedo * (direct + indirect_stored) + t.emission, vec3(0.0)), vis_dyn));
 	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
 }
 

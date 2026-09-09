@@ -914,6 +914,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.dynamic_motion = MAX(MAX(motion / MAX(dyn_motion, 1e-4f), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()), 0.0f);
 	params.dynamic_window = MAX(dyn_window, 1.0f);
 	params.dynamic_change = RendererRD::LightStorage::get_singleton()->get_card_dynamic_change();
+	// A light joining the dynamic set (LightStorage): the static
+	// accumulation holds its bounce, and hands it over to the dynamic
+	// histories as they converge (surface_cache_light.glsl accumulate).
+	// GODOT_CARD_JOIN=off leaves the accumulation to forget it over its
+	// window, with the bounce counted twice meanwhile.
+	static const bool join_off = OS::get_singleton()->get_environment("GODOT_CARD_JOIN") == "off";
+	params.dynamic_join = (dynamic_enabled && full_relight && !join_off) ? RendererRD::LightStorage::get_singleton()->get_card_dynamic_join() : 0.0f;
 	params.dynamic_rays = uint32_t(CLAMP(params.dynamic_motion >= 0.5f ? dyn_rays : dyn_rays_rest, 0, 8));
 	// The young texels' extra cosine rays while the dynamic histories are
 	// young too (a light moved or changed within the last eight relights),

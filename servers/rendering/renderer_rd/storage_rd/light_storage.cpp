@@ -786,6 +786,7 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 	card_dynamic_weights.clear();
 	card_dynamic_motion = 0.0f;
 	card_dynamic_change = 0.0f;
+	card_dynamic_join = 0.0f;
 	card_lights_valid = p_lights != nullptr && p_radius > 0.0f;
 	if (!card_lights_valid) {
 		return;
@@ -834,6 +835,14 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 				changed = track.param[p] != light->param[p];
 			}
 		}
+		// The light's weight before this frame's change (see below): what
+		// the static accumulation still holds of a light's bounce is the
+		// complement, and a change hands it to the dynamic histories.
+		float weight_before = 0.0f;
+		if (track.last_change > 0) {
+			const uint64_t age = card_light_frame - 1 - track.last_change;
+			weight_before = age < dynamic_hold ? 1.0f : MAX(0.0f, 1.0f - float(age - dynamic_hold) / float(dynamic_fade));
+		}
 		if (changed || !track.seen) {
 			track.transform = light_instance->transform;
 			track.color = light->color;
@@ -864,6 +873,19 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 			// hundreds of frames after a flashlight's first move).
 			track.dynamic = weight > 0.0f;
 			card_dynamic_generation++;
+		}
+		if (changed && weight > weight_before) {
+			// A light that was static (or fading back to it) changed: the
+			// cards' static accumulation holds its bounce, or the part the
+			// fade had handed back, and the dynamic histories now estimate
+			// the whole of it. The cards relight every set this frame and
+			// shed that share of the static bounce (surface_cache_light.glsl
+			// accumulate); without it the room read the beam's bounce twice
+			// for the static window after a flashlight's first move.
+			card_dynamic_join = MAX(card_dynamic_join, 1.0f - weight_before);
+			if (weight_before > 0.0f) {
+				card_dynamic_generation++;
+			}
 		}
 		// The card copy's pad marks a dynamic light (the cards' visibility
 		// ratio keeps the dynamic lights' apart, surface_cache_light.glsl

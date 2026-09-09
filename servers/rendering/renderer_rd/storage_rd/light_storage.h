@@ -227,6 +227,7 @@ private:
 	float card_dynamic_motion = 0.0f; // The most any dynamic light moved this frame, in metres (its origin, and its axis three metres out).
 	float card_dynamic_change = 0.0f; // The most any light's intensity or colour changed this frame, relative (1 = whole).
 	uint32_t card_dynamic_generation = 0; // Counts the frames a light joined or left the dynamic set (the cards relight everything then).
+	float card_dynamic_join = 0.0f; // This frame, the largest share of a joining light's bounce the cards' static accumulation holds: 1 for a light that was static, what the fade had already handed back for one changing again while fading.
 	uint64_t card_light_frame = 0;
 	void _fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const;
 
@@ -883,6 +884,7 @@ public:
 	float get_card_dynamic_motion() const { return card_dynamic_motion; }
 	float get_card_dynamic_change() const { return card_dynamic_change; }
 	uint32_t get_card_dynamic_generation() const { return card_dynamic_generation; }
+	float get_card_dynamic_join() const { return card_dynamic_join; }
 	RID get_card_omni_light_buffer() const { return card_omni_light_buffer; }
 	RID get_card_spot_light_buffer() const { return card_spot_light_buffer; }
 	uint32_t get_card_omni_light_count() const { return card_omni_lights.size(); }
