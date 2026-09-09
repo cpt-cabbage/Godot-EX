@@ -80,6 +80,7 @@ params;
 #define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
 #define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
+#define FLAG_FALLBACK_EVERY 131072u // The fallback for every pixel: the temporal pass modulates the history by its change (GODOT_GI_MOD).
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -1282,7 +1283,7 @@ void main() {
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
 	if (bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF)) {
-		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL)) {
+		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & (FLAG_FALLBACK_ALL | FLAG_FALLBACK_EVERY))) {
 			float view_len = length(rel_pos);
 			vec3 eye_dir = rel_pos / max(view_len, 1e-4);
 			rayQueryEXT rq;

@@ -101,7 +101,9 @@
 // xyz: luminance-weighted mean incoming direction, w: short-range visibility.
 #define RB_RT_GI_DIRECTIONAL SNAME("directional")
 #define RB_RT_GI_RAW_DIRECTIONAL SNAME("raw_directional")
-#define RB_RT_GI_FALLBACK SNAME("gi_fallback") // A young pixel's card bounce irradiance (rgb) and its relight count (a).
+// A young pixel's card bounce stand-in (rgb) and its confidence (a), ping-ponged: the temporal pass modulates the history by the change between the two.
+#define RB_RT_GI_FALLBACK_0 SNAME("gi_fallback_0")
+#define RB_RT_GI_FALLBACK_1 SNAME("gi_fallback_1")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
@@ -277,6 +279,7 @@ private:
 		DENOISE_FLAG_SPEC_PAINT = 512, // Temporal (GI, diagnostics): the reflection's frame count as a colour.
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
 		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
+		DENOISE_FLAG_MOD_PAINT = 4096, // Temporal (GI, diagnostics, GODOT_GI_MOD_PAINT): the card correction as a colour.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -418,6 +421,20 @@ private:
 		float fallback_ramp; // Spatial (GI): card relights at which the young pixel's stand-in reaches full weight.
 		float spec_restart_min; // Temporal (GI): the fewest frames the change mark restarts the reflection to (0: none).
 		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
+		// Push constants are capped at 128 bytes: the card correction's
+		// parameters (GI temporal) ride in the reprojection UBO instead.
+	};
+
+	// The temporal pass's per-view uniform buffer: the previous frame pair's
+	// reprojection, and the card correction's parameters (GI; see the shader).
+	struct ReprojectUBO {
+		float prev_reproject[16];
+		float mod_strength; // The card correction's strength (0 off, 1 the field's whole change).
+		float mod_floor; // The frames a corrected history is shortened to.
+		float mod_motion; // The dynamic lights' motion this frame (0: the field's change is not a lighting change).
+		float mod_dead; // The field's dead band (a relative change under it is the cards' relight noise).
+		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
+		float pad[3];
 	};
 
 	struct DecodePushConstant {

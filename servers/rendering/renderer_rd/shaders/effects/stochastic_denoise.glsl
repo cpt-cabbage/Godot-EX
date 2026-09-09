@@ -27,6 +27,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_PAINT 512u // Diagnostics (GODOT_GI_SPEC_ABLATE=paint): the reflection's frame count as a colour.
 #define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
 #define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
+#define FLAG_MOD_PAINT 4096u // Diagnostics (GODOT_GI_MOD_PAINT): the card correction as a colour (red its change, green the field's confidence, blue the mark).
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
@@ -155,10 +156,32 @@ layout(set = 1, binding = 3, rgba8) uniform restrict writeonly image2D out_meta;
 // it and only genuinely moving objects deviate.
 layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	mat4 prev_reproject;
+	// Temporal (GI): the card correction's strength (0 off, 1 the field's
+	// whole change), the frames a corrected history is shortened to, the
+	// dynamic lights' motion this frame and the dead band (see the
+	// lighting-change block). GODOT_GI_MOD, GODOT_GI_MOD_FLOOR,
+	// GODOT_GI_MOD_DEAD. In the UBO: push constants are capped at 128 bytes.
+	float mod_strength;
+	float mod_floor;
+	float mod_motion; // The dynamic lights' motion this frame (0: none, the field's change is not a lighting change).
+	float mod_dead; // The field's dead band: a relative change under it is taken for the cards' own relight noise (GODOT_GI_MOD_DEAD).
+	// Temporal (GI): the frames a rough reflection's history restarted by
+	// the change mark is worth once the raw 5x5 resolve has stood in for
+	// the changed part (0: the raw sample stands in, as before). GODOT_GI_SPEC_FIX.
+	float spec_fix;
+	float pad1;
+	float pad2;
+	float pad3;
 }
 reprojection;
 #ifdef HAS_DIRECTIONAL
 layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_directional;
+// The cards' bounce irradiance under the surface, this frame's and last
+// frame's (the gather's fallback output: rgb, and in a its relights / 64
+// times the lookup's confidence, 0 without a card). The card correction
+// replaces the changed fraction of the history by it (see that block).
+layout(set = 0, binding = 13) uniform sampler2D fallback_current;
+layout(set = 0, binding = 14) uniform sampler2D fallback_prev;
 #endif
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
@@ -390,6 +413,12 @@ void main() {
 	vec4 moments = vec4(0.0);
 	float frames_d = 1.0;
 	float frames_s = 1.0;
+#ifdef HAS_DIRECTIONAL
+	// The card correction (GI, see the lighting-change block).
+	const bool mod_on = reprojection.mod_strength > 0.0;
+	float paint_change = 0.0; // Diagnostics (FLAG_MOD_PAINT).
+	float paint_field = 0.0;
+#endif
 	// Disocclusion mark for the spatial pass; set until a usable history
 	// proves the pixel is not freshly revealed.
 	float reveal = 1.0;
@@ -476,6 +505,7 @@ void main() {
 		vec4 hist_meta = vec4(0.0);
 #ifdef HAS_DIRECTIONAL
 		vec4 hist_dir = vec4(0.0);
+		vec4 hist_fb = vec4(0.0);
 #endif
 #ifdef DEPTH_HISTORY
 		if (history_usable) {
@@ -518,6 +548,7 @@ void main() {
 				hist_meta += texelFetch(history_meta, tp, 0) * w;
 #ifdef HAS_DIRECTIONAL
 				hist_dir += texelFetch(history_directional, tp, 0) * w;
+				hist_fb += texelFetch(fallback_prev, tp, 0) * w;
 #endif
 				hist_weight += w;
 			}
@@ -533,6 +564,7 @@ void main() {
 				hist_meta *= inv_weight;
 #ifdef HAS_DIRECTIONAL
 				hist_dir *= inv_weight;
+				hist_fb *= inv_weight;
 #endif
 			}
 		}
@@ -544,6 +576,7 @@ void main() {
 			hist_meta = textureLod(history_meta, prev_uv, 0.0);
 #ifdef HAS_DIRECTIONAL
 			hist_dir = textureLod(history_directional, prev_uv, 0.0);
+			hist_fb = textureLod(fallback_prev, prev_uv, 0.0);
 #endif
 		}
 #endif
@@ -653,15 +686,93 @@ void main() {
 			// closer (the game project's flashlight, a cycling hue) and made
 			// a fast flicker worse, an oscillation's swings counting as
 			// distance travelled.
+			//
+			// With the card correction (reprojection.mod_strength > 0;
+			// MEGALIGHTS_PLAN.md section 27): the restart above took a pixel
+			// to one raw sample wherever a ray of its had landed on a changed
+			// card, at different pixels every frame under a moving
+			// flashlight, and the spatial pass widened its kernel on each --
+			// the grain that followed every move -- while the pixels no ray
+			// marked kept their history and lagged. The cards' bounce field
+			// under the surface (the gather's fallback, read for every pixel
+			// when this is on) estimates the same irradiance with the direct
+			// term exact every relight and a moving light's bounce in
+			// histories of its own, so where that field changed since last
+			// frame, while a light moves, the changed fraction of the history
+			// is replaced by the field (the history fix of the denoisers,
+			// with the world cache as the fix) and the history is shortened
+			// to mod_floor frames, so the pixel's own samples refine it from
+			// a smooth start instead of a raw one. The change is measured
+			// between consecutive frames of the field (the relights arrive on
+			// their own cadence, and a jump is seen exactly once), above a
+			// dead band for the cards' own relight noise, and only while a
+			// dynamic light moves: at rest the field's convergence is not a
+			// lighting change. Measured on the game flick it reads as the
+			// restart alone (stop 0.0704 against 0.0694) and on rt_lab's
+			// sweep identical, so it is off by default: the mark covers nine
+			// pixels in ten under the flashlight, and the flick's error on
+			// the glossy walls is the reflection's (below), not this
+			// history's. Measured and not kept before it: a fast history
+			// clamped to its neighbourhood (NRD's form; one ray per pixel
+			// over four frames spreads wider than the lag it should catch)
+			// and a multiplicative ratio of the field (biased above one on a
+			// noisy pair, it doubled the frame within a hundred frames
+			// ungated, and gated by the mark it lost the jumps the mark
+			// missed).
 			change_age = max(change_age, hist_d4.a - 0.125);
-			if (change_age > 0.02) {
+			bool changed = change_age > 0.02;
+			float field_change = 0.0;
+			if (mod_on && reprojection.mod_motion > 0.0) {
+				vec4 fb_now = texelFetch(fallback_current, pixel, 0);
+				paint_field = fb_now.a;
+				if (fb_now.a > 0.0 && hist_fb.a > 0.0) {
+					float l_now = luminance(fb_now.rgb);
+					float l_prev = luminance(hist_fb.rgb);
+					vec3 d = abs(fb_now.rgb - hist_fb.rgb);
+					float rel = max(d.r, max(d.g, d.b)) / max(max(l_now, l_prev), 1e-4);
+					field_change = clamp((rel - reprojection.mod_dead) / (1.0 - reprojection.mod_dead), 0.0, 1.0) * reprojection.mod_strength;
+					paint_change = field_change;
+					if (field_change > 0.0) {
+						vec3 fixed_d = mix(hist_d, fb_now.rgb, field_change);
+						float l_hist = luminance(hist_d);
+						float lr = l_hist > 1e-6 ? luminance(fixed_d) / l_hist : 1.0;
+						hist_d = fixed_d;
+						// The directional moment and the luminance moments
+						// follow the history they describe.
+						hist_dir.xyz *= lr;
+						hist_moments.x *= lr;
+						hist_moments.y *= lr * lr;
+						frames_d = min(frames_d, reprojection.mod_floor);
+					}
+				}
+			}
+			if (changed) {
 				float keep = max(1.0, 1.0 / change_age);
+				// The field's correction accounts for the mark's change in
+				// proportion; what it explains is not restarted.
+				keep = max(keep, mix(1.0, reprojection.mod_floor, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
 				frames_d = min(frames_d, keep);
 				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
 					// The reflection is one GGX sample per pixel with no
 					// stand-in for its young frames (the diffuse has the
 					// cards'), so it may not be restarted below a floor.
-					frames_s = min(frames_s, max(keep, params.spec_restart_min));
+					float keep_s = max(max(1.0, 1.0 / change_age), params.spec_restart_min);
+					// A rough lobe's history fix (reprojection.spec_fix > 0):
+					// the changed fraction of the history is replaced by the
+					// raw 5x5 resolve rather than by the pixel's one sample --
+					// a rough reflection of the beam's spot is as wide as the
+					// resolve, and the restart to one sample was the sparkle
+					// the glossy ceiling showed at every stop of the
+					// flashlight (the mark restarting it: ceiling error at the
+					// stop 0.047 with flicker 0.023, without it 0.057 and
+					// 0.013, lagging for thirty frames). A mirror keeps its
+					// sample: the resolve would blur its image.
+					float lobe = smoothstep(0.15, 0.4, nr_roughness);
+					if (reprojection.spec_fix > 0.0 && lobe > 0.0) {
+						hist_s = mix(hist_s, mean_s, change_age * lobe);
+						keep_s = max(keep_s, mix(1.0, reprojection.spec_fix, lobe));
+					}
+					frames_s = min(frames_s, keep_s);
 				}
 			}
 			// The reflection's history is fetched part way between the surface
@@ -739,6 +850,9 @@ void main() {
 	}
 
 #ifdef HAS_DIRECTIONAL
+	if ((params.flags & FLAG_MOD_PAINT) != 0u) {
+		result_diffuse = vec3(paint_change, paint_field, clamp(change_age, 0.0, 1.0));
+	}
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, clamp(change_age, 0.0, 1.0)));
 #else
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));

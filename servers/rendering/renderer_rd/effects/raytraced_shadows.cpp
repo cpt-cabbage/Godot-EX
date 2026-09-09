@@ -58,6 +58,17 @@ static void _set_luma_weights(float *p_out) {
 	p_out[2] = w.z;
 }
 
+// GODOT_GI_MOD=<strength>: how much of the cards' frame-to-frame change the
+// GI temporal pass writes into its history while a light moves (1 the whole
+// change; 0, the default, off: the change mark restarts the history alone).
+// Measured neutral on the game flick and inert on rt_lab's sweep
+// (MEGALIGHTS_PLAN.md section 27); kept as the knob to retest with. On, the
+// gather reads the cards' fallback for every pixel (a primary ray each).
+static float _card_modulation() {
+	static const float strength = OS::get_singleton()->get_environment("GODOT_GI_MOD") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_MOD").to_float());
+	return strength;
+}
+
 // GODOT_GI_LUMA_COMPRESS=1: the GI denoiser's filter weights measure a
 // compressed luminance (stochastic_denoise.glsl weight_lum). An experiment.
 static bool _luma_compress() {
@@ -879,7 +890,7 @@ RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p
 	}
 	RenderBuffersRT::ReprojectHistory &h = rb_state->reproject_history[p_view];
 	if (h.ubo.is_null()) {
-		h.ubo = RD::get_singleton()->uniform_buffer_create(sizeof(float) * 16);
+		h.ubo = RD::get_singleton()->uniform_buffer_create(sizeof(ReprojectUBO));
 	}
 	if (h.frame != rb_state->frame_index) {
 		// After a gap (first frame, or the pass was disabled for a while) fall
@@ -888,13 +899,37 @@ RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p
 		h.previous = (h.frame != UINT32_MAX && h.frame + 1 == rb_state->frame_index) ? h.current : p_reproject;
 		h.current = p_reproject;
 		h.frame = rb_state->frame_index;
-		float m[16];
+		ReprojectUBO ubo = {};
 		for (int col = 0; col < 4; col++) {
 			for (int row = 0; row < 4; row++) {
-				m[col * 4 + row] = h.previous.columns[col][row];
+				ubo.prev_reproject[col * 4 + row] = h.previous.columns[col][row];
 			}
 		}
-		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(m), m);
+		// The GI temporal pass's card correction (MEGALIGHTS_PLAN.md section
+		// 27): GODOT_GI_MOD=<strength> (0 restores the change mark's restart
+		// of the history alone), GODOT_GI_MOD_FLOOR=<frames> the frames a
+		// corrected history is shortened to, GODOT_GI_MOD_DEAD=<fraction> the
+		// relative change of the field under which it is the cards' own
+		// relight noise. The field's change counts only while a dynamic
+		// light moves (LightStorage's motion this frame, intensity and
+		// colour changes included). The direct lighting's temporal passes
+		// share the buffer and read only the matrix.
+		static const float mod_floor = OS::get_singleton()->get_environment("GODOT_GI_MOD_FLOOR") == "" ? 8.0f : float(OS::get_singleton()->get_environment("GODOT_GI_MOD_FLOOR").to_float());
+		static const float mod_dead = OS::get_singleton()->get_environment("GODOT_GI_MOD_DEAD") == "" ? 0.05f : float(OS::get_singleton()->get_environment("GODOT_GI_MOD_DEAD").to_float());
+		ubo.mod_strength = _card_modulation();
+		ubo.mod_floor = mod_floor;
+		ubo.mod_motion = RendererRD::LightStorage::get_singleton()->get_card_dynamic_motion();
+		static const bool mod_print = OS::get_singleton()->get_environment("GODOT_GI_MOD_PRINT") == "1";
+		if (mod_print && (rb_state->frame_index % 5) == 0) {
+			print_line(vformat("GI card correction: frame %d motion %.4f", rb_state->frame_index, ubo.mod_motion));
+		}
+		ubo.mod_dead = mod_dead;
+		// GODOT_GI_SPEC_FIX=<frames>: a rough reflection restarted by the
+		// change mark takes the raw 5x5 resolve for its changed part and is
+		// worth this many frames (0: the one sample, as before).
+		static const float spec_fix = OS::get_singleton()->get_environment("GODOT_GI_SPEC_FIX") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_FIX").to_float());
+		ubo.spec_fix = spec_fix;
+		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
 }
@@ -1564,7 +1599,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 			RB_RT_GI_RAW_AMBIENT, RB_RT_GI_RAW_REFLECTION,
 			RB_RT_GI_HIST_AMBIENT_0, RB_RT_GI_HIST_AMBIENT_1,
 			RB_RT_GI_HIST_REFLECTION_0, RB_RT_GI_HIST_REFLECTION_1,
-			RB_RT_GI_FALLBACK
+			RB_RT_GI_FALLBACK_0, RB_RT_GI_FALLBACK_1
 		};
 		for (const StringName &name : accum_names) {
 			p_render_buffers->create_texture(RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
@@ -1603,7 +1638,10 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RID raw_ambient = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT, p_view, 0);
 	RID raw_reflection = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION, p_view, 0);
 	RID raw_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_DIRECTIONAL, p_view, 0);
-	RID raw_fallback = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_FALLBACK, p_view, 0);
+	// The gather writes this frame's parity (as the view depth below); the
+	// temporal pass modulates the history by the change from the other.
+	RID raw_fallback = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_FALLBACK_0 : RB_RT_GI_FALLBACK_1, p_view, 0);
+	RID prev_fallback = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_FALLBACK_1 : RB_RT_GI_FALLBACK_0, p_view, 0);
 	// The gather writes this frame's parity; the temporal pass validates its
 	// history against the other one (last frame's).
 	RID view_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
@@ -1723,6 +1761,11 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	params.fallback_parts = uint32_t(fallback_parts);
 	if (fallback_all && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
+	}
+	// The temporal pass's card correction needs the fallback at every pixel
+	// (GODOT_GI_MOD, see _update_reproject_ubo).
+	if (_card_modulation() > 0.0f && use_cards) {
+		params.flags |= 131072; // FLAG_FALLBACK_EVERY
 	}
 	// Deferred hit shading: a packet per gather ray is the room (every hit
 	// can be deferred); the results hold a slot per diffuse ray and one for
@@ -1964,6 +2007,12 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		// flashlight floor's moving flicker 0.037 -> 0.033 for 0.003 of lag).
 		static const float spec_restart_min = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESTART_MIN") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESTART_MIN").to_float());
 		denoise_push_constant.spec_restart_min = spec_restart_min;
+		// The card correction's parameters ride in the reprojection UBO (see
+		// _update_reproject_ubo).
+		static const bool mod_paint = OS::get_singleton()->get_environment("GODOT_GI_MOD_PAINT") == "1";
+		if (mod_paint) {
+			denoise_push_constant.flags |= DENOISE_FLAG_MOD_PAINT;
+		}
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL_VALIDATE);
 		RD::Uniform u_raw_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_ambient }));
 		RD::Uniform u_raw_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_reflection }));
@@ -1978,6 +2027,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		RD::Uniform u_raw_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ sampler, raw_directional }));
 		RD::Uniform u_hist_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 11, Vector<RID>({ sampler, hist_read_d }));
 		RD::Uniform u_nr_temporal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, p_normal_roughness }));
+		RD::Uniform u_fb_now(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, raw_fallback }));
+		RD::Uniform u_fb_prev(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, prev_fallback }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ hist_write_a }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ hist_write_r }));
 		RD::Uniform u_out_m(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ moments_write }));
@@ -1989,7 +2040,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->draw_command_begin_label("RT GI Temporal");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL_VALIDATE]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal, u_fb_now, u_fb_prev), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_m, u_out_meta, u_reproject, u_out_d), 1);
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);

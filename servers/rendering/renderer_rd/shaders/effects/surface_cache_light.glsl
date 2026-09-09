@@ -1281,6 +1281,13 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	float dyn_frames = 0.0;
 	vec4 dyn2_old = imageLoad(indirect_dyn2_atlas, texel);
 	if (dyn_lights.count > 0u) {
+		// Floored at one old relight on purpose: a full-refresh motion keeps
+		// half of the last relight. Measured without the floor (the history
+		// worth 1 / motion relights including this one, so nothing kept at a
+		// full refresh) on the game flick: the cards' field 0.057 -> 0.062 at
+		// the stop, 0.022 -> 0.028 four frames on, the screen 0.069 -> 0.071;
+		// one relight's two light rays are noisier than the half-relight of
+		// lag they replace (MEGALIGHTS_PLAN.md section 27).
 		float keep_dyn = params.dynamic_motion > 0.0 ? max(1.0, 1.0 / params.dynamic_motion) : params.dynamic_window;
 		// A join (see below) starts them afresh: a light changing again while
 		// its weight fades had its histories at that weight.

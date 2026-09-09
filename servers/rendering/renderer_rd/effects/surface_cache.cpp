@@ -770,7 +770,9 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 	rd->buffer_update(sets_buffer, 0, needed * sizeof(CardSetRecord), set_records.ptr());
 
-	uint32_t budget = MAX(settings.lighting_sets_per_frame, 1u);
+	// Profiling: GODOT_CARD_BUDGET=n overrides the sets relit per frame.
+	static const uint32_t budget_override = OS::get_singleton()->get_environment("GODOT_CARD_BUDGET").to_int();
+	uint32_t budget = MAX(budget_override > 0 ? budget_override : settings.lighting_sets_per_frame, 1u);
 	// A light joining or leaving the dynamic set (see LightStorage): every
 	// captured set is relit this frame, so no set hands the static rays a
 	// static radiance assembled with the light in the other state.
@@ -1072,6 +1074,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	rd->compute_list_end();
 	rd->draw_command_end_label();
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
+		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d", sets.size(), budget, push.round_robin_period));
 		print_line(vformat("Dynamic lights: %d, motion this frame %.4f m, change %.3f", dyn.count, RendererRD::LightStorage::get_singleton()->get_card_dynamic_motion(), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 60 == 0) {
