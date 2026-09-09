@@ -3327,6 +3327,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 
 			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
+			RENDER_TIMESTAMP("MetalFX Temporal");
 			// Scale to ±0.5.
 			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
 			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.

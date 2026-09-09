@@ -302,12 +302,13 @@ private:
 		uint32_t flags;
 		uint32_t temporal_frames;
 		uint32_t atlas_size;
-		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no bounce gradient.
+		uint32_t debug; // GODOT_CARD_ABLATE bits (profiling): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no bounce gradient, 32 no bounce restart, 64 no visibility restart, 128 / 256 the gradients painted into the bounce atlas.
 		float grid_origin[3]; // The world light grid (flags bit 32 when built this frame).
 		float grid_cell;
 		uint32_t grid_n;
 		uint32_t grid_cap;
-		uint32_t pad_grid[2];
+		float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (GODOT_CARD_BOUNCE_FLOOR).
+		uint32_t young_rays; // Extra bounce rays for a texel whose accumulation is under eight relights (GODOT_CARD_YOUNG_RAYS).
 	};
 
 	struct GridPushConstant {

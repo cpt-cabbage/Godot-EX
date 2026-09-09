@@ -871,6 +871,13 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 
 	if (rb.is_valid() && using_scaling_pass) {
 		RD::get_singleton()->draw_command_begin_label(spatial_upscaler ? spatial_upscaler->get_label() : "3D Viewport Scaling");
+		if (spatial_upscaler) {
+			String label;
+			label.append_ascii(spatial_upscaler->get_label());
+			RENDER_TIMESTAMP(label);
+		} else {
+			RENDER_TIMESTAMP("3D Viewport Scaling");
+		}
 
 		if (spatial_upscaler) {
 			spatial_upscaler->ensure_context(rb);

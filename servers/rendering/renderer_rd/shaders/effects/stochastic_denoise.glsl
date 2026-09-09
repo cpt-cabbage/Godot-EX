@@ -19,11 +19,22 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
 #define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
 #define FLAG_FALLBACK_ALL 32u // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
+// Temporal (GI, diagnostics): the reflection history keeps its frames through
+// the named restart (GODOT_GI_SPEC_ABLATE=change,smear,mismatch).
+#define FLAG_SPEC_NO_CHANGE 64u
+#define FLAG_SPEC_NO_SMEAR 128u
+#define FLAG_SPEC_NO_MISMATCH 256u
+#define FLAG_SPEC_PAINT 512u // Diagnostics (GODOT_GI_SPEC_ABLATE=paint): the reflection's frame count as a colour.
+#define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
 // still borrow the nearest in-frame history instead of restarting.
 #define BORROW_BAND 0.15
+// Temporal (GI): how far a reflection history tap's stored image depth may
+// differ from the predicted one, relative, before the tap is left out (see
+// the reflection fetch); the whole-pixel mismatch restart begins at 0.1.
+#define SPEC_TAP_DEPTH_TOLERANCE 0.2
 // The frame count a borrowed history is trusted as: it is lighting from a
 // neighbouring column, so it starts the accumulation and is then replaced by
 // the pixel's own samples over the next few frames.
@@ -197,6 +208,14 @@ layout(push_constant, std430) uniform Params {
 	float z_near;
 	float z_far;
 	uint flags;
+	// Spatial (GI): the card relight count at which a young pixel's card
+	// stand-in reaches full weight (see store_result).
+	float fallback_ramp;
+	// Temporal (GI): the fewest frames the lighting-change mark may restart
+	// the reflection history to (0: no floor; GODOT_GI_SPEC_RESTART_MIN).
+	float spec_restart_min;
+	uint pad0;
+	uint pad1;
 	uint pad2;
 }
 params;
@@ -355,6 +374,8 @@ void main() {
 	// Disocclusion mark for the spatial pass; set until a usable history
 	// proves the pixel is not freshly revealed.
 	float reveal = 1.0;
+	// Diagnostics (FLAG_SPEC_PAINT_WHY): 1 history off frame, 2 borrowed, 3 every depth tap failed, 4 velocity-classified moving object.
+	int paint_why = 0;
 	// Shading confidence from the sampling pass (share of energy carried by
 	// the strongest single light).
 	float dominance = (params.flags & FLAG_HAS_META) != 0u ? texelFetch(raw_meta, pixel, 0).r : 0.0;
@@ -382,6 +403,7 @@ void main() {
 				vec2 object_pixels = (velocity - static_motion) * vec2(params.screen_size * params.depth_scale);
 				if (any(greaterThan(abs(object_pixels), vec2(2.0)))) {
 					prev_uv = uv + velocity;
+					paint_why = 4;
 				}
 			}
 		}
@@ -404,6 +426,9 @@ void main() {
 		}
 #endif
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+		if (!history_usable) {
+			paint_why = 1;
+		}
 		// Frame-edge reveal: the pixel's history lies just off the previous
 		// frame. Rotating the camera sweeps a band of these along the entering
 		// edge every frame, and restarting each of them from a single raw
@@ -423,6 +448,7 @@ void main() {
 			prev_uv = clamp(prev_uv, vec2(0.0), vec2(1.0));
 			history_usable = true;
 			borrowed = true;
+			paint_why = 2;
 		}
 #endif
 		vec4 hist_d4 = vec4(0.0);
@@ -477,6 +503,9 @@ void main() {
 				hist_weight += w;
 			}
 			history_usable = hist_weight > 0.05;
+			if (!history_usable) {
+				paint_why = 3;
+			}
 			if (history_usable) {
 				float inv_weight = 1.0 / hist_weight;
 				hist_d4 *= inv_weight;
@@ -507,10 +536,46 @@ void main() {
 		// reflecting surface's stored depth says nothing about where the
 		// image was, and a reflection that reprojects off frame keeps the
 		// surface's history rather than restarting.
+		//
+		// Fetched per bilinear tap, each tap validated against the depth the
+		// image is predicted at, like the surface's taps above. The image of
+		// a chair leg, a railing or a sofa's edge against the window is a
+		// depth edge in the reflection, and a plain bilinear fetch across it
+		// blends the two sides' depths into one that matches neither; the
+		// mismatch check below then restarted the reflection every frame the
+		// camera moved, over every reflected edge and (a normal-mapped mirror
+		// scatters those edges over its whole surface) the whole image of any
+		// thin geometry: the game project's floor buzzed wherever it showed
+		// the dining chairs or the upper floor's railing. The taps on the
+		// image's own side of the edge carry its history; only when none
+		// agrees does the mismatch restart below still fire.
 		if (history_usable && virtual_weight > 0.0 && virtual_view_depth > 0.0) {
 			vec2 prev_uv_v = mix(prev_uv, prev_uv_virtual, virtual_weight);
 			if (all(greaterThanEqual(prev_uv_v, vec2(0.0))) && all(lessThanEqual(prev_uv_v, vec2(1.0)))) {
-				hist_s4 = textureLod(history_specular, prev_uv_v, 0.0);
+				vec4 hist_blend = textureLod(history_specular, prev_uv_v, 0.0);
+				bool validate = predicted_virtual_depth > 0.0 && (params.flags & FLAG_SPEC_NO_MISMATCH) == 0u;
+				vec4 acc = vec4(0.0);
+				float acc_w = 0.0;
+				if (validate) {
+					vec2 hp = prev_uv_v * vec2(params.screen_size) - 0.5;
+					ivec2 hb = ivec2(floor(hp));
+					vec2 hf = hp - vec2(hb);
+					for (int i = 0; i < 4; i++) {
+						ivec2 off = ivec2(i & 1, i >> 1);
+						ivec2 tp = clamp(hb + off, ivec2(0), params.screen_size - 1);
+						float w = (off.x == 1 ? hf.x : 1.0 - hf.x) * (off.y == 1 ? hf.y : 1.0 - hf.y);
+						if (w <= 1e-4) {
+							continue;
+						}
+						vec4 h = texelFetch(history_specular, tp, 0);
+						if (h.a > 0.0 && abs(h.a - predicted_virtual_depth) > SPEC_TAP_DEPTH_TOLERANCE * max(predicted_virtual_depth, 1.0)) {
+							continue;
+						}
+						acc += h * w;
+						acc_w += w;
+					}
+				}
+				hist_s4 = (validate && acc_w > 0.05) ? acc / acc_w : hist_blend;
 			}
 		}
 #endif
@@ -573,7 +638,12 @@ void main() {
 			if (change_age > 0.02) {
 				float keep = max(1.0, 1.0 / change_age);
 				frames_d = min(frames_d, keep);
-				frames_s = min(frames_s, keep);
+				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
+					// The reflection is one GGX sample per pixel with no
+					// stand-in for its young frames (the diffuse has the
+					// cards'), so it may not be restarted below a floor.
+					frames_s = min(frames_s, max(keep, params.spec_restart_min));
+				}
 			}
 			// The reflection's history is fetched part way between the surface
 			// and its virtual image (virtual_weight), so the rest of the
@@ -590,7 +660,7 @@ void main() {
 			{
 				float smear_px = parallax_px * (1.0 - virtual_weight);
 				float allowed_px = 4.0 + 12.0 * clamp(nr_roughness, 0.0, 1.0);
-				if (smear_px > 1e-3) {
+				if (smear_px > 1e-3 && (params.flags & FLAG_SPEC_NO_SMEAR) == 0u) {
 					frames_s = min(frames_s, max(allowed_px / smear_px, 1.0));
 				}
 			}
@@ -604,7 +674,7 @@ void main() {
 			// neighbourhood clamp on this path to catch it). Only the smooth
 			// end of the roughness range has a hit depth stable enough to
 			// compare; the rough end's lobe lands somewhere new every frame.
-			if (virtual_weight > 0.0 && predicted_virtual_depth > 0.0 && hist_s4.a > 0.0) {
+			if (virtual_weight > 0.0 && predicted_virtual_depth > 0.0 && hist_s4.a > 0.0 && (params.flags & FLAG_SPEC_NO_MISMATCH) == 0u) {
 				float rel = abs(hist_s4.a - predicted_virtual_depth) / max(predicted_virtual_depth, 1.0);
 				float mismatch = smoothstep(0.1, 0.5, rel) * virtual_weight;
 				frames_s = min(frames_s, mix(frames_cap, 2.0, mismatch));
@@ -612,6 +682,14 @@ void main() {
 #endif
 			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
 			float alpha_s = max(1.0 / frames_s, params.blend_alpha);
+#ifdef HAS_DIRECTIONAL
+			if ((params.flags & FLAG_SPEC_PAINT) != 0u) {
+				// Diagnostics: the reflection's frame count as a colour (red
+				// under 2, green 2..8, blue above).
+				current_specular = frames_s < 2.0 ? vec3(1.0, 0.0, 0.0) : (frames_s < 8.0 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0));
+				alpha_s = 1.0;
+			}
+#endif
 
 			float lum_d = luminance(current_diffuse);
 			float lum_s = luminance(current_specular);
@@ -649,6 +727,12 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 	// The reflection's virtual view depth rides in the alpha for next frame's
 	// depth check (the spatial pass reads only the colour).
+	if ((params.flags & FLAG_SPEC_PAINT_WHY) != 0u) {
+		// Diagnostics: red history off frame, yellow borrowed, magenta every
+		// depth tap failed, cyan a velocity-classified moving object; else
+		// the reflection's frames in red and the diffuse's in green, over 32.
+		result_specular = paint_why == 1 ? vec3(1.0, 0.0, 0.0) : (paint_why == 2 ? vec3(1.0, 1.0, 0.0) : (paint_why == 3 ? vec3(1.0, 0.0, 1.0) : (paint_why == 4 ? vec3(0.0, 1.0, 1.0) : vec3(frames_s / 32.0, frames_d / 32.0, 0.0))));
+	}
 	imageStore(out_specular, pixel, vec4(result_specular, min(virtual_view_depth, 30000.0)));
 #else
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
@@ -705,7 +789,7 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, flo
 		vec4 fb = texelFetch(fallback_texture, pixel, 0);
 		// The card's own accumulation counts too: a texel relit once is no
 		// better than the pixel's sample.
-		float w = p_fallback_weight * clamp(fb.a * 64.0 / 8.0, 0.0, 1.0);
+		float w = p_fallback_weight * clamp(fb.a * 64.0 / max(params.fallback_ramp, 1.0), 0.0, 1.0);
 		d = mix(d, fb.rgb, w);
 	}
 #endif

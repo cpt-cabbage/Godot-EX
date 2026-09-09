@@ -271,6 +271,11 @@ private:
 		DENOISE_FLAG_HAS_DIRECTIONAL = 8, // The GI directional buffer travels with the diffuse signal.
 		DENOISE_FLAG_HAS_HIT_DISTANCE = 16, // Spatial: hit distance joins the edge-stopping weights.
 		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
+		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
+		DENOISE_FLAG_SPEC_NO_SMEAR = 128, // ... nor capped by the parallax smear.
+		DENOISE_FLAG_SPEC_NO_MISMATCH = 256, // ... nor restarted by the virtual depth mismatch.
+		DENOISE_FLAG_SPEC_PAINT = 512, // Temporal (GI, diagnostics): the reflection's frame count as a colour.
+		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -367,7 +372,7 @@ private:
 		uint32_t surface_cache_frame; // The cache's clock (update_scene count), for hit requests.
 		uint32_t hit_capacity; // Packets the hit shading has room for this frame.
 		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
-		uint32_t pad0;
+		float card_youth_lod; // The mip a hit reads a card texel relit once through (0 disables); halves per doubling of the texel's relights.
 		uint32_t pad1;
 		uint32_t pad2;
 	};
@@ -407,7 +412,9 @@ private:
 		float z_near; // Camera planes for depth-validated history (VALIDATE_DEPTH).
 		float z_far;
 		uint32_t flags; // DenoiseFlags.
-		uint32_t pad2;
+		float fallback_ramp; // Spatial (GI): card relights at which the young pixel's stand-in reaches full weight.
+		float spec_restart_min; // Temporal (GI): the fewest frames the change mark restarts the reflection to (0: none).
+		uint32_t pad[3];
 	};
 
 	struct DecodePushConstant {
@@ -641,7 +648,7 @@ private:
 		float screen_radiance_clamp;
 		float screen_radiance_border_fade;
 		float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
-		float pad;
+		float card_youth_lod; // The tent a young card texel's bounce is read through at a hit (0: the texel alone).
 	};
 	static_assert(sizeof(HitParamsUBO) == 464, "HitParamsUBO layout must match scene_hit_shade.glsl.");
 

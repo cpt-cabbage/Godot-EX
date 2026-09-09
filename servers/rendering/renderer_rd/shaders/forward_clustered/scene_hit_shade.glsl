@@ -69,7 +69,7 @@ layout(set = 0, binding = 1, std140) uniform Params {
 	float screen_radiance_clamp;
 	float screen_radiance_border_fade;
 	float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
-	float pad;
+	float card_youth_lod; // The tent a young card texel's bounce is read through (see card_indirect); 0 reads the texel alone.
 }
 params;
 
@@ -83,6 +83,7 @@ params;
 #define FLAG_NO_SHADOW_RAYS 128u
 #define FLAG_NO_INDIRECT 256u
 #define FLAG_NO_DIRECT 512u
+#define FLAG_BOUNCE_TRACED 1024u // Ablation (hit_shading_debug 64): the indirect term traces its own ray even where the hit's card holds an accumulated one.
 #define FLAG_SCREEN_RADIANCE 16384u // Last frame's screen stands in for the bounce's hit where it is on screen.
 #define FLAG_DEBUG_GEO_NORMAL 2048u // The triangle's own normal, as oriented.
 #define FLAG_DEBUG_VERTEX_NORMAL 4096u // The interpolated vertex normal, before any flip.
@@ -214,6 +215,9 @@ layout(set = 0, binding = 22) uniform texture2D card_lighting_atlas;
 // screen lookup (the gather's screen_radiance_boost).
 layout(set = 0, binding = 23) uniform sampler2D depth_texture;
 layout(set = 0, binding = 24) uniform sampler2D screen_radiance_texture;
+// The cards' accumulated bounce irradiance (surface_cache_light.glsl
+// indirect_atlas), for the hit's own indirect term (card_indirect).
+layout(set = 0, binding = 25) uniform texture2D card_indirect_atlas;
 
 /* Set 1: the material samplers, by the names the compiler emits. */
 
@@ -373,6 +377,11 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 
 // The world radius of the bounce ray's footprint at its hit (see card_lookup).
 float card_lookup_footprint = 0.0;
+// The texel card_lookup landed on (continuous atlas coordinates), its card's
+// origin and size, for card_indirect's read of the same texel in another atlas.
+vec2 card_hit_texel = vec2(0.0);
+ivec2 card_hit_origin = ivec2(0);
+ivec2 card_hit_dims = ivec2(1);
 
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup)
 // over this pass's bindings: the nearest texel of the lit atlas.
@@ -445,6 +454,54 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	float margin = 0.5 * exp2(lod);
 	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
 	r_radiance = textureLod(sampler2D(card_lighting_atlas, linear_sampler_mipmaps), atlas_texel / params.card_atlas_size, lod).rgb;
+	card_hit_texel = atlas_texel;
+	card_hit_origin = card_origin_packed(best_packed);
+	card_hit_dims = ivec2(best_dims);
+	return true;
+}
+
+// The hit's indirect term from its own card: the bounce irradiance the card
+// lighting accumulates over sixty-four relights at the texel under the hit
+// (surface_cache_light.glsl indirect_atlas, the same term the card's own
+// radiance is assembled from), in place of one cosine ray per hit. A single
+// ray's estimate of a room's bounce is a firefly wherever it lands on a lit
+// patch -- the game project's mirror floor under a flashlight: the reflected
+// ceiling's bounce rays landing on the beam's spot on the floor -- and a
+// mirror's reflection is never filtered spatially, so the screen history was
+// all that hid it, and a lighting change restarts that history (the floor
+// sparkled whenever the light moved). Read as the gather's young-pixel
+// fallback reads the atlas: a tent over the card's texels, wider the fewer
+// relights the texel has, never across the card's border. A hit with no card
+// under it, or a texel never relit, keeps the traced ray.
+bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec3 r_indirect) {
+	r_indirect = vec3(0.0);
+	vec3 unused;
+	card_lookup_footprint = 0.0;
+	// Along the normal: the card facing the surface is the one that holds
+	// it (along the ray a grazing wall picks its neighbour's card).
+	if (!card_lookup(p_instance_id, p_world_pos, -p_n_world, unused)) {
+		return false;
+	}
+	float relights = texelFetch(card_indirect_atlas, ivec2(card_hit_texel), 0).a * 64.0;
+	if (relights <= 0.0) {
+		return false;
+	}
+	vec2 dims = vec2(card_hit_dims);
+	float spacing = 1.0;
+	if (params.card_youth_lod > 0.0) {
+		float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
+		spacing = clamp(exp2(youth_lod - 1.0), 1.0, max(min(dims.x, dims.y) / 8.0, 1.0));
+	}
+	vec2 t_min = vec2(card_hit_origin) + 0.5;
+	vec2 t_max = vec2(card_hit_origin + card_hit_dims) - 0.5;
+	vec3 ind = vec3(0.0);
+	for (int dy = 0; dy < 4; dy++) {
+		for (int dx = 0; dx < 4; dx++) {
+			vec2 t = clamp(card_hit_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
+			ind += textureLod(sampler2D(card_indirect_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb;
+		}
+	}
+	r_indirect = max(ind / 16.0, vec3(0.0));
 	return true;
 }
 
@@ -967,7 +1024,11 @@ void main() {
 		vec3 direct = (params.flags & FLAG_NO_DIRECT) != 0u ? vec3(0.0) : shade_direct(world_pos, n_shade, origin, seed);
 		vec3 indirect = vec3(0.0);
 		if ((params.flags & FLAG_NO_INDIRECT) == 0u) {
-			indirect = trace_bounce(origin, n_shade, rel_pos, seed);
+			// The card's accumulated bounce where the hit has one, a traced
+			// ray otherwise (see card_indirect).
+			if ((params.flags & FLAG_BOUNCE_TRACED) != 0u || !card_indirect(record, world_pos, n_shade, indirect)) {
+				indirect = trace_bounce(origin, n_shade, rel_pos, seed);
+			}
 		}
 		emission *= params.emissive_exposure_normalization;
 		radiance = max(albedo * (direct + indirect * ao) + emission, vec3(0.0));

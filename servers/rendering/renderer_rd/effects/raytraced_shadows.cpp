@@ -1679,10 +1679,19 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	// every pixel in place of the gathered GI (its bias and coverage against
 	// a converged run).
 	static const bool fallback_all = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK") == "all";
+	// GODOT_GI_FALLBACK=off leaves young pixels to their own filtered history.
+	static const bool fallback_off = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK") == "off";
+	if (fallback_off) {
+		params.flags |= 65536; // FLAG_FALLBACK_OFF
+	}
 	// GODOT_GI_CONE=<tan>: the diffuse rays' cone (0 reads every hit at the
 	// cards' full resolution).
 	static const float card_cone_tan = OS::get_singleton()->get_environment("GODOT_GI_CONE") == "" ? 0.25f : float(OS::get_singleton()->get_environment("GODOT_GI_CONE").to_float());
 	params.card_cone_tan = use_cards ? card_cone_tan : 0.0f;
+	// GODOT_GI_YOUTH_LOD=<level>: the card mip a texel relit once is read
+	// through (0 reads young texels raw).
+	static const float card_youth_lod = OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD") == "" ? 3.0f : float(OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD").to_float());
+	params.card_youth_lod = use_cards ? card_youth_lod : 0.0f;
 	if (fallback_all && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
 	}
@@ -1888,6 +1897,30 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 	{
 		denoise_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
+		// Diagnostics: GODOT_GI_SPEC_ABLATE=change,smear,mismatch (or all)
+		// switches the named restarts of the reflection history off; paint
+		// renders the reflection's frame count as a colour.
+		static const String spec_ablate = OS::get_singleton()->get_environment("GODOT_GI_SPEC_ABLATE");
+		if (spec_ablate.contains("change") || spec_ablate.contains("all")) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_CHANGE;
+		}
+		if (spec_ablate.contains("smear") || spec_ablate.contains("all")) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_SMEAR;
+		}
+		if (spec_ablate.contains("mismatch") || spec_ablate.contains("all")) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_MISMATCH;
+		}
+		if (spec_ablate.contains("paint")) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_PAINT;
+		}
+		if (spec_ablate.contains("why")) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_PAINT_WHY;
+		}
+		// GODOT_GI_SPEC_RESTART_MIN=<frames>: a floor under the change mark's
+		// restart of the reflection (measured, off by default: 8 took the
+		// flashlight floor's moving flicker 0.037 -> 0.033 for 0.003 of lag).
+		static const float spec_restart_min = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESTART_MIN") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESTART_MIN").to_float());
+		denoise_push_constant.spec_restart_min = spec_restart_min;
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL_VALIDATE);
 		RD::Uniform u_raw_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_ambient }));
 		RD::Uniform u_raw_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_reflection }));
@@ -1946,6 +1979,10 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		// GI filters radiance directly: no analytic modulation, the bindings
 		// are dummies that are never fetched.
 		denoise_push_constant.flags = (fallback_all && use_cards) ? DENOISE_FLAG_FALLBACK_ALL : 0;
+		// GODOT_GI_FALLBACK_RAMP=<relights>: the card accumulation at which
+		// the young pixel's stand-in reaches full weight.
+		static const float fallback_ramp = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP") == "" ? 8.0f : float(OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP").to_float());
+		denoise_push_constant.fallback_ramp = fallback_ramp;
 		denoise_push_constant.stride = p_quality.spatial_stride << iteration;
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, variant);
 		RD::Uniform u_in_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_ambient }));
@@ -2364,6 +2401,11 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	params.probe_floor = MAX(p_quality.probe_floor, 0.0f);
 	params.probe_scale = p_probe_scale;
 	params.card_atlas_size = float(surface_cache->get_settings().atlas_size);
+	// The hits' indirect term reads their card's accumulated bounce through
+	// the same youth tent as the gather's young-pixel fallback
+	// (GODOT_GI_YOUTH_LOD, as the gather).
+	static const float hit_youth_lod = OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD") == "" ? 3.0f : float(OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD").to_float());
+	params.card_youth_lod = hit_youth_lod;
 	rd->buffer_update(hit_params_ubo, 0, sizeof(HitParamsUBO), &params);
 
 	HitBinPushConstant bin = {};
@@ -2439,6 +2481,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	RD::Uniform h_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ surface_cache->get_sets_buffer() }));
 	RD::Uniform h_card_depth(RD::UNIFORM_TYPE_TEXTURE, 21, Vector<RID>({ surface_cache->get_depth_atlas() }));
 	RD::Uniform h_card_lighting(RD::UNIFORM_TYPE_TEXTURE, 22, Vector<RID>({ surface_cache->get_lighting_atlas() }));
+	RD::Uniform h_card_indirect(RD::UNIFORM_TYPE_TEXTURE, 25, Vector<RID>({ surface_cache->get_indirect_atlas() }));
 	RID default_black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 	RD::Uniform h_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 23, Vector<RID>({ sampler, p_depth.is_valid() ? p_depth : default_black }));
 	RD::Uniform h_screen(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 24, Vector<RID>({ material_sampler, p_screen_radiance.is_valid() ? p_screen_radiance : default_black }));
@@ -2451,7 +2494,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 		for (uint32_t s = 0; s < hit_material_slots.size(); s++) {
 			const HitMaterial &hm = hit_material_slots[s];
 			rd->compute_list_bind_compute_pipeline(list, hm.pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 1, su[0], su[1], su[2], su[3], su[4], su[5], su[6], su[7], su[8], su[9], su[10], su[11]), 1);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 2, h_results), 2);
 			if (hm.uniform_set.is_valid()) {

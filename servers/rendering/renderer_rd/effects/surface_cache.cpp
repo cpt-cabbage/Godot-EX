@@ -825,14 +825,15 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	last_grid_built = use_grid;
 	last_grid_origin = grid_origin;
 	last_grid_cell = grid_cell;
-	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient switches
-	// parts of the texel shading off (gradient: the bounce ray re-traced for the
-	// temporal gradient), read once.
+	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart
+	// switches parts of the texel shading off (gradient: the bounce ray
+	// re-traced for the temporal gradient; restart: the bounce accumulation's
+	// restart on a change), read once.
 	static const uint32_t ablate = []() {
 		uint32_t bits = 0;
 		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
 			const String name = part.strip_edges().to_lower();
-			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : 0;
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : 0;
 		}
 		if (bits != 0) {
 			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
@@ -840,6 +841,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		return bits;
 	}();
 	params.debug = ablate;
+	// GODOT_CARD_BOUNCE_FLOOR=<relights>: the fewest relights a lighting
+	// change restarts a texel's bounce accumulation to (1 is a full restart).
+	static const float bounce_floor = OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR") == "" ? 1.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR").to_float());
+	params.bounce_floor = MAX(bounce_floor, 1.0f);
+	// GODOT_CARD_YOUNG_RAYS=<n>: extra bounce rays for a texel whose
+	// accumulation is under eight relights (a restart, a fresh capture).
+	static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS") == "" ? 3 : OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS").to_int();
+	params.young_rays = uint32_t(CLAMP(young_rays, 0, 15));
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray

@@ -80,8 +80,8 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float grid_cell;
 	uint grid_n;
 	uint grid_cap;
-	uint pad_grid0;
-	uint pad_grid1;
+	float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (see accumulate).
+	uint young_rays; // Extra bounce rays for a texel whose accumulation is young (see trace_bounce_young).
 }
 params;
 
@@ -713,6 +713,36 @@ void trace_bounce(Texel t, inout uint seed, out vec3 indirect_sample, out float 
 	}
 }
 
+// The young texel's extra rays. A lighting change restarts the bounce
+// accumulation (see accumulate), and for the relights after it the texel is
+// one sample, then a few: every gather ray landing near it reads that same
+// sample, so its noise is not per pixel but a mottle over the whole surface,
+// which no screen-space filter averages and the cards' mip levels only
+// spread (a flashlight sweeping the room left the ceiling and walls blotched
+// for the cards' whole window; a softer restart traded the mottle for the
+// old beam's bounce lingering). More rays where the history is young buy
+// the samples back at the restart, and cost nothing where it is not.
+#define YOUNG_RELIGHTS 8.0
+void trace_bounce_young(ivec2 texel, Texel t, inout uint seed, inout vec3 indirect_sample, inout float bounce_change) {
+	if (params.young_rays == 0u || (params.debug & 1u) != 0u) {
+		return;
+	}
+	float relights = imageLoad(indirect_atlas, texel).a * 64.0;
+	if (relights >= YOUNG_RELIGHTS) {
+		return;
+	}
+	for (uint r = 0u; r < params.young_rays; r++) {
+		vec3 extra;
+		float extra_change;
+		uint extra_set;
+		float extra_t;
+		trace_bounce(t, seed, extra, extra_change, extra_set, extra_t);
+		indirect_sample += extra;
+		bounce_change = max(bounce_change, extra_change);
+	}
+	indirect_sample /= float(params.young_rays + 1u);
+}
+
 // The bounce gradient: the previous relight's ray traced again from the same
 // texel with the same seed, what it hits now against what it hit then
 // (stored per texel): another set, or the same one at a distance changed by
@@ -822,7 +852,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	float window = float(min(2u * params.temporal_frames, 64u));
 
 	// The visibility ratio.
-	float keep_vis = geom_change > 0.02 ? max(1.0, 1.0 / geom_change) : 64.0;
+	float keep_vis = (geom_change > 0.02 && (params.debug & 64u) == 0u) ? max(1.0, 1.0 / geom_change) : 64.0;
 	float frames = reset ? 0.0 : min(old.a * 64.0, keep_vis);
 	float vis = prev.vis;
 	if (d.sampled) {
@@ -856,11 +886,32 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// still sweeping) -- that flicker is the GI screen history restarting
 	// at the pixels whose rays hit the tracked texels, not the bounce's
 	// own sample count.
-	float keep_ind = change > 0.02 ? max(1.0, 1.0 / change) : 64.0;
+	float keep_ind = (change > 0.02 && (params.debug & 32u) == 0u) ? max(params.bounce_floor, 1.0 / change) : 64.0;
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
 	float ind_frames = reset ? 0.0 : min(old_indirect.a * 64.0, keep_ind);
 	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / window);
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
+	if ((params.debug & 128u) != 0u) {
+		// Diagnostics (GODOT_CARD_ABLATE=paint, seen through GODOT_GI_FALLBACK=all):
+		// the texel's own radiance gradient, the re-traced bounce gradient,
+		// and the capture reset, as colour. The paint replaces the
+		// accumulation, and the rays of other texels read it through their
+		// hits, so the whole scene tints within a few relights: read the
+		// first frames.
+		indirect = vec3(fresh ? 0.0 : max(max(rel.r, rel.g), rel.b), max(bounce_gradient, 0.0), reset ? 1.0 : 0.0);
+	} else if ((params.debug & 256u) != 0u) {
+		// (paint2) The change the bounce ray carried from its hit, the
+		// neighbours' spread, and the fading change from the last relight.
+		indirect = vec3(max(bounce_change, 0.0), 0.0, max(prev.change - 0.125, 0.0));
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				ivec2 n = texel + ivec2(dx, dy);
+				if ((dx != 0 || dy != 0) && all(greaterThanEqual(n, card_min)) && all(lessThanEqual(n, card_max))) {
+					indirect.g = max(indirect.g, change_load_gradient(n));
+				}
+			}
+		}
+	}
 	imageStore(indirect_atlas, texel, vec4(indirect, min(ind_frames + 1.0, 64.0) / 64.0));
 
 	vec3 direct = d.exact + d.local_sum * vis;
@@ -939,6 +990,7 @@ void main() {
 		uint bounce_set;
 		float bounce_t;
 		trace_bounce(t, bounce_seed, indirect_sample, bounce_change, bounce_set, bounce_t);
+		trace_bounce_young(texel, t, bounce_seed, indirect_sample, bounce_change);
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
 	}
@@ -991,6 +1043,7 @@ void main() {
 	uint bounce_set;
 	float bounce_t;
 	trace_bounce(t[tracer], seed, indirect_sample, bounce_change, bounce_set, bounce_t);
+	trace_bounce_young(tracer_texel, t[tracer], seed, indirect_sample, bounce_change);
 	for (uint k = 0u; k < 4u; k++) {
 		if (!valid[k]) {
 			continue;

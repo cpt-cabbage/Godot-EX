@@ -55,7 +55,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint surface_cache_frame; // The cache's own clock, stamped on the sets hits reach.
 	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
 	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
-	uint pad0;
+	float card_youth_lod; // The mip a texel relit once is read through (0 disables); a level less per doubling of its relights (see surface_cache_lookup).
 	uint pad1;
 	uint pad2;
 }
@@ -77,6 +77,7 @@ params;
 #define FLAG_HIT_MIRROR 8192u // The mirror ray's hits are, cards or not.
 #define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
 #define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
+#define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -740,9 +741,27 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	vec2 best_dims = vec2(card_dims_packed(best_packed));
 	float best_texel_world = (longest + 2.0 * s.margin) / max(best_dims.x, best_dims.y);
 	float lod = 0.0;
+	float max_lod = max(min(CARD_LIGHTING_MIPS - 1.0, log2(min(best_dims.x, best_dims.y)) - 2.0), 0.0);
 	if (card_lookup_footprint > 0.0) {
-		float max_lod = min(CARD_LIGHTING_MIPS - 1.0, log2(min(best_dims.x, best_dims.y)) - 2.0);
-		lod = clamp(log2(max(card_lookup_footprint / best_texel_world, 1.0)), 0.0, max(max_lod, 0.0));
+		lod = clamp(log2(max(card_lookup_footprint / best_texel_world, 1.0)), 0.0, max_lod);
+	}
+	// A young texel is read through a coarser level. The bounce a texel
+	// accumulates restarts when the light on it changes (the temporal
+	// gradient), and for the relights after that it is one or a few samples
+	// -- every ray landing near it reads the same sample, so the noise is
+	// not per pixel but a mottle over the whole surface that no screen-space
+	// filter averages (a flashlight sweeping the room left the ceiling and
+	// walls blotched for the cards' whole window). The level halves the
+	// noise per step: a texel relit once reads eight by eight of its
+	// neighbours, and the level falls half a step per doubling of its
+	// relights until the texel stands on its own at sixty-four.
+	if (params.card_youth_lod > 0.0) {
+		ivec2 tex0 = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
+		float relights = texelFetch(card_indirect_atlas, tex0, 0).a * 64.0;
+		if (relights > 0.0) {
+			float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
+			lod = clamp(max(lod, youth_lod), 0.0, max_lod);
+		}
 	}
 	float margin = 0.5 * exp2(lod);
 	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
@@ -1182,7 +1201,7 @@ void main() {
 	// instance is missing, which the G-buffer does not carry: one short
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
-	if (bool(params.flags & FLAG_SURFACE_CACHE)) {
+	if (bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF)) {
 		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL)) {
 			float view_len = length(rel_pos);
 			vec3 eye_dir = rel_pos / max(view_len, 1e-4);
@@ -1204,19 +1223,33 @@ void main() {
 					card_requests.frame[card_set] = params.surface_cache_frame;
 					// A tent over the card's texels (never across its border):
 					// the card is coarse against the screen, and its texels
-					// would show as blocks at the fade's full weight.
+					// would show as blocks at the fade's full weight. The tent
+					// widens the younger the texel's accumulation is (see
+					// surface_cache_lookup: a few samples per texel read as a
+					// mottle over the whole surface, and the fade shows this
+					// read at full weight): a texel relit once is read as a
+					// four-by-four grid of bilinear taps four texels apart (a
+					// wider grid, eight apart, leaked light across the walls and
+					// flickered against the history it fades into), the spacing
+					// halving with every doubling of its relights.
+					float relights = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0).a * 64.0;
+					vec2 dims = vec2(card_atlas_dims);
+					float spacing = 1.0;
+					if (params.card_youth_lod > 0.0 && relights > 0.0) {
+						float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
+						spacing = clamp(exp2(youth_lod - 1.0), 1.0, max(min(dims.x, dims.y) / 8.0, 1.0));
+					}
 					vec2 t_min = vec2(card_atlas_origin) + 0.5;
 					vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
-					vec4 ind = vec4(0.0);
-					for (int dy = -1; dy <= 1; dy++) {
-						for (int dx = -1; dx <= 1; dx++) {
-							float w = (dx == 0 ? 2.0 : 1.0) * (dy == 0 ? 2.0 : 1.0);
-							vec2 t = clamp(card_atlas_texel + vec2(dx, dy) * 1.5, t_min, t_max);
-							ind += textureLod(card_indirect_atlas, t / float(params.surface_cache_atlas_size), 0.0) * w;
+					vec3 ind = vec3(0.0);
+					for (int dy = 0; dy < 4; dy++) {
+						for (int dx = 0; dx < 4; dx++) {
+							vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
+							ind += textureLod(card_indirect_atlas, t / float(params.surface_cache_atlas_size), 0.0).rgb;
 						}
 					}
 					ind /= 16.0;
-					fallback = vec4(max(ind.rgb, vec3(0.0)), ind.a * card_lookup_confidence);
+					fallback = vec4(max(ind, vec3(0.0)), min(relights, 64.0) / 64.0 * card_lookup_confidence);
 				}
 				pixel_change = change_before;
 			}
