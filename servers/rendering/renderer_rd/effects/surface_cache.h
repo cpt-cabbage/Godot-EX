@@ -105,8 +105,11 @@ public:
 		RID omni_light_buffer;
 		RID spot_light_buffer;
 		RID directional_light_buffer;
+		RID area_light_buffer; // The area lights (the population's, like the omni and spot buffers), and the atlas their textures live in.
+		RID area_light_atlas;
 		uint32_t omni_light_count = 0;
 		uint32_t spot_light_count = 0;
+		uint32_t area_light_count = 0;
 		uint32_t directional_light_count = 0;
 		Transform3D world_from_view; // Camera transform: the light buffers are view space.
 		uint32_t frame = 0;
@@ -322,7 +325,8 @@ private:
 		float dynamic_window; // The most relights the dynamic histories accumulate (GODOT_CARD_DYN_WINDOW).
 		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
 		float dynamic_join; // The share of a joining light's bounce the static accumulation holds, on the frame it joins (LightStorage; 0 otherwise).
-		float pad_join[3];
+		uint32_t area_light_count;
+		float pad_join[2];
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 	};
 

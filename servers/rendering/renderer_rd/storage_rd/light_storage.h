@@ -198,13 +198,17 @@ private:
 	RID spot_light_buffer;
 	RID area_light_buffer;
 
-	// The surface cache's light population: the scene's omni and spot lights
-	// within a radius of the camera, in the view or not, in the same LightData
-	// layout (shadow atlas fields empty: the cards trace their shadows).
+	// The surface cache's light population: the scene's omni, spot and area
+	// lights within a radius of the camera, in the view or not, in the same
+	// LightData layout (shadow atlas fields empty: the cards trace their
+	// shadows). Area lights are never dynamic: a moved one reaches the cards
+	// through their exact direct term at the next relight.
 	LocalVector<LightData> card_omni_lights;
 	LocalVector<LightData> card_spot_lights;
+	LocalVector<LightData> card_area_lights;
 	RID card_omni_light_buffer;
 	RID card_spot_light_buffer;
+	RID card_area_light_buffer;
 	uint32_t card_light_buffer_capacity = 0;
 	bool card_lights_valid = false;
 	// The lights that moved or changed lately: the surface cache estimates
@@ -887,8 +891,10 @@ public:
 	float get_card_dynamic_join() const { return card_dynamic_join; }
 	RID get_card_omni_light_buffer() const { return card_omni_light_buffer; }
 	RID get_card_spot_light_buffer() const { return card_spot_light_buffer; }
+	RID get_card_area_light_buffer() const { return card_area_light_buffer; }
 	uint32_t get_card_omni_light_count() const { return card_omni_lights.size(); }
 	uint32_t get_card_spot_light_count() const { return card_spot_lights.size(); }
+	uint32_t get_card_area_light_count() const { return card_area_lights.size(); }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_directional_light_buffer() { return directional_light_buffer; }
 	uint32_t get_omni_light_count() const { return omni_light_count; }

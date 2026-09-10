@@ -649,6 +649,10 @@ void LightStorage::free_light_data() {
 			RD::get_singleton()->free_rid(card_spot_light_buffer);
 			card_spot_light_buffer = RID();
 		}
+		if (card_area_light_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(card_area_light_buffer);
+			card_area_light_buffer = RID();
+		}
 		omni_light_buffer = RID();
 	}
 
@@ -743,7 +747,7 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 	float energy = sign * p_light->param[RSE::LIGHT_PARAM_ENERGY] * fade;
 	if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
 		energy *= p_light->param[RSE::LIGHT_PARAM_INTENSITY];
-		energy *= (p_type == RSE::LIGHT_OMNI) ? 1.0 / (Math::PI * 4.0) : 1.0 / Math::PI;
+		energy *= (p_type == RSE::LIGHT_OMNI) ? 1.0 / (Math::PI * 4.0) : (p_type == RSE::LIGHT_AREA) ? 1.0 / (Math::PI * 2.0) : 1.0 / Math::PI;
 	} else {
 		energy *= Math::PI;
 	}
@@ -770,6 +774,36 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 	r_data.size = p_light->param[RSE::LIGHT_PARAM_SIZE];
 	r_data.inv_spot_attenuation = 1.0f / p_light->param[RSE::LIGHT_PARAM_SPOT_ATTENUATION];
 	r_data.cos_spot_angle = Math::cos(Math::deg_to_rad(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
+	if (p_type == RSE::LIGHT_AREA) {
+		// The rect's axes, its energy per unit area, and its texture's place
+		// in the area light atlas with the mip count the LTC fetch may read,
+		// as update_light_buffers fills them.
+		const Vector2 area_size = p_light->area_size;
+		const Vector3 area_vec_a = p_inverse_transform.basis.xform(light_transform.basis.xform(Vector3(1, 0, 0))).normalized() * area_size.x;
+		const Vector3 area_vec_b = p_inverse_transform.basis.xform(light_transform.basis.xform(Vector3(0, 1, 0))).normalized() * area_size.y;
+		for (int i = 0; i < 3; i++) {
+			r_data.area_width[i] = area_vec_a[i];
+			r_data.area_height[i] = area_vec_b[i];
+		}
+		r_data.inv_spot_attenuation = 1.0 / (radius + area_size.length() / 2.0);
+		if (p_light->area_normalize_energy) {
+			const float surface_area = area_size.x * area_size.y;
+			for (int i = 0; i < 3; i++) {
+				r_data.color[i] /= surface_area;
+			}
+		}
+		r_data.cos_spot_angle = 0.0f;
+		if (p_light->area_texture.is_valid()) {
+			RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+			const Rect2 rect = texture_storage->area_light_atlas_get_texture_rect(p_light->area_texture);
+			r_data.projector_rect[0] = rect.position.x;
+			r_data.projector_rect[1] = rect.position.y;
+			r_data.projector_rect[2] = rect.size.width;
+			r_data.projector_rect[3] = rect.size.height;
+			const Size2i texture_size = (rect.size * texture_storage->area_light_atlas_get_size()).ceil();
+			r_data.cos_spot_angle = MIN(Math::floor(Math::log2(MAX(MIN(texture_size.x, texture_size.y), 1.0f))), texture_storage->area_light_atlas_get_mipmaps()) - 1.0f; // max mipmaps
+		}
+	}
 	r_data.mask = p_light->cull_mask;
 	{
 		const uint32_t caster = p_light->shadow_caster_mask;
@@ -781,6 +815,7 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_light_count, const Transform3D &p_camera_transform, RID p_camera_attributes, float p_radius) {
 	card_omni_lights.clear();
 	card_spot_lights.clear();
+	card_area_lights.clear();
 	card_dynamic_lights.clear();
 	card_dynamic_light_data.clear();
 	card_dynamic_weights.clear();
@@ -805,7 +840,7 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 			continue;
 		}
 		const Light *light = light_owner.get_or_null(light_instance->light);
-		if (light == nullptr || (light->type != RSE::LIGHT_OMNI && light->type != RSE::LIGHT_SPOT)) {
+		if (light == nullptr || (light->type != RSE::LIGHT_OMNI && light->type != RSE::LIGHT_SPOT && light->type != RSE::LIGHT_AREA)) {
 			continue;
 		}
 		const float distance = p_camera_transform.origin.distance_to(light_instance->transform.origin);
@@ -814,6 +849,11 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 		}
 		LightData data;
 		_fill_card_light_data(data, light->type, light, light_instance, inverse_transform, distance, p_camera_attributes);
+		if (light->type == RSE::LIGHT_AREA) {
+			// Never dynamic (see card_area_lights).
+			card_area_lights.push_back(data);
+			continue;
+		}
 		// Dynamic: changed since last seen (a light seen for the first time
 		// is not a change), and within the hold.
 		CardLightTrack &track = card_light_tracks[p_lights[i]];
@@ -908,21 +948,26 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 		}
 	}
 
-	const uint32_t needed = MAX(card_omni_lights.size(), card_spot_lights.size());
+	const uint32_t needed = MAX(MAX(card_omni_lights.size(), card_spot_lights.size()), card_area_lights.size());
 	if (needed > card_light_buffer_capacity || card_omni_light_buffer.is_null()) {
 		if (card_omni_light_buffer.is_valid()) {
 			RD::get_singleton()->free_rid(card_omni_light_buffer);
 			RD::get_singleton()->free_rid(card_spot_light_buffer);
+			RD::get_singleton()->free_rid(card_area_light_buffer);
 		}
 		card_light_buffer_capacity = MAX(64u, Math::next_power_of_2(needed));
 		card_omni_light_buffer = RD::get_singleton()->storage_buffer_create(card_light_buffer_capacity * sizeof(LightData));
 		card_spot_light_buffer = RD::get_singleton()->storage_buffer_create(card_light_buffer_capacity * sizeof(LightData));
+		card_area_light_buffer = RD::get_singleton()->storage_buffer_create(card_light_buffer_capacity * sizeof(LightData));
 	}
 	if (card_omni_lights.size() > 0) {
 		RD::get_singleton()->buffer_update(card_omni_light_buffer, 0, sizeof(LightData) * card_omni_lights.size(), card_omni_lights.ptr());
 	}
 	if (card_spot_lights.size() > 0) {
 		RD::get_singleton()->buffer_update(card_spot_light_buffer, 0, sizeof(LightData) * card_spot_lights.size(), card_spot_lights.ptr());
+	}
+	if (card_area_lights.size() > 0) {
+		RD::get_singleton()->buffer_update(card_area_light_buffer, 0, sizeof(LightData) * card_area_lights.size(), card_area_lights.ptr());
 	}
 }
 

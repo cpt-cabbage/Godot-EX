@@ -691,8 +691,10 @@ private:
 		float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
 		float card_youth_lod; // The tent a young card texel's bounce is read through at a hit (0: the texel alone).
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
+		uint32_t area_light_count;
+		uint32_t pad_area[3];
 	};
-	static_assert(sizeof(HitParamsUBO) == 480, "HitParamsUBO layout must match scene_hit_shade.glsl.");
+	static_assert(sizeof(HitParamsUBO) == 496, "HitParamsUBO layout must match scene_hit_shade.glsl.");
 
 	// The lighting the card pass ran with this frame, kept for the hits.
 	SurfaceCache::LightingInputs hit_lighting;
@@ -904,7 +906,7 @@ public:
 	SurfaceCache *get_surface_cache() const { return surface_cache; }
 
 	// Lights the surface cache for this frame; call before process_rt_gi.
-	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky);
+	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky);
 
 	// p_sky_use_octmap_array selects the sky radiance octmap layout the GI
 	// gather shader compiles against (must match the sky renderer's).

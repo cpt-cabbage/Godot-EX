@@ -810,6 +810,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.omni_light_count = p_inputs.omni_light_count;
 	params.spot_light_count = p_inputs.spot_light_count;
 	params.directional_light_count = p_inputs.directional_light_count;
+	params.area_light_count = p_inputs.area_light_buffer.is_valid() ? p_inputs.area_light_count : 0;
 	params.frame = p_inputs.frame;
 	params.ray_bias = p_inputs.ray_bias;
 	params.sky_energy = p_inputs.sky_energy;
@@ -1067,12 +1068,16 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect_dyn2(RD::UNIFORM_TYPE_IMAGE, 26, Vector<RID>({ indirect_dyn2_atlas }));
 	RD::Uniform l_dyn_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 27, Vector<RID>({ dynamic_lights_buffer }));
 	RD::Uniform l_static(RD::UNIFORM_TYPE_IMAGE, 28, Vector<RID>({ static_atlas }));
+	// The area lights: the omni buffer stands in when the frame has none
+	// (their count is zero then, so the shader never reads it).
+	RD::Uniform l_area(RD::UNIFORM_TYPE_STORAGE_BUFFER, 29, Vector<RID>({ p_inputs.area_light_buffer.is_valid() ? p_inputs.area_light_buffer : p_inputs.omni_light_buffer }));
+	RD::Uniform l_area_atlas(RD::UNIFORM_TYPE_TEXTURE, 30, Vector<RID>({ p_inputs.area_light_atlas.is_valid() ? p_inputs.area_light_atlas : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK) }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

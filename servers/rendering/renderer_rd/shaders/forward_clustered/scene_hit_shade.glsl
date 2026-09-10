@@ -71,6 +71,10 @@ layout(set = 0, binding = 1, std140) uniform Params {
 	float card_atlas_size; // The lighting atlas edge, for the bounce's mip reads.
 	float card_youth_lod; // The tent a young card texel's bounce is read through (see card_indirect); 0 reads the texel alone.
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
+	uint area_light_count; // The area lights (every one in the population, each tested for range at the hit).
+	uint pad_area0;
+	uint pad_area1;
+	uint pad_area2;
 }
 params;
 
@@ -221,7 +225,14 @@ layout(set = 0, binding = 24) uniform sampler2D screen_radiance_texture;
 // indirect_atlas), for the hit's own indirect term (card_indirect).
 layout(set = 0, binding = 25) uniform texture2D card_indirect_atlas;
 layout(set = 0, binding = 26) uniform texture2D card_indirect_dyn_atlas; // The dynamic lights' bounce, apart.
-layout(set = 0, binding = 27) uniform texture2D card_indirect_dyn2_atlas; // Their second bounce.
+layout(set = 0, binding = 27) uniform texture2D card_indirect_dyn2_atlas;
+// The area lights and the atlas their textures live in (read through
+// linear_sampler_mipmaps), as the card lighting has them.
+layout(set = 0, binding = 28, std430) restrict readonly buffer AreaLights {
+	LightData data[];
+}
+area_lights;
+layout(set = 0, binding = 29) uniform texture2D area_light_atlas; // Their second bounce.
 
 /* Set 1: the material samplers, by the names the compiler emits. */
 
@@ -287,6 +298,8 @@ float get_omni_attenuation(float dist, float inv_range, float decay) {
 	nd *= nd;
 	return nd * pow(max(dist, 0.0001), -decay);
 }
+
+#include "../area_light_diffuse_inc.glsl"
 
 vec3 sky_eval(vec3 world_dir) {
 	if (bool(params.flags & FLAG_SKY_MODE_SKY)) {
@@ -739,6 +752,31 @@ vec3 shade_direct(vec3 world_pos, vec3 n_world, vec3 origin, inout uint seed) {
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
 			sel_pos = pos;
+			sel_opacity = ld.shadow_opacity;
+			sel_mask = ld.shadow_caster_mask & 0xFFu;
+		}
+	}
+	// Area lights, in the same estimator (as the card lighting): the LTC
+	// diffuse term, the shadow ray to a point drawn uniformly on the rect.
+	for (uint j = 0u; j < params.area_light_count; j++) {
+		LightData ld = area_lights.data[j];
+		seed = pcg_hash(seed);
+		float xi0 = hash_to_float(seed);
+		seed = pcg_hash(seed);
+		float xi1 = hash_to_float(seed);
+		float geom;
+		vec3 point;
+		vec3 c = area_light_contribution(ld, params.world_from_view, world_pos, n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
+		float w = luminance(abs(c));
+		if (w <= 0.0) {
+			continue;
+		}
+		sum += c;
+		weight_sum += w;
+		seed = pcg_hash(seed);
+		if (hash_to_float(seed) * weight_sum < w) {
+			selected = true;
+			sel_pos = point;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
 		}

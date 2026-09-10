@@ -835,7 +835,7 @@ void RaytracedShadows::set_surface_cache_enabled(bool p_enabled, const SurfaceCa
 	}
 }
 
-void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
+void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
 	if (surface_cache == nullptr || tlas.is_null()) {
 		return;
 	}
@@ -847,14 +847,19 @@ void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_
 	if (light_storage->card_lights_are_valid()) {
 		in.omni_light_buffer = light_storage->get_card_omni_light_buffer();
 		in.spot_light_buffer = light_storage->get_card_spot_light_buffer();
+		in.area_light_buffer = light_storage->get_card_area_light_buffer();
 		in.omni_light_count = light_storage->get_card_omni_light_count();
 		in.spot_light_count = light_storage->get_card_spot_light_count();
+		in.area_light_count = light_storage->get_card_area_light_count();
 	} else {
 		in.omni_light_buffer = light_storage->get_omni_light_buffer();
 		in.spot_light_buffer = light_storage->get_spot_light_buffer();
+		in.area_light_buffer = light_storage->get_area_light_buffer();
 		in.omni_light_count = p_omni_light_count;
 		in.spot_light_count = p_spot_light_count;
+		in.area_light_count = p_area_light_count;
 	}
+	in.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
 	in.directional_light_buffer = light_storage->get_directional_light_buffer();
 	in.directional_light_count = p_directional_light_count;
 	in.world_from_view = p_world_from_view;
@@ -2558,6 +2563,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	params.flags |= (p_quality.hit_debug & 1023) << 4; // The debug and ablation bits, FLAG_DEBUG_ALBEDO on.
 	params.omni_light_count = hit_lighting.omni_light_count;
 	params.spot_light_count = hit_lighting.spot_light_count;
+	params.area_light_count = hit_lighting.area_light_buffer.is_valid() ? hit_lighting.area_light_count : 0;
 	params.directional_light_count = hit_lighting.directional_light_count;
 	params.frame = scene_frame;
 	params.ray_bias = p_quality.ray_bias;
@@ -2656,6 +2662,9 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	RD::Uniform h_card_indirect_dyn(RD::UNIFORM_TYPE_TEXTURE, 26, Vector<RID>({ surface_cache->get_indirect_dyn_atlas() }));
 	RD::Uniform h_card_indirect_dyn2(RD::UNIFORM_TYPE_TEXTURE, 27, Vector<RID>({ surface_cache->get_indirect_dyn2_atlas() }));
 	RID default_black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+	RID area = hit_lighting.area_light_buffer.is_valid() ? hit_lighting.area_light_buffer : rt_gi_dummy_buffer;
+	RD::Uniform h_area(RD::UNIFORM_TYPE_STORAGE_BUFFER, 28, Vector<RID>({ area }));
+	RD::Uniform h_area_atlas(RD::UNIFORM_TYPE_TEXTURE, 29, Vector<RID>({ hit_lighting.area_light_atlas.is_valid() ? hit_lighting.area_light_atlas : default_black }));
 	RD::Uniform h_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 23, Vector<RID>({ sampler, p_depth.is_valid() ? p_depth : default_black }));
 	RD::Uniform h_screen(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 24, Vector<RID>({ material_sampler, p_screen_radiance.is_valid() ? p_screen_radiance : default_black }));
 	Vector<RD::Uniform> su;
@@ -2667,7 +2676,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 		for (uint32_t s = 0; s < hit_material_slots.size(); s++) {
 			const HitMaterial &hm = hit_material_slots[s];
 			rd->compute_list_bind_compute_pipeline(list, hm.pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect, h_card_indirect_dyn, h_card_indirect_dyn2), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect, h_card_indirect_dyn, h_card_indirect_dyn2, h_area, h_area_atlas), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 1, su[0], su[1], su[2], su[3], su[4], su[5], su[6], su[7], su[8], su[9], su[10], su[11]), 1);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 2, h_results), 2);
 			if (hm.uniform_set.is_valid()) {

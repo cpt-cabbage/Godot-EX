@@ -87,7 +87,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_window; // The most relights the dynamic histories accumulate.
 	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
 	float dynamic_join; // On the frame a light joins the dynamic set (every set relit): the share of its bounce the static accumulation holds, which it sheds (see accumulate). 0 otherwise.
-	float pad_join0;
+	uint area_light_count; // The area lights (every one in the population: a few, each tested for range per texel).
 	float pad_join1;
 	float pad_join2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
@@ -247,6 +247,14 @@ layout(set = 0, binding = 26, rgba16f) uniform restrict image2D indirect_dyn2_at
 // read the two from different moments of the same dispatch.
 layout(set = 0, binding = 28, rgba16f) uniform restrict image2D static_atlas;
 
+// The area lights (the population's, like the omni and spot buffers) and
+// the atlas their textures live in, read through linear_sampler_mipmaps.
+layout(set = 0, binding = 29, std430) restrict readonly buffer AreaLights {
+	LightData data[];
+}
+area_lights;
+layout(set = 0, binding = 30) uniform texture2D area_light_atlas;
+
 // Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
 // (see trace_dynamic; surface_cache.cpp prints and clears it).
 layout(set = 0, binding = 25, std430) restrict buffer DynStats {
@@ -341,6 +349,8 @@ float get_omni_attenuation(float dist, float inv_range, float decay) {
 	nd *= nd;
 	return nd * pow(max(dist, 0.0001), -decay);
 }
+
+#include "../area_light_diffuse_inc.glsl"
 
 vec3 sky_eval(vec3 world_dir) {
 	if (bool(params.flags & FLAG_SKY_MODE_SKY)) {
@@ -817,6 +827,35 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
 			sel_pos = pos;
+			sel_opacity = ld.shadow_opacity;
+			sel_mask = ld.shadow_caster_mask & 0xFFu;
+		}
+	}
+	// Area lights, in the same estimator: their LTC diffuse term, with the
+	// shadow ray to a point drawn uniformly on the rect (a soft shadow over
+	// the relights). Not culled: a scene holds a few, and the range test in
+	// the term is the first thing it does.
+	uint area_count = (params.debug & 4u) != 0u ? 0u : params.area_light_count;
+	for (uint j = 0u; j < area_count; j++) {
+		LightData ld = area_lights.data[j];
+		seed = pcg_hash(seed);
+		float xi0 = hash_to_float(seed);
+		seed = pcg_hash(seed);
+		float xi1 = hash_to_float(seed);
+		float geom;
+		vec3 point;
+		vec3 c = area_light_contribution(ld, params.world_from_view, t.world_pos, t.n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
+		float w = luminance(abs(c));
+		if (w <= 0.0) {
+			continue;
+		}
+		sum += c;
+		d.local_geom += geom;
+		weight_sum += w;
+		seed = pcg_hash(seed);
+		if (hash_to_float(seed) * weight_sum < w) {
+			selected = true;
+			sel_pos = point;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
 		}

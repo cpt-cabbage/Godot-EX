@@ -2887,7 +2887,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				// lighting, so the gather below reads this frame's radiance.
 				_surface_cache_capture(p_render_data);
 				light_storage->update_card_light_buffers(p_render_data->scene_lights, p_render_data->scene_light_count, p_render_data->scene_data->get_cam_transform(), p_render_data->camera_attributes, surface_cache_light_radius);
-				rt_shadows->update_surface_cache_lighting(p_render_data->scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), p_render_data->directional_light_count, stochastic_quality.ray_bias, surface_cache_light_radius, gi_cascades, gi_sky);
+				rt_shadows->update_surface_cache_lighting(p_render_data->scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(), p_render_data->directional_light_count, stochastic_quality.ray_bias, surface_cache_light_radius, gi_cascades, gi_sky);
 			}
 
 			stochastic_traced_this_frame = run_stochastic;
