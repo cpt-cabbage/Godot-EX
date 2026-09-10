@@ -35,6 +35,7 @@
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_grid.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/surface_cache_mip.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_light.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_prepare.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -280,6 +281,10 @@ private:
 	SurfaceCacheGridShaderRD grid_shader;
 	RID grid_shader_version;
 	RID grid_pipeline;
+	// The lighting atlas's coverage-weighted mip chain (surface_cache_mip.glsl).
+	SurfaceCacheMipShaderRD mip_shader;
+	RID mip_shader_version;
+	RID mip_pipeline;
 	RID grid_buffer; // GRID_N^3 cells of 1 + GRID_CAP uints.
 	bool last_grid_built = false; // The grid's state after the last update_lighting, for the hit shading.
 	Vector3 last_grid_origin;

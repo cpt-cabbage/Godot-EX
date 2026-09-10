@@ -86,6 +86,13 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 		grid_pipeline = rd->compute_pipeline_create(grid_shader.version_get_shader(grid_shader_version, 0));
 		grid_buffer = rd->storage_buffer_create(GRID_N * GRID_N * GRID_N * (1 + GRID_CAP) * sizeof(uint32_t));
 	}
+	{
+		Vector<String> modes;
+		modes.push_back("");
+		mip_shader.initialize(modes);
+		mip_shader_version = mip_shader.version_create();
+		mip_pipeline = rd->compute_pipeline_create(mip_shader.version_get_shader(mip_shader_version, 0));
+	}
 
 	requests_buffer = rd->storage_buffer_create(MAX_SETS * sizeof(uint32_t));
 	rd->buffer_clear(requests_buffer, 0, MAX_SETS * sizeof(uint32_t));
@@ -115,6 +122,7 @@ SurfaceCache::~SurfaceCache() {
 	prepare_shader.version_free(prepare_shader_version);
 	light_shader.version_free(light_shader_version);
 	grid_shader.version_free(grid_shader_version);
+	mip_shader.version_free(mip_shader_version);
 	if (grid_buffer.is_valid()) {
 		rd->free_rid(grid_buffer);
 	}
@@ -1133,12 +1141,35 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 
 	// The lighting atlas's mip chain, for the gather's cone-filtered reads.
 	// The whole atlas, every frame: the relit cards are scattered through it.
+	// Weighted by coverage (surface_cache_mip.glsl): a plain box downsample
+	// averaged the cards with the black between them, and the gather's
+	// cone reads lost 6-12% of a flashlight's bounce in the game room.
 	RENDER_TIMESTAMP("Surface Cache Lighting Mips");
 	rd->draw_command_begin_label("Surface Cache Lighting Mips");
-	CopyEffects *copy_effects = CopyEffects::get_singleton();
-	for (uint32_t i = 1; i < LIGHTING_MIPS; i++) {
-		int32_t mip_size = int32_t(settings.atlas_size >> i);
-		copy_effects->make_mipmap(lighting_atlas_mips[i - 1], lighting_atlas_mips[i], Size2i(mip_size, mip_size));
+	{
+		RID mip_rid = mip_shader.version_get_shader(mip_shader_version, 0);
+		RD::ComputeListID mip_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(mip_list, mip_pipeline);
+		for (uint32_t i = 1; i < LIGHTING_MIPS; i++) {
+			uint32_t mip_size = settings.atlas_size >> i;
+			RD::Uniform m_source(RD::UNIFORM_TYPE_TEXTURE, 0, Vector<RID>({ lighting_atlas_mips[i - 1] }));
+			RD::Uniform m_depth(RD::UNIFORM_TYPE_TEXTURE, 1, Vector<RID>({ depth_atlas }));
+			RD::Uniform m_dest(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ lighting_atlas_mips[i] }));
+			rd->compute_list_bind_uniform_set(mip_list, uniform_set_cache->get_cache(mip_rid, 0, m_source, m_depth, m_dest), 0);
+			struct MipPush {
+				uint32_t size[2];
+				uint32_t source_is_level0;
+				uint32_t pad;
+			} push;
+			push.size[0] = mip_size;
+			push.size[1] = mip_size;
+			push.source_is_level0 = i == 1 ? 1 : 0;
+			push.pad = 0;
+			rd->compute_list_set_push_constant(mip_list, &push, sizeof(push));
+			rd->compute_list_dispatch_threads(mip_list, mip_size, mip_size, 1);
+			rd->compute_list_add_barrier(mip_list);
+		}
+		rd->compute_list_end();
 	}
 	rd->draw_command_end_label();
 }
