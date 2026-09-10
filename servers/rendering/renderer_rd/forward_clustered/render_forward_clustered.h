@@ -870,6 +870,11 @@ private:
 	// material pass each frame.
 	bool use_surface_cache = false;
 	bool use_surface_cache_mirror = true;
+	// True when the gather's traced reflection covers every roughness (a
+	// mirror ray for smooth surfaces, a GGX ray above): stock SSR is then a
+	// second estimator that would overwrite it where its march hits, so the
+	// SSR pass is skipped. GODOT_GI_SSR=1 forces stock SSR back for A/B runs.
+	bool _rt_gi_owns_reflections() const;
 	// The translucency lighting volume for the transparent pass.
 	RendererRD::RaytracedShadows::TranslucencyQuality translucency_quality;
 	// Deferred hit shading: 0 off, 1 the hits the cards cannot shade, 2 every hit.

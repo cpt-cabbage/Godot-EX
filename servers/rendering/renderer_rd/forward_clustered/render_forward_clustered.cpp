@@ -858,7 +858,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			// Ray-traced GI replaces SSIL (its rays already carry the on-screen
 			// bounce SSIL approximates; keeping both would double count).
 			ss_flags |= (environment_get_ssil_enabled(p_render_data->environment) && !use_rt_gi) ? (1 << 1) : 0;
-			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
+			// Likewise SSR once the traced reflection covers every roughness:
+			// composited last, it would overwrite the traced term wherever its
+			// screen march hits, with the march's own stepping artifacts and a
+			// seam against the traced estimate where it does not.
+			ss_flags |= (environment_get_ssr_enabled(p_render_data->environment) && !_rt_gi_owns_reflections()) ? (1 << 2) : 0;
 
 			if (rd.is_valid()) {
 				Ref<RenderBufferDataForwardClustered> rb_data;
@@ -1987,6 +1991,11 @@ RID RenderForwardClustered::_get_scene_shader_tlas() const {
 	return rt_dummy_tlas;
 }
 
+bool RenderForwardClustered::_rt_gi_owns_reflections() const {
+	static const bool force_ssr = OS::get_singleton()->get_environment("GODOT_GI_SSR") == "1";
+	return use_rt_gi && use_rt_gi_specular && use_surface_cache && use_surface_cache_mirror && !force_ssr;
+}
+
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
@@ -2373,7 +2382,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			if (environment_get_sdfgi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
 				using_sdfgi = true;
 			}
-			if (environment_get_ssr_enabled(p_render_data->environment)) {
+			// The traced reflection owns the specular band under the surface
+			// cache's mirror path (see _rt_gi_owns_reflections), so the SSR
+			// pass and its last-frame framebuffer copy are skipped there.
+			if (environment_get_ssr_enabled(p_render_data->environment) && !_rt_gi_owns_reflections()) {
 				if (!p_render_data->transparent_bg) {
 					using_ssr = true;
 				} else {

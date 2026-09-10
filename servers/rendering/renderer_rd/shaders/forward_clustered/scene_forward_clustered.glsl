@@ -2458,7 +2458,9 @@ void fragment_shader(in SceneData scene_data) {
 			if (bool(implementation_data.rt_gi & 4u)) {
 				// With the surface cache the gather traces a mirror ray for
 				// smooth surfaces too, so the traced term covers every
-				// roughness; SSR still overrides it below where it hits.
+				// roughness and stock SSR is not run (it would overwrite the
+				// traced term below where its march hits); without it the
+				// smooth band stays with the probes and SSR.
 				float rt_gi_spec_blend = bool(implementation_data.rt_gi & 64u) ? 1.0 : smoothstep(0.2, 0.35, roughness);
 				// Composed after the specular occlusion term (see the
 				// declaration): the untraced share stays here to be occluded,
