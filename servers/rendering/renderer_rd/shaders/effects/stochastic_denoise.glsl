@@ -171,7 +171,7 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// the changed part (0: the raw sample stands in, as before). GODOT_GI_SPEC_FIX.
 	float spec_fix;
 	float borrow_band; // How far outside the frame (UV) a history may lie and still borrow the edge's (GODOT_GI_BORROW; 0 never borrows).
-	float pad2;
+	float young_rays; // The gather's diffuse rays for a pixel whose history is under 8 frames: that frame's sample counts for as many.
 	float pad3;
 }
 reprojection;
@@ -413,6 +413,7 @@ void main() {
 	vec3 result_specular = current_specular;
 	vec4 moments = vec4(0.0);
 	float frames_d = 1.0;
+	float samples_d = 1.0; // Samples this frame's diffuse carries (the gather's young rays).
 	float frames_s = 1.0;
 #ifdef HAS_DIRECTIONAL
 	// The card correction (GI, see the lighting-change block).
@@ -672,7 +673,15 @@ void main() {
 			// energy, and even a generous mean-relative firefly limit feeds
 			// back into a progressively darker mean.
 			float frames_cap = 1.0 / max(params.blend_alpha, 1e-3);
-			frames_d = min(hist_meta.r * 64.0 * confidence_d + 1.0, frames_cap);
+			// A young pixel's frame carries young_rays samples (the gather
+			// applies the same rule to last frame's count at its own
+			// reprojection): the history grows by as many, and the blend
+			// below weighs the sample by as many.
+			float hist_frames_d = hist_meta.r * 64.0 * confidence_d;
+#ifdef HAS_DIRECTIONAL
+			samples_d = hist_frames_d < 8.0 ? max(reprojection.young_rays, 1.0) : 1.0;
+#endif
+			frames_d = min(hist_frames_d + samples_d, frames_cap);
 			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
 			if (borrowed) {
 				frames_d = min(frames_d, BORROW_FRAMES);
@@ -819,7 +828,11 @@ void main() {
 				frames_s = min(frames_s, mix(frames_cap, 2.0, mismatch));
 			}
 #endif
-			float alpha_d = max(1.0 / frames_d, params.blend_alpha);
+			// Never past 1: a restart below (the change mark, a borrow) can
+			// leave fewer frames than this frame's samples, and a blend that
+			// extrapolated ran the screen-fed loop away within thirty
+			// frames (37% of the frame clipped white).
+			float alpha_d = min(max(samples_d / frames_d, params.blend_alpha), 1.0);
 			float alpha_s = max(1.0 / frames_s, params.blend_alpha);
 #ifdef HAS_DIRECTIONAL
 			if ((params.flags & FLAG_SPEC_PAINT) != 0u) {

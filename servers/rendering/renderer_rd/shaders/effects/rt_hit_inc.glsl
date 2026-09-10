@@ -31,7 +31,7 @@ struct HitGeometry {
 // 0: pixel x (13 bits) | pixel y << 13 (13) | slot << 26 (3) | flags << 29 (3)
 // 1: the instance record (CardInstance)
 // 2: the primitive index within its geometry
-// 3: the material slot (16 bits) | the geometry index << 16 (8)
+// 3: the material slot (16 bits) | the geometry index << 16 (8) | the pixel's diffuse rays - 1 << 24 (2)
 // 4: barycentrics (half2)
 // 5: the ray direction (octahedral, two 16-bit unorms)
 // 6-8: the world-space hit position
@@ -45,6 +45,9 @@ struct HitGeometry {
 #define RT_HIT_RESULT_PENDING 1u
 #define RT_HIT_RESULT_DONE 2u
 #define RT_HIT_RESULT_MIRROR 4u
+// Bits 8-9: the pixel's diffuse rays - 1 (a young pixel traces more; the
+// resolve divides its deferred hits by the count the pixel used).
+#define RT_HIT_RESULT_RAYS_SHIFT 8u
 
 // The counts buffer: one per material slot, then the packets appended, then
 // the ones that found no room.

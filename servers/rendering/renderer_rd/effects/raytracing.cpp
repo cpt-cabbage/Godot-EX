@@ -470,6 +470,10 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// shader's BORROW_BAND by default; 0 restarts every entering pixel).
 		static const float borrow_band = OS::get_singleton()->get_environment("GODOT_GI_BORROW") == "" ? 0.15f : float(OS::get_singleton()->get_environment("GODOT_GI_BORROW").to_float());
 		ubo.borrow_band = borrow_band;
+		// The gather's rays for a young pixel (see process_rt_gi): the
+		// temporal pass weighs such a frame's sample by as many.
+		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
+		ubo.young_rays = float(CLAMP(young_rays, 1, 4));
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
@@ -1221,7 +1225,22 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.full_screen_size[1] = full_size.y;
 	params.depth_scale = depth_scale;
 	params.frame_index = rb_state->frame_index;
-	params.ray_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
+	// GODOT_GI_YOUNG_RAYS=<n>: the diffuse rays a pixel whose history is
+	// young (under 8 frames) traces, in place of the setting's count; the
+	// entering band of a turn then converges in a few frames instead of
+	// thirty, at no cost while the screen is settled (section 33).
+	// Measured (section 33): four rays cut a flick's stop error 0.0136 ->
+	// 0.0126 on the ceiling and nothing off its blur (the other temporal
+	// passes' restarts), for 0.4 ms at rest and a fourfold gather while a
+	// screen is young; off by default.
+	static const int64_t young_rays_setting = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
+	const uint32_t base_rays = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
+	const uint32_t young_rays = uint32_t(CLAMP(young_rays_setting, 1, 4));
+	params.ray_count = MAX(base_rays, young_rays);
+	params.ray_params[0] = base_rays;
+	params.ray_params[1] = young_rays;
+	params.ray_params[2] = 0;
+	params.ray_params[3] = 0;
 	params.flags = 0;
 	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
 	// GODOT_GI_SRAD_CLAMP=<lum> overrides the project's absolute firefly

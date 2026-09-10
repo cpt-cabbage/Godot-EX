@@ -65,6 +65,11 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// y: the firefly ceiling's ratio over the cache value; z: the allowance
 	// added above the ceiling.
 	vec4 screen_radiance_extra;
+	// x: diffuse rays per pixel with a history; y: rays for a pixel whose
+	// history is young (under FALLBACK_FRAMES), so the entering band of a
+	// turn converges in a few frames instead of thirty. ray_count above is
+	// the larger of the two: the hit slots are sized by it.
+	uvec4 ray_params;
 }
 params;
 
@@ -260,6 +265,7 @@ ivec2 hit_pixel = ivec2(0);
 uint hit_slot = 0u;
 bool hit_specular = false;
 bool hit_mirror = false;
+uint pixel_rays = 1u; // The diffuse rays this pixel traces (ray_params), for the deferred hits' packets.
 
 // Set per pixel in main(): the largest lighting change a ray of this pixel
 // landed on. The temporal pass restarts the history in proportion.
@@ -1153,7 +1159,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 							hit_packets.data[b] = rt_hit_pack_pixel(hit_pixel, hit_slot, flags);
 							hit_packets.data[b + 1u] = instance_id;
 							hit_packets.data[b + 2u] = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-							hit_packets.data[b + 3u] = (slot & 0xFFFFu) | ((geometry_index & 0xFFu) << 16u);
+							hit_packets.data[b + 3u] = (slot & 0xFFFFu) | ((geometry_index & 0xFFu) << 16u) | ((pixel_rays - 1u) << 24u);
 							hit_packets.data[b + 4u] = packHalf2x16(rayQueryGetIntersectionBarycentricsEXT(rq, true));
 							hit_packets.data[b + 5u] = rt_hit_pack_dir(world_dir);
 							hit_packets.data[b + 6u] = floatBitsToUint(world_hit.x);
@@ -1277,6 +1283,22 @@ void main() {
 	vec3 world_normal = normalize(world_basis * view_normal);
 	vec3 world_geo_normal = normalize(world_basis * geo_view_normal);
 
+	// How young this pixel's screen history is (last frame's frame count at
+	// its reprojection, none off frame): a young pixel traces more rays
+	// (ray_params.y), and reads the cards' stand-in below.
+	float prev_frames = 0.0;
+	{
+		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
+		if (prev_ndc.w > 0.0) {
+			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
+			if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+				prev_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
+			}
+		}
+	}
+	uint rays = clamp(prev_frames < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
+	pixel_rays = rays;
+
 	vec3 irradiance = vec3(0.0);
 	// First moment of the incoming radiance and the near-field visibility,
 	// both free from the rays we already trace.
@@ -1285,7 +1307,7 @@ void main() {
 	hit_pixel = pixel;
 	hit_mirror = false;
 	hit_specular = false;
-	for (uint r = 0u; r < params.ray_count; r++) {
+	for (uint r = 0u; r < rays; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
 		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
@@ -1302,23 +1324,10 @@ void main() {
 		// total occlusion everywhere.
 		visibility += clamp(t_hit * params.inv_ao_range, 0.0, 1.0);
 	}
-	float inv_rays = 1.0 / float(params.ray_count);
+	float inv_rays = 1.0 / float(rays);
 	irradiance *= inv_rays;
 	moment *= inv_rays;
 	visibility *= inv_rays;
-
-	// How young this pixel's screen history is (last frame's frame count at
-	// its reprojection, none off frame), for the fallback below.
-	float prev_frames = 0.0;
-	{
-		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
-		if (prev_ndc.w > 0.0) {
-			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
-			if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
-				prev_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
-			}
-		}
-	}
 	vec3 reflection = vec3(0.0);
 	// Where the reflected image lives: the virtual point behind the surface,
 	// at the hit distance beyond it along the view ray, expressed as a view

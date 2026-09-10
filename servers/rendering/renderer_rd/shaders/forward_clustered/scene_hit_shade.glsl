@@ -933,12 +933,13 @@ void main() {
 	uint record = packets.data[p + 1u];
 	uint primitive = packets.data[p + 2u];
 	uint geometry_index = (packets.data[p + 3u] >> 16u) & 0xFFu;
+	uint pixel_rays_minus_one = (packets.data[p + 3u] >> 24u) & 3u; // The pixel's diffuse rays, for the resolve's average.
 	vec2 bary = unpackHalf2x16(packets.data[p + 4u]);
 	vec3 dir = rt_hit_unpack_dir(packets.data[p + 5u]);
 	vec3 world_pos = vec3(uintBitsToFloat(packets.data[p + 6u]), uintBitsToFloat(packets.data[p + 7u]), uintBitsToFloat(packets.data[p + 8u]));
 	float t_hit = uintBitsToFloat(packets.data[p + 9u]);
 	uint result_index = uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + slot;
-	uint result_flags = RT_HIT_RESULT_DONE | ((pflags & RT_HIT_PACKET_MIRROR) != 0u ? RT_HIT_RESULT_MIRROR : 0u);
+	uint result_flags = RT_HIT_RESULT_DONE | ((pflags & RT_HIT_PACKET_MIRROR) != 0u ? RT_HIT_RESULT_MIRROR : 0u) | (pixel_rays_minus_one << RT_HIT_RESULT_RAYS_SHIFT);
 	hit_result_index = result_index;
 	hit_result_flags = result_flags;
 	hit_dir = dir;

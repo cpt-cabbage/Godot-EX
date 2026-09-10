@@ -390,6 +390,7 @@ private:
 		uint32_t pad2;
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
+		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -458,7 +459,8 @@ private:
 		float mod_dead; // The field's dead band (a relative change under it is the cards' relight noise).
 		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
 		float borrow_band; // The frame-edge history borrow's reach outside the frame, in UV (GODOT_GI_BORROW; 0 off).
-		float pad[2];
+		float young_rays; // Diffuse rays the gather spends on a pixel whose history is under 8 frames (GODOT_GI_YOUNG_RAYS): the temporal pass weighs that frame's sample by as many.
+		float pad[1];
 	};
 
 public:

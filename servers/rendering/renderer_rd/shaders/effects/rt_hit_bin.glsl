@@ -132,7 +132,6 @@ void main() {
 	vec3 reflection = vec3(0.0);
 	bool any_diffuse = false;
 	bool any_mirror = false;
-	float inv_rays = 1.0 / float(max(params.ray_count, 1u));
 	for (uint s = 0u; s < params.slots; s++) {
 		uvec4 r = results.data[base + s];
 		if (r.w == 0u) {
@@ -142,6 +141,10 @@ void main() {
 		if ((r.w & RT_HIT_RESULT_DONE) == 0u) {
 			continue; // Deferred but never shaded: the material's dispatch had no room, or failed.
 		}
+		// The rays this pixel traced (a young pixel traces more than the
+		// setting), carried through the packet: the diffuse hits average
+		// over that many.
+		float inv_rays = 1.0 / float(((r.w >> RT_HIT_RESULT_RAYS_SHIFT) & 3u) + 1u);
 		vec3 radiance = max(rt_hit_unpack_radiance(r.xy), vec3(0.0));
 		if ((r.w & RT_HIT_RESULT_MIRROR) != 0u) {
 			reflection += radiance;
