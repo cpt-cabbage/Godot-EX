@@ -150,8 +150,6 @@ RDD::BufferID RenderingDeviceDriverMetal::buffer_create(uint64_t p_size, BitFiel
 	}
 	*static_cast<MetalBuffer *>(buf_info) = buffer;
 
-	_track_resource(buf_info->buffer.get());
-
 	return BufferID(buf_info);
 }
 
@@ -162,8 +160,6 @@ bool RenderingDeviceDriverMetal::buffer_set_texel_format(BufferID p_buffer, Data
 
 void RenderingDeviceDriverMetal::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
-
-	_untrack_resource(buf_info->buffer.get());
 
 	allocator->free_buffer(*buf_info);
 
@@ -431,12 +427,6 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create(const TextureFormat &p
 		ERR_FAIL_V_MSG(TextureID(), "Unable to create texture.");
 	}
 
-	// Track after the error path, so a failed create leaves nothing in the residency list.
-	if (tex_info->linear_backing.buffer) {
-		_track_resource(tex_info->linear_backing.buffer.get());
-	}
-	_track_resource(tex_info->texture.get());
-
 	return TextureID(tex_info);
 }
 
@@ -453,6 +443,8 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create_from_extension(uint64_
 		return TextureID(tex_info);
 	}
 
+	tex_info->imported = true;
+
 	// If the requested format is different, we need to create a view.
 	MTL::PixelFormat format = (MTL::PixelFormat)pixel_formats->getMTLPixelFormat(p_format);
 	if (res->pixelFormat() != format) {
@@ -467,7 +459,15 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create_from_extension(uint64_
 		tex_info->texture = NS::RetainPtr(res);
 	}
 
-	_track_resource(tex_info->texture.get());
+	{
+		MutexLock lock(imported_textures_mutex);
+		imported_textures.push_back(tex_info->texture.get());
+	}
+
+	if (main_residency_set) {
+		main_residency_set->addAllocation(tex_info->texture.get());
+		main_residency_set->commit();
+	}
 
 	return TextureID(tex_info);
 }
@@ -511,7 +511,6 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create_shared(TextureID p_ori
 #undef SWIZZLE
 	MTL::Texture *obj = src_texture->newTextureView(format, src_texture->textureType(), NS::Range::Make(0, src_texture->mipmapLevelCount()), NS::Range::Make(0, slices), swizzle);
 	ERR_FAIL_NULL_V_MSG(obj, TextureID(), "Unable to create shared texture");
-	_track_resource(obj);
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->texture = NS::TransferPtr(obj);
@@ -572,7 +571,6 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create_shared_from_slice(Text
 #undef SWIZZLE
 	MTL::Texture *obj = src_texture->newTextureView(format, textureType, NS::Range::Make(p_mipmap, p_mipmaps), NS::Range::Make(p_layer, p_layers), swizzle);
 	ERR_FAIL_NULL_V_MSG(obj, TextureID(), "Unable to create shared texture");
-	_track_resource(obj);
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->texture = NS::TransferPtr(obj);
@@ -581,10 +579,13 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create_shared_from_slice(Text
 
 void RenderingDeviceDriverMetal::texture_free(TextureID p_texture) {
 	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
-	if (!tex_info->rasterization_rate_map) {
-		_untrack_resource(tex_info->texture.get());
-		if (tex_info->linear_backing.buffer) {
-			_untrack_resource(tex_info->linear_backing.buffer.get());
+	if (tex_info->imported) {
+		MutexLock lock(imported_textures_mutex);
+		imported_textures.erase(tex_info->texture.get());
+
+		if (main_residency_set) {
+			main_residency_set->removeAllocation(tex_info->texture.get());
+			main_residency_set->commit();
 		}
 	}
 	allocator->free_texture(*tex_info);
@@ -965,10 +966,10 @@ void RenderingDeviceDriverMetal::_swap_chain_release_buffers(SwapChain *p_swap_c
 
 RDD::SwapChainID RenderingDeviceDriverMetal::swap_chain_create(RenderingContextDriver::SurfaceID p_surface) {
 	const RenderingContextDriverMetal::Surface *surface = (RenderingContextDriverMetal::Surface *)(p_surface);
-	if (use_barriers) {
-		GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability")
-		add_residency_set_to_main_queue(surface->get_residency_set());
-		GODOT_CLANG_WARNING_POP
+	if (sync_mode != HazardTracking) {
+		if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)) {
+			add_residency_set_to_main_queue(surface->get_residency_set());
+		}
 	}
 
 	SwapChain *swap_chain = memnew(SwapChain);
@@ -1063,11 +1064,11 @@ void RenderingDeviceDriverMetal::swap_chain_set_max_fps(SwapChainID p_swap_chain
 
 void RenderingDeviceDriverMetal::swap_chain_free(SwapChainID p_swap_chain) {
 	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
-	if (use_barriers) {
-		GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability")
-		RenderingContextDriverMetal::Surface *surface = (RenderingContextDriverMetal::Surface *)(swap_chain->surface);
-		remove_residency_set_to_main_queue(surface->get_residency_set());
-		GODOT_CLANG_WARNING_POP
+	if (sync_mode != HazardTracking) {
+		if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)) {
+			RenderingContextDriverMetal::Surface *surface = (RenderingContextDriverMetal::Surface *)(swap_chain->surface);
+			remove_residency_set_to_main_queue(surface->get_residency_set());
+		}
 	}
 	_swap_chain_release(swap_chain);
 	memdelete(swap_chain);
@@ -1101,7 +1102,7 @@ RDD::FramebufferID RenderingDeviceDriverMetal::framebuffer_create(RenderPassID p
 		}
 	}
 
-	MDFrameBuffer *fb = memnew(MDFrameBuffer(textures, Size2i(p_width, p_height)));
+	MDFrameBufferTexture *fb = memnew(MDFrameBufferTexture(textures, Size2i(p_width, p_height)));
 	fb->rasterization_rate_map = rasterization_rate_map;
 	return FramebufferID(fb);
 }
@@ -1392,7 +1393,7 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 			}
 		};
 #define ADD_USAGE(res, stage, usage) \
-	if (!use_barriers) { \
+	if (sync_mode == HazardTracking) { \
 		add_usage(res, stage, usage); \
 	}
 
@@ -1499,7 +1500,7 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 
 #undef ADD_USAGE
 
-		if (!use_barriers) {
+		if (sync_mode == HazardTracking) {
 			for (const KeyValue<MTL::Resource *, StageResourceUsage> &keyval : bound_resources) {
 				ResourceVector *resources = set->usage_to_resources.getptr(keyval.value);
 				if (resources == nullptr) {
@@ -1519,7 +1520,6 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 			snprintf(label, sizeof(label), "Uniform Set %u", p_set_index);
 			set->arg_buffer.buffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
 #endif
-			_track_resource(set->arg_buffer.buffer.get());
 			_copy_queue_copy_to_buffer(arg_buffer_data, set->arg_buffer.buffer.get());
 		} else {
 			// Store the arg buffer data for dynamic uniform sets.
@@ -1541,9 +1541,6 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 
 void RenderingDeviceDriverMetal::uniform_set_free(UniformSetID p_uniform_set) {
 	MDUniformSet *obj = (MDUniformSet *)p_uniform_set.id;
-	if (obj->arg_buffer.buffer) {
-		_untrack_resource(obj->arg_buffer.buffer.get());
-	}
 	allocator->free_buffer(obj->arg_buffer);
 	memdelete(obj);
 }
@@ -1697,10 +1694,21 @@ RDD::RenderPassID RenderingDeviceDriverMetal::render_pass_create(VectorView<Atta
 
 	size_t subpass_count = p_subpasses.size();
 
-	Vector<MDSubpass> subpasses;
+#ifdef DEV_ENABLED
+	// This loop validates the assumption that Godot configures subpass N is
+	// dependent on all prior subpasses (transitively).
+	for (uint32_t i = 0; i < p_subpass_dependencies.size(); i++) {
+		const SubpassDependency &dep = p_subpass_dependencies[i];
+		// If this asserts, then MDCommandBuffer::render_next_subpass will need
+		// to be updated, as it assumes subpass N must complete before N+1 starts.
+		DEV_ASSERT(dep.src_subpass < dep.dst_subpass && "unimplemented: subpass dependency not covered by the sequential subpass fence chain");
+	}
+#endif
+
+	LocalVector<MDSubpass> subpasses;
 	subpasses.resize(subpass_count);
 	for (uint32_t i = 0; i < subpass_count; i++) {
-		MDSubpass &subpass = subpasses.write[i];
+		MDSubpass &subpass = subpasses[i];
 		subpass.subpass_index = i;
 		subpass.view_count = p_view_count;
 		subpass.input_references = p_subpasses[i].input_references;
@@ -1721,12 +1729,12 @@ RDD::RenderPassID RenderingDeviceDriverMetal::render_pass_create(VectorView<Atta
 		MTL::StoreActionDontCare, // ATTACHMENT_STORE_OP_DONT_CARE
 	};
 
-	Vector<MDAttachment> attachments;
+	LocalVector<MDAttachment> attachments;
 	attachments.resize(p_attachments.size());
 
 	for (uint32_t i = 0; i < p_attachments.size(); i++) {
 		const Attachment &a = p_attachments[i];
-		MDAttachment &mda = attachments.write[i];
+		MDAttachment &mda = attachments[i];
 		MTL::PixelFormat format = pf.getMTLPixelFormat(a.format);
 		mda.format = format;
 		if (a.samples > TEXTURE_SAMPLES_1) {
@@ -1748,7 +1756,7 @@ RDD::RenderPassID RenderingDeviceDriverMetal::render_pass_create(VectorView<Atta
 			mda.type |= MDAttachmentType::Color;
 		}
 	}
-	MDRenderPass *obj = memnew(MDRenderPass(attachments, subpasses));
+	MDRenderPass *obj = memnew(MDRenderPass(std::move(attachments), std::move(subpasses)));
 	return RenderPassID(obj);
 }
 
@@ -2286,6 +2294,16 @@ RDD::PipelineID RenderingDeviceDriverMetal::render_pipeline_create(
 
 // ----- COMMANDS -----
 
+void RenderingDeviceDriverMetal::command_begin_compute_pass(CommandBufferID p_cmd_buffer) {
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	cb->compute_begin_pass();
+}
+
+void RenderingDeviceDriverMetal::command_end_compute_pass(CommandBufferID p_cmd_buffer) {
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	cb->compute_end_pass();
+}
+
 void RenderingDeviceDriverMetal::command_bind_compute_pipeline(CommandBufferID p_cmd_buffer, PipelineID p_pipeline) {
 	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
 	cb->bind_pipeline(p_pipeline);
@@ -2561,148 +2579,26 @@ void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer
 
 // ----- TIMESTAMP -----
 
-// Apple GPUs sample their timestamp counter at encoder boundaries only, so a
-// RenderingDevice capture becomes the start-of-encoder sample of the encoder
-// that follows it (MDCommandBufferBase::timestamp_write). One counter sample
-// buffer per query pool. The GPU tick is calibrated against the CPU clock the
-// device reports alongside it in sampleTimestamps(), nanoseconds on Apple
-// silicon, so the results convert to the nanoseconds RenderingDevice expects.
-// A device without the timestamp counter set gets the dummy pool (id 1) and
-// reads back zeros, as before.
-namespace {
-struct TimestampQueryPool {
-	NS::SharedPtr<MTL::CounterSampleBuffer> buffer;
-	uint32_t count = 0;
-	LocalVector<uint8_t> sampled; // Per index: attached to an encoder since the last reset.
-};
-constexpr uint64_t TIMESTAMP_DUMMY_POOL = 1;
-NS::SharedPtr<MTL::CounterSet> timestamp_counter_set;
-bool timestamp_counter_set_searched = false;
-MTL::Timestamp timestamp_calibration_cpu = 0;
-MTL::Timestamp timestamp_calibration_gpu = 0;
-double gpu_timestamp_to_ns = 1.0;
-} // namespace
-
 RDD::QueryPoolID RenderingDeviceDriverMetal::timestamp_query_pool_create(uint32_t p_query_count) {
-	if (!timestamp_counter_set_searched) {
-		timestamp_counter_set_searched = true;
-		if (device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)) {
-			NS::Array *sets = device->counterSets();
-			for (NS::UInteger i = 0; sets != nullptr && i < sets->count(); i++) {
-				MTL::CounterSet *set = sets->object<MTL::CounterSet>(i);
-				if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
-					timestamp_counter_set = NS::RetainPtr(set);
-					break;
-				}
-			}
-		}
-		device->sampleTimestamps(&timestamp_calibration_cpu, &timestamp_calibration_gpu);
-	}
-	if (!timestamp_counter_set) {
-		return QueryPoolID(TIMESTAMP_DUMMY_POOL);
-	}
-	NS::SharedPtr<MTL::CounterSampleBufferDescriptor> desc = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
-	desc->setCounterSet(timestamp_counter_set.get());
-	desc->setSampleCount(p_query_count);
-	desc->setStorageMode(MTL::StorageModeShared);
-	desc->setLabel(MTLSTR("Timestamp Query Pool"));
-	NS::Error *error = nullptr;
-	MTL::CounterSampleBuffer *buffer = device->newCounterSampleBuffer(desc.get(), &error);
-	if (buffer == nullptr) {
-		ERR_PRINT(vformat("Metal: could not create the timestamp counter sample buffer: %s", error != nullptr ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
-		return QueryPoolID(TIMESTAMP_DUMMY_POOL);
-	}
-	TimestampQueryPool *pool = memnew(TimestampQueryPool);
-	pool->buffer = NS::TransferPtr(buffer);
-	pool->count = p_query_count;
-	pool->sampled.resize_initialized(p_query_count);
-	return QueryPoolID(pool);
+	return QueryPoolID(1);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_free(QueryPoolID p_pool_id) {
-	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
-		return;
-	}
-	memdelete((TimestampQueryPool *)p_pool_id.id);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
+	// Metal doesn't support timestamp queries, so we just clear the buffer.
 	bzero(r_results, p_query_count * sizeof(uint64_t));
-	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
-		return;
-	}
-	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
-	uint32_t count = MIN(p_query_count, pool->count);
-	// resolveCounterRange() hands back an autoreleased NSData.
-	NS::AutoreleasePool *autorelease_pool = NS::AutoreleasePool::alloc()->init();
-	NS::Data *data = pool->buffer->resolveCounterRange(NS::Range::Make(0, count));
-	if (data != nullptr) {
-		const MTL::CounterResultTimestamp *samples = (const MTL::CounterResultTimestamp *)data->mutableBytes();
-		count = MIN(count, uint32_t(data->length() / sizeof(MTL::CounterResultTimestamp)));
-		// Captures recorded with no GPU work between them collapse onto the
-		// last of the run (MDCommandBuffer::timestamp_write), so one that was
-		// never sampled takes the value of the next one that was: the same
-		// GPU instant. A trailing unsampled capture takes the previous one.
-		uint64_t next_valid = 0;
-		bool has_next = false;
-		for (int32_t i = int32_t(count) - 1; i >= 0; i--) {
-			uint64_t v = samples[i].timestamp;
-			if (pool->sampled[i] != 0 && v != MTL::CounterErrorValue && v != 0) {
-				next_valid = v;
-				has_next = true;
-				r_results[i] = v;
-			} else {
-				r_results[i] = has_next ? next_valid : 0;
-			}
-		}
-		// A trailing unsampled capture takes the previous one, and the
-		// sequence is kept monotonic: the GPU starts a render pass's vertex
-		// phase before an earlier encoder's fragment or compute work has
-		// finished when nothing it reads depends on it (resources are
-		// untracked here, with explicit barriers), and such an overlap is
-		// charged to the earlier pass rather than shown as time going back.
-		uint64_t prev = 0;
-		for (uint32_t i = 0; i < count; i++) {
-			if (r_results[i] < prev) {
-				r_results[i] = prev;
-			}
-			prev = r_results[i];
-		}
-	}
-	autorelease_pool->release();
-
-	// Refresh the tick calibration; the baseline only lengthens.
-	MTL::Timestamp cpu = 0;
-	MTL::Timestamp gpu = 0;
-	device->sampleTimestamps(&cpu, &gpu);
-	if (gpu > timestamp_calibration_gpu && cpu > timestamp_calibration_cpu) {
-		gpu_timestamp_to_ns = double(cpu - timestamp_calibration_cpu) / double(gpu - timestamp_calibration_gpu);
-	}
 }
 
 uint64_t RenderingDeviceDriverMetal::timestamp_query_result_to_time(uint64_t p_result) {
-	return uint64_t(double(p_result) * gpu_timestamp_to_ns);
+	return p_result;
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
-	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
-		return;
-	}
-	// Samples are overwritten in place; only the attachment record resets.
-	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
-	memset(pool->sampled.ptr(), 0, pool->sampled.size());
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
-	if (p_pool_id.id == TIMESTAMP_DUMMY_POOL) {
-		return;
-	}
-	TimestampQueryPool *pool = (TimestampQueryPool *)p_pool_id.id;
-	if (p_index >= pool->count) {
-		return;
-	}
-	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
-	cb->timestamp_write(pool->buffer.get(), p_index, &pool->sampled[p_index]);
 }
 
 #pragma mark - Labels
@@ -2715,6 +2611,14 @@ void RenderingDeviceDriverMetal::command_begin_label(CommandBufferID p_cmd_buffe
 void RenderingDeviceDriverMetal::command_end_label(CommandBufferID p_cmd_buffer) {
 	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
 	cb->end_label();
+}
+
+void RenderingDeviceDriverMetal::command_group_end(CommandBufferID p_cmd_buffer) {
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	// Closing the encoder here is what guarantees no encoder straddles a level
+	// boundary, which is what makes per-encoder fences sufficient.
+	cb->end();
+	cb->advance_sync_level();
 }
 
 #pragma mark - Debug
@@ -2853,7 +2757,6 @@ void RenderingDeviceDriverMetal::_copy_queue_copy_to_buffer(Span<uint8_t> p_src_
 
 	memcpy(_copy_queue_buffer_ptr(), p_src_data.ptr(), p_src_data.size());
 
-	copy_queue_rs.get()->addAllocation(p_dst_buffer);
 	blit_encoder->copyFromBuffer(copy_queue_buffer.buffer.get(), copy_queue_buffer_offset, p_dst_buffer, p_dst_offset, p_src_data.size());
 
 	_copy_queue_buffer_consume(p_src_data.size());
@@ -2864,16 +2767,12 @@ void RenderingDeviceDriverMetal::_copy_queue_flush() {
 		return;
 	}
 
-	copy_queue_rs.get()->addAllocation(copy_queue_buffer.buffer.get());
-	copy_queue_rs.get()->commit();
-
 	copy_queue_blit_encoder.get()->endEncoding();
 	copy_queue_blit_encoder.reset();
 	copy_queue_command_buffer.get()->commit();
 	copy_queue_command_buffer.get()->waitUntilCompleted();
 	copy_queue_command_buffer.reset();
 	copy_queue_buffer_offset = 0;
-	copy_queue_rs.get()->removeAllAllocations();
 }
 
 Error RenderingDeviceDriverMetal::_copy_queue_initialize() {
@@ -2886,18 +2785,6 @@ Error RenderingDeviceDriverMetal::_copy_queue_initialize() {
 	// Reserve 64 KiB for copy commands. If the buffer fills, it will be flushed automatically.
 	copy_queue_buffer = allocator->new_buffer(64 * 1024, MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked);
 	copy_queue_buffer.buffer.get()->setLabel(MTLSTR("Copy Command Scratch Buffer"));
-
-	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
-		if (device_properties->features.supports_residency_sets) {
-			MTL::ResidencySetDescriptor *rs_desc = MTL::ResidencySetDescriptor::alloc()->init();
-			rs_desc->setInitialCapacity(2);
-			rs_desc->setLabel(MTLSTR("Copy Queue Residency Set"));
-			NS::Error *error = nullptr;
-			copy_queue_rs = NS::TransferPtr(device->newResidencySet(rs_desc, &error));
-			rs_desc->release();
-			copy_queue.get()->addResidencySet(copy_queue_rs.get());
-		}
-	}
 
 	return OK;
 }
@@ -3032,8 +2919,12 @@ uint64_t RenderingDeviceDriverMetal::limit_get(Limit p_limit) {
 uint64_t RenderingDeviceDriverMetal::api_trait_get(ApiTrait p_trait) {
 	switch (p_trait) {
 		case API_TRAIT_HONORS_PIPELINE_BARRIERS:
-			return use_barriers;
-		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
+			return sync_mode == Barriers;
+		case API_TRAIT_BUFFER_CLEARS_WITH_COPY_ENGINE:
+			return true;
+		case API_TRAIT_TEXTURE_CLEARS_WITH_COPY_ENGINE:
+			return false;
+		case API_TRAIT_TEXTURES_REQUIRE_LAYOUT_TRANSITIONS:
 			return false;
 		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
 			return sizeof(MTL::IndirectAccelerationStructureInstanceDescriptor);
@@ -3130,6 +3021,12 @@ RenderingDeviceDriverMetal::RenderingDeviceDriverMetal(RenderingContextDriverMet
 		archive_fail_on_miss = true;
 	}
 
+	// Barriers is the default; "none" selects native hazard tracking.
+	// Unrecognized values intentionally keep the default.
+	if (String res = OS::get_singleton()->get_environment("GODOT_MTL_SYNC_MODE"); res == U"none") {
+		sync_mode = HazardTracking;
+	}
+
 #if TARGET_OS_OSX
 	if (String res = OS::get_singleton()->get_environment("GODOT_MTL_SHADER_LOAD_STRATEGY"); res == U"lazy") {
 		_shader_load_strategy = ShaderLoadStrategy::LAZY;
@@ -3183,15 +3080,31 @@ Error RenderingDeviceDriverMetal::_create_device() {
 	return OK;
 }
 
+void RenderingDeviceDriverMetal::encode_imported_resources(MTL::RenderCommandEncoder *p_enc) {
+	MutexLock lock(imported_textures_mutex);
+	if (!imported_textures.is_empty()) {
+		p_enc->useResources((const MTL::Resource *const *)imported_textures.ptr(), imported_textures.size(), MTL::ResourceUsageRead, MTL::RenderStageVertex | MTL::RenderStageFragment);
+	}
+}
+
+void RenderingDeviceDriverMetal::encode_imported_resources(MTL::ComputeCommandEncoder *p_enc) {
+	MutexLock lock(imported_textures_mutex);
+	if (!imported_textures.is_empty()) {
+		p_enc->useResources((const MTL::Resource *const *)imported_textures.ptr(), imported_textures.size(), MTL::ResourceUsageRead);
+	}
+}
+
 void RenderingDeviceDriverMetal::_track_resource(MTL::Resource *p_resource) {
-	if (use_barriers) {
-		_residency_add.push_back(p_resource);
+	if (main_residency_set) {
+		main_residency_set->addAllocation(p_resource);
+		main_residency_set->commit();
 	}
 }
 
 void RenderingDeviceDriverMetal::_untrack_resource(MTL::Resource *p_resource) {
-	if (use_barriers) {
-		_residency_del.push_back(p_resource);
+	if (main_residency_set) {
+		main_residency_set->removeAllocation(p_resource);
+		main_residency_set->commit();
 	}
 }
 
@@ -3264,7 +3177,19 @@ Error RenderingDeviceDriverMetal::_initialize(uint32_t p_device_index, uint32_t 
 	Error err = _create_device();
 	ERR_FAIL_COND_V(err, ERR_CANT_CREATE);
 
-	allocator = MetalAllocator::create(device, false);
+	// Must be resolved before the allocator is created, so use_heaps sees the
+	// final sync_mode.
+	_resolve_sync_mode();
+
+	// Must be created before _copy_queue_initialize(), which sources its scratch
+	// buffer from the allocator. Barriers mode implies heap suballocation:
+	// on Metal 3 it is the residency mechanism (useHeaps), and Metal 4 always
+	// runs barriers.
+	bool use_heaps = sync_mode == Barriers;
+	allocator = MetalAllocator::create(device, use_heaps);
+	if (use_heaps) {
+		print_verbose("Metal: heap suballocation enabled.");
+	}
 
 	device_properties = memnew(MetalDeviceProperties(device));
 	pixel_formats = memnew(PixelFormats(device, device_properties->features));

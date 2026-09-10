@@ -5405,7 +5405,6 @@ RDD::PipelineID RenderingDeviceDriverD3D12::render_pipeline_create(
 	(&pipeline_desc.RasterizerState)->ForcedSampleCount = 0;
 	(&pipeline_desc.RasterizerState)->ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
 	(&pipeline_desc.RasterizerState)->MultisampleEnable = TEXTURE_SAMPLES_COUNT[p_multisample_state.sample_count] != 1;
-	(&pipeline_desc.RasterizerState)->AntialiasedLineEnable = true;
 
 	// In D3D12, there's no line width.
 	ERR_FAIL_COND_V(!Math::is_equal_approx(p_rasterization_state.line_width, 1.0f), PipelineID());
@@ -6074,7 +6073,9 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 			return D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 		case API_TRAIT_SECONDARY_VIEWPORT_SCISSOR:
 			return false;
-		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
+		case API_TRAIT_BUFFER_CLEARS_WITH_COPY_ENGINE:
+			return false;
+		case API_TRAIT_TEXTURE_CLEARS_WITH_COPY_ENGINE:
 			return false;
 		case API_TRAIT_USE_GENERAL_IN_COPY_QUEUES:
 			return true;
