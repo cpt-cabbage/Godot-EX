@@ -3713,7 +3713,11 @@ void RenderingServer::init() {
 	// counter carries the first frames, so this can be long without a slow start.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), false);
+	// Half resolution is the paper's design and, measured (plan section 33),
+	// the frame's largest lever: the sampling pass 8.3 -> 2.4 ms at 0.67
+	// scale with the captures the same image (0.003 mean difference) and
+	// the flick's settle unchanged.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/light_guiding"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces"), true);
