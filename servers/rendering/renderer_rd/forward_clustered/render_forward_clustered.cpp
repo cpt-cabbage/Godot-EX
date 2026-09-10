@@ -2877,8 +2877,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 						gi_quality.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 					}
 				}
-				if (run_rt_gi && !gi_cascades.active && gi_cascades.voxel_gi_count == 0) {
-					WARN_PRINT_ONCE("Ray-traced GI is enabled but the scene has neither SDFGI nor a VoxelGI to shade ray hits from: off-screen hits return black, so interiors go dark. Enable SDFGI on the WorldEnvironment (or add a VoxelGI).");
+				// The surface cache shades off-screen hits from the cards, and
+				// where a card lookup fails the cards' own bounce stands in
+				// with the sky rather than black; only without it does the
+				// chain end at the cascades, which have nothing to give.
+				// The cache is not ready on the first frames (its buffers come
+				// with the first capture below), so this asks whether it is
+				// enabled at all, as the capture does.
+				if (run_rt_gi && !gi_cascades.active && gi_cascades.voxel_gi_count == 0 && raytracing->get_surface_cache() == nullptr) {
+					WARN_PRINT_ONCE("Ray-traced GI is enabled but the scene has neither the surface cache nor SDFGI or a VoxelGI to shade ray hits from: off-screen hits return black, so interiors go dark. Enable rendering/ray_tracing/surface_cache/enabled, or SDFGI on the WorldEnvironment (or add a VoxelGI).");
 				}
 			}
 
