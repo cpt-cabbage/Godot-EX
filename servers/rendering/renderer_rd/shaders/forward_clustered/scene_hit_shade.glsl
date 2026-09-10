@@ -85,6 +85,7 @@ params;
 #define FLAG_NO_INDIRECT 256u
 #define FLAG_NO_DIRECT 512u
 #define FLAG_BOUNCE_TRACED 1024u // Ablation (hit_shading_debug 64): the indirect term traces its own ray even where the hit's card holds an accumulated one.
+#define FLAG_TIER_STATS 65536u // Diagnostics (GODOT_GI_TIER_PRINT): count where the hits' bounce came from (RT_HIT_COUNT_TIERS).
 #define FLAG_SCREEN_RADIANCE 16384u // Last frame's screen stands in for the bounce's hit where it is on screen.
 #define FLAG_DEBUG_GEO_NORMAL 2048u // The triangle's own normal, as oriented.
 #define FLAG_DEBUG_VERTEX_NORMAL 4096u // The interpolated vertex normal, before any flip.
@@ -199,7 +200,7 @@ layout(set = 0, binding = 18, std430) restrict readonly buffer Offsets {
 }
 offsets;
 
-layout(set = 0, binding = 19, std430) restrict readonly buffer Counts {
+layout(set = 0, binding = 19, std430) restrict buffer Counts {
 	uint data[];
 }
 counts;
@@ -607,6 +608,15 @@ vec3 hit_triangle_normal(uint p_instance_id, uint p_geometry_index, uint p_primi
 // probes stand in the way the gather's own fallback does (the probe tier
 // at the hit, calibrated against the screen); a miss reads the sky; and
 // last frame's screen overrides either where the hit is in view.
+// Diagnostics (FLAG_TIER_STATS): the slot's count and luminance sum, see
+// RT_HIT_COUNT_TIERS for what the slots mean.
+void tier_stat(uint i, vec3 radiance) {
+	if ((params.flags & FLAG_TIER_STATS) != 0u) {
+		atomicAdd(counts.data[RT_HIT_COUNT_TIERS + i], 1u);
+		atomicAdd(counts.data[RT_HIT_COUNT_TIERS + 8u + i], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+	}
+}
+
 vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 	seed = pcg_hash(seed);
 	float r0 = hash_to_float(seed);
@@ -622,6 +632,7 @@ vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 		vec3 hit = origin + ray_dir * t_hit;
 		uint hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 		vec3 cache_radiance;
+		uint src = 2u;
 		// The bounce's cone is the diffuse gather's (the pixel's own cone
 		// scale is a few pixels' worth, for texture detail at the hit).
 		card_lookup_footprint = t_hit * max(params.cone_scale, 0.5);
@@ -630,13 +641,18 @@ vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 			vec3 irr;
 			if (sdfgi_probe_irradiance(hit - params.camera_origin.xyz, hit_n, irr)) {
 				cache_radiance = irr * params.probe_floor * params.probe_scale;
+				src = 3u;
 			} else {
 				cache_radiance = sky_eval(ray_dir);
+				src = 4u;
 			}
 		}
+		tier_stat(src, cache_radiance);
 		return screen_radiance_boost(hit, cache_radiance);
 	}
-	return sky_eval(ray_dir);
+	vec3 sky = sky_eval(ray_dir);
+	tier_stat(5u, sky);
+	return sky;
 }
 
 // Shadow rays take alpha-tested casters whole, like the gather's bounce ray
@@ -761,8 +777,10 @@ void hit_write_discard() {
 	vec3 radiance;
 	if (sdfgi_probe_irradiance(hit_rel_pos, -hit_dir, irr)) {
 		radiance = irr * params.probe_floor * params.probe_scale;
+		tier_stat(6u, radiance);
 	} else {
 		radiance = sky_eval(hit_dir);
+		tier_stat(7u, radiance);
 	}
 	results.data[hit_result_index] = uvec4(rt_hit_pack_radiance(radiance), rt_hit_pack_dir(hit_dir), hit_result_flags);
 }
@@ -1043,11 +1061,14 @@ void main() {
 			// ray otherwise (see card_indirect).
 			if ((params.flags & FLAG_BOUNCE_TRACED) != 0u || !card_indirect(record, world_pos, n_shade, indirect)) {
 				indirect = trace_bounce(origin, n_shade, rel_pos, seed);
+			} else {
+				tier_stat(1u, indirect);
 			}
 		}
 		emission *= params.emissive_exposure_normalization;
 		radiance = max(albedo * (direct + indirect * ao) + emission, vec3(0.0));
 	}
 
+	tier_stat(0u, radiance);
 	results.data[result_index] = uvec4(rt_hit_pack_radiance(radiance), rt_hit_pack_dir(dir), result_flags);
 }

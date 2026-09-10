@@ -250,9 +250,23 @@ layout(set = 0, binding = 28, rgba16f) uniform restrict image2D static_atlas;
 // Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
 // (see trace_dynamic; surface_cache.cpp prints and clears it).
 layout(set = 0, binding = 25, std430) restrict buffer DynStats {
-	uint count[16];
+	// [0..15] the dynamic rays' fate (dyn_stat); [16..23] and [24..31] the
+	// static bounce ray's source, counts and luminance sums (tier_stat).
+	uint count[32];
 }
 dyn_stats;
+
+// Diagnostics (GODOT_GI_TIER_PRINT, debug bit 8192): where a texel's static
+// bounce ray got its radiance. i: 0 a card, 1 the SDFGI probes at a hit
+// without a card, 2 the sky at such a hit without probes, 3 a miss (sky).
+// Luminance sums are in 1/16 units.
+float luminance(vec3 c);
+void tier_stat(uint i, vec3 radiance) {
+	if ((params.debug & 8192u) != 0u) {
+		atomicAdd(dyn_stats.count[16u + i], 1u);
+		atomicAdd(dyn_stats.count[24u + i], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+	}
+}
 
 struct Change {
 	vec3 unshadowed; // The static lights' unshadowed term (the dynamic lights' is in indirect_dyn_atlas.a).
@@ -1016,17 +1030,22 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 					}
 				}
 				indirect_sample = card_radiance;
+				tier_stat(0u, card_radiance);
 				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
 				// weaker by a quarter per bounce, so lighting that reaches
 				// this texel only indirectly restarts it too.
 				bounce_change = hit_change - 0.25;
 				bounce_change_total = hit_change_total - 0.25;
-			} else if (!sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
+			} else if (sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
+				tier_stat(1u, indirect_sample);
+			} else {
 				indirect_sample = sky_eval(t.n_world);
+				tier_stat(2u, indirect_sample);
 			}
 		} else {
 			indirect_sample = sky_eval(ray_dir);
+			tier_stat(3u, indirect_sample);
 		}
 	}
 }

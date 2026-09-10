@@ -1663,7 +1663,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(32);
+		c.buffer = rd->storage_buffer_create(96); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT).
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -1701,6 +1701,14 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	if (calibrate) {
 		params.flags |= 256; // FLAG_CALIBRATE_CACHE
+	}
+	// GODOT_GI_TIER_PRINT: which tier answered each ray (screen, card, hit
+	// shader, cascades, probes, sky), counted in the calibration buffer and
+	// printed every sixty frames, with the hit shader's and the cards' own
+	// bounce sources alongside.
+	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
+	if (tier_stats) {
+		params.flags |= 262144; // FLAG_TIER_STATS
 	}
 	if (p_quality.specular) {
 		params.flags |= 2; // FLAG_SPECULAR
@@ -1804,12 +1812,12 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 			rd->buffer_clear(hit_results, 0, hit_results_capacity * 4 * sizeof(uint32_t));
 		}
 		if (hit_counts.is_null()) {
-			hit_counts = rd->storage_buffer_create((HIT_MAX_MATERIALS + 4) * sizeof(uint32_t));
+			hit_counts = rd->storage_buffer_create((HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 			hit_offsets = rd->storage_buffer_create(2 * HIT_MAX_MATERIALS * sizeof(uint32_t));
 			hit_dispatch_args = rd->storage_buffer_create((HIT_MAX_MATERIALS + 1) * 4 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 			hit_params_ubo = rd->uniform_buffer_create(sizeof(HitParamsUBO));
 		}
-		rd->buffer_clear(hit_counts, 0, (HIT_MAX_MATERIALS + 4) * sizeof(uint32_t));
+		rd->buffer_clear(hit_counts, 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 		params.hit_capacity = hit_packet_capacity;
 		params.flags |= 2048; // FLAG_HIT_SHADING
 		if (hit_shading_mode == 2) {
@@ -1923,8 +1931,8 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	RD::Uniform u_out_fallback(RD::UNIFORM_TYPE_IMAGE, 4, Vector<RID>({ raw_fallback }));
 	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
-	if (calibrate) {
-		rd->buffer_clear(calibration.buffer, 0, 32);
+	if (calibrate || tier_stats) {
+		rd->buffer_clear(calibration.buffer, 0, 96);
 	}
 	RENDER_TIMESTAMP("RT GI Gather");
 	rd->draw_command_begin_label("RT GI Gather");
@@ -1943,6 +1951,9 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	if (calibrate && !calibration.state->pending) {
 		calibration.state->pending = true;
 		rd->buffer_get_data_async(calibration.buffer, callable_mp(calibration.state.ptr(), &RenderBuffersRT::RtGiCacheCalibration::on_readback), 0, 32);
+	}
+	if (tier_stats && (rb_state->frame_index % 60) == 0) {
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&RaytracedShadows::_tier_stats_readback), 24, 64);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -2518,6 +2529,9 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	if (p_screen_radiance.is_valid()) {
 		params.flags |= 16384; // FLAG_SCREEN_RADIANCE
 	}
+	if (OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT")) {
+		params.flags |= 65536; // FLAG_TIER_STATS
+	}
 	if (p_sky.mode == 2 && p_sky.radiance.is_valid()) {
 		params.flags |= 2; // FLAG_SKY_MODE_SKY
 		params.sky_quat_or_color[0] = p_sky.orientation.x;
@@ -2681,9 +2695,9 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	}
 	rd->draw_command_end_label();
 
-	static const bool debug_counts = OS::get_singleton()->has_environment("RT_HIT_DEBUG");
+	static const bool debug_counts = OS::get_singleton()->has_environment("RT_HIT_DEBUG") || OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
 	if (debug_counts && (scene_frame % 60) == 0) {
-		rd->buffer_get_data_async(hit_counts, callable_mp_static(&RaytracedShadows::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 4) * sizeof(uint32_t));
+		rd->buffer_get_data_async(hit_counts, callable_mp_static(&RaytracedShadows::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 	}
 }
 
@@ -2850,5 +2864,47 @@ void RaytracedShadows::_hit_counts_readback(const Vector<uint8_t> &p_data) {
 			in_slots += counts[i];
 		}
 	}
-	print_line(vformat("RT_HIT_DEBUG appended=%d overflow=%d in_slots=%d materials=%d", counts[HIT_MAX_MATERIALS], counts[HIT_MAX_MATERIALS + 1], in_slots, slots_used));
+	if (OS::get_singleton()->has_environment("RT_HIT_DEBUG")) {
+		print_line(vformat("RT_HIT_DEBUG appended=%d overflow=%d in_slots=%d materials=%d", counts[HIT_MAX_MATERIALS], counts[HIT_MAX_MATERIALS + 1], in_slots, slots_used));
+	}
+	// GODOT_GI_TIER_PRINT: the shaded hits' own light, and where their bounce
+	// came from (the RT_HIT_COUNT_TIERS slots), as shares of the hits and of
+	// their summed luminance. Slot 0 is every shaded hit, so its luminance is
+	// what the gather's "hit-shaded" share carried.
+	if (OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT") && p_data.size() >= int((HIT_MAX_MATERIALS + 20) * sizeof(uint32_t))) {
+		const uint32_t *t = counts + HIT_MAX_MATERIALS + 4;
+		double n = 0.0;
+		double l = 0.0;
+		for (int i = 1; i < 8; i++) {
+			n += t[i];
+			l += t[8 + i];
+		}
+		const char *names[8] = { "shaded", "card-accum", "bounce-card", "bounce-probe", "bounce-sky-at-hit", "bounce-miss", "discard-probe", "discard-sky" };
+		String line = vformat("RT_GI_TIERS hits: %d shaded, mean lum %.3f; bounce:", t[0], t[0] > 0 ? t[8] / 16.0 / t[0] : 0.0);
+		for (int i = 1; i < 8; i++) {
+			line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * t[i] / n : 0.0, l > 0.0 ? 100.0 * t[8 + i] / l : 0.0);
+		}
+		print_line(line);
+	}
+}
+
+void RaytracedShadows::_tier_stats_readback(const Vector<uint8_t> &p_data) {
+	if (p_data.size() < 64) {
+		return;
+	}
+	const uint32_t *t = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	double n = 0.0;
+	double l = 0.0;
+	for (int i = 0; i < 7; i++) {
+		n += t[i];
+		l += t[8 + i];
+	}
+	// The hit-shaded rays carry no luminance here (the hit shader adds it
+	// later, see its own line), so the luminance shares are of the rest.
+	const char *names[7] = { "screen", "card", "hit-shaded", "cascade", "probe", "sky", "none" };
+	String line = vformat("RT_GI_TIERS gather: %d rays", int(n));
+	for (int i = 0; i < 7; i++) {
+		line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * t[i] / n : 0.0, l > 0.0 ? 100.0 * t[8 + i] / l : 0.0);
+	}
+	print_line(line);
 }

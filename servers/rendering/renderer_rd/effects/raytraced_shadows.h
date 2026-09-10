@@ -728,6 +728,7 @@ private:
 	};
 	static_assert(sizeof(TranslucencyParamsUBO) == 240, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
 
+	static void _tier_stats_readback(const Vector<uint8_t> &p_data); // GODOT_GI_TIER_PRINT: the gather's tier counts.
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
 	void _build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance);
 	void _free_hit_geometry(MeshBlas &r_entry);

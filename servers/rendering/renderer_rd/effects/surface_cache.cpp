@@ -92,8 +92,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	active_buffer = rd->storage_buffer_create((1 + MAX_SETS) * sizeof(uint32_t));
 	relit_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
 	rd->buffer_clear(relit_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
-	dyn_stats_buffer = rd->storage_buffer_create(16 * sizeof(uint32_t));
-	rd->buffer_clear(dyn_stats_buffer, 0, 16 * sizeof(uint32_t));
+	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
+	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
 	rd->buffer_clear(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer));
 	dispatch_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t), {}, RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
@@ -871,7 +871,10 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		}
 		return bits;
 	}();
-	params.debug = ablate;
+	// GODOT_GI_TIER_PRINT: the static bounce rays' sources, counted in the
+	// stats buffer and printed every sixty frames (debug bit 8192).
+	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
+	params.debug = ablate | (tier_stats ? 8192 : 0);
 	// GODOT_CARD_BOUNCE_FLOOR=<relights>: the fewest relights a lighting
 	// change restarts a texel's bounce accumulation to (1 is a full restart).
 	static const float bounce_floor = OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR") == "" ? 1.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR").to_float());
@@ -1083,7 +1086,28 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		Vector<uint8_t> data = rd->buffer_get_data(dyn_stats_buffer);
 		const uint32_t *c = (const uint32_t *)data.ptr();
 		print_line(vformat("Dynamic rays: %d traced, %d hit, %d card, %d facing light, %d facing texel, %d facing hit, %d connected | ceiling (normal down): %d %d %d %d %d %d %d ", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[8], c[9], c[10], c[11], c[12], c[13], c[14]));
-		rd->buffer_clear(dyn_stats_buffer, 0, 16 * sizeof(uint32_t));
+		rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
+	}
+
+	if ((params.debug & 8192) != 0 && p_inputs.frame % 60 == 0) {
+		// Diagnostics (GODOT_GI_TIER_PRINT): where the static bounce rays got
+		// their radiance over the last sixty frames, as a share of the rays
+		// and of their summed luminance (the tier_stat slots).
+		Vector<uint8_t> data = rd->buffer_get_data(dyn_stats_buffer);
+		const uint32_t *c = (const uint32_t *)data.ptr();
+		double n = 0.0;
+		double l = 0.0;
+		for (int i = 0; i < 4; i++) {
+			n += c[16 + i];
+			l += c[24 + i];
+		}
+		const char *names[4] = { "card", "probe", "sky-at-hit", "miss" };
+		String line = vformat("RT_GI_TIERS cards: %d rays", int(n));
+		for (int i = 0; i < 4; i++) {
+			line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * c[16 + i] / n : 0.0, l > 0.0 ? 100.0 * c[24 + i] / l : 0.0);
+		}
+		print_line(line);
+		rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	}
 
 	// The lighting atlas's mip chain, for the gather's cone-filtered reads.

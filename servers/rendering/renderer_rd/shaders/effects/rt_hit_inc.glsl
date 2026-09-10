@@ -50,6 +50,15 @@ struct HitGeometry {
 // the ones that found no room.
 #define RT_HIT_COUNT_TOTAL RT_HIT_MAX_MATERIALS
 #define RT_HIT_COUNT_OVERFLOW (RT_HIT_MAX_MATERIALS + 1u)
+// Diagnostics (GODOT_GI_TIER_PRINT): after those, where the shaded hits' own
+// bounce came from. Counts at RT_HIT_COUNT_TIERS + i, luminance sums (1/16
+// units) at RT_HIT_COUNT_TIERS + 8 + i, for i: 0 the shaded hit's whole
+// radiance (every shaded hit), 1 the card's accumulated bounce, 2 a traced
+// bounce that read a card, 3 one that read the probes, 4 one at a hit without
+// probes (sky), 5 a bounce miss (sky), 6 a discarded hit (probes), 7 a
+// discarded hit (sky).
+#define RT_HIT_COUNT_TIERS (RT_HIT_MAX_MATERIALS + 4u)
+#define RT_HIT_COUNT_WORDS (RT_HIT_MAX_MATERIALS + 20u)
 
 uint rt_hit_pack_pixel(ivec2 pixel, uint slot, uint flags) {
 	return uint(pixel.x) | (uint(pixel.y) << 13u) | (slot << 26u) | (flags << 29u);

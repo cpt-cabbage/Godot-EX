@@ -81,6 +81,7 @@ params;
 #define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 #define FLAG_FALLBACK_EVERY 131072u // The fallback for every pixel: the temporal pass modulates the history by its change (GODOT_GI_MOD).
+#define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -185,6 +186,10 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint sum_screen[2];
 	uint sum_cache[2];
 	uint samples[2];
+	// Diagnostics (FLAG_TIER_STATS): per TIER_SRC_* value, how many rays it
+	// answered and their summed luminance in 1/16 units.
+	uint tier_count[8];
+	uint tier_lum[8];
 }
 calibration;
 
@@ -257,6 +262,22 @@ float pixel_change = 0.0;
 
 // Set per pixel in main(): this pixel's hits contribute to the calibration.
 bool calibrate_pixel = false;
+
+// Diagnostics (FLAG_TIER_STATS): where the last trace_radiance() got its
+// answer. The chain sets trace_source where it leaves without a cache tier
+// (a deferred hit, a miss, a scene with no cache); otherwise the tier that
+// answered is cache_tier, and boost_from_screen says whether last frame's
+// screen then stood in for it.
+#define TIER_SRC_SCREEN 0u
+#define TIER_SRC_CARD 1u
+#define TIER_SRC_HIT_SHADED 2u
+#define TIER_SRC_CASCADE 3u // The SDFGI light cascades, or a VoxelGI volume.
+#define TIER_SRC_PROBE 4u
+#define TIER_SRC_SKY 5u
+#define TIER_SRC_NONE 6u
+#define TIER_SRC_UNSET 7u
+uint trace_source = TIER_SRC_UNSET;
+bool boost_from_screen = false;
 
 #define SDFGI_OCT_SIZE 6
 
@@ -555,6 +576,7 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 			cache_tier = CACHE_TIER_SOLID;
 			return voxel_cache_radiance(rel_pos, ray_dir);
 		}
+		trace_source = TIER_SRC_NONE;
 		return vec3(0.0);
 	}
 	// The light cascades hold albedo x (direct + feedback x probe) at solid
@@ -714,8 +736,9 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// an edge decides how much of the boost survives.
 	vec2 border = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
 	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
-	return mix(cache_radiance, col,
-			smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)));
+	float screen_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y));
+	boost_from_screen = screen_share > 0.5;
+	return mix(cache_radiance, col, screen_share);
 }
 
 // Radiance from the surface cache at a hit, if a captured card covers it.
@@ -988,7 +1011,7 @@ vec3 fold_above(vec3 dir, vec3 geo_normal) {
 // world_geo_normal is the geometric normal: the ray origins are pushed off
 // the surface along it, and the shading normal, which may lean into the
 // surface, has no say in that.
-vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
+vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
 	r_hit_distance = params.ao_range; // Nothing hit within range.
 	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
 		vec3 hit_view;
@@ -1086,6 +1109,7 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 							hit_packets.data[b + 9u] = floatBitsToUint(t_hit);
 							hit_results.data[uint(hit_pixel.y * params.screen_size.x + hit_pixel.x) * (params.ray_count + 1u) + hit_slot] = uvec4(0u, 0u, rt_hit_pack_dir(world_dir), RT_HIT_RESULT_PENDING);
 							// Nothing now; the resolve adds the material's answer.
+							trace_source = TIER_SRC_HIT_SHADED;
 							return vec3(0.0);
 						} else {
 							atomicAdd(hit_counts.data[RT_HIT_COUNT_OVERFLOW], 1u);
@@ -1105,7 +1129,33 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 		}
 		return screen_radiance_boost(view_hit, sdfgi_cache_radiance(rel_hit, world_dir));
 	}
+	trace_source = TIER_SRC_SKY;
 	return sky_eval(world_dir);
+}
+
+// The chain above, with the diagnostics' accounting of which tier answered
+// (FLAG_TIER_STATS, off in normal use): a deferred hit or a miss names itself,
+// a card, cascade or probe answer is the cache tier the chain left behind,
+// and last frame's screen counts as its own source wherever the boost took
+// it over. The deferred hits' light is added later by the hit shader, which
+// keeps its own counts (RT_HIT_COUNT_TIERS).
+vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
+	trace_source = TIER_SRC_UNSET;
+	boost_from_screen = false;
+	cache_tier = CACHE_TIER_PROBE;
+	vec3 radiance = trace_radiance_chain(rel_origin, world_geo_normal, world_dir, view_origin, view_dir, jitter, r_hit_distance);
+	if (bool(params.flags & FLAG_TIER_STATS)) {
+		uint src = trace_source;
+		if (src == TIER_SRC_UNSET) {
+			src = cache_tier == CACHE_TIER_CARD ? TIER_SRC_CARD : (cache_tier == CACHE_TIER_SOLID ? TIER_SRC_CASCADE : TIER_SRC_PROBE);
+		}
+		if (boost_from_screen && src != TIER_SRC_HIT_SHADED && src != TIER_SRC_SKY) {
+			src = TIER_SRC_SCREEN;
+		}
+		atomicAdd(calibration.tier_count[src], 1u);
+		atomicAdd(calibration.tier_lum[src], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+	}
+	return radiance;
 }
 
 void main() {
