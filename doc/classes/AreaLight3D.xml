@@ -35,6 +35,12 @@
 			If no texture is assigned, the area light emits uniform light across its surface.
 			[b]Note:[/b] Area light textures are only supported in the Forward+ and Mobile rendering methods, not Compatibility. To reduce the performance impact of switching textures at runtime, make sure each dimension of an area texture is either a multiple of 128 pixels, or a power of two. This removes the need for a scaling pass, which slows down texture changes. The textures don't necessarily have to be square to be optimal. Examples of optimal texture sizes include 32×64, 128×128, and 256×384.
 		</member>
+		<member name="area_visible_to_camera" type="bool" setter="set_area_visible_to_camera" getter="is_area_visible_to_camera" default="false">
+			If [code]true[/code], the camera sees the light's emitting surface: a rectangle of [member area_size] at the light's position, facing the direction the light emits in, glowing with the light's color, energy and [member area_texture]. Its brightness matches the light it casts, so it looks right next to the surfaces it illuminates. The rectangle is only visible from its front.
+			The rectangle is only drawn for the camera. It casts no shadows and takes no part in global illumination or reflections, which already account for the light itself.
+			[b]Note:[/b] The match is exact with [member area_attenuation] set to [code]2.0[/code] (inverse square). With other attenuation values, the rectangle is as bright as the light's contribution at 1 meter. A perfect mirror reflects the rectangle at twice its brightness with the default [member Light3D.light_specular] of [code]1.0[/code]; set it to [code]0.5[/code] for reflections that match.
+			[b]Note:[/b] Like the light, the rectangle ignores the node's scale. [member Light3D.distance_fade_enabled] does not fade it.
+		</member>
 		<member name="light_size" type="float" setter="set_param" getter="get_param" overrides="Light3D" default="0.5" />
 		<member name="shadow_normal_bias" type="float" setter="set_param" getter="get_param" overrides="Light3D" default="1.0" />
 	</members>

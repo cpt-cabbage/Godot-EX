@@ -31,6 +31,9 @@
 #pragma once
 
 #include "scene/3d/visual_instance_3d.h"
+#include "scene/resources/material.h"
+#include "scene/resources/mesh.h"
+#include "scene/resources/shader.h"
 
 class Light3D : public VisualInstance3D {
 	GDCLASS(Light3D, VisualInstance3D);
@@ -81,6 +84,7 @@ private:
 	real_t distance_fade_length = 10.0;
 	RSE::LightType type = RSE::LIGHT_DIRECTIONAL;
 	bool editor_only = false;
+	bool light_visible = false; // What the server was last told.
 	void _update_visibility();
 	BakeMode bake_mode = BAKE_DYNAMIC;
 	Ref<Texture2D> projector;
@@ -96,6 +100,12 @@ protected:
 	static void _bind_methods();
 	void _notification(int p_what);
 	void _validate_property(PropertyInfo &p_property) const;
+
+	// Called after the light's parameters, color, sign or visibility changed
+	// on the server, for subclasses that keep server objects in step with the
+	// light (the area light's visible emitter).
+	virtual void _light_changed() {}
+	bool _is_light_visible() const { return light_visible; }
 
 	Light3D(RSE::LightType p_type);
 
@@ -245,9 +255,25 @@ private:
 	Vector2 area_size;
 	Ref<Texture2D> area_texture;
 	bool area_normalize_energy = true;
+	bool area_visible_to_camera = false;
+
+	// The emitter the camera sees when area_visible_to_camera is on: a quad
+	// the size of the light, emissive with the light's radiance. It is a
+	// separate render instance owned by this node, not a child node.
+	RID emitter_instance;
+	Ref<ArrayMesh> emitter_mesh;
+	Ref<Shader> emitter_shader;
+	Ref<ShaderMaterial> emitter_material;
+
+	void _update_emitter();
+	void _update_emitter_transform(const Transform3D &p_global_transform);
+	void _free_emitter();
 
 protected:
 	static void _bind_methods();
+	void _notification(int p_what);
+	virtual void _light_changed() override;
+	virtual void fti_update_servers_xform() override;
 
 public:
 	void set_area_size(const Vector2 &p_size);
@@ -258,6 +284,11 @@ public:
 
 	void set_area_normalize_energy(bool p_enable);
 	bool is_area_normalizing_energy() const;
+
+	void set_area_visible_to_camera(bool p_enable);
+	bool is_area_visible_to_camera() const;
+
+	virtual void set_layer_mask(uint32_t p_mask) override;
 
 	PackedStringArray get_configuration_warnings() const override;
 

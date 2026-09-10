@@ -50,6 +50,7 @@ void Light3D::set_param(Param p_param, real_t p_value) {
 			update_configuration_warnings();
 		}
 	}
+	_light_changed();
 }
 
 real_t Light3D::get_param(Param p_param) const {
@@ -71,6 +72,7 @@ bool Light3D::has_shadow() const {
 void Light3D::set_negative(bool p_enable) {
 	negative = p_enable;
 	RS::get_singleton()->light_set_negative(light, p_enable);
+	_light_changed();
 }
 
 bool Light3D::is_negative() const {
@@ -135,6 +137,7 @@ void Light3D::set_color(const Color &p_color) {
 	}
 	// The gizmo color depends on the light color, so update it.
 	update_gizmos();
+	_light_changed();
 }
 
 Color Light3D::get_color() const {
@@ -279,6 +282,7 @@ void Light3D::set_temperature(const float p_temperature) {
 	RS::get_singleton()->light_set_color(light, combined.linear_to_srgb());
 	// The gizmo color depends on the light color, so update it.
 	update_gizmos();
+	_light_changed();
 }
 
 Color Light3D::get_correlated_color() const {
@@ -310,7 +314,9 @@ void Light3D::_update_visibility() {
 	}
 #endif
 
-	RS::get_singleton()->instance_set_visible(get_instance(), is_visible_in_tree() && editor_ok);
+	light_visible = is_visible_in_tree() && editor_ok;
+	RS::get_singleton()->instance_set_visible(get_instance(), light_visible);
+	_light_changed();
 }
 
 void Light3D::_notification(int p_what) {
@@ -728,6 +734,7 @@ void AreaLight3D::set_area_texture(const Ref<Texture2D> &p_texture) {
 
 	RS::get_singleton()->light_area_set_texture(light, tex_id);
 	update_configuration_warnings();
+	_update_emitter();
 }
 
 Ref<Texture2D> AreaLight3D::get_area_texture() const {
@@ -739,6 +746,7 @@ void AreaLight3D::set_area_size(const Vector2 &p_size) {
 	RS::get_singleton()->light_area_set_size(light, area_size);
 
 	update_gizmos();
+	_update_emitter();
 }
 
 Vector2 AreaLight3D::get_area_size() const {
@@ -748,10 +756,184 @@ Vector2 AreaLight3D::get_area_size() const {
 void AreaLight3D::set_area_normalize_energy(bool p_enabled) {
 	area_normalize_energy = p_enabled;
 	RS::get_singleton()->light_area_set_normalize_energy(light, p_enabled);
+	_update_emitter();
 }
 
 bool AreaLight3D::is_area_normalizing_energy() const {
 	return area_normalize_energy;
+}
+
+void AreaLight3D::set_area_visible_to_camera(bool p_enable) {
+	if (area_visible_to_camera == p_enable) {
+		return;
+	}
+	area_visible_to_camera = p_enable;
+	_update_emitter();
+}
+
+bool AreaLight3D::is_area_visible_to_camera() const {
+	return area_visible_to_camera;
+}
+
+void AreaLight3D::set_layer_mask(uint32_t p_mask) {
+	Light3D::set_layer_mask(p_mask);
+	if (emitter_instance.is_valid()) {
+		RS::get_singleton()->instance_set_layer_mask(emitter_instance, p_mask);
+	}
+}
+
+void AreaLight3D::_light_changed() {
+	_update_emitter();
+}
+
+// The emitter is a plain emissive quad. Its radiance is the light's color
+// scaled exactly as LightStorage scales the light's energy (the LTC diffuse
+// term makes that value the radiance of the rect), and the exposure
+// normalization the lights receive comes to EMISSION from the scene data.
+// It is unlit itself (black albedo, no specular) and, with shadow casting
+// off, stays out of the shadow maps and of the ray-traced scene: the light's
+// own lighting, reflections and bounce already account for the rect, so the
+// camera is the only thing that sees the quad.
+static const char *EMITTER_SHADER_CODE =
+		"shader_type spatial;\n"
+		"render_mode cull_back, shadows_disabled, ambient_light_disabled, specular_disabled;\n"
+		"uniform vec3 emitter_color : source_color = vec3(1.0);\n"
+		"uniform float emitter_energy = 1.0;\n"
+		"uniform sampler2D emitter_texture : source_color, hint_default_white, filter_linear_mipmap;\n"
+		"void fragment() {\n"
+		"	vec4 tex = texture(emitter_texture, UV);\n"
+		"	ALBEDO = vec3(0.0);\n"
+		"	METALLIC = 0.0;\n"
+		"	SPECULAR = 0.0;\n"
+		"	ROUGHNESS = 1.0;\n"
+		"	EMISSION = emitter_color * emitter_energy * tex.rgb * tex.a;\n"
+		"}\n";
+
+void AreaLight3D::_update_emitter() {
+	if (!area_visible_to_camera) {
+		_free_emitter();
+		return;
+	}
+	RS *rs = RS::get_singleton();
+	if (emitter_instance.is_null()) {
+		// A unit quad in the XY plane facing -Z, the direction the light
+		// emits in; the instance transform scales it to the area size.
+		// Front faces wind clockwise as seen from the front. The UVs put the
+		// texture's top-left at the (+X, +Y) corner, matching the light's
+		// LTC texture fetch, so the image reads unmirrored from in front.
+		Vector<Vector3> vertices = { Vector3(-0.5, -0.5, 0), Vector3(0.5, -0.5, 0), Vector3(0.5, 0.5, 0), Vector3(-0.5, 0.5, 0) };
+		Vector<Vector3> normals = { Vector3(0, 0, -1), Vector3(0, 0, -1), Vector3(0, 0, -1), Vector3(0, 0, -1) };
+		Vector<Vector2> uvs = { Vector2(1, 1), Vector2(0, 1), Vector2(0, 0), Vector2(1, 0) };
+		Vector<int> indices = { 0, 1, 3, 1, 2, 3 };
+		Array arrays;
+		arrays.resize(Mesh::ARRAY_MAX);
+		arrays[Mesh::ARRAY_VERTEX] = vertices;
+		arrays[Mesh::ARRAY_NORMAL] = normals;
+		arrays[Mesh::ARRAY_TEX_UV] = uvs;
+		arrays[Mesh::ARRAY_INDEX] = indices;
+		emitter_mesh.instantiate();
+		emitter_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+
+		emitter_shader.instantiate();
+		emitter_shader->set_code(EMITTER_SHADER_CODE);
+		emitter_material.instantiate();
+		emitter_material->set_shader(emitter_shader);
+
+		emitter_instance = rs->instance_create();
+		rs->instance_set_base(emitter_instance, emitter_mesh->get_rid());
+		rs->instance_geometry_set_material_override(emitter_instance, emitter_material->get_rid());
+		rs->instance_geometry_set_cast_shadows_setting(emitter_instance, RSE::SHADOW_CASTING_SETTING_OFF);
+		rs->instance_geometry_set_flag(emitter_instance, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+		rs->instance_geometry_set_flag(emitter_instance, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, false);
+		rs->instance_set_layer_mask(emitter_instance, get_layer_mask());
+		// Clicking the quad in the editor selects the light.
+		rs->instance_attach_object_instance_id(emitter_instance, get_instance_id());
+		if (is_inside_world()) {
+			rs->instance_set_scenario(emitter_instance, get_world_3d()->get_scenario());
+		}
+		if (is_inside_tree()) {
+			_update_emitter_transform(get_global_transform());
+		}
+	}
+
+	// The color and energy as Light3D and LightStorage hand them to the
+	// light: the temperature folded into the color under physical light
+	// units, the energy scaled for the units and spread over the area.
+	const bool physical_units = GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/use_physical_light_units");
+	Color color = get_color();
+	float energy = get_param(PARAM_ENERGY);
+	if (physical_units) {
+		color = (color.srgb_to_linear() * get_correlated_color().srgb_to_linear()).linear_to_srgb();
+		energy *= get_param(PARAM_INTENSITY) / (Math::PI * 2.0);
+	} else {
+		energy *= Math::PI;
+	}
+	const float surface_area = area_size.x * area_size.y;
+	if (area_normalize_energy && surface_area > 0.0f) {
+		energy /= surface_area;
+	}
+	emitter_material->set_shader_parameter("emitter_color", color);
+	emitter_material->set_shader_parameter("emitter_energy", energy);
+	emitter_material->set_shader_parameter("emitter_texture", area_texture);
+
+	// A negative light takes light away; there is nothing to see. A rect
+	// with no area emits nothing either.
+	const bool visible = _is_light_visible() && !is_negative() && surface_area > 0.0f;
+	rs->instance_set_visible(emitter_instance, visible);
+}
+
+void AreaLight3D::_update_emitter_transform(const Transform3D &p_global_transform) {
+	if (emitter_instance.is_null()) {
+		return;
+	}
+	// The light ignores its scale (LightStorage normalizes the rect's axes),
+	// so the quad does too: the area size alone sets its extent.
+	Transform3D t;
+	t.origin = p_global_transform.origin;
+	t.basis = p_global_transform.basis.orthonormalized().scaled_local(Vector3(MAX(area_size.x, 1e-4f), MAX(area_size.y, 1e-4f), 1.0));
+	RS::get_singleton()->instance_set_transform(emitter_instance, t);
+}
+
+void AreaLight3D::_free_emitter() {
+	if (emitter_instance.is_valid()) {
+		RS::get_singleton()->free_rid(emitter_instance);
+		emitter_instance = RID();
+	}
+	emitter_material.unref();
+	emitter_shader.unref();
+	emitter_mesh.unref();
+}
+
+void AreaLight3D::_notification(int p_what) {
+	if (emitter_instance.is_null()) {
+		return;
+	}
+	switch (p_what) {
+		case NOTIFICATION_ENTER_WORLD: {
+			ERR_FAIL_COND(get_world_3d().is_null());
+			RS::get_singleton()->instance_set_scenario(emitter_instance, get_world_3d()->get_scenario());
+			_update_emitter_transform(get_global_transform());
+		} break;
+		case NOTIFICATION_EXIT_WORLD: {
+			RS::get_singleton()->instance_set_scenario(emitter_instance, RID());
+		} break;
+		case NOTIFICATION_TRANSFORM_CHANGED: {
+			// As VisualInstance3D: interpolated transforms come through fti_update_servers_xform.
+			if (is_inside_tree() && !get_tree()->is_physics_interpolation_enabled()) {
+				_update_emitter_transform(get_global_transform());
+			}
+		} break;
+		case NOTIFICATION_RESET_PHYSICS_INTERPOLATION: {
+			if (is_inside_tree()) {
+				RS::get_singleton()->instance_teleport(emitter_instance);
+			}
+		} break;
+	}
+}
+
+void AreaLight3D::fti_update_servers_xform() {
+	Light3D::fti_update_servers_xform();
+	_update_emitter_transform(_get_cached_global_transform_interpolated());
 }
 
 AreaLight3D::AreaLight3D() :
@@ -774,12 +956,16 @@ void AreaLight3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_area_normalize_energy", "enable"), &AreaLight3D::set_area_normalize_energy);
 	ClassDB::bind_method(D_METHOD("is_area_normalizing_energy"), &AreaLight3D::is_area_normalizing_energy);
 
+	ClassDB::bind_method(D_METHOD("set_area_visible_to_camera", "enable"), &AreaLight3D::set_area_visible_to_camera);
+	ClassDB::bind_method(D_METHOD("is_area_visible_to_camera"), &AreaLight3D::is_area_visible_to_camera);
+
 	ADD_GROUP("Area", "area_");
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "area_range", PROPERTY_HINT_RANGE, "0,4096,0.001,or_greater,exp,suffix:m"), "set_param", "get_param", PARAM_RANGE);
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "area_attenuation", PROPERTY_HINT_RANGE, "-10,10,0.001,or_greater,or_less"), "set_param", "get_param", PARAM_ATTENUATION);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "area_normalize_energy"), "set_area_normalize_energy", "is_area_normalizing_energy");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "area_size", PROPERTY_HINT_LINK, "suffix:m"), "set_area_size", "get_area_size");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "area_texture", PROPERTY_HINT_RESOURCE_TYPE, "Texture2D,-AnimatedTexture,-AtlasTexture,-CameraTexture,-CanvasTexture,-MeshTexture,-Texture2DRD,-ViewportTexture"), "set_area_texture", "get_area_texture");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "area_visible_to_camera"), "set_area_visible_to_camera", "is_area_visible_to_camera");
 }
 
 PackedStringArray AreaLight3D::get_configuration_warnings() const {
@@ -803,6 +989,7 @@ AreaLight3D::~AreaLight3D() {
 	// has to run, because light RID needs to be freed before area_texture RID.
 	// Since area_texture is a member of AreaLight3D, it would be destructed before the deconstructor of Light3D would be called, leading to errors.
 	ERR_FAIL_NULL(RenderingServer::get_singleton());
+	_free_emitter();
 	if (light.is_valid()) {
 		RenderingServer::get_singleton()->free_rid(light);
 	}

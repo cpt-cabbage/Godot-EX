@@ -71,7 +71,7 @@ public:
 	void set_base(const RID &p_base);
 	RID get_base() const;
 
-	void set_layer_mask(uint32_t p_mask);
+	virtual void set_layer_mask(uint32_t p_mask);
 	uint32_t get_layer_mask() const;
 
 	void set_layer_mask_value(int p_layer_number, bool p_enable);
