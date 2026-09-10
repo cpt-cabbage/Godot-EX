@@ -398,3 +398,7 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+
+# Test captures: the harnesses write here (see rt_lab/out_path.gd), never into
+# a Godot project directory, where the editor would import every image.
+/rt_out/
