@@ -441,16 +441,24 @@ void main() {
 		// rendered with: only where the two disagree is the pixel a moving
 		// object, and the stale velocity is then the best predictor available
 		// of where its history lives.
+		// A moving object's shift beyond the camera's, carried to the
+		// reflection's reprojection below (the reflector took its image
+		// along).
+		vec2 object_delta = vec2(0.0);
 		if ((params.flags & FLAG_HAS_VELOCITY) != 0u) {
 			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
-			if (velocity != vec2(0.0) && prevprev_ndc.w > 0.0) {
+			// Under FSR2 the pixels no geometry wrote carry a (-1, -1)
+			// sentinel, not a motion.
+			bool has_velocity = velocity != vec2(0.0) && all(greaterThan(velocity, vec2(-0.99)));
+			if (has_velocity && prevprev_ndc.w > 0.0) {
 				vec2 static_motion = (prevprev_ndc.xy / prevprev_ndc.w) * 0.5 + 0.5 - prev_uv;
 				// Threshold of 2 full-resolution pixels: the velocity buffer is
 				// unjittered while the reprojection matrices carry the TAA
 				// jitter of both frames.
 				vec2 object_pixels = (velocity - static_motion) * vec2(params.screen_size * params.depth_scale);
 				if (any(greaterThan(abs(object_pixels), vec2(2.0)))) {
+					object_delta = uv + velocity - prev_uv;
 					prev_uv = uv + velocity;
 					paint_why = 4;
 				}
@@ -468,7 +476,7 @@ void main() {
 		if (virtual_view_depth > 0.0) {
 			vec4 prev_ndc_v = params.reproject * vec4(uv * 2.0 - 1.0, depth_from_linear(virtual_view_depth), 1.0);
 			if (prev_ndc_v.w > 0.0) {
-				prev_uv_virtual = (prev_ndc_v.xy / prev_ndc_v.w) * 0.5 + 0.5;
+				prev_uv_virtual = (prev_ndc_v.xy / prev_ndc_v.w) * 0.5 + 0.5 + object_delta;
 				parallax_px = length((prev_uv_virtual - prev_uv) * vec2(params.screen_size));
 				predicted_virtual_depth = linearize_depth(prev_ndc_v.z / prev_ndc_v.w);
 			}

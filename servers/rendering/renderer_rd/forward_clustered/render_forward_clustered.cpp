@@ -2340,7 +2340,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		motion_vectors_required = true;
 	} else if (!is_reflection_probe && using_upscaling) {
 		motion_vectors_required = true;
-	} else if (!is_reflection_probe && rb_data.is_valid() && (use_raytraced_shadows || use_stochastic_lighting)) {
+	} else if (!is_reflection_probe && rb_data.is_valid() && (use_raytraced_shadows || use_stochastic_lighting || use_rt_gi)) {
 		// The ray-traced denoisers reproject history with last frame's motion
 		// vectors, so moving objects don't smear their accumulated lighting.
 		motion_vectors_required = true;
