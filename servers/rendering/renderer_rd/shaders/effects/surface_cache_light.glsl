@@ -250,8 +250,10 @@ layout(set = 0, binding = 28, rgba16f) uniform restrict image2D static_atlas;
 // Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
 // (see trace_dynamic; surface_cache.cpp prints and clears it).
 layout(set = 0, binding = 25, std430) restrict buffer DynStats {
-	// [0..15] the dynamic rays' fate (dyn_stat); [16..23] and [24..31] the
-	// static bounce ray's source, counts and luminance sums (tier_stat).
+	// [0..15] the dynamic rays' fate (dyn_stat); [16..19] and [20..23] the
+	// static bounce ray's source, counts and luminance sums (tier_stat);
+	// [24..28] why a card lookup failed (card_reject); [29..30] the count and
+	// luminance of the bounces read through a failed depth test.
 	uint count[32];
 }
 dyn_stats;
@@ -264,7 +266,7 @@ float luminance(vec3 c);
 void tier_stat(uint i, vec3 radiance) {
 	if ((params.debug & 8192u) != 0u) {
 		atomicAdd(dyn_stats.count[16u + i], 1u);
-		atomicAdd(dyn_stats.count[24u + i], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+		atomicAdd(dyn_stats.count[20u + i], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
 	}
 }
 
@@ -436,6 +438,12 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup),
 // over this pass's own bindings: nearest texel of the lit atlas.
+// Diagnostics (tier_stat): why the last card_lookup() failed. 0 the hit's
+// instance is not in the cache, 1 it has no card set, 2 the set is not
+// captured yet (or too small), 3 no card faces the ray with a filled texel
+// under the hit, 4 a card does but its stored depth disagrees with the hit.
+uint card_reject = 0u;
+
 bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change, out float r_change_total, out vec3 r_n_world, out vec3 r_albedo, out ivec2 r_texel) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
@@ -444,24 +452,33 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_n_world = vec3(0.0);
 	r_albedo = vec3(0.0);
 	r_texel = ivec2(0);
+	card_reject = 0u;
 	if (p_instance_id == SURFACE_CACHE_INVALID) {
 		return false;
 	}
 	CardInstance inst = card_instances.data[p_instance_id];
+	card_reject = 1u;
 	if (inst.set == SURFACE_CACHE_INVALID) {
 		return false;
 	}
 	r_set = inst.set;
 	CardSet s = sets.data[inst.set];
+	card_reject = 2u;
 	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
 		return false;
 	}
+	card_reject = 3u;
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
 	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	ivec2 best_texel = ivec2(0);
 	uint best_k = 0u;
+	// The best-facing card with a filled texel under the hit whatever its
+	// stored depth says: the stand-in when every card fails the depth test.
+	float alt_w = 0.0;
+	ivec2 alt_texel = ivec2(0);
+	uint alt_k = 0u;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -482,12 +499,18 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		if (stored <= 0.0) {
 			continue;
 		}
+		if (facing > alt_w) {
+			alt_w = facing;
+			alt_texel = texel;
+			alt_k = k;
+		}
 		// The box's longest extent over the card's longer edge, as when the
 		// cards were square: a card's own (shorter) texel made the tolerance
 		// reject grazing hits that then paid for the probe fallback.
 		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
 		float tolerance = max(2.0 * texel_world, 0.02 * longest);
 		if (abs(stored - depth) > tolerance) {
+			card_reject = 4u;
 			continue;
 		}
 		if (facing > best_w) {
@@ -497,7 +520,23 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		}
 	}
 	if (best_w <= 0.0) {
-		return false;
+		// Every facing card disagrees on depth: the hit is on another layer
+		// of the same instance than the card captured (a back face reached
+		// from inside a wall, a face behind the captured one, a corner
+		// within a texel). A tenth of the bounce rays end here on the
+		// closed box and the game room alike, and the SDFGI probe that
+		// used to stand in read 130x darker than the card rays in the box
+		// and 4.5x brighter in the game. The card's own texel -- the same
+		// instance and material, lit by the same lights -- is the nearer
+		// answer, and the one that stays when SDFGI is off.
+		// GODOT_CARD_ABLATE=strict (debug bit 16384) keeps the rejection.
+		if (alt_w <= 0.0 || (params.debug & 16384u) != 0u) {
+			return false;
+		}
+		best_w = alt_w;
+		best_texel = alt_texel;
+		best_k = alt_k;
+		card_reject = 5u;
 	}
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
 	r_change = change_load_gradient(best_texel);
@@ -1031,17 +1070,26 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 				}
 				indirect_sample = card_radiance;
 				tier_stat(0u, card_radiance);
+				if (card_reject == 5u && (params.debug & 8192u) != 0u) {
+					atomicAdd(dyn_stats.count[29u], 1u); // Read through a depth mismatch (see card_lookup).
+					atomicAdd(dyn_stats.count[30u], uint(min(luminance(max(card_radiance, vec3(0.0))), 64.0) * 16.0));
+				}
 				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
 				// weaker by a quarter per bounce, so lighting that reaches
 				// this texel only indirectly restarts it too.
 				bounce_change = hit_change - 0.25;
 				bounce_change_total = hit_change_total - 0.25;
-			} else if (sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
-				tier_stat(1u, indirect_sample);
 			} else {
-				indirect_sample = sky_eval(t.n_world);
-				tier_stat(2u, indirect_sample);
+				if ((params.debug & 8192u) != 0u) {
+					atomicAdd(dyn_stats.count[24u + min(card_reject, 4u)], 1u); // Why the lookup failed (card_reject), 5 slots at 24..28.
+				}
+				if (sdfgi_probe_irradiance(t.world_pos - params.camera_origin.xyz, t.n_world, indirect_sample)) {
+					tier_stat(1u, indirect_sample);
+				} else {
+					indirect_sample = sky_eval(t.n_world);
+					tier_stat(2u, indirect_sample);
+				}
 			}
 		} else {
 			indirect_sample = sky_eval(ray_dir);

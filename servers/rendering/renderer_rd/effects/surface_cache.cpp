@@ -856,7 +856,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	last_grid_built = use_grid;
 	last_grid_origin = grid_origin;
 	last_grid_cell = grid_cell;
-	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart
+	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart,strict
 	// switches parts of the texel shading off (gradient: the bounce ray
 	// re-traced for the temporal gradient; restart: the bounce accumulation's
 	// restart on a change), read once.
@@ -864,7 +864,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		uint32_t bits = 0;
 		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
 			const String name = part.strip_edges().to_lower();
-			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : name == "paint3" ? 512 : name == "paint5" ? 2048 : name == "stats" ? 4096 : name == "paint8" ? 131072 : 0;
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : name == "paint3" ? 512 : name == "paint5" ? 2048 : name == "stats" ? 4096 : name == "strict" ? 16384 : name == "paint8" ? 131072 : 0;
 		}
 		if (bits != 0) {
 			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
@@ -1099,13 +1099,24 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		double l = 0.0;
 		for (int i = 0; i < 4; i++) {
 			n += c[16 + i];
-			l += c[24 + i];
+			l += c[20 + i];
 		}
 		const char *names[4] = { "card", "probe", "sky-at-hit", "miss" };
 		String line = vformat("RT_GI_TIERS cards: %d rays", int(n));
 		for (int i = 0; i < 4; i++) {
-			line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * c[16 + i] / n : 0.0, l > 0.0 ? 100.0 * c[24 + i] / l : 0.0);
+			line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * c[16 + i] / n : 0.0, l > 0.0 ? 100.0 * c[20 + i] / l : 0.0);
 		}
+		print_line(line);
+		const char *rejects[5] = { "no-instance", "no-set", "uncaptured", "no-facing-card", "depth-mismatch" };
+		double r = 0.0;
+		for (int i = 0; i < 5; i++) {
+			r += c[24 + i];
+		}
+		line = "RT_GI_TIERS cards' failed lookups:";
+		for (int i = 0; i < 5; i++) {
+			line += vformat("  %s %.1f%%", rejects[i], r > 0.0 ? 100.0 * c[24 + i] / r : 0.0);
+		}
+		line += vformat("  | read through a depth mismatch: %.1f%% of rays (lum %.1f%%)", n > 0.0 ? 100.0 * c[29] / n : 0.0, l > 0.0 ? 100.0 * c[30] / l : 0.0);
 		print_line(line);
 		rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	}
