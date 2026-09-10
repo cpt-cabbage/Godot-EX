@@ -768,7 +768,8 @@ vec3 shade_direct(vec3 world_pos, vec3 n_world, vec3 origin, inout uint seed) {
 		vec3 point;
 		vec3 c = area_light_contribution(ld, params.world_from_view, world_pos, n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
 		float w = luminance(abs(c));
-		if (w <= 0.0) {
+		// The negation rejects a NaN term as well (see the card lighting).
+		if (!(w > 0.0)) {
 			continue;
 		}
 		sum += c;

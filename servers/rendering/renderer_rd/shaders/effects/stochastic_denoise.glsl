@@ -849,7 +849,25 @@ void main() {
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 	}
 
+	// The history never holds a non-finite value: it would keep it for the
+	// whole temporal window, and the spatial filter's taps would carry it to
+	// the neighbours, a stride further every frame (growing black voids). A
+	// poisoned history restarts at this pixel instead.
+	if (any(isnan(result_diffuse)) || any(isinf(result_diffuse))) {
+		result_diffuse = vec3(0.0);
+		frames_d = 0.0;
+	}
+	if (any(isnan(result_specular)) || any(isinf(result_specular))) {
+		result_specular = vec3(0.0);
+		frames_s = 0.0;
+	}
+	if (any(isnan(moments)) || any(isinf(moments))) {
+		moments = vec4(0.0);
+	}
 #ifdef HAS_DIRECTIONAL
+	if (any(isnan(result_directional)) || any(isinf(result_directional))) {
+		result_directional = vec4(0.0, 0.0, 0.0, 1.0);
+	}
 	if ((params.flags & FLAG_MOD_PAINT) != 0u) {
 		result_diffuse = vec3(paint_change, paint_field, clamp(change_age, 0.0, 1.0));
 	}

@@ -1333,11 +1333,25 @@ void main() {
 		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
 	}
 
+	// Nothing non-finite leaves the gather: the temporal filter would keep
+	// it for the history's lifetime and the spatial filter spread it a
+	// stride further every frame (growing black voids). A bad sample counts
+	// as no light this frame; the tier print reports how many there were.
+	vec4 directional_out = vec4(moment, visibility);
+	bool non_finite = any(isnan(irradiance)) || any(isinf(irradiance)) || any(isnan(reflection)) || any(isinf(reflection)) || any(isnan(directional_out)) || any(isinf(directional_out));
+	if (non_finite) {
+		irradiance = vec3(0.0);
+		reflection = vec3(0.0);
+		directional_out = vec4(0.0, 0.0, 0.0, 1.0);
+		if (bool(params.flags & FLAG_TIER_STATS)) {
+			atomicAdd(calibration.tier_count[7], 1u); // Diagnostics (GODOT_GI_TIER_PRINT): the pixels whose gather went non-finite.
+		}
+	}
 	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_spec_ray, pixel, spec_ray);
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
-	imageStore(out_directional, pixel, vec4(moment, visibility));
+	imageStore(out_directional, pixel, directional_out);
 
 	// The young pixel's stand-in. A fast turn refreshes most of the screen
 	// within a few frames, and the entering band is one-sample pixels among

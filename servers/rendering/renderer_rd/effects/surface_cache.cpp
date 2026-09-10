@@ -1122,6 +1122,9 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			line += vformat("  %s %.1f%%", rejects[i], r > 0.0 ? 100.0 * c[24 + i] / r : 0.0);
 		}
 		line += vformat("  | read through a depth mismatch: %.1f%% of rays (lum %.1f%%)", n > 0.0 ? 100.0 * c[29] / n : 0.0, l > 0.0 ? 100.0 * c[30] / l : 0.0);
+		// Slot 31: the area-light terms and accumulations rejected as
+		// non-finite (the growing-black-voids guard).
+		line += vformat("  | non-finite rejected: %d", c[31]);
 		print_line(line);
 		rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	}

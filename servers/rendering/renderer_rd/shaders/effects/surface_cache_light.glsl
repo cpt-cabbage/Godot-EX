@@ -846,7 +846,16 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		vec3 point;
 		vec3 c = area_light_contribution(ld, params.world_from_view, t.world_pos, t.n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
 		float w = luminance(abs(c));
-		if (w <= 0.0) {
+		// Written as the negation so a NaN term is rejected too (every
+		// comparison with a NaN is false): the accumulation below keeps
+		// whatever enters it for the texel's lifetime, and a single NaN
+		// texel poisons every ray that reads it, then the gather's history
+		// and its spatial filter, which spreads it a stride further every
+		// frame (growing black voids over the whole frame).
+		if (!(w > 0.0)) {
+			if ((params.debug & 8192u) != 0u && (isnan(w) || isinf(w))) {
+				atomicAdd(dyn_stats.count[31], 1u); // Diagnostics (GODOT_GI_TIER_PRINT): the area terms rejected as NaN.
+			}
 			continue;
 		}
 		sum += c;
@@ -1477,6 +1486,22 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn = vec3(0.0);
 		dyn2 = vec3(0.0);
 	}
+	// Nothing non-finite reaches the atlases: they persist, and every reader
+	// (the gather's rays, the other texels' bounce rays, the hit shader)
+	// would carry it on. A poisoned accumulation restarts instead.
+	if (any(isnan(indirect)) || any(isinf(indirect))) {
+		indirect = vec3(0.0);
+		ind_frames = 0.0;
+		join = 0.0;
+		if ((params.debug & 8192u) != 0u) {
+			atomicAdd(dyn_stats.count[31], 1u);
+		}
+	}
+	if (any(isnan(dyn)) || any(isinf(dyn)) || any(isnan(dyn2)) || any(isinf(dyn2))) {
+		dyn = vec3(0.0);
+		dyn2 = vec3(0.0);
+		dyn_frames = 0.0;
+	}
 	imageStore(indirect_dyn_atlas, texel, vec4(dyn, dyn_lum));
 	imageStore(indirect_dyn2_atlas, texel, vec4(dyn2, dyn_frames / 64.0));
 	// The accumulation less the joining light's share of the dynamic
@@ -1491,7 +1516,15 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// subtracting it where it is now.
 	vec3 direct = d.exact + max(d.local_sum - d.dyn_sum, vec3(0.0)) * vis;
 	vec3 radiance = max(t.albedo * (direct + indirect_stored + dyn + dyn2) + t.emission, vec3(0.0));
-	imageStore(static_atlas, texel, vec4(max(t.albedo * (direct + indirect_stored) + t.emission, vec3(0.0)), vis_dyn));
+	vec3 static_radiance = max(t.albedo * (direct + indirect_stored) + t.emission, vec3(0.0));
+	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(static_radiance)) || any(isinf(static_radiance))) {
+		radiance = vec3(0.0);
+		static_radiance = vec3(0.0);
+		if ((params.debug & 8192u) != 0u) {
+			atomicAdd(dyn_stats.count[31], 1u);
+		}
+	}
+	imageStore(static_atlas, texel, vec4(static_radiance, vis_dyn));
 	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
 }
 
