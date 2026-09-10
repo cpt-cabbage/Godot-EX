@@ -851,9 +851,10 @@ void AreaLight3D::_update_emitter() {
 		if (is_inside_world()) {
 			rs->instance_set_scenario(emitter_instance, get_world_3d()->get_scenario());
 		}
-		if (is_inside_tree()) {
-			_update_emitter_transform(get_global_transform());
-		}
+	}
+	// The area size scales the quad through the instance transform.
+	if (is_inside_tree()) {
+		_update_emitter_transform(get_global_transform());
 	}
 
 	// The color and energy as Light3D and LightStorage hand them to the
