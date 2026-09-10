@@ -809,9 +809,13 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 		float tv_length = 0.0f;
 		float tv_spread = 1.0f;
 		Vector2 tv_inv_proj;
+		bool tv_indirect = false;
 		const bool tv_ablated = transparent_debug_ablating && (transparent_debug_ablate & TRANSPARENT_ABLATE_VOLUME);
-		if (rt_shadows != nullptr && !p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && !tv_ablated && rd.is_valid() && rd->get_view_count() == 1 && rt_shadows->get_translucency_volume_mapping(rd, 0, tv_size, tv_length, tv_spread, tv_inv_proj)) {
-			scene_state.ubo.translucency_volume = 1 | (translucency_quality.core ? 2 : 0);
+		if (rt_shadows != nullptr && !p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && !tv_ablated && rd.is_valid() && rd->get_view_count() == 1 && rt_shadows->get_translucency_volume_mapping(rd, 0, tv_size, tv_length, tv_spread, tv_inv_proj, &tv_indirect)) {
+			// Bit 3: the volume's froxels traced bounce rays, so it carries the
+			// indirect light and a blended fragment reading it needs no
+			// per-fragment SDFGI (which would count the same bounce twice).
+			scene_state.ubo.translucency_volume = 1 | (translucency_quality.core ? 2 : 0) | (tv_indirect ? 4 : 0);
 			scene_state.ubo.tv_length = tv_length;
 			scene_state.ubo.tv_spread = tv_spread;
 			scene_state.ubo.tv_size[0] = tv_size.x;
@@ -2034,6 +2038,11 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	translucency_quality.spread = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread");
 	translucency_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames"));
 	translucency_quality.ray_bias = stochastic_quality.ray_bias;
+	// The froxels' bounce rays against the surface cache: with them the volume
+	// carries the blended fragments' indirect light too, so they need no
+	// per-fragment SDFGI. Off without the cache, which is what the rays read.
+	translucency_quality.indirect = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect") && use_surface_cache && use_rt_gi;
+	translucency_quality.indirect_rays = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect_rays"));
 	if (scene_shader_ray_query) {
 		// Outside any draw list, which is where an acceleration structure
 		// may be built; the scene shader's TLAS binding reads it later.

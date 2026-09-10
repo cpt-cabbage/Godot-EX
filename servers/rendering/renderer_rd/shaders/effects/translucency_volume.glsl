@@ -5,6 +5,7 @@
 #VERSION_DEFINES
 
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
 
 // The translucency lighting volume (MegaLights' translucency: light the
 // blended surfaces from a sampled volume rather than per fragment). A
@@ -23,8 +24,10 @@
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 #include "../light_data_inc.glsl"
+#include "surface_cache_inc.glsl"
 
 #define STREAMS 2u
+#define M_PI 3.14159265359
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 
@@ -72,17 +75,33 @@ layout(set = 0, binding = 5, std140) uniform Params {
 	float temporal_alpha;
 	uint sun_caster_mask;
 	uint flags;
+	vec4 indirect; // a: the froxel's bounce rays; rgb unused.
 }
 params;
 
 #define FLAG_HISTORY 1u
 #define FLAG_NO_SHADOW_RAYS 2u
+#define FLAG_SURFACE_CACHE 4u // The froxel traces a bounce ray and reads the cards, so the volume carries the indirect light too.
 
 layout(set = 0, binding = 6) uniform sampler3D history_a;
 layout(set = 0, binding = 7) uniform sampler3D history_bx;
 layout(set = 0, binding = 8) uniform sampler3D history_by;
 layout(set = 0, binding = 9) uniform sampler3D history_bz;
 
+// The surface cache (see surface_cache.cpp): the froxel's bounce ray reads
+// the lit cards, as the GI gather's rays do.
+layout(set = 0, binding = 10, std430) restrict readonly buffer CardInstances {
+	CardInstance data[];
+}
+card_instances;
+
+layout(set = 0, binding = 11, std430) restrict readonly buffer CardSets {
+	CardSet data[];
+}
+card_sets;
+
+layout(set = 0, binding = 12) uniform texture2D card_lighting_atlas;
+layout(set = 0, binding = 13) uniform texture2D card_depth_atlas;
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image3D out_a;
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image3D out_bx;
 layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image3D out_by;
@@ -131,6 +150,73 @@ bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	while (rayQueryProceedEXT(rq)) {
 	}
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// The lit card covering a bounce ray's hit, as the GI gather's
+// surface_cache_lookup reads it (the card facing the ray whose stored depth
+// agrees with the hit, the best-facing one anyway where none agrees, since a
+// froxel's ray has no better answer than the instance's own texel).
+bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance) {
+	r_radiance = vec3(0.0);
+	if (p_instance_id == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardInstance inst = card_instances.data[p_instance_id];
+	if (inst.set == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardSet s = card_sets.data[inst.set];
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+		return false;
+	}
+	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
+	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
+	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
+	float best_w = 0.0;
+	float alt_w = 0.0;
+	ivec2 best_texel = ivec2(0);
+	ivec2 alt_texel = ivec2(0);
+	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
+		vec3 axis, u, v;
+		card_basis(k, axis, u, v);
+		float facing = -dot(axis, local_dir);
+		if (facing <= 0.0) {
+			continue;
+		}
+		vec2 uv01;
+		float depth;
+		card_project(s, k, local_pos, uv01, depth);
+		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
+			continue;
+		}
+		uint packed = card_sets.data[inst.set].cards[k];
+		ivec2 dims = card_dims_packed(packed);
+		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
+		float stored = texelFetch(card_depth_atlas, texel, 0).r;
+		if (stored <= 0.0) {
+			continue;
+		}
+		if (facing > alt_w) {
+			alt_w = facing;
+			alt_texel = texel;
+		}
+		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
+		if (abs(stored - depth) > max(2.0 * texel_world, 0.02 * longest)) {
+			continue;
+		}
+		if (facing > best_w) {
+			best_w = facing;
+			best_texel = texel;
+		}
+	}
+	if (best_w <= 0.0) {
+		if (alt_w <= 0.0) {
+			return false;
+		}
+		best_texel = alt_texel;
+	}
+	r_radiance = max(texelFetch(card_lighting_atlas, best_texel, 0).rgb, vec3(0.0));
+	return true;
 }
 
 // A froxel's view position from its unit coordinates: xy across the
@@ -265,6 +351,59 @@ void main() {
 		total_bx += c * dl.direction.x;
 		total_by += c * dl.direction.y;
 		total_bz += c * dl.direction.z;
+	}
+
+	// The indirect light: bounce rays over the sphere, each reading the lit
+	// card at its hit -- the room's own surfaces, the same radiance the GI
+	// gather's rays see. A ray of radiance L from direction d enters the sum
+	// the way a light of irradiance 4*PI*L/N from d would, so that a uniform
+	// L over the sphere reads back as the irradiance PI*L a surface receives
+	// from it. A ray that reaches nothing contributes nothing: the environment
+	// is what the fragment's own ambient already carries, and this pass cannot
+	// evaluate it per direction. So the volume adds the room's bounce to the
+	// sky the fragment has, and the fragment consults no SDFGI, whose diffuse
+	// would be that same bounce over again.
+	//
+	// The sky is left unoccluded by the room, which the fragment's ambient
+	// cannot know: a froxel's escaped-ray fraction was tried as that occlusion
+	// and read as froxel-sized blotches wherever a blended surface lay along
+	// the view (a froxel straddling the floor sees a different sky than its
+	// neighbour, and no accumulation window smooths a step that is real).
+	// Noisy at one ray a froxel, and left that way: the volume accumulates
+	// over its temporal window and the fragments read it trilinearly, which
+	// is the whole reason the transparent pass can afford this at all.
+	if (bool(params.flags & FLAG_SURFACE_CACHE)) {
+		uint rays = max(uint(params.indirect.a), 1u);
+		float scale = 4.0 * M_PI / float(rays);
+		for (uint r = 0u; r < rays; r++) {
+			seed = pcg_hash(seed);
+			float u1 = hash_to_float(seed);
+			seed = pcg_hash(seed);
+			float u2 = hash_to_float(seed);
+			float cos_theta = 1.0 - 2.0 * u1;
+			float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+			float phi = 2.0 * M_PI * u2;
+			vec3 dir = vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, world_pos, params.ray_bias, dir, 1e4);
+			while (rayQueryProceedEXT(rq)) {
+			}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+				continue;
+			}
+			float t_hit = rayQueryGetIntersectionTEXT(rq, true);
+			vec3 card_radiance;
+			// No card at the hit: the surface is there and blocks the sky, so
+			// the froxel sees nothing that way rather than the ambient.
+			if (!card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), world_pos + dir * t_hit, dir, card_radiance)) {
+				continue;
+			}
+			vec3 c = card_radiance * scale;
+			total_a += c;
+			total_bx += c * dir.x;
+			total_by += c * dir.y;
+			total_bz += c * dir.z;
+		}
 	}
 
 	// Against last frame's volume where the froxel's point was inside it.

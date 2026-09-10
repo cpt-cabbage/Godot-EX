@@ -2093,7 +2093,11 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #else
 
-	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_SDFGI)) { //has lightmap capture
+	// Bit 3 of translucency_volume: the volume's froxels traced bounce rays,
+	// so a blended fragment reads the room's indirect light from it and the
+	// per-fragment SDFGI below would be that same bounce a second time. Only
+	// the transparent pass sets the volume at all.
+	if (sc_use_forward_gi() && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_SDFGI) && (implementation_data.translucency_volume & 4u) == 0u) { //has lightmap capture
 
 		//make vertex orientation the world one, but still align to camera
 		vec3 cam_pos = mat3(inv_view_matrix) * vertex;

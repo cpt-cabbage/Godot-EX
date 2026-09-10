@@ -3736,6 +3736,11 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_length", PROPERTY_HINT_RANGE, "4.0,1000.0,1.0"), 64.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread", PROPERTY_HINT_RANGE, "0.5,6.0,0.1"), 2.0);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+	// The froxels' bounce rays against the surface cache: the volume then
+	// carries the blended fragments' indirect light as well as their direct,
+	// which is what lets the transparent pass do without per-fragment SDFGI.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect_rays", PROPERTY_HINT_RANGE, "1,8,1"), 2);
 	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
 	// available, i.e. any other ray tracing feature is on or SDFGI is active).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);

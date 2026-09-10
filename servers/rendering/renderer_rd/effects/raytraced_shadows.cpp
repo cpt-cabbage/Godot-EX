@@ -2786,7 +2786,13 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	params.ray_bias = p_quality.ray_bias;
 	params.temporal_alpha = 1.0f / float(MAX(p_quality.temporal_frames, 1u));
 	params.sun_caster_mask = p_sun_caster_mask;
-	params.flags = (st.history_valid ? 1 : 0) | (p_quality.shadow_rays ? 0 : 2);
+	// The froxels' bounce rays need lit cards to read; without them the
+	// volume stays direct-only and the blended fragments keep whatever
+	// ambient the environment (or SDFGI) gives them.
+	const bool cards_ready = p_quality.indirect && surface_cache != nullptr && surface_cache->is_ready();
+	params.flags = (st.history_valid ? 1 : 0) | (p_quality.shadow_rays ? 0 : 2) | (cards_ready ? 4 : 0);
+	params.indirect[3] = float(CLAMP(p_quality.indirect_rays, 1, 8));
+	st.carries_indirect = cards_ready;
 	rd->buffer_update(st.ubo, 0, sizeof(TranslucencyParamsUBO), &params);
 
 	RID shader_rid = translucency_shader.version_get_shader(translucency_shader_version, 0);
@@ -2800,6 +2806,16 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	RD::Uniform t_hist_bx(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ material_sampler, st.textures[read][1] }));
 	RD::Uniform t_hist_by(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ material_sampler, st.textures[read][2] }));
 	RD::Uniform t_hist_bz(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ material_sampler, st.textures[read][3] }));
+	// The surface cache, for the froxels' bounce rays; dummies when it has
+	// nothing to read (FLAG_SURFACE_CACHE is off then and they are not read).
+	if (rt_gi_dummy_buffer.is_null()) {
+		rt_gi_dummy_buffer = rd->storage_buffer_create(256);
+	}
+	RID tv_black = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+	RD::Uniform t_sc_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, Vector<RID>({ cards_ready ? surface_cache->get_instances_buffer() : rt_gi_dummy_buffer }));
+	RD::Uniform t_sc_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 11, Vector<RID>({ cards_ready ? surface_cache->get_sets_buffer() : rt_gi_dummy_buffer }));
+	RD::Uniform t_sc_lighting(RD::UNIFORM_TYPE_TEXTURE, 12, Vector<RID>({ cards_ready ? surface_cache->get_lighting_atlas() : tv_black }));
+	RD::Uniform t_sc_depth(RD::UNIFORM_TYPE_TEXTURE, 13, Vector<RID>({ cards_ready ? surface_cache->get_depth_atlas() : tv_black }));
 	RD::Uniform t_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ st.textures[write][0] }));
 	RD::Uniform t_out_bx(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ st.textures[write][1] }));
 	RD::Uniform t_out_by(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ st.textures[write][2] }));
@@ -2809,7 +2825,7 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	rd->draw_command_begin_label("Translucency Volume");
 	RD::ComputeListID list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, translucency_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 0, t_tlas, t_omni, t_spot, t_directional, t_cluster, t_params, t_hist_a, t_hist_bx, t_hist_by, t_hist_bz), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 0, t_tlas, t_omni, t_spot, t_directional, t_cluster, t_params, t_hist_a, t_hist_bx, t_hist_by, t_hist_bz, t_sc_instances, t_sc_sets, t_sc_lighting, t_sc_depth), 0);
 	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 1, t_out_a, t_out_bx, t_out_by, t_out_bz), 1);
 	rd->compute_list_dispatch_threads(list, size.x, size.y, size.z);
 	rd->compute_list_end();
@@ -2835,7 +2851,7 @@ RID RaytracedShadows::get_translucency_volume_texture(Ref<RenderSceneBuffersRD> 
 	return st.textures[st.parity ? 1 : 0][CLAMP(p_index, 0, 3)];
 }
 
-bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj) const {
+bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj, bool *r_carries_indirect) const {
 	if (p_render_buffers.is_null() || !p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
 		return false;
 	}
@@ -2848,6 +2864,9 @@ bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD>
 	r_length = st.prev_length; // What this frame's pass used (stored after it ran).
 	r_spread = st.prev_spread;
 	r_inv_proj = st.prev_inv_proj;
+	if (r_carries_indirect != nullptr) {
+		*r_carries_indirect = st.carries_indirect;
+	}
 	return true;
 }
 

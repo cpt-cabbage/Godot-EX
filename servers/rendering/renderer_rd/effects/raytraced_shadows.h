@@ -169,6 +169,7 @@ public:
 		bool history_valid = false;
 		bool parity = false;
 		bool ready = false; // Written this frame.
+		bool carries_indirect = false; // Its froxels traced bounce rays, so it holds the indirect light too.
 	};
 	LocalVector<TranslucencyState> translucency; // Per view.
 
@@ -725,8 +726,9 @@ private:
 		float temporal_alpha;
 		uint32_t sun_caster_mask;
 		uint32_t flags;
+		float indirect[4]; // a: the bounce rays per froxel; rgb unused.
 	};
-	static_assert(sizeof(TranslucencyParamsUBO) == 240, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
+	static_assert(sizeof(TranslucencyParamsUBO) == 256, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
 
 	static void _tier_stats_readback(const Vector<uint8_t> &p_data); // GODOT_GI_TIER_PRINT: the gather's tier counts.
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
@@ -867,12 +869,17 @@ public:
 		uint32_t temporal_frames = 8;
 		float ray_bias = 0.08f;
 		bool shadow_rays = true;
+		// The froxels' bounce rays against the surface cache: the volume then
+		// carries the indirect light too, and the blended fragments reading it
+		// need no per-fragment SDFGI.
+		bool indirect = true;
+		int32_t indirect_rays = 2;
 	};
 	void process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_projection, const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, uint32_t p_sun_caster_mask, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const TranslucencyQuality &p_quality);
 	// The volume written this frame for the view (null when none): 0 A, 1 Bx, 2 By, 3 Bz.
 	RID get_translucency_volume_texture(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, int p_index) const;
 	// Its mapping for the scene shader; false when none was written.
-	bool get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj) const;
+	bool get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj, bool *r_carries_indirect = nullptr) const;
 
 	// Call once per frame, per render buffer, before that buffer's per-view
 	// process() calls. Selects the viewport's own temporal state (creating it
