@@ -389,14 +389,26 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 	}
 
 	if (Object::cast_to<AreaLight3D>(light)) {
+		AreaLight3D *cl = Object::cast_to<AreaLight3D>(light);
+		Vector2 area_size = cl->get_area_size();
+		float a = area_size.x;
+		float b = area_size.y;
+
+		// Clicking anywhere on the rect selects the light, not only its icon.
+		if (a > 0.0f && b > 0.0f) {
+			Vector<Vector3> faces = {
+				Vector3(-a / 2, b / 2, 0), Vector3(a / 2, b / 2, 0), Vector3(a / 2, -b / 2, 0),
+				Vector3(-a / 2, b / 2, 0), Vector3(a / 2, -b / 2, 0), Vector3(-a / 2, -b / 2, 0)
+			};
+			Ref<TriangleMesh> tm;
+			tm.instantiate();
+			tm->create_from_faces(faces);
+			p_gizmo->add_collision_triangles(tm);
+		}
+
 		if (p_gizmo->is_selected()) {
 			const Ref<Material> material = get_material("lines_primary", p_gizmo);
 			Vector<Vector3> points;
-
-			AreaLight3D *cl = Object::cast_to<AreaLight3D>(light);
-			Vector2 area_size = cl->get_area_size();
-			float a = area_size.x;
-			float b = area_size.y;
 
 			// Draw rectangle
 			points.push_back(Vector3(-a / 2, b / 2, 0));
