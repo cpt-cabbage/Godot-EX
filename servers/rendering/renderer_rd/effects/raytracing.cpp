@@ -1442,12 +1442,16 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// atlas it reads for them.
 	RID prev_meta = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_1 : RB_RT_GI_META_0, p_view, 0);
 	RD::Uniform u_prev_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 29, Vector<RID>({ sampler, prev_meta }));
-	RID sc_indirect = use_cards ? surface_cache->get_indirect_atlas() : default_black;
+	// The static bounce as the readers take it: filtered over the card (surface_cache_light.glsl filter_bounce).
+	RID sc_indirect = use_cards ? surface_cache->get_indirect_filtered_atlas() : default_black;
 	RD::Uniform u_sc_indirect(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 30, Vector<RID>({ material_sampler, sc_indirect }));
-	RID sc_indirect_dyn = use_cards ? surface_cache->get_indirect_dyn_atlas() : default_black;
+	// The dynamic lights' bounce as the readers take it: both bounces summed
+	// and filtered over the card while young, the age to read it at in the
+	// alpha (surface_cache_light.glsl filter_dynamic). Bound twice: the
+	// shader's two dynamic samplers both read it.
+	RID sc_indirect_dyn = use_cards ? surface_cache->get_indirect_dyn_filtered_atlas() : default_black;
 	RD::Uniform u_sc_indirect_dyn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 31, Vector<RID>({ material_sampler, sc_indirect_dyn }));
-	RID sc_indirect_dyn2 = use_cards ? surface_cache->get_indirect_dyn2_atlas() : default_black;
-	RD::Uniform u_sc_indirect_dyn2(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 32, Vector<RID>({ material_sampler, sc_indirect_dyn2 }));
+	RD::Uniform u_sc_indirect_dyn2(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 32, Vector<RID>({ material_sampler, sc_indirect_dyn }));
 	RID sc_albedo_atlas = use_cards ? surface_cache->get_albedo_atlas() : default_black;
 	RID sc_normal_atlas = use_cards ? surface_cache->get_normal_atlas() : default_black;
 	RD::Uniform u_sc_albedo_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 33, Vector<RID>({ sampler, sc_albedo_atlas }));
@@ -1889,9 +1893,10 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 	RD::Uniform h_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, Vector<RID>({ surface_cache->get_sets_buffer() }));
 	RD::Uniform h_card_depth(RD::UNIFORM_TYPE_TEXTURE, 21, Vector<RID>({ surface_cache->get_depth_atlas() }));
 	RD::Uniform h_card_lighting(RD::UNIFORM_TYPE_TEXTURE, 22, Vector<RID>({ surface_cache->get_lighting_atlas() }));
-	RD::Uniform h_card_indirect(RD::UNIFORM_TYPE_TEXTURE, 25, Vector<RID>({ surface_cache->get_indirect_atlas() }));
-	RD::Uniform h_card_indirect_dyn(RD::UNIFORM_TYPE_TEXTURE, 26, Vector<RID>({ surface_cache->get_indirect_dyn_atlas() }));
-	RD::Uniform h_card_indirect_dyn2(RD::UNIFORM_TYPE_TEXTURE, 27, Vector<RID>({ surface_cache->get_indirect_dyn2_atlas() }));
+	RD::Uniform h_card_indirect(RD::UNIFORM_TYPE_TEXTURE, 25, Vector<RID>({ surface_cache->get_indirect_filtered_atlas() }));
+	// The filtered sum of the dynamic bounces (see the gather's binding 31).
+	RD::Uniform h_card_indirect_dyn(RD::UNIFORM_TYPE_TEXTURE, 26, Vector<RID>({ surface_cache->get_indirect_dyn_filtered_atlas() }));
+	RD::Uniform h_card_indirect_dyn2(RD::UNIFORM_TYPE_TEXTURE, 27, Vector<RID>({ surface_cache->get_indirect_dyn_filtered_atlas() }));
 	RID default_black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 	RID area = hit_lighting.area_light_buffer.is_valid() ? hit_lighting.area_light_buffer : rt_gi_dummy_buffer;
 	RD::Uniform h_area(RD::UNIFORM_TYPE_STORAGE_BUFFER, 28, Vector<RID>({ area }));

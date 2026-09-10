@@ -174,6 +174,10 @@ void SurfaceCache::_create_atlases() {
 	rd->texture_clear(indirect_dyn_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	indirect_dyn2_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(indirect_dyn2_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	indirect_dyn_filtered_atlas = rd->texture_create(tf, RD::TextureView());
+	rd->texture_clear(indirect_dyn_filtered_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	indirect_filtered_atlas = rd->texture_create(tf, RD::TextureView());
+	rd->texture_clear(indirect_filtered_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	static_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(static_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	tf.format = RD::DATA_FORMAT_R32G32B32A32_UINT; // Six packed halves; see the shader.
@@ -234,7 +238,7 @@ void SurfaceCache::_free_atlases() {
 			rid = RID();
 		}
 	}
-	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &static_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -845,6 +849,12 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (settings.shared_bounce_ray) {
 		params.flags |= 16;
 	}
+	// GODOT_CARD_DYN_FILTER=0: the dynamic bounce reaches the readers raw
+	// (the filter over the card while the histories are young off).
+	static const bool dyn_filter = OS::get_singleton()->get_environment("GODOT_CARD_DYN_FILTER") != "0";
+	if (dyn_filter) {
+		params.flags |= 128;
+	}
 	params.temporal_frames = MAX(settings.temporal_frames, 1u);
 	params.atlas_size = settings.atlas_size;
 	// The world light grid: GRID_N cells across twice the light radius,
@@ -1095,12 +1105,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// The projector textures (never sampled without a projector rect).
 	RD::Uniform l_decal_atlas(RD::UNIFORM_TYPE_TEXTURE, 31, Vector<RID>({ p_inputs.decal_atlas.is_valid() ? p_inputs.decal_atlas : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK) }));
 	RD::Uniform l_projector_tables(RD::UNIFORM_TYPE_STORAGE_BUFFER, 32, Vector<RID>({ projector_tables_buffer }));
+	RD::Uniform l_indirect_dyn_filtered(RD::UNIFORM_TYPE_IMAGE, 33, Vector<RID>({ indirect_dyn_filtered_atlas }));
+	RD::Uniform l_indirect_filtered(RD::UNIFORM_TYPE_IMAGE, 34, Vector<RID>({ indirect_filtered_atlas }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

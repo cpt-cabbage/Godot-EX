@@ -98,6 +98,7 @@ params;
 #define FLAG_SKY_MODE_SKY 2u
 #define FLAG_SKY_MODE_COLOR 4u
 #define FLAG_SHARED_BOUNCE_RAY 16u
+#define FLAG_DYN_FILTER 128u // The dynamic bounce filtered over the card while its histories are young (filter_dynamic; GODOT_CARD_DYN_FILTER=0 clears it).
 #define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
 #define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights. // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
 
@@ -269,6 +270,16 @@ layout(set = 0, binding = 32, std430) restrict readonly buffer ProjectorTables {
 	float data[];
 }
 proj_tables;
+// The dynamic bounces as the readers take them (the gather's fallback and
+// hits, the hit shader, this pass's own recursion): both histories summed,
+// and while they are young filtered over the card (filter_dynamic); the
+// alpha is the age the readers should read it at (the filter's samples
+// counted in), 64ths.
+layout(set = 0, binding = 33, rgba16f) uniform restrict image2D indirect_dyn_filtered_atlas;
+// The static bounce accumulation the same way: filtered over the card for
+// the readers (the gather's fallback and youth, the hit shader), the
+// accumulation itself staying raw in indirect_atlas. Alpha: its relights.
+layout(set = 0, binding = 34, rgba16f) uniform restrict image2D indirect_filtered_atlas;
 #define PROJ_TABLE_N 16u
 #define PROJ_TABLE_FLOATS 528u
 
@@ -1220,7 +1231,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 					// and, through the later history's own readings, every
 					// one after (a bounce of lag apiece); the static
 					// accumulation holds none of the dynamic lights' light.
-					vec3 dyn_hit = max(imageLoad(indirect_dyn_atlas, texel_hit).rgb, vec3(0.0)) + max(imageLoad(indirect_dyn2_atlas, texel_hit).rgb, vec3(0.0));
+					vec3 dyn_hit = max(imageLoad(indirect_dyn_filtered_atlas, texel_hit).rgb, vec3(0.0));
 					card_radiance = max(imageLoad(static_atlas, texel_hit).rgb, vec3(0.0));
 					r_dyn2 = albedo_hit * dyn_hit;
 					float vis_hit = imageLoad(static_atlas, texel_hit).a;
@@ -1389,6 +1400,106 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 	}
 	float rel = abs(t_now - prev.bounce_t) / max(max(t_now, prev.bounce_t), 0.05);
 	return smoothstep(0.05, 0.3, rel);
+}
+
+// The bounce a texel hands its readers: its histories filtered over the
+// card -- an a-trous 5x5 at a stride from the histories' age (3 texels at
+// one or two relights, 2 up to six, 1 from there on), the taps weighted by
+// the binomial kernel, by how alike the captured normals are and by how
+// near the stored depths (a tilted plane's depth climbs a few centimetres
+// a texel; another object in the same card sits tens of centimetres off).
+// The bounce is a smooth field and one cosine ray per texel per relight
+// estimates it: in a room lit by bounce alone the accumulation still
+// wandered by 6% of itself at three hundred relights, and where a moving
+// light kept the dynamic histories at a relight or two the readers used
+// to read them through the youth mip -- the 8x8 blocks the beam's bounce
+// blotched into -- as noisy as the block's few texels. The 5x5 binomial
+// cuts the noise by 3.7; at stride one its twelve lightest taps are
+// dropped (thirteen taps, the noise cut by 3.2) for half the fetches. The static and the dynamic
+// histories share the taps (one stride, the younger's); a texel whose
+// histories are both past sixteen relights refreshes its filtered value
+// every eighth relight only, staggered (the field moves slowly by then,
+// and the taps were two thirds of the lighting pass). The ages the
+// readers should take the results for count the taps in.
+void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn, float dyn_age, bool dynamic, ivec2 card_min, ivec2 card_max, out vec3 r_static, out float r_static_age, out vec3 r_dyn, out float r_dyn_age) {
+	r_static = own_static;
+	r_static_age = static_age;
+	r_dyn = own_dyn;
+	r_dyn_age = dyn_age;
+	if ((params.flags & FLAG_DYN_FILTER) == 0u) {
+		return;
+	}
+	float age = dynamic ? min(static_age, dyn_age) : static_age;
+	if (age > 16.0 && ((params.frame + uint(texel.x) + uint(texel.y)) & 7u) != 0u) {
+		// Between refreshes: the last filtered values stand.
+		vec4 prev_static = imageLoad(indirect_filtered_atlas, texel);
+		vec4 prev_dyn = imageLoad(indirect_dyn_filtered_atlas, texel);
+		if (prev_static.a > 0.0) {
+			r_static = prev_static.rgb;
+			r_static_age = prev_static.a * 64.0;
+		}
+		if (dynamic && prev_dyn.a > 0.0) {
+			r_dyn = prev_dyn.rgb;
+			r_dyn_age = prev_dyn.a * 64.0;
+		}
+		return;
+	}
+	int stride = age <= 2.0 ? 3 : (age <= 6.0 ? 2 : 1);
+	float depth_c = texelFetch(depth_atlas, texel, 0).r;
+	vec3 n_c = normalize(texelFetch(normal_atlas, texel, 0).rgb * 2.0 - 1.0);
+	float depth_tol = 0.1 + 0.08 * float(stride);
+	const float kernel[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+	vec3 sum_static = vec3(0.0);
+	vec3 sum_dyn = vec3(0.0);
+	float weight = 0.0;
+	float taps = 0.0;
+	for (int dy = -2; dy <= 2; dy++) {
+		for (int dx = -2; dx <= 2; dx++) {
+			ivec2 n = texel + ivec2(dx, dy) * stride;
+			if (any(lessThan(n, card_min)) || any(greaterThan(n, card_max))) {
+				continue;
+			}
+			float w = kernel[dx + 2] * kernel[dy + 2];
+			if (stride == 1 && w <= 4.0) {
+				continue; // At stride one (the histories past six relights) the twelve lightest taps go: a seventh of the weight for half the fetches.
+			}
+			vec3 v_static;
+			vec3 v_dyn;
+			if (dx == 0 && dy == 0) {
+				v_static = own_static;
+				v_dyn = own_dyn;
+			} else {
+				float depth_n = texelFetch(depth_atlas, n, 0).r;
+				if (depth_n <= 0.0 || abs(depth_n - depth_c) >= depth_tol) {
+					continue;
+				}
+				vec3 n_n = normalize(texelFetch(normal_atlas, n, 0).rgb * 2.0 - 1.0);
+				float align = max(dot(n_c, n_n), 0.0);
+				w *= align * align * align * align;
+				if (w <= 0.0) {
+					continue;
+				}
+				v_static = max(imageLoad(indirect_atlas, n).rgb, vec3(0.0));
+				v_dyn = dynamic ? (max(imageLoad(indirect_dyn_atlas, n).rgb, vec3(0.0)) + max(imageLoad(indirect_dyn2_atlas, n).rgb, vec3(0.0))) : vec3(0.0);
+				if (any(isnan(v_static)) || any(isinf(v_static)) || any(isnan(v_dyn)) || any(isinf(v_dyn))) {
+					continue;
+				}
+			}
+			sum_static += v_static * w;
+			sum_dyn += v_dyn * w;
+			weight += w;
+			taps += w / 36.0; // In centre-tap units: the kernel-equivalent sample count.
+		}
+	}
+	if (weight <= 0.0) {
+		return;
+	}
+	r_static = sum_static / weight;
+	r_static_age = min(static_age * max(taps, 1.0), 64.0);
+	if (dynamic) {
+		r_dyn = sum_dyn / weight;
+		r_dyn_age = min(dyn_age * max(taps, 1.0), 64.0);
+	}
 }
 
 // The temporal gradients and the accumulations, into the atlases. The card's
@@ -1644,6 +1755,19 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// histories (see the hand-over above); the readers add the histories.
 	vec3 indirect_stored = max(indirect - join * (dyn + dyn2), vec3(0.0));
 	imageStore(indirect_atlas, texel, vec4(indirect_stored, ind_pack(min(ind_frames + 1.0, 64.0), join)));
+	// What the readers take for the bounces: the accumulations filtered
+	// over the card (the accumulations themselves stay raw above).
+	vec3 ind_read;
+	float ind_read_age;
+	vec3 dyn_read;
+	float dyn_read_age;
+	filter_bounces(texel, indirect_stored, min(ind_frames + 1.0, 64.0), dyn + dyn2, dyn_frames, dyn_lights.count > 0u, card_min, card_max, ind_read, ind_read_age, dyn_read, dyn_read_age);
+	if (dyn_lights.count == 0u) {
+		dyn_read = vec3(0.0);
+		dyn_read_age = 0.0;
+	}
+	imageStore(indirect_filtered_atlas, texel, vec4(ind_read, ind_read_age / 64.0));
+	imageStore(indirect_dyn_filtered_atlas, texel, vec4(dyn_read, dyn_read_age / 64.0));
 
 	// The radiance the rays read: without the dynamic lights' direct term,
 	// which every reader adds from the lights' current state (the gather at
@@ -1651,8 +1775,8 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// beam where it was a frame ago never hands that beam to a reader
 	// subtracting it where it is now.
 	vec3 direct = d.exact + max(d.local_sum - d.dyn_sum, vec3(0.0)) * vis;
-	vec3 radiance = max(t.albedo * (direct + indirect_stored + dyn + dyn2) + t.emission, vec3(0.0));
-	vec3 static_radiance = max(t.albedo * (direct + indirect_stored) + t.emission, vec3(0.0));
+	vec3 radiance = max(t.albedo * (direct + ind_read + dyn_read) + t.emission, vec3(0.0));
+	vec3 static_radiance = max(t.albedo * (direct + ind_read) + t.emission, vec3(0.0));
 	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(static_radiance)) || any(isinf(static_radiance))) {
 		radiance = vec3(0.0);
 		static_radiance = vec3(0.0);

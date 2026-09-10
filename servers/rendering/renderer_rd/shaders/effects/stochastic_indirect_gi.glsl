@@ -334,8 +334,10 @@ float card_omni_attenuation(float dist, float inv_range, float decay) {
 // light counts as ten times its age (the youth tent and level are blurs,
 // and after any move every texel's dynamic history is young).
 float card_dynamic_age(ivec2 tex0, vec3 static_bounce) {
+	// Both bounces come summed in the one (filtered) atlas; its alpha is the
+	// age to read it at.
 	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, tex0, 0);
-	vec3 dyn = max(texelFetch(card_indirect_dyn_atlas, tex0, 0).rgb, vec3(0.0)) + max(dyn2.rgb, vec3(0.0));
+	vec3 dyn = max(dyn2.rgb, vec3(0.0));
 	float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
 	float share = dyn_lum / max(dyn_lum + dot(max(static_bounce, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
 	return dyn2.a * 64.0 / max(share, 0.05);
@@ -1449,7 +1451,8 @@ void main() {
 							vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
 							vec2 uv = t / float(params.surface_cache_atlas_size);
 							uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
-							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0)) + ((parts & 2u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0)) + ((parts & 4u) != 0u ? max(textureLod(card_indirect_dyn2_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
+							// The dynamic bounces come summed and filtered in the one atlas (parts 2 and 4 both select it).
+							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0)) + ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
 						}
 					}
 					ind /= 16.0;

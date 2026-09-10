@@ -151,6 +151,8 @@ private:
 	RID lighting_atlas_mips[LIGHTING_MIPS];
 	RID indirect_dyn_atlas; // RGBA16F, the dynamic lights' bounce (surface_cache_light.glsl trace_dynamic), alpha their direct term's luminance.
 	RID indirect_dyn2_atlas; // RGBA16F, their second bounce.
+	RID indirect_dyn_filtered_atlas; // RGBA16F, both dynamic bounces summed and filtered over the card (surface_cache_light.glsl filter_bounce); alpha the age the readers should take it for. What the readers read.
+	RID indirect_filtered_atlas; // RGBA16F, the static bounce accumulation filtered the same way; alpha its relights, 64ths. What the readers read in place of indirect_atlas.
 	RID static_atlas; // RGBA16F, the static lights' radiance alone, for the static cosine rays (surface_cache_light.glsl static_atlas).
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
 	// RGBA32UI, six packed halves: the unshadowed direct radiance (in
@@ -415,6 +417,8 @@ public:
 	RID get_indirect_atlas() const { return indirect_atlas; }
 	RID get_indirect_dyn_atlas() const { return indirect_dyn_atlas; }
 	RID get_indirect_dyn2_atlas() const { return indirect_dyn2_atlas; }
+	RID get_indirect_dyn_filtered_atlas() const { return indirect_dyn_filtered_atlas; }
+	RID get_indirect_filtered_atlas() const { return indirect_filtered_atlas; }
 	RID get_dynamic_lights_buffer() const { return dynamic_lights_buffer; }
 	RID get_static_atlas() const { return static_atlas; }
 	uint32_t get_dynamic_light_count() const { return dynamic_light_count; }

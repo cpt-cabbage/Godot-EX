@@ -509,9 +509,11 @@ bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec
 	// (surface_cache_light.glsl accumulate; their age is the second one's
 	// alpha), counted by their share of the bounce here: the tent is a
 	// blur, and after any move every texel's dynamic history is young.
+	// Both bounces come summed and filtered in the one atlas, its alpha the
+	// age to read it at (surface_cache_light.glsl filter_dynamic).
 	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, ivec2(card_hit_texel), 0);
 	if (dyn2.a > 0.0) {
-		vec3 dyn = max(texelFetch(card_indirect_dyn_atlas, ivec2(card_hit_texel), 0).rgb, vec3(0.0)) + max(dyn2.rgb, vec3(0.0));
+		vec3 dyn = max(dyn2.rgb, vec3(0.0));
 		float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
 		float share = dyn_lum / max(dyn_lum + dot(max(ind0.rgb, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
 		relights = min(relights, dyn2.a * 64.0 / max(share, 0.05));
@@ -528,7 +530,7 @@ bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec
 	for (int dy = 0; dy < 4; dy++) {
 		for (int dx = 0; dx < 4; dx++) {
 			vec2 t = clamp(card_hit_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
-			ind += textureLod(sampler2D(card_indirect_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb + max(textureLod(sampler2D(card_indirect_dyn_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb, vec3(0.0)) + max(textureLod(sampler2D(card_indirect_dyn2_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb, vec3(0.0));
+			ind += textureLod(sampler2D(card_indirect_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb + max(textureLod(sampler2D(card_indirect_dyn_atlas, linear_sampler_mipmaps), t / params.card_atlas_size, 0.0).rgb, vec3(0.0));
 		}
 	}
 	r_indirect = max(ind / 16.0, vec3(0.0));
