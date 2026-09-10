@@ -2025,6 +2025,16 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 		}
 	}
 
+	// Fifty string-hashed lookups a frame otherwise: the settings are read
+	// again only when the project settings changed (their version counts
+	// every set).
+	const uint32_t settings_version = ProjectSettings::get_singleton()->get_version();
+	if (settings_version == rt_settings_version) {
+		_update_ray_tracing_backend();
+		return;
+	}
+	rt_settings_version = settings_version;
+
 	use_raytraced_shadows = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
 	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/rays_per_pixel"));
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
@@ -2074,6 +2084,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi_specular_occlusion = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular_occlusion");
 	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/reflection_probe_refit");
 	rt_gi_ao_range = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/occlusion_range");
+	rt_gi_replaces_ssao = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/replace_ssao");
 	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directionality");
 	use_surface_cache = GLOBAL_GET("rendering/ray_tracing/surface_cache/enabled");
 	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
@@ -2110,6 +2121,10 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	stochastic_quality.spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/denoiser/spatial_iterations"));
 	stochastic_quality.variance_threshold = GLOBAL_GET("rendering/ray_tracing/denoiser/variance_threshold");
 
+	_update_ray_tracing_backend();
+}
+
+void RenderForwardClustered::_update_ray_tracing_backend() {
 	// Lazily create the ray tracing backend the first frame anything needs it.
 	// SDFGI probe rays alone only warrant it once SDFGI is actually rendering.
 	if ((use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || (use_rt_sdfgi_probes && sdfgi_used_last_frame)) && raytracing == nullptr) {
@@ -2675,7 +2690,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	SceneShaderForwardClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
 	base_specialization.use_depth_fog = p_render_data->environment.is_valid() && environment_get_fog_mode(p_render_data->environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH;
 
-	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
+	// Under the traced GI the gather's rays carry the occlusion SSAO
+	// approximates, so SSAO would darken the same corners twice (and cost
+	// its depth downsample); skipped like SSIL and SSR unless the project
+	// keeps it.
+	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment) && !(use_rt_gi && rt_gi_replaces_ssao);
 
 	if (depth_pre_pass) { //depth pre pass
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);

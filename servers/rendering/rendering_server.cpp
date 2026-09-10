@@ -3811,6 +3811,9 @@ void RenderingServer::init() {
 	// different lighting.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular_occlusion"), true);
+	// The gather's rays occlude for real, so screen-space AO would darken
+	// the same corners twice; skipped under the traced GI like SSIL and SSR.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/replace_ssao"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/reflection_probe_refit"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/occlusion_range", PROPERTY_HINT_RANGE, "0.1,20.0,0.1,or_greater"), 3.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/directionality", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);

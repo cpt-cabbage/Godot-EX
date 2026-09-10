@@ -864,6 +864,9 @@ private:
 	// Reads the live ray tracing project settings (called once per frame) and
 	// lazily creates the ray tracing backend when first enabled.
 	void _update_ray_tracing_settings();
+	void _update_ray_tracing_backend();
+	uint32_t rt_settings_version = UINT32_MAX; // ProjectSettings::get_version() the settings were last read at.
+	bool rt_gi_replaces_ssao = true; // rendering/ray_tracing/raytraced_gi/replace_ssao: SSAO is skipped under the traced GI, whose rays occlude for real.
 
 	// Surface cache (material cards the GI gather shades hits from): live
 	// settings, and the capture step that draws pending cards through the
@@ -927,6 +930,7 @@ private:
 
 public:
 	virtual bool needs_ray_tracing_instances() override;
+	virtual bool ray_tracing_owns_local_shadows() const override { return stochastic_owns_local_shadows; }
 	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) override;
 	virtual RID get_ray_tracing_tlas() const override;
 

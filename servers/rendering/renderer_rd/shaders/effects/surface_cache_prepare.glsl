@@ -97,6 +97,7 @@ layout(push_constant, std430) uniform Push {
 	uint omni_light_count;
 	uint spot_light_count;
 	uint max_blocks_per_set;
+	uint idle_divisor; // Settled cards under static lights: only one set in this many is due each frame (1: all).
 }
 push;
 
@@ -114,11 +115,18 @@ void main() {
 	// A set the gather reached last frame, or one just captured, is due now;
 	// everything else comes round on the period so stale lighting never lasts.
 	bool urgent = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || (push.frame - requests.frame[set]) <= 1u;
+	// Once the cards have settled under static lights (SurfaceCache's
+	// convergence count), a relight only re-derives what the texel already
+	// holds: the sets the hits reach take turns, one in idle_divisor a
+	// frame, and the round comes idle_divisor times slower. A fresh capture
+	// is due at once regardless.
+	bool fresh = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
+	bool turn = fresh || ((set + push.frame) % push.idle_divisor) == 0u;
 	bool pick;
 	if (push.mode == 0u) {
-		pick = urgent;
+		pick = urgent && turn;
 	} else {
-		pick = !urgent && ((set + push.frame) % push.round_robin_period) == 0u;
+		pick = !urgent && ((set + push.frame) % (push.round_robin_period * push.idle_divisor)) == 0u;
 	}
 	if (!pick) {
 		return;

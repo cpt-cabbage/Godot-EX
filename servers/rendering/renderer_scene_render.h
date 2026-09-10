@@ -283,6 +283,9 @@ public:
 	// Ray tracing wants the whole scene's geometry, not the frustum-culled
 	// subset: off-screen occluders must still block rays.
 	virtual bool needs_ray_tracing_instances() { return false; }
+	// Whether the ray traced lighting shaded every local light's shadow last
+	// frame, so the culler can skip their shadow map updates.
+	virtual bool ray_tracing_owns_local_shadows() const { return false; }
 	virtual void update_ray_tracing_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {}
 	// The frame's scene acceleration structure (null when unavailable), for
 	// consumers like the SDFGI probe integrator.

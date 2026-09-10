@@ -1031,14 +1031,11 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (dyn_young == "1" || (dyn_young != "0" && dyn_omni)) {
 		params.flags |= 64;
 	}
-	// The convergence count (converge_buffer), for the editor's idle
-	// repaints: only wanted in low processor usage mode, where frames stop
-	// on their own; a game draws every frame regardless.
-	bool count_convergence = OS::get_singleton()->is_in_low_processor_usage_mode() || OS::get_singleton()->has_environment("GODOT_CARD_CONVERGE_PRINT");
-	if (count_convergence) {
-		params.flags |= 4096;
-		rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
-	}
+	// The convergence count (converge_buffer): the editor's idle repaints
+	// and the idle relight budget below both read it.
+	const bool count_convergence = true;
+	params.flags |= 4096;
+	rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
@@ -1046,10 +1043,24 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	const uint32_t tile = settings.shared_bounce_ray ? 16 : 8;
 	const uint32_t max_blocks_per_set = CARDS_PER_SET * MAX(settings.max_card_size / tile, 1u) * MAX(settings.max_card_size / tile, 1u); // The longest edge squared: an upper bound, most groups of a smaller card exit at once.
 
+	// Settled cards under static lights: a relight re-derives what the
+	// texels hold, so the sets take turns, one in GODOT_CARD_IDLE (8) a
+	// frame, and the budget shrinks with them; anything that can change the
+	// lighting (a dynamic light, a light joining or leaving, a capture this
+	// frame) restores the full rate at once, and a change the rays find
+	// unsettles the count within a few relights. Measured (section 33): the
+	// lighting pass at rest 10.9 -> ... ms.
+	static const int64_t idle_setting = OS::get_singleton()->get_environment("GODOT_CARD_IDLE") == "" ? 8 : OS::get_singleton()->get_environment("GODOT_CARD_IDLE").to_int();
+	const uint32_t idle_divisor = uint32_t(CLAMP(idle_setting, 1, 64));
+	const bool idle = idle_divisor > 1 && !full_relight && dyn.count == 0 && RendererRD::LightStorage::get_singleton()->get_card_dynamic_change() <= 0.0f && pending_captures.is_empty() && _settled();
+	if (idle) {
+		budget = MAX(budget / idle_divisor, 4u);
+	}
 	PreparePushConstant push = {};
 	push.set_count = sets.size();
 	push.frame = p_inputs.frame;
 	push.budget = budget;
+	push.idle_divisor = idle ? idle_divisor : 1u;
 	// Profiling: GODOT_CARD_RR=n overrides the round-robin period (1 relights
 	// every captured set every frame, within the budget).
 	static const uint32_t rr_override = OS::get_singleton()->get_environment("GODOT_CARD_RR").to_int();
@@ -1188,7 +1199,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
-		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d", sets.size(), budget, push.round_robin_period));
+		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d", sets.size(), budget, push.round_robin_period, push.idle_divisor));
 		print_line(vformat("Dynamic lights: %d, motion this frame %.4f m, change %.3f", dyn.count, RendererRD::LightStorage::get_singleton()->get_card_dynamic_motion(), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 60 == 0) {

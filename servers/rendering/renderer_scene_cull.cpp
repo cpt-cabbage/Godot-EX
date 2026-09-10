@@ -3525,6 +3525,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		}
 
 		// Positional Shadows
+		const bool local_shadows_traced = p_reflection_probe.is_null() && scene_render->ray_tracing_owns_local_shadows();
 		for (uint32_t i = 0; i < (uint32_t)scene_cull_result.lights.size(); i++) {
 			Instance *ins = scene_cull_result.lights[i];
 
@@ -3636,7 +3637,11 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			// so that we can turn off tighter caster culling.
 			light->detect_light_intersects_multiple_cameras(Engine::get_singleton()->get_frames_drawn());
 
-			if (light->is_shadow_dirty()) {
+			// A renderer whose ray traced lighting owns every local light's
+			// shadow (last frame's verdict) needs neither the caster culls
+			// nor the atlas passes for them; a frame it turns out unable to,
+			// the atlas holds last frame's maps rather than nothing.
+			if (light->is_shadow_dirty() && !local_shadows_traced) {
 				// Dirty shadows have no need to be drawn if
 				// the light volume doesn't intersect the camera frustum.
 
@@ -3661,7 +3666,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 			bool redraw = RSG::light_storage->shadow_atlas_update_light(p_shadow_atlas, light->instance, coverage, light->last_version);
 
-			if (redraw && max_shadows_used < MAX_UPDATE_SHADOWS) {
+			if (redraw && !local_shadows_traced && max_shadows_used < MAX_UPDATE_SHADOWS) {
 				//must redraw!
 				RENDER_TIMESTAMP("> Render Light3D " + itos(i));
 				if (_light_instance_update_shadow(ins, p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect, p_shadow_atlas, scenario, p_screen_mesh_lod_threshold, p_visible_layers)) {

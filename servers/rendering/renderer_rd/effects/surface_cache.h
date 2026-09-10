@@ -320,6 +320,7 @@ private:
 		uint32_t omni_light_count;
 		uint32_t spot_light_count;
 		uint32_t max_blocks_per_set;
+		uint32_t idle_divisor; // Settled cards under static lights relight one set in this many (1: every due set).
 	};
 
 	struct LightParamsUBO {
