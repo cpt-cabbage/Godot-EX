@@ -1,8 +1,8 @@
 // Ray-traced hit shading: the geometry pool the BLAS surfaces are unpacked
 // into, the hit packets the GI gather defers to the materials, and the
 // per-ray result slots the resolve pass folds back. Mirrors the hit shading
-// half of RaytracedShadows in raytraced_shadows.cpp; the two must agree on
-// every constant here.
+// code in raytracing_scene.cpp (the pools and tables) and raytracing.cpp
+// (the packets and their binning); they must agree on every constant here.
 
 #define RT_HIT_MAX_MATERIALS 2048u
 #define RT_HIT_INVALID 0xFFFFFFFFu

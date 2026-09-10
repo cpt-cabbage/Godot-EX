@@ -369,7 +369,7 @@ struct ImplementationData {
 	uint pad_transparent_debug_1;
 	uint pad_transparent_debug_2;
 
-	// The translucency lighting volume (RaytracedShadows::process_translucency_volume):
+	// The translucency lighting volume (Raytracing::process_translucency_volume):
 	// bit 0, blended fragments read it for their direct light in place of the
 	// light loops and the shadow rays; bit 1, the fragments an alpha depth
 	// pre-pass wrote read it too. tv_size froxels, tv_length the view depth

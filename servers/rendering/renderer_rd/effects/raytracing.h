@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  raytraced_shadows.h                                                   */
+/*  raytracing.h                                                          */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -34,9 +34,7 @@
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/effects/rt_geometry_unpack.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
@@ -44,6 +42,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/translucency_volume.glsl.gen.h"
+#include "servers/rendering/renderer_rd/effects/raytracing_scene.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -112,14 +111,14 @@
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
 // Per-viewport temporal state, attached to the render buffers rather than held
-// on the (single, renderer-wide) RaytracedShadows object.
+// on the (single, renderer-wide) Raytracing object.
 #define RB_SCOPE_RT_STATE SNAME("rb_rt_state")
 
 namespace RendererRD {
 
 // One viewport's temporal state for the ray-traced passes.
 //
-// RaytracedShadows itself is created once per renderer and is walked through by
+// Raytracing itself is created once per renderer and is walked through by
 // every viewport that draws: the editor's 3D views, SubViewports, reflection
 // probe faces. The history textures the temporal filters ping-pong, though, are
 // created per render buffer. Keeping the ping-pong parity and the frame counter
@@ -215,12 +214,19 @@ public:
 	virtual void free_data() override;
 };
 
-// Ray-traced directional (sun) shadows using inline ray queries.
-// Maintains a BLAS per mesh and a per-frame TLAS over the visible instances,
-// then traces one shadow ray per pixel from the depth buffer toward the sun,
-// producing a screen-space visibility mask consumed by the scene shader.
-class RaytracedShadows {
+// The ray-traced lighting passes, over the scene RaytracingScene builds:
+// the sun's and the area lights' shadow masks, the stochastic direct lighting
+// (MegaLights), the indirect lighting gather with its reflections and
+// deferred hit shading, the translucency lighting volume, and the surface
+// cache they shade their hits from. One per renderer; every viewport walks
+// through it with its own temporal state (RenderBuffersRT).
+class Raytracing {
 private:
+	// The scene the passes trace against, and the hit shading's geometry.
+	RaytracingScene scene;
+	static constexpr uint32_t HIT_MAX_MATERIALS = RaytracingScene::HIT_MAX_MATERIALS;
+	using HitMaterial = RaytracingScene::HitMaterial;
+
 	struct PushConstant {
 		float inv_view_proj[16];
 		float light_pos[4]; // Directional: xyz to-sun dir, w tan half-angle. Area: xyz center.
@@ -242,10 +248,6 @@ private:
 	RID pipeline; // Directional variant.
 	RID area_pipeline;
 	RID sampler;
-
-	RaytracedShadowsDecodeShaderRD decode_shader;
-	RID decode_shader_version;
-	RID decode_pipeline;
 
 	RaytracedShadowsBlurShaderRD blur_shader;
 	RID blur_shader_version;
@@ -392,8 +394,6 @@ private:
 	// the renderer drives its captures through the material pass).
 	SurfaceCache *surface_cache = nullptr;
 	bool surface_cache_mirror_reflections = true;
-	uint32_t scene_frame = 0; // Counts update_scene() calls: the cache's clock.
-	uint32_t alpha_tested_instances = 0; // TLAS instances flagged non-opaque this frame (see update_scene).
 	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
 	RID rt_gi_dummy_rw_buffer; // The same for the buffers a shader writes.
 
@@ -458,150 +458,16 @@ private:
 		float pad[3];
 	};
 
-	struct DecodePushConstant {
-		float aabb_position[4];
-		float aabb_size[4];
-		uint32_t vertex_count;
-		uint32_t pad[3];
-	};
-
-	// A compressed-position decode that must re-run when its source deforms.
-	struct DecodeJob {
-		RID source;
-		RID dest;
-		uint32_t vertex_count = 0;
-		AABB aabb;
-	};
-
-	// One surface's unpack into the hit shading's geometry pool (see
-	// rt_geometry_unpack.glsl); re-run per frame for deforming geometry.
-	struct HitUnpackJob {
-		RID vertex_buffer;
-		RID attribute_buffer; // Null when the surface has no colour or uvs.
-		RID index_buffer; // Null when not indexed.
-		uint32_t vertex_count = 0;
-		uint32_t index_count = 0; // Three per triangle, indexed or not.
-		uint32_t position_stride = 0;
-		uint32_t normal_offset = 0;
-		uint32_t normal_stride = 0;
-		uint32_t attribute_stride = 0;
-		uint32_t uv_offset = 0;
-		uint32_t uv2_offset = 0;
-		uint32_t color_offset = 0;
-		uint32_t flags = 0;
-		uint32_t vertex_base = 0; // Pool offsets.
-		uint32_t index_base = 0;
-		AABB aabb;
-		Vector4 uv_scale;
-	};
-
-	struct MeshBlas {
-		RID blas; // Null if the mesh has no BLAS-eligible surfaces.
-		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
-		LocalVector<DecodeJob> decode_jobs; // Re-run per frame for deforming geometry.
-		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
-		bool built = false;
-		// The hit shading's view of the BLAS: its geometries (the casting
-		// surfaces, in the BLAS's order) as records over the pools.
-		LocalVector<uint32_t> geometry_surfaces; // The surface index of each geometry.
-		LocalVector<HitUnpackJob> unpack_jobs;
-		uint32_t geometry_base = 0xFFFFFFFF; // First record in hit_geometry_records, or none.
-		uint32_t pool_vertex_base = 0; // The pool ranges the geometries share.
-		uint32_t pool_vertex_count = 0;
-		uint32_t pool_index_base = 0;
-		uint32_t pool_index_count = 0;
-		bool unpacked = false;
-	};
-	// Variants per mesh: instances can exclude different surfaces from shadow
-	// casting (transparent glass being the classic case), and material
-	// overrides make that per instance, not per mesh.
-	HashMap<RID, LocalVector<MeshBlas>> blas_cache;
-
-	// Skinned / blend-shaped instances: one BLAS per mesh instance over its
-	// deformed vertex buffers, rebuilt every frame.
-	HashMap<RID, MeshBlas> skinned_blas_cache;
-
-	RID tlas;
-	uint32_t tlas_capacity = 0;
-
-	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer = RID());
-	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance = RID());
-
-	// Hit shading: the gather defers the hits its cards cannot shade to
-	// their materials, run in compute (scene_hit_shade.glsl). The geometry
-	// they read comes out of the meshes once, into pools; the materials are
-	// per frame, from the renderer.
 public:
 	struct GiCascades;
 	struct GiSky;
 	struct GiQuality;
-	static constexpr uint32_t HIT_MAX_MATERIALS = 2048;
-	static constexpr uint32_t HIT_INVALID = 0xFFFFFFFFu;
-
-	// A material as the hit shading dispatches it: its shader's hit variant
-	// and its uniform set (null when the material has no uniforms).
-	struct HitMaterial {
-		RID shader;
-		RID pipeline;
-		RID uniform_set;
-	};
-
-	// The renderer answers which material an instance's surface is drawn
-	// with, when that material can be run at a hit.
-	class HitMaterialResolver {
-	public:
-		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, HitMaterial &r_material) = 0;
-		virtual ~HitMaterialResolver() {}
-	};
-
-	// Mode 0: off. 1: the hits the cards cannot shade. 2: every hit (the
-	// cards then only serve the card lighting's bounce).
-	void set_hit_shading(uint32_t p_mode, HitMaterialResolver *p_resolver);
 
 private:
-	struct HitGeometryRecord {
-		uint32_t vertex_base;
-		uint32_t index_base;
-		uint32_t triangle_count;
-		uint32_t flags;
-	};
-
-	// A range allocator over a growable storage buffer; growth copies.
-	struct HitPool {
-		RID buffer;
-		uint32_t element_size = 4;
-		uint32_t capacity = 0;
-		struct Range {
-			uint32_t offset;
-			uint32_t count;
-		};
-		LocalVector<Range> free_ranges;
-		bool alloc(uint32_t p_count, uint32_t &r_offset); // False when the buffer must grow first.
-		void free(uint32_t p_offset, uint32_t p_count);
-		void grow(uint32_t p_min_capacity);
-		void release();
-	};
-
-	uint32_t hit_shading_mode = 0;
-	HitMaterialResolver *hit_material_resolver = nullptr;
-	HitPool hit_vertex_pool; // RT_HIT_VERTEX_WORDS words per vertex.
-	HitPool hit_index_pool;
-	HitPool hit_record_pool; // Allocates record indices; the records live below.
-	LocalVector<HitGeometryRecord> hit_geometry_records;
-	RID hit_geometry_buffer;
-	uint32_t hit_geometry_buffer_capacity = 0;
-	bool hit_geometry_dirty = false;
-
-	// Per frame: the material slots the instances' surfaces resolved to, and
-	// the table of slots per instance geometry the records index.
-	LocalVector<HitMaterial> hit_material_slots;
-	HashMap<uint64_t, uint32_t> hit_material_dedupe;
-	LocalVector<uint32_t> hit_material_table;
-	RID hit_material_table_buffer;
-	uint32_t hit_material_table_capacity = 0;
-	uint32_t hit_materials_dropped = 0; // Slots past HIT_MAX_MATERIALS this frame.
-
-	// The frame's packets, their binning, and the result slots.
+	// Hit shading: the gather defers the hits its cards cannot shade to
+	// their materials, run in compute (scene_hit_shade.glsl) over the
+	// geometry and material tables the scene keeps. The frame's packets,
+	// their binning, and the result slots:
 	RID hit_packets;
 	RID hit_sorted;
 	uint32_t hit_packet_capacity = 0;
@@ -612,9 +478,6 @@ private:
 	RID hit_dispatch_args;
 	RID hit_params_ubo;
 
-	RtGeometryUnpackShaderRD hit_unpack_shader;
-	RID hit_unpack_shader_version;
-	RID hit_unpack_pipeline;
 	RtHitBinShaderRD hit_bin_shader;
 	RID hit_bin_shader_version;
 	enum HitBinVariant {
@@ -624,24 +487,6 @@ private:
 		HIT_BIN_MAX,
 	};
 	RID hit_bin_pipelines[HIT_BIN_MAX];
-
-	struct HitUnpackPushConstant {
-		float aabb_position[4];
-		float aabb_size[4];
-		float uv_scale[4];
-		uint32_t vertex_count;
-		uint32_t index_count;
-		uint32_t position_stride;
-		uint32_t normal_offset;
-		uint32_t normal_stride;
-		uint32_t attribute_stride;
-		uint32_t uv_offset;
-		uint32_t uv2_offset;
-		uint32_t color_offset;
-		uint32_t flags;
-		uint32_t vertex_base;
-		uint32_t index_base;
-	};
 
 	struct HitBinPushConstant {
 		int32_t screen_size[2];
@@ -734,16 +579,7 @@ private:
 
 	static void _tier_stats_readback(const Vector<uint8_t> &p_data); // GODOT_GI_TIER_PRINT: the gather's tier counts.
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
-	void _build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance);
-	void _free_hit_geometry(MeshBlas &r_entry);
-	void _unpack_hit_geometry(MeshBlas &r_entry);
-	uint32_t _hit_material_slot(const HitMaterial &p_material);
 	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
-	// Finds (or creates) the cached BLAS variant for a mesh + surface mask,
-	// healing stale cache entries whose buffers were freed behind our back.
-	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
-	// Same for a deforming instance's per-frame BLAS.
-	MeshBlas *_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask);
 
 public:
 	// Live quality settings for the stochastic pass, read from the project
@@ -765,9 +601,12 @@ public:
 	// from the live project settings every frame.
 	uint32_t shadow_temporal_frames = 16;
 
-	// Rebuilds the TLAS from the frame's instances.
-	// Returns false if there is no geometry to trace against.
-	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position);
+	// Rebuilds the scene (its TLAS, and the surface cache's instance records)
+	// from the frame's instances. Returns false if there is no geometry to
+	// trace against.
+	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) { return scene.update(p_instances, p_camera_position, surface_cache); }
+	// See RaytracingScene::set_hit_shading.
+	void set_hit_shading(uint32_t p_mode, RaytracingScene::HitMaterialResolver *p_resolver) { scene.set_hit_shading(p_mode, p_resolver); }
 
 	// Traces the shadow mask for one view into the RB_SCOPE_RT_SHADOWS texture.
 	// p_tan_half_angle > 0 enables soft shadows sampling the sun's angular size,
@@ -897,7 +736,7 @@ public:
 	bool get_history_parity() const { return rb_state != nullptr && rb_state->history_parity; }
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
-	RID get_tlas() const { return tlas; }
+	RID get_tlas() const { return scene.get_tlas(); }
 
 	// Surface cache control. Enabling creates it (settings applied live);
 	// disabling frees it. update_scene() registers instances with it and
@@ -910,8 +749,8 @@ public:
 
 	// p_sky_use_octmap_array selects the sky radiance octmap layout the GI
 	// gather shader compiles against (must match the sky renderer's).
-	RaytracedShadows(bool p_sky_use_octmap_array);
-	~RaytracedShadows();
+	Raytracing(bool p_sky_use_octmap_array);
+	~Raytracing();
 };
 
 } // namespace RendererRD

@@ -2784,7 +2784,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	// The translucency lighting volume (transparent pass): a blended
 	// fragment reads its direct light from the froxel grid the ray tracer
-	// filled this frame (RaytracedShadows::process_translucency_volume) in
+	// filled this frame (Raytracing::process_translucency_volume) in
 	// place of the light loops and shadow rays below. The fragments an alpha
 	// depth pre-pass wrote keep the per-fragment shading unless the flag's
 	// second bit says otherwise: they are the surface's opaque core, where

@@ -30,7 +30,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // Light-type permutation (MegaLights' tile classification, reduced to the one
 // axis that pays here): the LTC area-light paths cost registers in every
 // pixel whether or not the frame has an area light, and this pass is
-// occupancy-bound. RaytracedShadows builds one pipeline per value and picks
+// occupancy-bound. Raytracing builds one pipeline per value and picks
 // by the frame's area light count, so a scene without area lights never
 // carries the code at all. Every area branch below tests this first.
 layout(constant_id = 0) const bool sc_has_area_lights = true;

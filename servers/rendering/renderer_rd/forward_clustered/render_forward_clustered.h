@@ -35,7 +35,7 @@
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
-#include "servers/rendering/renderer_rd/effects/raytraced_shadows.h"
+#include "servers/rendering/renderer_rd/effects/raytracing.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
@@ -789,7 +789,7 @@ private:
 	RendererRD::TAA *taa = nullptr;
 	RendererRD::FSR2Effect *fsr2_effect = nullptr;
 	RendererRD::SSEffects *ss_effects = nullptr;
-	RendererRD::RaytracedShadows *rt_shadows = nullptr;
+	RendererRD::Raytracing *raytracing = nullptr;
 	bool use_raytraced_shadows = false;
 	uint32_t rt_shadow_rays = 4;
 	bool use_stochastic_lighting = false;
@@ -859,7 +859,7 @@ private:
 	// Whether the last main-view frame rendered SDFGI (drives whether the TLAS
 	// must be built when only the SDFGI probe integrator consumes it).
 	bool sdfgi_used_last_frame = false;
-	RendererRD::RaytracedShadows::StochasticQuality stochastic_quality;
+	RendererRD::Raytracing::StochasticQuality stochastic_quality;
 
 	// Reads the live ray tracing project settings (called once per frame) and
 	// lazily creates the ray tracing backend when first enabled.
@@ -876,7 +876,7 @@ private:
 	// SSR pass is skipped. GODOT_GI_SSR=1 forces stock SSR back for A/B runs.
 	bool _rt_gi_owns_reflections() const;
 	// The translucency lighting volume for the transparent pass.
-	RendererRD::RaytracedShadows::TranslucencyQuality translucency_quality;
+	RendererRD::Raytracing::TranslucencyQuality translucency_quality;
 	// Deferred hit shading: 0 off, 1 the hits the cards cannot shade, 2 every hit.
 	uint32_t rt_gi_hit_shading = 1;
 	bool rt_gi_hit_mirror = true;
@@ -886,9 +886,9 @@ private:
 	// Answers the ray tracer's question of which material an instance's
 	// surface is drawn with: the base material's (not a next pass or an
 	// overlay), when its shader compiled for a hit.
-	class HitMaterialResolver : public RendererRD::RaytracedShadows::HitMaterialResolver {
+	class HitMaterialResolver : public RendererRD::RaytracingScene::HitMaterialResolver {
 	public:
-		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracedShadows::HitMaterial &r_material) override;
+		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracingScene::HitMaterial &r_material) override;
 	};
 	HitMaterialResolver hit_material_resolver;
 	RendererRD::SurfaceCache::Settings surface_cache_settings;

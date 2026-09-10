@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  raytraced_shadows.cpp                                                 */
+/*  raytracing.cpp                                                        */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,7 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "raytraced_shadows.h"
+#include "raytracing.h"
 
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
@@ -76,7 +76,7 @@ static bool _luma_compress() {
 	return compress;
 }
 
-RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
+Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	Vector<String> shader_modes;
 	shader_modes.push_back("");
 	shader_modes.push_back("\n#define MODE_AREA\n");
@@ -87,22 +87,10 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, SHADER_VARIANT_DIRECTIONAL));
 	area_pipeline = RD::get_singleton()->compute_pipeline_create(shader.version_get_shader(shader_version, SHADER_VARIANT_AREA));
 
-	Vector<String> decode_modes;
-	decode_modes.push_back("");
-	decode_shader.initialize(decode_modes);
-	decode_shader_version = decode_shader.version_create();
-	decode_pipeline = RD::get_singleton()->compute_pipeline_create(decode_shader.version_get_shader(decode_shader_version, 0));
-
 	{
-		// Hit shading: the geometry unpack and the binning around the
-		// per-material dispatches (the materials' own shaders live with the
-		// scene shader).
-		Vector<String> unpack_modes;
-		unpack_modes.push_back("");
-		hit_unpack_shader.initialize(unpack_modes);
-		hit_unpack_shader_version = hit_unpack_shader.version_create();
-		hit_unpack_pipeline = RD::get_singleton()->compute_pipeline_create(hit_unpack_shader.version_get_shader(hit_unpack_shader_version, 0));
-
+		// Hit shading: the binning around the per-material dispatches (the
+		// materials' own shaders live with the scene shader, the geometry
+		// unpack with the scene).
 		Vector<String> bin_modes;
 		bin_modes.push_back("\n#define MODE_SCAN\n");
 		bin_modes.push_back("\n#define MODE_SCATTER\n");
@@ -112,9 +100,6 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 		for (int i = 0; i < HIT_BIN_MAX; i++) {
 			hit_bin_pipelines[i] = RD::get_singleton()->compute_pipeline_create(hit_bin_shader.version_get_shader(hit_bin_shader_version, i));
 		}
-		hit_vertex_pool.element_size = sizeof(uint32_t) * 8; // RT_HIT_VERTEX_WORDS.
-		hit_index_pool.element_size = sizeof(uint32_t);
-		hit_record_pool.element_size = 0; // CPU-side indices only.
 		rt_gi_dummy_buffer = RD::get_singleton()->storage_buffer_create(256);
 
 		Vector<String> translucency_modes;
@@ -237,41 +222,13 @@ RaytracedShadows::RaytracedShadows(bool p_sky_use_octmap_array) {
 	}
 }
 
-RaytracedShadows::~RaytracedShadows() {
-	// Scene teardown may already have cascade-freed acceleration structures
-	// through the mesh buffers they depend on, so validity is checked before
-	// freeing (freeing a dead RID would error). The decoded position buffers
-	// are ours alone and nothing else frees them. Order matters: TLAS first
-	// (it depends on every BLAS), then BLASes, then their input buffers.
-	if (tlas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(tlas)) {
-		RD::get_singleton()->free_rid(tlas);
-	}
-	for (const KeyValue<RID, LocalVector<MeshBlas>> &E : blas_cache) {
-		for (const MeshBlas &variant : E.value) {
-			if (variant.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(variant.blas)) {
-				RD::get_singleton()->free_rid(variant.blas);
-			}
-			for (const RID &buffer : variant.decoded_buffers) {
-				RD::get_singleton()->free_rid(buffer);
-			}
-		}
-	}
-	for (const KeyValue<RID, MeshBlas> &E : skinned_blas_cache) {
-		if (E.value.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(E.value.blas)) {
-			RD::get_singleton()->free_rid(E.value.blas);
-		}
-		for (const RID &buffer : E.value.decoded_buffers) {
-			RD::get_singleton()->free_rid(buffer);
-		}
-	}
-	hit_vertex_pool.release();
-	hit_index_pool.release();
-	for (RID rid : { hit_geometry_buffer, hit_material_table_buffer, hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo }) {
+Raytracing::~Raytracing() {
+	// The scene (TLAS, BLASes, geometry pools) frees itself as a member.
+	for (RID rid : { hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo }) {
 		if (rid.is_valid()) {
 			RD::get_singleton()->free_rid(rid);
 		}
 	}
-	hit_unpack_shader.version_free(hit_unpack_shader_version);
 	hit_bin_shader.version_free(hit_bin_shader_version);
 	translucency_shader.version_free(translucency_shader_version);
 	RD::get_singleton()->free_rid(sampler);
@@ -291,462 +248,12 @@ RaytracedShadows::~RaytracedShadows() {
 	RD::get_singleton()->free_rid(material_sampler);
 	shader.version_free(shader_version);
 	rt_gi_shader.version_free(rt_gi_shader_version);
-	decode_shader.version_free(decode_shader_version);
 	blur_shader.version_free(blur_shader_version);
 	temporal_shader.version_free(temporal_shader_version);
 	stochastic_shader.version_free(stochastic_shader_version);
 	stochastic_denoise_shader.version_free(stochastic_denoise_shader_version);
 	reflection_resolve_shader.version_free(reflection_resolve_shader_version);
 	light_list_shader.version_free(light_list_shader_version);
-}
-
-RID RaytracedShadows::_decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer) {
-	RD *rd = RD::get_singleton();
-	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
-
-	RID decoded = p_reuse_buffer;
-	if (decoded.is_null()) {
-		decoded = rd->vertex_buffer_create(p_vertex_count * sizeof(float) * 3, Vector<uint8_t>(),
-				BitField<RD::BufferCreationBits>(uint32_t(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) | uint32_t(RD::BUFFER_CREATION_AS_STORAGE_BIT)));
-	}
-	ERR_FAIL_COND_V(decoded.is_null(), RID());
-
-	DecodePushConstant push_constant = {};
-	push_constant.aabb_position[0] = p_aabb.position.x;
-	push_constant.aabb_position[1] = p_aabb.position.y;
-	push_constant.aabb_position[2] = p_aabb.position.z;
-	push_constant.aabb_size[0] = p_aabb.size.x;
-	push_constant.aabb_size[1] = p_aabb.size.y;
-	push_constant.aabb_size[2] = p_aabb.size.z;
-	push_constant.vertex_count = p_vertex_count;
-
-	RID decode_shader_rid = decode_shader.version_get_shader(decode_shader_version, 0);
-	RD::Uniform u_src(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ p_source_buffer }));
-	RD::Uniform u_dst(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ decoded }));
-
-	RENDER_TIMESTAMP("RT Mesh Decode");
-	rd->draw_command_begin_label("RT Mesh Decode");
-	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, decode_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(decode_shader_rid, 0, u_src, u_dst), 0);
-	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(DecodePushConstant));
-	rd->compute_list_dispatch_threads(compute_list, p_vertex_count, 1, 1);
-	rd->compute_list_end();
-	rd->draw_command_end_label();
-
-	return decoded;
-}
-
-void RaytracedShadows::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance) {
-	MeshStorage *mesh_storage = MeshStorage::get_singleton();
-
-	r_entry.surface_mask = p_surface_mask;
-
-	uint32_t surface_count = 0;
-	mesh_storage->mesh_get_surface_count_and_materials(p_mesh, surface_count);
-
-	thread_local LocalVector<RD::AccelerationStructureGeometry> geometries;
-	geometries.clear();
-
-	for (uint32_t i = 0; i < surface_count; i++) {
-		if (i < 32 && (p_surface_mask & (1u << i)) == 0) {
-			continue; // Surface does not cast shadows (e.g. transparent glass).
-		}
-		void *surface = mesh_storage->mesh_get_surface(p_mesh, i);
-		if (mesh_storage->mesh_surface_get_primitive(surface) != RSE::PRIMITIVE_TRIANGLES) {
-			continue;
-		}
-		uint64_t format = mesh_storage->mesh_surface_get_format(surface);
-		if (format & RSE::ARRAY_FLAG_USE_2D_VERTICES) {
-			continue;
-		}
-		uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(surface);
-		uint32_t index_count = mesh_storage->mesh_surface_get_index_count(surface);
-		if (index_count > 0 ? (index_count % 3) != 0 : (vertex_count % 3) != 0) {
-			continue;
-		}
-		RID vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, i);
-		if (p_mesh_instance.is_valid()) {
-			// Deformed surfaces read the skinned/blend-shaped output instead
-			// of the base geometry; rigid surfaces of the same mesh have no
-			// per-instance buffer and keep the base one.
-			RID skinned_buffer = mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(p_mesh_instance, i);
-			if (skinned_buffer.is_valid()) {
-				vertex_buffer = skinned_buffer;
-			}
-		}
-		if (vertex_buffer.is_null()) {
-			continue;
-		}
-
-		RD::AccelerationStructureGeometry geometry;
-		geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
-		if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-			// Compressed positions (R16G16B16A16_UNORM normalized into the surface AABB)
-			// can't feed an acceleration structure build directly; decode to float3 first.
-			RID decoded = _decode_compressed_positions(vertex_buffer, vertex_count, mesh_storage->mesh_surface_get_aabb(surface));
-			if (decoded.is_null()) {
-				continue;
-			}
-			r_entry.decoded_buffers.push_back(decoded);
-			// Deforming geometry re-decodes every frame; remember the job.
-			DecodeJob job;
-			job.source = vertex_buffer;
-			job.dest = decoded;
-			job.vertex_count = vertex_count;
-			job.aabb = mesh_storage->mesh_surface_get_aabb(surface);
-			r_entry.decode_jobs.push_back(job);
-			geometry.vertex_buffer = decoded;
-		} else {
-			// Uncompressed 3D positions are tightly packed floats at the start of the buffer.
-			geometry.vertex_buffer = vertex_buffer;
-		}
-		geometry.vertex_offset = 0;
-		geometry.vertex_stride = sizeof(float) * 3;
-		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
-		geometry.vertex_count = vertex_count;
-		if (index_count > 0) {
-			geometry.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(p_mesh, i);
-			geometry.index_count = index_count;
-		}
-		geometries.push_back(geometry);
-		r_entry.geometry_surfaces.push_back(i); // The geometry index a ray query reports is this surface.
-	}
-
-	if (geometries.is_empty()) {
-		return;
-	}
-	r_entry.blas = RD::get_singleton()->blas_create(geometries, 0);
-}
-
-RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask) {
-	RD *rd = RD::get_singleton();
-
-	LocalVector<MeshBlas> *variants = blas_cache.getptr(p_mesh);
-	if (variants != nullptr) {
-		// The BLAS may have been freed behind our back (e.g. the mesh was
-		// reimported and its surface buffers were recreated, cascading the
-		// free); all variants share those buffers, so all die together.
-		// The decoded position buffers are ours and did not cascade: free
-		// them here or they leak for the rest of the session.
-		bool stale = false;
-		for (const MeshBlas &variant : *variants) {
-			if (variant.blas.is_valid() && !rd->acceleration_structure_is_valid(variant.blas)) {
-				stale = true;
-				break;
-			}
-		}
-		if (stale) {
-			for (MeshBlas &variant : *variants) {
-				for (const RID &buffer : variant.decoded_buffers) {
-					rd->free_rid(buffer);
-				}
-				_free_hit_geometry(variant);
-			}
-			blas_cache.erase(p_mesh);
-			variants = nullptr;
-		}
-	}
-	if (variants == nullptr) {
-		variants = &blas_cache.insert(p_mesh, LocalVector<MeshBlas>())->value;
-	}
-	for (MeshBlas &variant : *variants) {
-		if (variant.surface_mask == p_surface_mask) {
-			return &variant;
-		}
-	}
-	MeshBlas new_entry;
-	_create_blas_for_mesh(p_mesh, new_entry, p_surface_mask);
-	variants->push_back(new_entry);
-	return &(*variants)[variants->size() - 1];
-}
-
-RaytracedShadows::MeshBlas *RaytracedShadows::_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask) {
-	RD *rd = RD::get_singleton();
-
-	MeshBlas *entry = skinned_blas_cache.getptr(p_mesh_instance);
-	if (entry != nullptr) {
-		// Same self-heal as the mesh cache: the BLAS cascade-frees with the
-		// instance's (or mesh's) buffers; our decoded buffers do not.
-		bool stale = entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas);
-		if (stale || entry->surface_mask != p_surface_mask) {
-			if (entry->blas.is_valid() && rd->acceleration_structure_is_valid(entry->blas)) {
-				rd->free_rid(entry->blas);
-			}
-			for (const RID &buffer : entry->decoded_buffers) {
-				rd->free_rid(buffer);
-			}
-			_free_hit_geometry(*entry);
-			skinned_blas_cache.erase(p_mesh_instance);
-			entry = nullptr;
-		}
-	}
-	if (entry == nullptr) {
-		MeshBlas new_entry;
-		_create_blas_for_mesh(p_mesh, new_entry, p_surface_mask, p_mesh_instance);
-		entry = &skinned_blas_cache.insert(p_mesh_instance, new_entry)->value;
-	}
-	return entry;
-}
-
-bool RaytracedShadows::update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {
-	RD *rd = RD::get_singleton();
-
-	if (tlas.is_valid() && !rd->acceleration_structure_is_valid(tlas)) {
-		// The TLAS depends on every BLAS it was built with, so freeing any mesh
-		// cascades into freeing the TLAS. Recreate it below.
-		tlas = RID();
-		tlas_capacity = 0;
-	}
-
-	thread_local LocalVector<RD::AccelerationStructureInstance> as_instances;
-	as_instances.clear();
-
-	scene_frame++;
-	alpha_tested_instances = 0;
-	if (surface_cache != nullptr) {
-		surface_cache->begin_frame(scene_frame, p_camera_position);
-	}
-	// The hit shading's per-frame tables: the materials the instances'
-	// surfaces resolve to, one slot per distinct (pipeline, uniform set).
-	const bool hit_shading = hit_shading_mode != 0 && hit_material_resolver != nullptr && surface_cache != nullptr;
-	hit_material_slots.clear();
-	hit_material_dedupe.clear();
-	hit_material_table.clear();
-	hit_materials_dropped = 0;
-
-	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-
-	for (uint64_t i = 0; i < p_instances.size(); i++) {
-		RenderGeometryInstanceBase *inst = static_cast<RenderGeometryInstanceBase *>(p_instances[i]);
-		const bool is_multimesh = inst->data->base_type == RSE::INSTANCE_MULTIMESH;
-		const bool is_skinned = !is_multimesh && inst->mesh_instance.is_valid();
-		if (inst->data->base_type != RSE::INSTANCE_MESH && !is_multimesh) {
-			continue; // Particles are not supported yet.
-		}
-		if (!inst->data->casts_shadows) {
-			continue; // Respects GeometryInstance3D's shadow casting setting (e.g. editor gizmos).
-		}
-		if (!inst->data->has_shadow_casting_surface || inst->data->shadow_casting_surface_mask == 0) {
-			continue; // Alpha-blended geometry does not cast shadows, as with shadow maps.
-		}
-		RID mesh = inst->data->base;
-		if (is_multimesh) {
-			mesh = mesh_storage->multimesh_get_mesh(inst->data->base);
-			if (mesh.is_null() || mesh_storage->multimesh_get_transform_format(inst->data->base) != RSE::MULTIMESH_TRANSFORM_3D) {
-				continue;
-			}
-		}
-		const uint32_t casting_mask = inst->data->shadow_casting_surface_mask;
-
-		// Surface cache cards for this instance (one set per geometry
-		// instance; a multimesh's sub-instances share none, they fall back to
-		// the coarse cache at hits).
-		// A multimesh gets one set too: the capture is of the whole multimesh
-		// in the instance's local space (the material pass draws every
-		// sub-instance), and every sub-instance's record maps the world into
-		// that space, so a hit on any of them reads the shared cards. Coarse
-		// for a field, right for a room's worth of chairs; before this the
-		// sub-instances had no cards at all (GODOT_CARD_NO_MULTIMESH=1 keeps
-		// that, for the comparison).
-		static const bool no_multimesh_cards = OS::get_singleton()->get_environment("GODOT_CARD_NO_MULTIMESH") == "1";
-		uint32_t card_set = SurfaceCache::INVALID_ID;
-		if (surface_cache != nullptr && !(is_multimesh && no_multimesh_cards)) {
-			card_set = surface_cache->add_instance(inst, is_skinned, is_skinned ? mesh_storage->mesh_instance_get_skeleton_version(inst->mesh_instance) : 0);
-		}
-
-		// Shadow rays cull front faces so that, like shadow maps, a surface
-		// occludes only through the faces its material draws. Surfaces drawn
-		// double-sided or with front-face culling need their own TLAS
-		// instance carrying the flag that changes that, so the casting
-		// surfaces split into up to three BLASes by facing class.
-		struct FacingClass {
-			uint32_t mask;
-			BitField<RD::AccelerationStructureInstanceFlagBits> flags;
-		};
-		const uint32_t double_sided = casting_mask & inst->data->double_sided_shadow_surface_mask;
-		const uint32_t front_cull = casting_mask & inst->data->front_cull_shadow_surface_mask & ~double_sided;
-		// Surfaces whose material covers only part of its triangles are a
-		// class of their own per facing, flagged non-opaque: the shaders
-		// with card tables then get their hits as candidates and confirm
-		// them from the cards' coverage (shaders without keep the opaque ray
-		// flag and see them whole, as before).
-		const uint32_t alpha_tested = surface_cache != nullptr ? (casting_mask & inst->data->alpha_tested_shadow_surface_mask) : 0;
-		const uint32_t plain = casting_mask & ~double_sided & ~front_cull;
-		const FacingClass classes[6] = {
-			{ plain & ~alpha_tested, {} },
-			{ double_sided & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT },
-			{ front_cull & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT },
-			{ plain & alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT },
-			{ double_sided & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
-			{ front_cull & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
-		};
-		if (alpha_tested != 0) {
-			alpha_tested_instances++;
-		}
-
-		for (const FacingClass &facing : classes) {
-			const uint32_t surface_mask = facing.mask;
-			if (surface_mask == 0) {
-				continue;
-			}
-
-			MeshBlas *entry;
-			if (is_skinned) {
-				// Deformed geometry: its own BLAS over the skinned vertex buffers,
-				// rebuilt every frame (the skinning dispatch is recorded earlier in
-				// the cull, so the build reads this frame's positions).
-				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
-			} else {
-				entry = _resolve_mesh_blas(mesh, surface_mask);
-			}
-			if (entry == nullptr || entry->blas.is_null()) {
-				continue;
-			}
-			if (is_skinned) {
-				for (const DecodeJob &job : entry->decode_jobs) {
-					_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
-				}
-				RENDER_TIMESTAMP("RT BLAS Build");
-				rd->draw_command_begin_label("RT BLAS Build");
-				rd->blas_build(entry->blas);
-				rd->draw_command_end_label();
-				entry->built = true;
-			} else if (!entry->built) {
-				RENDER_TIMESTAMP("RT BLAS Build");
-				rd->draw_command_begin_label("RT BLAS Build");
-				rd->blas_build(entry->blas);
-				rd->draw_command_end_label();
-				entry->built = true;
-			}
-
-			// The hit shading's geometry for this BLAS (once; every frame for
-			// a deforming one, whose pose the pool must follow), and the
-			// materials its geometries are drawn with this frame.
-			uint32_t material_base = SurfaceCache::INVALID_ID;
-			if (hit_shading) {
-				if (entry->geometry_base == HIT_INVALID) {
-					_build_hit_geometry(*entry, mesh, is_skinned ? inst->mesh_instance : RID());
-				}
-				if (entry->geometry_base != HIT_INVALID && (!entry->unpacked || is_skinned)) {
-					_unpack_hit_geometry(*entry);
-				}
-				if (entry->geometry_base != HIT_INVALID) {
-					material_base = hit_material_table.size();
-					for (uint32_t surface_index : entry->geometry_surfaces) {
-						HitMaterial hm;
-						uint32_t slot = HIT_INVALID;
-						if (hit_material_resolver->resolve(inst, surface_index, hm)) {
-							slot = _hit_material_slot(hm);
-						}
-						hit_material_table.push_back(slot);
-					}
-				}
-			}
-			const uint32_t geometry_base = hit_shading ? entry->geometry_base : HIT_INVALID;
-
-			RD::AccelerationStructureInstance as_instance;
-			// Instance mask from the object's render layers so per-light shadow
-			// caster masks can cull rays (exact for layers 1-8; objects on only
-			// higher layers degrade to always casting).
-			uint32_t layers = inst->layer_mask & 0xFF;
-			as_instance.mask = layers != 0 ? layers : 0xFF;
-			// Ray-query-only use has no hit SBT; a non-zero range with offset 0 satisfies validation.
-			as_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
-			as_instance.blas = entry->blas;
-
-			// A mirrored transform needs no facing flip here, unlike the raster
-			// passes' flipped cull: intersection tests facing in the BLAS's
-			// own space, where a reflection leaves the drawn side the drawn
-			// side (rt_lab/facing_test.gd MIRROR=1 measures both cases).
-			auto push_instance = [&](const Transform3D &p_transform) {
-				as_instance.transform = p_transform;
-				as_instance.flags = facing.flags;
-				// The custom index a ray query hands back: the cache's record
-				// for this TLAS instance (its cards, and its geometry and
-				// materials for the hit shading), or none.
-				as_instance.id = SurfaceCache::INVALID_ID;
-				if (surface_cache != nullptr && (card_set != SurfaceCache::INVALID_ID || geometry_base != HIT_INVALID)) {
-					as_instance.id = surface_cache->add_instance_record(card_set, is_multimesh ? inst->transform : p_transform, geometry_base, material_base, inst->shader_uniforms_offset);
-				}
-				as_instances.push_back(as_instance);
-			};
-
-			if (is_multimesh) {
-				// One TLAS instance per multimesh instance, sharing the BLAS. The
-				// per-instance transforms come from the multimesh data cache
-				// (reading it makes GPU-set buffers CPU-local once, then stays
-				// cheap). Capped so pathological instance counts (grass fields)
-				// cannot explode the TLAS; instances past the cap just don't
-				// occlude, matching how they'd LOD out of shadow maps anyway.
-				const int MAX_MULTIMESH_TLAS_INSTANCES = 16384;
-				int instance_count = mesh_storage->multimesh_get_instance_count(inst->data->base);
-				int visible = mesh_storage->multimesh_get_visible_instances(inst->data->base);
-				if (visible >= 0) {
-					instance_count = MIN(instance_count, visible);
-				}
-				instance_count = MIN(instance_count, MAX_MULTIMESH_TLAS_INSTANCES);
-				for (int mm = 0; mm < instance_count; mm++) {
-					push_instance(inst->transform * mesh_storage->multimesh_instance_get_transform(inst->data->base, mm));
-				}
-			} else {
-				push_instance(inst->transform);
-			}
-		}
-	}
-
-	if (surface_cache != nullptr) {
-		surface_cache->end_frame();
-	}
-	if (hit_shading) {
-		if (hit_geometry_dirty) {
-			uint32_t needed = MAX(hit_geometry_records.size(), 1u);
-			if (hit_geometry_buffer.is_null() || needed > hit_geometry_buffer_capacity) {
-				if (hit_geometry_buffer.is_valid()) {
-					rd->free_rid(hit_geometry_buffer);
-				}
-				hit_geometry_buffer_capacity = MAX(256u, Math::next_power_of_2(needed));
-				hit_geometry_buffer = rd->storage_buffer_create(hit_geometry_buffer_capacity * sizeof(HitGeometryRecord));
-			}
-			if (!hit_geometry_records.is_empty()) {
-				rd->buffer_update(hit_geometry_buffer, 0, hit_geometry_records.size() * sizeof(HitGeometryRecord), hit_geometry_records.ptr());
-			}
-			hit_geometry_dirty = false;
-		}
-		uint32_t needed = MAX(hit_material_table.size(), 1u);
-		if (hit_material_table_buffer.is_null() || needed > hit_material_table_capacity) {
-			if (hit_material_table_buffer.is_valid()) {
-				rd->free_rid(hit_material_table_buffer);
-			}
-			hit_material_table_capacity = MAX(1024u, Math::next_power_of_2(needed));
-			hit_material_table_buffer = rd->storage_buffer_create(hit_material_table_capacity * sizeof(uint32_t));
-		}
-		if (!hit_material_table.is_empty()) {
-			rd->buffer_update(hit_material_table_buffer, 0, hit_material_table.size() * sizeof(uint32_t), hit_material_table.ptr());
-		}
-		if (hit_materials_dropped > 0) {
-			WARN_PRINT_ONCE(vformat("Ray-traced hit shading: more than %d distinct materials in view; the hits of %d of them fall back to the probes.", HIT_MAX_MATERIALS, hit_materials_dropped));
-		}
-	}
-
-	if (as_instances.is_empty()) {
-		return false;
-	}
-
-	if (tlas.is_null() || as_instances.size() > tlas_capacity) {
-		if (tlas.is_valid()) {
-			rd->free_rid(tlas);
-		}
-		tlas_capacity = MAX(16u, Math::next_power_of_2(as_instances.size()));
-		tlas = rd->tlas_create(tlas_capacity, 0);
-		ERR_FAIL_COND_V(tlas.is_null(), false);
-	}
-
-	RENDER_TIMESTAMP("RT TLAS Build");
-	rd->draw_command_begin_label("RT TLAS Build");
-	bool built = rd->tlas_build(tlas, as_instances) == OK;
-	rd->draw_command_end_label();
-	return built;
 }
 
 void RenderBuffersRT::RtGiCacheCalibration::on_readback(const Vector<uint8_t> &p_data) {
@@ -823,7 +330,7 @@ void RenderBuffersRT::free_data() {
 	light_lists.clear();
 }
 
-void RaytracedShadows::set_surface_cache_enabled(bool p_enabled, const SurfaceCache::Settings &p_settings, bool p_mirror_reflections) {
+void Raytracing::set_surface_cache_enabled(bool p_enabled, const SurfaceCache::Settings &p_settings, bool p_mirror_reflections) {
 	surface_cache_mirror_reflections = p_mirror_reflections;
 	if (p_enabled && surface_cache == nullptr) {
 		surface_cache = memnew(SurfaceCache(p_settings, sky_uses_octmap_array));
@@ -835,13 +342,13 @@ void RaytracedShadows::set_surface_cache_enabled(bool p_enabled, const SurfaceCa
 	}
 }
 
-void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
-	if (surface_cache == nullptr || tlas.is_null()) {
+void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
+	if (surface_cache == nullptr || scene.get_tlas().is_null()) {
 		return;
 	}
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	SurfaceCache::LightingInputs in;
-	in.tlas = tlas;
+	in.tlas = scene.get_tlas();
 	// The scene's lights near the camera when the cull provided them (see
 	// LightStorage::update_card_light_buffers), else the view's.
 	if (light_storage->card_lights_are_valid()) {
@@ -863,7 +370,7 @@ void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_
 	in.directional_light_buffer = light_storage->get_directional_light_buffer();
 	in.directional_light_count = p_directional_light_count;
 	in.world_from_view = p_world_from_view;
-	in.frame = scene_frame;
+	in.frame = scene.get_frame();
 	in.ray_bias = p_ray_bias;
 	in.sdfgi_active = p_cascades.active;
 	in.sdfgi_ubo = p_cascades.sdfgi_ubo;
@@ -883,7 +390,7 @@ void RaytracedShadows::update_surface_cache_lighting(const Transform3D &p_world_
 	hit_lighting_valid = true;
 }
 
-void RaytracedShadows::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
+void Raytracing::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
 	Ref<RenderBuffersRT> state;
 	if (p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
 		state = p_render_buffers->get_custom_data(RB_SCOPE_RT_STATE);
@@ -896,7 +403,7 @@ void RaytracedShadows::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers)
 	rb_state = state.ptr();
 }
 
-RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
+RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
 	while (rb_state->reproject_history.size() <= p_view) {
 		rb_state->reproject_history.push_back(RenderBuffersRT::ReprojectHistory());
 	}
@@ -946,10 +453,10 @@ RID RaytracedShadows::_update_reproject_ubo(uint32_t p_view, const Projection &p
 	return h.ubo;
 }
 
-void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity) {
+void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
-	ERR_FAIL_COND(tlas.is_null());
+	ERR_FAIL_COND(scene.get_tlas().is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 
@@ -999,7 +506,7 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 
 	RID shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_DIRECTIONAL);
 
-	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ trace_target }));
 
@@ -1087,10 +594,10 @@ void RaytracedShadows::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 }
 
-void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays) {
+void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Vector3 &p_light_pos, const Vector3 &p_axis_u, const Vector3 &p_axis_v, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
-	ERR_FAIL_COND(tlas.is_null());
+	ERR_FAIL_COND(scene.get_tlas().is_null());
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 
@@ -1130,7 +637,7 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	RID area_shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_AREA);
 
-	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_slice }));
 
@@ -1168,10 +675,10 @@ void RaytracedShadows::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	rd->draw_command_end_label();
 }
 
-void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
+void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
-	ERR_FAIL_COND(tlas.is_null());
+	ERR_FAIL_COND(scene.get_tlas().is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cluster_buffer.is_null());
 	RD *rd = RD::get_singleton();
@@ -1318,12 +825,12 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	// occupancy on every pixel.
 	params.reservoir_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	const bool cards_ready = surface_cache != nullptr && surface_cache->is_ready();
-	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0) | ((cards_ready && alpha_tested_instances > 0) ? 4 : 0); // 4: FLAG_ALPHA_CASTERS
+	params.flags = (p_quality.light_guiding ? 1 : 0) | (p_quality.screen_traces ? 2 : 0) | ((cards_ready && scene.get_alpha_tested_instances() > 0) ? 4 : 0); // 4: FLAG_ALPHA_CASTERS
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);
 
-	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
 	RD::Uniform u_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ light_storage->get_omni_light_buffer() }));
@@ -1577,10 +1084,10 @@ void RaytracedShadows::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
-void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality) {
+void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
-	ERR_FAIL_COND(tlas.is_null());
+	ERR_FAIL_COND(scene.get_tlas().is_null());
 	ERR_FAIL_COND(p_normal_roughness.is_null());
 	ERR_FAIL_COND(p_cascades.sdfgi_ubo.is_null());
 	ERR_FAIL_COND(p_cascades.voxel_gi_ubo.is_null());
@@ -1759,7 +1266,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		}
 		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
 	}
-	params.surface_cache_frame = scene_frame;
+	params.surface_cache_frame = scene.get_frame();
 	// Diagnostics: GODOT_GI_FALLBACK=all shows the cards' bounce fallback at
 	// every pixel in place of the gathered GI (its bias and coverage against
 	// a converged run).
@@ -1794,7 +1301,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	// can be deferred); the results hold a slot per diffuse ray and one for
 	// the specular ray.
 	const uint32_t hit_slots = params.ray_count + 1;
-	const bool hit_shading = hit_shading_mode != 0 && use_cards && hit_lighting_valid && !hit_material_slots.is_empty();
+	const bool hit_shading = scene.get_hit_shading_mode() != 0 && use_cards && hit_lighting_valid && !scene.get_hit_materials().is_empty();
 	params.hit_capacity = 0;
 	if (hit_shading) {
 		const uint32_t pixels = uint32_t(size.x) * uint32_t(size.y);
@@ -1825,7 +1332,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->buffer_clear(hit_counts, 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 		params.hit_capacity = hit_packet_capacity;
 		params.flags |= 2048; // FLAG_HIT_SHADING
-		if (hit_shading_mode == 2) {
+		if (scene.get_hit_shading_mode() == 2) {
 			params.flags |= 4096; // FLAG_HIT_ALL
 		}
 		if (p_quality.hit_shading_mirror) {
@@ -1855,7 +1362,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	}
 	RID screen_radiance = p_screen_radiance.is_valid() ? p_screen_radiance : default_black;
 
-	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ rb_state->rt_gi_params_ubos[p_view] }));
@@ -1908,7 +1415,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 	if (rt_gi_dummy_rw_buffer.is_null()) {
 		rt_gi_dummy_rw_buffer = rd->storage_buffer_create(256);
 	}
-	RD::Uniform u_hit_materials(RD::UNIFORM_TYPE_STORAGE_BUFFER, 25, Vector<RID>({ hit_shading ? hit_material_table_buffer : rt_gi_dummy_buffer }));
+	RD::Uniform u_hit_materials(RD::UNIFORM_TYPE_STORAGE_BUFFER, 25, Vector<RID>({ hit_shading ? scene.get_hit_material_table_buffer() : rt_gi_dummy_buffer }));
 	RD::Uniform u_hit_packets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 26, Vector<RID>({ hit_shading ? hit_packets : rt_gi_dummy_rw_buffer }));
 	RD::Uniform u_hit_counts(RD::UNIFORM_TYPE_STORAGE_BUFFER, 27, Vector<RID>({ hit_shading ? hit_counts : rt_gi_dummy_rw_buffer }));
 	RD::Uniform u_hit_results(RD::UNIFORM_TYPE_STORAGE_BUFFER, 28, Vector<RID>({ hit_shading ? hit_results : rt_gi_dummy_rw_buffer }));
@@ -1958,7 +1465,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 		rd->buffer_get_data_async(calibration.buffer, callable_mp(calibration.state.ptr(), &RenderBuffersRT::RtGiCacheCalibration::on_readback), 0, 32);
 	}
 	if (tier_stats && (rb_state->frame_index % 60) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&RaytracedShadows::_tier_stats_readback), 24, 64);
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 64);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -2198,305 +1705,7 @@ void RaytracedShadows::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 /* Hit shading */
 
-bool RaytracedShadows::HitPool::alloc(uint32_t p_count, uint32_t &r_offset) {
-	for (uint32_t i = 0; i < free_ranges.size(); i++) {
-		Range &r = free_ranges[i];
-		if (r.count >= p_count) {
-			r_offset = r.offset;
-			r.offset += p_count;
-			r.count -= p_count;
-			if (r.count == 0) {
-				free_ranges.remove_at(i);
-			}
-			return true;
-		}
-	}
-	return false;
-}
-
-void RaytracedShadows::HitPool::free(uint32_t p_offset, uint32_t p_count) {
-	if (p_count == 0) {
-		return;
-	}
-	// Merge with a neighbour where there is one.
-	for (Range &r : free_ranges) {
-		if (r.offset + r.count == p_offset) {
-			r.count += p_count;
-			return;
-		}
-		if (p_offset + p_count == r.offset) {
-			r.offset = p_offset;
-			r.count += p_count;
-			return;
-		}
-	}
-	free_ranges.push_back({ p_offset, p_count });
-}
-
-void RaytracedShadows::HitPool::grow(uint32_t p_min_capacity) {
-	uint32_t new_capacity = MAX(MAX(capacity * 2, p_min_capacity), 1024u);
-	if (element_size > 0) {
-		RD *rd = RD::get_singleton();
-		RID new_buffer = rd->storage_buffer_create(uint64_t(new_capacity) * element_size);
-		if (buffer.is_valid()) {
-			if (capacity > 0) {
-				rd->buffer_copy(buffer, new_buffer, 0, 0, uint64_t(capacity) * element_size);
-			}
-			rd->free_rid(buffer);
-		}
-		buffer = new_buffer;
-	}
-	free(capacity, new_capacity - capacity);
-	capacity = new_capacity;
-}
-
-void RaytracedShadows::HitPool::release() {
-	if (buffer.is_valid()) {
-		RD::get_singleton()->free_rid(buffer);
-		buffer = RID();
-	}
-	free_ranges.clear();
-	capacity = 0;
-}
-
-void RaytracedShadows::set_hit_shading(uint32_t p_mode, HitMaterialResolver *p_resolver) {
-	hit_shading_mode = p_mode;
-	hit_material_resolver = p_resolver;
-}
-
-uint32_t RaytracedShadows::_hit_material_slot(const HitMaterial &p_material) {
-	if (p_material.pipeline.is_null() || p_material.shader.is_null()) {
-		return HIT_INVALID;
-	}
-	uint64_t key = hash_murmur3_one_64(p_material.pipeline.get_id(), hash_murmur3_one_64(p_material.uniform_set.get_id()));
-	if (const uint32_t *slot = hit_material_dedupe.getptr(key)) {
-		return *slot;
-	}
-	if (hit_material_slots.size() >= HIT_MAX_MATERIALS) {
-		hit_materials_dropped++;
-		return HIT_INVALID;
-	}
-	uint32_t slot = hit_material_slots.size();
-	hit_material_slots.push_back(p_material);
-	hit_material_dedupe.insert(key, slot);
-	return slot;
-}
-
-void RaytracedShadows::_build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance) {
-	MeshStorage *mesh_storage = MeshStorage::get_singleton();
-	r_entry.unpack_jobs.clear();
-	if (r_entry.geometry_surfaces.is_empty()) {
-		return;
-	}
-
-	// The pool ranges: every geometry's vertices and indices back to back.
-	uint32_t total_vertices = 0;
-	uint32_t total_indices = 0;
-	for (uint32_t surface_index : r_entry.geometry_surfaces) {
-		void *surface = mesh_storage->mesh_get_surface(p_mesh, surface_index);
-		uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(surface);
-		uint32_t index_count = mesh_storage->mesh_surface_get_index_count(surface);
-		total_vertices += vertex_count;
-		total_indices += index_count > 0 ? index_count : vertex_count;
-	}
-	uint32_t record_base = 0;
-	if (!hit_record_pool.alloc(r_entry.geometry_surfaces.size(), record_base)) {
-		hit_record_pool.grow(hit_record_pool.capacity + r_entry.geometry_surfaces.size());
-		hit_geometry_records.resize(hit_record_pool.capacity);
-		ERR_FAIL_COND(!hit_record_pool.alloc(r_entry.geometry_surfaces.size(), record_base));
-	}
-	if (!hit_vertex_pool.alloc(total_vertices, r_entry.pool_vertex_base)) {
-		hit_vertex_pool.grow(hit_vertex_pool.capacity + total_vertices);
-		ERR_FAIL_COND(!hit_vertex_pool.alloc(total_vertices, r_entry.pool_vertex_base));
-	}
-	if (!hit_index_pool.alloc(total_indices, r_entry.pool_index_base)) {
-		hit_index_pool.grow(hit_index_pool.capacity + total_indices);
-		ERR_FAIL_COND(!hit_index_pool.alloc(total_indices, r_entry.pool_index_base));
-	}
-	r_entry.pool_vertex_count = total_vertices;
-	r_entry.pool_index_count = total_indices;
-	r_entry.geometry_base = record_base;
-
-	uint32_t vertex_cursor = r_entry.pool_vertex_base;
-	uint32_t index_cursor = r_entry.pool_index_base;
-	for (uint32_t g = 0; g < r_entry.geometry_surfaces.size(); g++) {
-		uint32_t surface_index = r_entry.geometry_surfaces[g];
-		void *surface = mesh_storage->mesh_get_surface(p_mesh, surface_index);
-		uint64_t format = mesh_storage->mesh_surface_get_format(surface);
-		const bool compressed = format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
-		HitUnpackJob job;
-		job.vertex_count = mesh_storage->mesh_surface_get_vertex_count(surface);
-		uint32_t index_count = mesh_storage->mesh_surface_get_index_count(surface);
-		job.index_count = index_count > 0 ? index_count : job.vertex_count;
-		job.vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, surface_index);
-		if (p_mesh_instance.is_valid()) {
-			RID skinned = mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(p_mesh_instance, surface_index);
-			if (skinned.is_valid()) {
-				job.vertex_buffer = skinned;
-			}
-		}
-		job.attribute_buffer = mesh_storage->mesh_surface_get_attribute_buffer_rd_rid(p_mesh, surface_index);
-		if (index_count > 0) {
-			job.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(p_mesh, surface_index);
-		}
-		job.aabb = mesh_storage->mesh_surface_get_aabb(surface);
-		job.uv_scale = mesh_storage->mesh_surface_get_uv_scale(surface);
-		// The vertex buffer: positions, then the normal/tangent block (see
-		// MeshStorage::_mesh_surface_generate_vertex_format).
-		job.position_stride = compressed ? sizeof(uint16_t) * 4 : sizeof(float) * 3;
-		job.normal_offset = job.position_stride * job.vertex_count;
-		const bool has_tangent = format & RSE::ARRAY_FORMAT_TANGENT;
-		job.normal_stride = compressed ? sizeof(uint16_t) * 2 : (has_tangent ? sizeof(uint16_t) * 4 : sizeof(uint16_t) * 2);
-		// The attribute buffer: colour, uv, uv2, then the custom channels.
-		uint32_t stride = 0;
-		if (format & RSE::ARRAY_FORMAT_COLOR) {
-			job.color_offset = stride;
-			stride += 4;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV) {
-			job.uv_offset = stride;
-			stride += compressed ? 4 : 8;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV2) {
-			job.uv2_offset = stride;
-			stride += compressed ? 4 : 8;
-		}
-		for (int c = 0; c < RSE::ARRAY_CUSTOM_COUNT; c++) {
-			if (format & (uint64_t(RSE::ARRAY_FORMAT_CUSTOM0) << c)) {
-				const uint32_t fmt_shift[RSE::ARRAY_CUSTOM_COUNT] = { RSE::ARRAY_FORMAT_CUSTOM0_SHIFT, RSE::ARRAY_FORMAT_CUSTOM1_SHIFT, RSE::ARRAY_FORMAT_CUSTOM2_SHIFT, RSE::ARRAY_FORMAT_CUSTOM3_SHIFT };
-				uint32_t fmt = (format >> fmt_shift[c]) & RSE::ARRAY_FORMAT_CUSTOM_MASK;
-				const uint32_t fmtsize[RSE::ARRAY_CUSTOM_MAX] = { 4, 4, 4, 8, 4, 8, 12, 16 };
-				stride += fmtsize[fmt];
-			}
-		}
-		job.attribute_stride = stride;
-		job.flags = 0;
-		if (compressed) {
-			job.flags |= 1 | 2; // FLAG_COMPRESSED_POSITIONS | FLAG_COMPRESSED_ATTRIBUTES
-		}
-		if (has_tangent) {
-			job.flags |= 4;
-		}
-		if (format & RSE::ARRAY_FORMAT_NORMAL) {
-			job.flags |= 8;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV) {
-			job.flags |= 16;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV2) {
-			job.flags |= 32;
-		}
-		if (format & RSE::ARRAY_FORMAT_COLOR) {
-			job.flags |= 64;
-		}
-		if (index_count > 0) {
-			job.flags |= 256;
-			if (job.vertex_count <= 65536) {
-				job.flags |= 128;
-			}
-		}
-		job.vertex_base = vertex_cursor;
-		job.index_base = index_cursor;
-		r_entry.unpack_jobs.push_back(job);
-		static const bool debug_geometry = OS::get_singleton()->has_environment("RT_HIT_DEBUG");
-		if (debug_geometry) {
-			print_line(vformat("RT_HIT_DEBUG geometry: surface %d vertices %d indices %d format 0x%x flags 0x%x pos_stride %d normal_stride %d attr_stride %d uv_off %d", surface_index, job.vertex_count, job.index_count, uint32_t(format), job.flags, job.position_stride, job.normal_stride, job.attribute_stride, job.uv_offset));
-		}
-
-		HitGeometryRecord &rec = hit_geometry_records[record_base + g];
-		rec.vertex_base = vertex_cursor;
-		rec.index_base = index_cursor;
-		rec.triangle_count = job.index_count / 3;
-		rec.flags = 0;
-		if (format & RSE::ARRAY_FORMAT_NORMAL) {
-			rec.flags |= 1;
-		}
-		if (has_tangent) {
-			rec.flags |= 2;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV) {
-			rec.flags |= 4;
-		}
-		if (format & RSE::ARRAY_FORMAT_TEX_UV2) {
-			rec.flags |= 8;
-		}
-		if (format & RSE::ARRAY_FORMAT_COLOR) {
-			rec.flags |= 16;
-		}
-		vertex_cursor += job.vertex_count;
-		index_cursor += job.index_count;
-	}
-	r_entry.unpacked = false;
-	hit_geometry_dirty = true;
-}
-
-void RaytracedShadows::_free_hit_geometry(MeshBlas &r_entry) {
-	if (r_entry.geometry_base == HIT_INVALID) {
-		return;
-	}
-	hit_record_pool.free(r_entry.geometry_base, r_entry.geometry_surfaces.size());
-	hit_vertex_pool.free(r_entry.pool_vertex_base, r_entry.pool_vertex_count);
-	hit_index_pool.free(r_entry.pool_index_base, r_entry.pool_index_count);
-	r_entry.geometry_base = HIT_INVALID;
-	r_entry.pool_vertex_count = 0;
-	r_entry.pool_index_count = 0;
-	r_entry.unpack_jobs.clear();
-	r_entry.unpacked = false;
-}
-
-void RaytracedShadows::_unpack_hit_geometry(MeshBlas &r_entry) {
-	RD *rd = RD::get_singleton();
-	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
-	if (r_entry.unpack_jobs.is_empty() || hit_vertex_pool.buffer.is_null() || hit_index_pool.buffer.is_null()) {
-		return;
-	}
-	RID unpack_rid = hit_unpack_shader.version_get_shader(hit_unpack_shader_version, 0);
-	RENDER_TIMESTAMP("RT Hit Geometry Unpack");
-	rd->draw_command_begin_label("RT Hit Geometry Unpack");
-	RD::ComputeListID list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(list, hit_unpack_pipeline);
-	for (const HitUnpackJob &job : r_entry.unpack_jobs) {
-		if (job.vertex_buffer.is_null()) {
-			continue;
-		}
-		HitUnpackPushConstant pc = {};
-		pc.aabb_position[0] = job.aabb.position.x;
-		pc.aabb_position[1] = job.aabb.position.y;
-		pc.aabb_position[2] = job.aabb.position.z;
-		pc.aabb_size[0] = job.aabb.size.x;
-		pc.aabb_size[1] = job.aabb.size.y;
-		pc.aabb_size[2] = job.aabb.size.z;
-		pc.uv_scale[0] = job.uv_scale.x;
-		pc.uv_scale[1] = job.uv_scale.y;
-		pc.uv_scale[2] = job.uv_scale.z;
-		pc.uv_scale[3] = job.uv_scale.w;
-		pc.vertex_count = job.vertex_count;
-		pc.index_count = job.index_count;
-		pc.position_stride = job.position_stride;
-		pc.normal_offset = job.normal_offset;
-		pc.normal_stride = job.normal_stride;
-		pc.attribute_stride = job.attribute_stride;
-		pc.uv_offset = job.uv_offset;
-		pc.uv2_offset = job.uv2_offset;
-		pc.color_offset = job.color_offset;
-		pc.flags = job.flags;
-		pc.vertex_base = job.vertex_base;
-		pc.index_base = job.index_base;
-		RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ job.vertex_buffer }));
-		RD::Uniform u_attributes(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ job.attribute_buffer.is_valid() ? job.attribute_buffer : rt_gi_dummy_buffer }));
-		RD::Uniform u_indices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ job.index_buffer.is_valid() ? job.index_buffer : rt_gi_dummy_buffer }));
-		RD::Uniform u_vpool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ hit_vertex_pool.buffer }));
-		RD::Uniform u_ipool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ hit_index_pool.buffer }));
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(unpack_rid, 0, u_vertices, u_attributes, u_indices, u_vpool, u_ipool), 0);
-		rd->compute_list_set_push_constant(list, &pc, sizeof(HitUnpackPushConstant));
-		rd->compute_list_dispatch_threads(list, MAX(job.vertex_count, job.index_count), 1, 1);
-	}
-	rd->compute_list_end();
-	rd->draw_command_end_label();
-	r_entry.unpacked = true;
-}
-
-void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale) {
+void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale) {
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -2565,7 +1774,7 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	params.spot_light_count = hit_lighting.spot_light_count;
 	params.area_light_count = hit_lighting.area_light_buffer.is_valid() ? hit_lighting.area_light_count : 0;
 	params.directional_light_count = hit_lighting.directional_light_count;
-	params.frame = scene_frame;
+	params.frame = scene.get_frame();
 	params.ray_bias = p_quality.ray_bias;
 	params.sky_energy = p_sky.energy;
 	params.sky_border[0] = p_sky.border_size;
@@ -2635,13 +1844,13 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	RID omni = hit_lighting.omni_light_buffer.is_valid() ? hit_lighting.omni_light_buffer : rt_gi_dummy_buffer;
 	RID spot = hit_lighting.spot_light_buffer.is_valid() ? hit_lighting.spot_light_buffer : rt_gi_dummy_buffer;
 	RID grid_buffer = grid ? surface_cache->get_grid_buffer() : rt_gi_dummy_buffer;
-	RD::Uniform h_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform h_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform h_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 1, Vector<RID>({ hit_params_ubo }));
 	RD::Uniform h_sorted(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ hit_sorted }));
 	RD::Uniform h_packets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ hit_packets }));
-	RD::Uniform h_geometry(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ hit_geometry_buffer }));
-	RD::Uniform h_vpool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ hit_vertex_pool.buffer }));
-	RD::Uniform h_ipool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ hit_index_pool.buffer }));
+	RD::Uniform h_geometry(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ scene.get_hit_geometry_buffer() }));
+	RD::Uniform h_vpool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ scene.get_hit_vertex_buffer() }));
+	RD::Uniform h_ipool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ scene.get_hit_index_buffer() }));
 	RD::Uniform h_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, Vector<RID>({ surface_cache->get_instances_buffer() }));
 	RD::Uniform h_globals(RD::UNIFORM_TYPE_STORAGE_BUFFER, 8, Vector<RID>({ material_storage->global_shader_uniforms_get_storage_buffer() }));
 	RD::Uniform h_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 9, Vector<RID>({ omni }));
@@ -2673,8 +1882,9 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	RD::Uniform h_results(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ hit_results }));
 	{
 		RD::ComputeListID list = rd->compute_list_begin();
-		for (uint32_t s = 0; s < hit_material_slots.size(); s++) {
-			const HitMaterial &hm = hit_material_slots[s];
+		const LocalVector<HitMaterial> &materials = scene.get_hit_materials();
+		for (uint32_t s = 0; s < materials.size(); s++) {
+			const HitMaterial &hm = materials[s];
 			rd->compute_list_bind_compute_pipeline(list, hm.pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect, h_card_indirect_dyn, h_card_indirect_dyn2, h_area, h_area_atlas), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 1, su[0], su[1], su[2], su[3], su[4], su[5], su[6], su[7], su[8], su[9], su[10], su[11]), 1);
@@ -2705,14 +1915,14 @@ void RaytracedShadows::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_b
 	rd->draw_command_end_label();
 
 	static const bool debug_counts = OS::get_singleton()->has_environment("RT_HIT_DEBUG") || OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
-	if (debug_counts && (scene_frame % 60) == 0) {
-		rd->buffer_get_data_async(hit_counts, callable_mp_static(&RaytracedShadows::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
+	if (debug_counts && (scene.get_frame() % 60) == 0) {
+		rd->buffer_get_data_async(hit_counts, callable_mp_static(&Raytracing::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 	}
 }
 
 /* Translucency lighting volume */
 
-void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_projection, const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, uint32_t p_sun_caster_mask, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const TranslucencyQuality &p_quality) {
+void Raytracing::process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_projection, const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_directional_light_count, uint32_t p_sun_caster_mask, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_far, const TranslucencyQuality &p_quality) {
 	ERR_FAIL_NULL(rb_state);
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -2723,7 +1933,7 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	}
 	RenderBuffersRT::TranslucencyState &st = rb_state->translucency[p_view];
 	st.ready = false;
-	if (!p_quality.enabled || tlas.is_null() || p_cluster_buffer.is_null()) {
+	if (!p_quality.enabled || scene.get_tlas().is_null() || p_cluster_buffer.is_null()) {
 		return;
 	}
 
@@ -2805,7 +2015,7 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	rd->buffer_update(st.ubo, 0, sizeof(TranslucencyParamsUBO), &params);
 
 	RID shader_rid = translucency_shader.version_get_shader(translucency_shader_version, 0);
-	RD::Uniform t_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ tlas }));
+	RD::Uniform t_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, Vector<RID>({ scene.get_tlas() }));
 	RD::Uniform t_omni(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ light_storage->get_omni_light_buffer() }));
 	RD::Uniform t_spot(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ light_storage->get_spot_light_buffer() }));
 	RD::Uniform t_directional(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ light_storage->get_directional_light_buffer() }));
@@ -2848,7 +2058,7 @@ void RaytracedShadows::process_translucency_volume(Ref<RenderSceneBuffersRD> p_r
 	st.ready = true;
 }
 
-RID RaytracedShadows::get_translucency_volume_texture(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, int p_index) const {
+RID Raytracing::get_translucency_volume_texture(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, int p_index) const {
 	if (p_render_buffers.is_null() || !p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
 		return RID();
 	}
@@ -2860,7 +2070,7 @@ RID RaytracedShadows::get_translucency_volume_texture(Ref<RenderSceneBuffersRD> 
 	return st.textures[st.parity ? 1 : 0][CLAMP(p_index, 0, 3)];
 }
 
-bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj, bool *r_carries_indirect) const {
+bool Raytracing::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Vector3i &r_size, float &r_length, float &r_spread, Vector2 &r_inv_proj, bool *r_carries_indirect) const {
 	if (p_render_buffers.is_null() || !p_render_buffers->has_custom_data(RB_SCOPE_RT_STATE)) {
 		return false;
 	}
@@ -2879,7 +2089,7 @@ bool RaytracedShadows::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD>
 	return true;
 }
 
-void RaytracedShadows::_hit_counts_readback(const Vector<uint8_t> &p_data) {
+void Raytracing::_hit_counts_readback(const Vector<uint8_t> &p_data) {
 	if (p_data.size() < int((HIT_MAX_MATERIALS + 2) * sizeof(uint32_t))) {
 		return;
 	}
@@ -2916,7 +2126,7 @@ void RaytracedShadows::_hit_counts_readback(const Vector<uint8_t> &p_data) {
 	}
 }
 
-void RaytracedShadows::_tier_stats_readback(const Vector<uint8_t> &p_data) {
+void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 	if (p_data.size() < 64) {
 		return;
 	}
