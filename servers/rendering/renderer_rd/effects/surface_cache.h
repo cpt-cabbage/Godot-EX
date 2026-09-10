@@ -107,6 +107,7 @@ public:
 		RID directional_light_buffer;
 		RID area_light_buffer; // The area lights (the population's, like the omni and spot buffers), and the atlas their textures live in.
 		RID area_light_atlas;
+		RID decal_atlas; // The lights' projector textures (sRGB view); may be null when no light has one.
 		uint32_t omni_light_count = 0;
 		uint32_t spot_light_count = 0;
 		uint32_t area_light_count = 0;

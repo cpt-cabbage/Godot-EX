@@ -309,6 +309,7 @@ layout(set = 0, binding = 32) uniform sampler2D card_indirect_dyn2_atlas; // The
 layout(set = 0, binding = 33) uniform sampler2D card_albedo_atlas;
 layout(set = 0, binding = 34) uniform sampler2D card_normal_atlas;
 layout(set = 0, binding = 36) uniform sampler2D card_static_atlas; // Alpha: the dynamic lights' visibility ratio.
+layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic lights' projector textures (see card_dynamic_direct).
 layout(set = 0, binding = 35, std430) restrict readonly buffer DynamicLights {
 	uint count;
 	uint pad0;
@@ -350,12 +351,41 @@ vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
 		float len = length(rel);
 		float attenuation = card_omni_attenuation(len, ld.inv_radius, ld.attenuation);
 		vec3 l = rel / max(len, 1e-5);
-		if (ld.pad > 0.5) {
+		bool is_spot = ld.pad > 0.5;
+		if (is_spot) {
 			float scos = max(dot(-l, normalize(ld.direction)), ld.cone_angle);
 			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - ld.cone_angle));
 			attenuation *= 1.0 - pow(spot_rim, ld.cone_attenuation);
 		}
-		sum += ld.color * (max(dot(n, l), 0.0) * attenuation * (1.0 / 3.14159265359)) * dyn_lights.weights[i >> 2u][i & 3u];
+		float geom = max(dot(n, l), 0.0) * attenuation;
+		if (geom <= 0.0) {
+			continue;
+		}
+		vec3 color = ld.color;
+		// The projector texture, as the card lighting reads it
+		// (surface_cache_light.glsl projector_factor): a spot's cookie
+		// through the cards' world-space projector matrix, an omni's map
+		// through the dual paraboloid.
+		if (ld.projector_rect != vec4(0.0)) {
+			vec4 proj;
+			if (is_spot) {
+				vec4 splane = ld.shadow_matrix * vec4(world_pos, 1.0);
+				splane /= splane.w;
+				proj = textureLod(decal_atlas_srgb, splane.xy * ld.projector_rect.zw + ld.projector_rect.xy, 0.0);
+			} else {
+				vec3 local_v = normalize((ld.shadow_matrix * vec4(world_pos, 1.0)).xyz);
+				vec4 atlas_rect = ld.projector_rect;
+				if (local_v.z >= 0.0) {
+					atlas_rect.y += atlas_rect.w;
+				}
+				local_v.z = 1.0 + abs(local_v.z);
+				local_v.xy /= local_v.z;
+				local_v.xy = local_v.xy * 0.5 + 0.5;
+				proj = textureLod(decal_atlas_srgb, local_v.xy * atlas_rect.zw + atlas_rect.xy, 0.0);
+			}
+			color *= proj.rgb * proj.a;
+		}
+		sum += color * (geom * (1.0 / 3.14159265359)) * dyn_lights.weights[i >> 2u][i & 3u];
 	}
 	return sum;
 }

@@ -774,6 +774,50 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 	r_data.size = p_light->param[RSE::LIGHT_PARAM_SIZE];
 	r_data.inv_spot_attenuation = 1.0f / p_light->param[RSE::LIGHT_PARAM_SPOT_ATTENUATION];
 	r_data.cos_spot_angle = Math::cos(Math::deg_to_rad(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
+	if (p_light->projector.is_valid() && p_type != RSE::LIGHT_AREA) {
+		// The projector texture (a spot's cookie, an omni's dual paraboloid
+		// map), packed as update_light_buffers packs it, with a projector
+		// matrix of the cards' own from WORLD space: the scene's shadow
+		// matrix exists only while the light has a shadow, and the cards must
+		// see the cookie either way (without it they lit a flashlight's beam
+		// at the cookie's full brightness, and its bounce came out several
+		// times too bright). The shaders evaluate it at a world position.
+		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+		const Rect2 rect = texture_storage->decal_atlas_get_texture_rect(p_light->projector);
+		if (p_type == RSE::LIGHT_SPOT) {
+			r_data.projector_rect[0] = rect.position.x;
+			r_data.projector_rect[1] = rect.position.y + rect.size.height; // Flipped like the shadow.
+			r_data.projector_rect[2] = rect.size.width;
+			r_data.projector_rect[3] = -rect.size.height;
+			Projection cm;
+			cm.set_perspective(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE] * 2.0, 1.0, 0.01, radius);
+			Projection bias;
+			bias.set_light_bias();
+			Projection correction;
+			correction.set_depth_correction(false, true, false);
+			Projection projector_mtx = bias * correction * cm * Projection(light_transform.affine_inverse());
+			RendererRD::MaterialStorage::store_camera(projector_mtx, r_data.shadow_matrix);
+			// Diagnostics (GODOT_CARD_PROJ_PRINT): this matrix against the
+			// scene's own, built from the shadow camera, for a light with a
+			// shadow; they must agree for the cards' cookie to match the
+			// screen's.
+			static const bool proj_print = OS::get_singleton()->has_environment("GODOT_CARD_PROJ_PRINT");
+			if (proj_print && p_light->shadow) {
+				static uint32_t printed = 0;
+				if (printed < 2) {
+					printed++;
+					Projection stock = bias * correction * p_light_instance->shadow_transform[0].camera * Projection(light_transform.affine_inverse());
+					print_line(vformat("CARD_PROJ spot angle %.2f range %.2f\n  ours:  %s\n  stock: %s", p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE], radius, projector_mtx, stock));
+				}
+			}
+		} else {
+			r_data.projector_rect[0] = rect.position.x;
+			r_data.projector_rect[1] = rect.position.y;
+			r_data.projector_rect[2] = rect.size.width;
+			r_data.projector_rect[3] = rect.size.height * 0.5; // Half: the dual paraboloid's two halves.
+			RendererRD::MaterialStorage::store_transform(light_transform.affine_inverse(), r_data.shadow_matrix);
+		}
+	}
 	if (p_type == RSE::LIGHT_AREA) {
 		// The rect's axes, its energy per unit area, and its texture's place
 		// in the area light atlas with the mip count the LTC fetch may read,

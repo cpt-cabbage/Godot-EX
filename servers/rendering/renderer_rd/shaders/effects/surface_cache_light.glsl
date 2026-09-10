@@ -254,6 +254,9 @@ layout(set = 0, binding = 29, std430) restrict readonly buffer AreaLights {
 }
 area_lights;
 layout(set = 0, binding = 30) uniform texture2D area_light_atlas;
+// The projector textures (a spot's cookie, an omni's dual paraboloid map),
+// sampled where a light's projector_rect is set (see projector_factor).
+layout(set = 0, binding = 31) uniform texture2D decal_atlas_srgb;
 
 // Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
 // (see trace_dynamic; surface_cache.cpp prints and clears it).
@@ -689,6 +692,36 @@ LightData light_at(uint base, uint j, bool from_grid, out bool r_is_spot) {
 // cosine, the attenuation and the cone, over pi (the direct pass's terms).
 // r_pos is the light's world position, r_geom the geometric factor
 // (attenuation times cosine) the geometric gradient sums.
+// A light's projector texture at a world point (the direct pass's mapping:
+// a spot's cookie through a perspective projection, an omni's map through
+// the dual paraboloid), read through the cards' own world-space projector
+// matrix (light_storage.cpp _fill_card_light_data). One where the light has
+// none.
+vec3 projector_factor(LightData ld, bool is_spot, vec3 world_pos) {
+	if (ld.projector_rect == vec4(0.0)) {
+		return vec3(1.0);
+	}
+	vec4 proj;
+	if (is_spot) {
+		vec4 splane = ld.shadow_matrix * vec4(world_pos, 1.0);
+		splane /= splane.w;
+		vec2 proj_uv = splane.xy * ld.projector_rect.zw;
+		proj = textureLod(sampler2D(decal_atlas_srgb, linear_sampler_mipmaps), proj_uv + ld.projector_rect.xy, 0.0);
+	} else {
+		vec3 local_v = normalize((ld.shadow_matrix * vec4(world_pos, 1.0)).xyz);
+		vec4 atlas_rect = ld.projector_rect;
+		if (local_v.z >= 0.0) {
+			atlas_rect.y += atlas_rect.w;
+		}
+		local_v.z = 1.0 + abs(local_v.z);
+		local_v.xy /= local_v.z;
+		local_v.xy = local_v.xy * 0.5 + 0.5;
+		vec2 proj_uv = local_v.xy * atlas_rect.zw;
+		proj = textureLod(sampler2D(decal_atlas_srgb, linear_sampler_mipmaps), proj_uv + atlas_rect.xy, 0.0);
+	}
+	return proj.rgb * proj.a;
+}
+
 vec3 light_contribution_world(LightData ld, bool is_spot, vec3 light_pos, vec3 spot_dir, vec3 world_pos, vec3 n, out float r_geom) {
 	vec3 rel = light_pos - world_pos;
 	float len = length(rel);
@@ -701,7 +734,10 @@ vec3 light_contribution_world(LightData ld, bool is_spot, vec3 light_pos, vec3 s
 	}
 	float ndotl = max(dot(n, l), 0.0);
 	r_geom = ndotl * attenuation;
-	return ld.color * (r_geom * (1.0 / M_PI));
+	if (r_geom <= 0.0) {
+		return vec3(0.0);
+	}
+	return ld.color * projector_factor(ld, is_spot, world_pos) * (r_geom * (1.0 / M_PI));
 }
 
 // The scene's light buffers hold view-space positions and directions.

@@ -384,6 +384,7 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 		in.area_light_count = p_area_light_count;
 	}
 	in.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
+	in.decal_atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
 	in.directional_light_buffer = light_storage->get_directional_light_buffer();
 	in.directional_light_count = p_directional_light_count;
 	in.world_from_view = p_world_from_view;
@@ -1453,6 +1454,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_sc_normal_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 34, Vector<RID>({ sampler, sc_normal_atlas }));
 	RD::Uniform u_sc_dyn_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ use_cards ? surface_cache->get_dynamic_lights_buffer() : rt_gi_dummy_buffer }));
 	RD::Uniform u_sc_static(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 36, Vector<RID>({ sampler, use_cards ? surface_cache->get_static_atlas() : default_black }));
+	// The projector textures of the dynamic lights (never sampled without a
+	// projector rect, so the atlas may be absent).
+	RID gather_decal_atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
+	RD::Uniform u_sc_decal_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 37, Vector<RID>({ material_sampler, gather_decal_atlas.is_valid() ? gather_decal_atlas : default_black }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
@@ -1467,7 +1472,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1891,6 +1896,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 	RID area = hit_lighting.area_light_buffer.is_valid() ? hit_lighting.area_light_buffer : rt_gi_dummy_buffer;
 	RD::Uniform h_area(RD::UNIFORM_TYPE_STORAGE_BUFFER, 28, Vector<RID>({ area }));
 	RD::Uniform h_area_atlas(RD::UNIFORM_TYPE_TEXTURE, 29, Vector<RID>({ hit_lighting.area_light_atlas.is_valid() ? hit_lighting.area_light_atlas : default_black }));
+	RD::Uniform h_decal_atlas(RD::UNIFORM_TYPE_TEXTURE, 30, Vector<RID>({ hit_lighting.decal_atlas.is_valid() ? hit_lighting.decal_atlas : default_black }));
 	RD::Uniform h_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 23, Vector<RID>({ sampler, p_depth.is_valid() ? p_depth : default_black }));
 	RD::Uniform h_screen(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 24, Vector<RID>({ material_sampler, p_screen_radiance.is_valid() ? p_screen_radiance : default_black }));
 	Vector<RD::Uniform> su;
@@ -1903,7 +1909,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 		for (uint32_t s = 0; s < materials.size(); s++) {
 			const HitMaterial &hm = materials[s];
 			rd->compute_list_bind_compute_pipeline(list, hm.pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect, h_card_indirect_dyn, h_card_indirect_dyn2, h_area, h_area_atlas), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 0, h_tlas, h_params, h_sorted, h_packets, h_geometry, h_vpool, h_ipool, h_instances, h_globals, h_omni, h_spot, h_directional, h_grid, h_sdfgi, h_lightprobe, h_occlusion, h_sampler, h_sky, h_offsets, h_counts, h_sets, h_card_depth, h_card_lighting, h_depth, h_screen, h_card_indirect, h_card_indirect_dyn, h_card_indirect_dyn2, h_area, h_area_atlas, h_decal_atlas), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 1, su[0], su[1], su[2], su[3], su[4], su[5], su[6], su[7], su[8], su[9], su[10], su[11]), 1);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hm.shader, 2, h_results), 2);
 			if (hm.uniform_set.is_valid()) {

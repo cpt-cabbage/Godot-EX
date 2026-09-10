@@ -232,6 +232,7 @@ layout(set = 0, binding = 28, std430) restrict readonly buffer AreaLights {
 	LightData data[];
 }
 area_lights;
+layout(set = 0, binding = 30) uniform texture2D decal_atlas_srgb; // The lights' projector textures.
 layout(set = 0, binding = 29) uniform texture2D area_light_atlas; // Their second bounce.
 
 /* Set 1: the material samplers, by the names the compiler emits. */
@@ -745,6 +746,32 @@ vec3 shade_direct(vec3 world_pos, vec3 n_world, vec3 origin, inout uint seed) {
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
 			continue;
+		}
+		// The projector texture, as the card lighting reads it
+		// (surface_cache_light.glsl projector_factor): the cards' light
+		// buffers carry a world-space projector matrix.
+		if (ld.projector_rect != vec4(0.0)) {
+			vec4 proj;
+			if (is_spot) {
+				vec4 splane = ld.shadow_matrix * vec4(world_pos, 1.0);
+				splane /= splane.w;
+				proj = textureLod(sampler2D(decal_atlas_srgb, linear_sampler_mipmaps), splane.xy * ld.projector_rect.zw + ld.projector_rect.xy, 0.0);
+			} else {
+				vec3 local_v = normalize((ld.shadow_matrix * vec4(world_pos, 1.0)).xyz);
+				vec4 atlas_rect = ld.projector_rect;
+				if (local_v.z >= 0.0) {
+					atlas_rect.y += atlas_rect.w;
+				}
+				local_v.z = 1.0 + abs(local_v.z);
+				local_v.xy /= local_v.z;
+				local_v.xy = local_v.xy * 0.5 + 0.5;
+				proj = textureLod(sampler2D(decal_atlas_srgb, linear_sampler_mipmaps), local_v.xy * atlas_rect.zw + atlas_rect.xy, 0.0);
+			}
+			c *= proj.rgb * proj.a;
+			w = luminance(abs(c));
+			if (w <= 0.0) {
+				continue;
+			}
 		}
 		sum += c;
 		weight_sum += w;
