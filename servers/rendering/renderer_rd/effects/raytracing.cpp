@@ -466,6 +466,10 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// worth this many frames (0: the one sample, as before).
 		static const float spec_fix = OS::get_singleton()->get_environment("GODOT_GI_SPEC_FIX") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_FIX").to_float());
 		ubo.spec_fix = spec_fix;
+		// GODOT_GI_BORROW=<uv>: the frame-edge history borrow's reach (the
+		// shader's BORROW_BAND by default; 0 restarts every entering pixel).
+		static const float borrow_band = OS::get_singleton()->get_environment("GODOT_GI_BORROW") == "" ? 0.15f : float(OS::get_singleton()->get_environment("GODOT_GI_BORROW").to_float());
+		ubo.borrow_band = borrow_band;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
@@ -1220,7 +1224,27 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.ray_count = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	params.flags = 0;
 	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
-	params.screen_radiance_clamp = MAX(p_quality.screen_radiance_clamp, 0.0f);
+	// GODOT_GI_SRAD_CLAMP=<lum> overrides the project's absolute firefly
+	// ceiling on the screen term, GODOT_GI_SRAD_FLOOR=<lum> the allowance
+	// added above whichever ceiling applies (0.5).
+	static const String srad_clamp = OS::get_singleton()->get_environment("GODOT_GI_SRAD_CLAMP");
+	static const float srad_floor = OS::get_singleton()->get_environment("GODOT_GI_SRAD_FLOOR") == "" ? 0.5f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_FLOOR").to_float());
+	params.screen_radiance_clamp = MAX(srad_clamp == "" ? p_quality.screen_radiance_clamp : srad_clamp.to_float(), 0.0f);
+	// GODOT_GI_SRAD_YOUNG=<frames>: the screen term fades in with the hit
+	// pixel's own history over this many frames (0: trusted at once, the old
+	// behaviour); GODOT_GI_SRAD_RATIO=<x>: the firefly ceiling over the cache.
+	// Measured on the game's flick (section 33): the fade-in takes a quarter
+	// off the flash and nothing off the settle, so it is off by default.
+	static const float srad_young = OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG").to_float());
+	static const float srad_ratio = OS::get_singleton()->get_environment("GODOT_GI_SRAD_RATIO") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_RATIO").to_float());
+	params.screen_radiance_extra[0] = srad_young;
+	params.screen_radiance_extra[1] = srad_ratio;
+	params.screen_radiance_extra[2] = srad_floor;
+	// GODOT_GI_CALIB_CARDS=1 (diagnostics): the cards' hits join the
+	// calibration count in the probe slot, for RT_GI_CALIB_DEBUG to print
+	// the screen against the cards at the same points.
+	static const bool calib_cards = OS::get_singleton()->get_environment("GODOT_GI_CALIB_CARDS") == "1";
+	params.screen_radiance_extra[3] = calib_cards ? 1.0f : 0.0f;
 	params.probe_floor = MAX(p_quality.probe_floor, 0.0f);
 	// The calibration only has data while hits can be shaded from the screen.
 	bool calibrate = p_quality.cache_calibration && p_quality.screen_radiance && p_screen_radiance.is_valid();
@@ -1589,6 +1613,11 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		denoise_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
 		if (_luma_compress()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
+		}
+		// GODOT_GI_LUMSTOP=0: the spatial luminance stop off (experiment).
+		static const bool no_lum_stop = OS::get_singleton()->get_environment("GODOT_GI_LUMSTOP") == "0";
+		if (no_lum_stop) {
+			denoise_push_constant.flags |= DENOISE_FLAG_NO_LUM_STOP;
 		}
 		// Diagnostics: GODOT_GI_SPEC_ABLATE=change,smear,mismatch (or all)
 		// switches the named restarts of the reflection history off; paint

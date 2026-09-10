@@ -265,6 +265,20 @@ private:
 	uint32_t dynamic_light_count = 0;
 	uint32_t dynamic_generation = 0; // LightStorage::get_card_dynamic_generation as last seen; a change relights every set this frame.
 	RID relit_buffer; // Per set, two uints: the frame of the relight before the last, and of the last (the bounce gradient re-traces the previous relight's ray).
+	// The cards' settledness, for the editor's idle repaints: the lighting
+	// pass counts the texels it relit and those still converging (a bounce
+	// accumulation short of its window, or a live change mark); read back
+	// every few frames, one readback in flight.
+	RID converge_buffer;
+	static bool converge_pending;
+	static uint32_t converge_young;
+	static uint32_t converge_relit;
+	static uint32_t converge_up; // The settled texels' bounce luminance that rose this relight, summed (fixed point, 1/1024).
+	static uint32_t converge_down; // And that fell.
+	static double converge_drift; // |up - down| / (up + down), smoothed over the readbacks (1 while any count is young).
+	static uint64_t converge_readback_frame; // Engine frame the last readback landed on.
+	static void _converge_readback(const Vector<uint8_t> &p_data);
+	static bool _settled();
 	RID set_lights_buffer; // Per active slot: count + MAX_LIGHTS_PER_SET indices.
 	RID dispatch_buffer; // Indirect args for the lighting pass.
 	RID params_ubo;
@@ -426,6 +440,10 @@ public:
 	// shading reads it the way the card lighting does).
 	RID get_grid_buffer() const { return grid_buffer; }
 	bool is_grid_built() const { return last_grid_built; }
+	// Whether the cards' bounce has converged (fewer than one texel in a
+	// hundred still young among those relit); true until the first count
+	// lands so an idle viewport is not pinned by a cache that never lit.
+	bool is_settled() const;
 	Vector3 get_grid_origin() const { return last_grid_origin; }
 	float get_grid_cell() const { return last_grid_cell; }
 	uint32_t get_set_count() const { return sets.size(); }

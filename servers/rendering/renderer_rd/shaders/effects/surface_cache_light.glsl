@@ -280,6 +280,22 @@ layout(set = 0, binding = 33, rgba16f) uniform restrict image2D indirect_dyn_fil
 // the readers (the gather's fallback and youth, the hit shader), the
 // accumulation itself staying raw in indirect_atlas. Alpha: its relights.
 layout(set = 0, binding = 34, rgba16f) uniform restrict image2D indirect_filtered_atlas;
+
+// How settled the cards are, for the editor's idle repaints (see
+// RenderForwardClustered::_request_ray_tracing_convergence): of the texels
+// relit this frame, how many still have a bounce accumulation short of its
+// window or a live change mark. Counted when FLAG 4096 is set.
+layout(set = 0, binding = 35, std430) restrict buffer Converge {
+	uint young;
+	uint relit;
+	// The bounce's signed drift this relight, summed over the texels as the
+	// luminance that rose and the luminance that fell (fixed point): a
+	// converged field's relights cancel, a field still climbing through its
+	// bounces (every texel's window full, all of them trending) does not.
+	uint up;
+	uint down;
+}
+converge;
 #define PROJ_TABLE_N 16u
 #define PROJ_TABLE_FLOATS 528u
 
@@ -1692,6 +1708,23 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	float ind_alpha = max(1.0 / (ind_frames + 1.0), 1.0 / window);
 	vec3 indirect = ind_frames <= 0.0 ? indirect_sample : mix(old_indirect.rgb, indirect_sample, ind_alpha);
 	join *= ind_frames <= 0.0 ? 0.0 : 1.0 - ind_alpha;
+	if ((params.flags & 4096u) != 0u) {
+		// The editor's convergence count (the Converge buffer above): this
+		// texel is settled once its bounce has a window's worth of relights
+		// behind it and nothing marked it changed.
+		atomicAdd(converge.relit, 1u);
+		if (ind_frames + 1.0 < window - 1.0 || change_total > 0.05) {
+			atomicAdd(converge.young, 1u);
+		} else {
+			float drift = luminance(indirect) - luminance(old_indirect.rgb);
+			uint q = uint(min(abs(drift), 16.0) * 1024.0);
+			if (drift >= 0.0) {
+				atomicAdd(converge.up, q);
+			} else {
+				atomicAdd(converge.down, q);
+			}
+		}
+	}
 	if ((params.debug & 128u) != 0u) {
 		// Diagnostics (GODOT_CARD_ABLATE=paint, seen through GODOT_GI_FALLBACK=all):
 		// the texel's own radiance gradient, the re-traced bounce gradient,

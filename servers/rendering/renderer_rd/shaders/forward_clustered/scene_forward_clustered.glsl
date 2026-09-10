@@ -2599,6 +2599,12 @@ void fragment_shader(in SceneData scene_data) {
 
 	//finalize ambient light here
 	{
+		// Experiment (GODOT_GI_NO_AO): the material's and the screen-space
+		// occlusion left out of the ambient term, to measure what the GI
+		// gather's screen reads inherit from it (section 33).
+		if (bool(implementation_data.rt_gi & 128u)) {
+			ao = 1.0;
+		}
 #ifdef MULTI_BOUNCE_OCCLUSION_ENABLED
 		// Apply multi-bounce ambient-occlusion approximation to ambient light:
 		// https://blog.selfshadow.com/publications/s2016-shading-course/activision/s2016_pbs_activision_occlusion.pdf#page=78

@@ -287,6 +287,7 @@ private:
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
 		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
 		DENOISE_FLAG_MOD_PAINT = 4096, // Temporal (GI, diagnostics, GODOT_GI_MOD_PAINT): the card correction as a colour.
+		DENOISE_FLAG_NO_LUM_STOP = 8192, // Spatial (GI, experiment, GODOT_GI_LUMSTOP=0): the luminance stop off for settled pixels too.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -388,6 +389,7 @@ private:
 		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS).
 		uint32_t pad2;
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
+		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -455,7 +457,8 @@ private:
 		float mod_motion; // The dynamic lights' motion this frame (0: the field's change is not a lighting change).
 		float mod_dead; // The field's dead band (a relative change under it is the cards' relight noise).
 		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
-		float pad[3];
+		float borrow_band; // The frame-edge history borrow's reach outside the frame, in UV (GODOT_GI_BORROW; 0 off).
+		float pad[2];
 	};
 
 public:

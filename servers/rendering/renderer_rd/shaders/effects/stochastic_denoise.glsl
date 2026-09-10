@@ -28,6 +28,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
 #define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
 #define FLAG_MOD_PAINT 4096u // Diagnostics (GODOT_GI_MOD_PAINT): the card correction as a colour (red its change, green the field's confidence, blue the mark).
+#define FLAG_NO_LUM_STOP 8192u // Experiment (GODOT_GI_LUMSTOP=0): the spatial pass's luminance stop off for settled pixels too.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
@@ -169,7 +170,7 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// the change mark is worth once the raw 5x5 resolve has stood in for
 	// the changed part (0: the raw sample stands in, as before). GODOT_GI_SPEC_FIX.
 	float spec_fix;
-	float pad1;
+	float borrow_band; // How far outside the frame (UV) a history may lie and still borrow the edge's (GODOT_GI_BORROW; 0 never borrows).
 	float pad2;
 	float pad3;
 }
@@ -492,7 +493,7 @@ void main() {
 		// it would be worse than the noise.
 		bool borrowed = false;
 #ifdef DEPTH_HISTORY
-		if (!history_usable && all(greaterThanEqual(prev_uv, vec2(-BORROW_BAND))) && all(lessThanEqual(prev_uv, vec2(1.0 + BORROW_BAND)))) {
+		if (!history_usable && reprojection.borrow_band > 0.0 && all(greaterThanEqual(prev_uv, vec2(-reprojection.borrow_band))) && all(lessThanEqual(prev_uv, vec2(1.0 + reprojection.borrow_band)))) {
 			prev_uv = clamp(prev_uv, vec2(0.0), vec2(1.0));
 			history_usable = true;
 			borrowed = true;
@@ -1019,6 +1020,7 @@ void main() {
 	// history clipping) also has no usable variance yet, so it filters
 	// unconditionally at normal stride until a few frames have accumulated.
 	bool newly_revealed = meta.a > 0.25;
+	bool no_lum_stop = (params.flags & FLAG_NO_LUM_STOP) != 0u;
 	bool young_d = frames_d < 4.0;
 	bool young_s = frames_s < 4.0;
 	// A young GI pixel's hit-distance term is one or two rays' worth: it
@@ -1155,10 +1157,10 @@ void main() {
 
 			float wd = w_spatial;
 			float ws = w_spatial_s;
-			if (!newly_revealed && !young_d) {
+			if (!newly_revealed && !young_d && !no_lum_stop) {
 				wd *= exp(-abs(weight_lum(d) - moments.x) / sigma_d);
 			}
-			if (!newly_revealed && !young_s) {
+			if (!newly_revealed && !young_s && !no_lum_stop) {
 				ws *= exp(-abs(weight_lum(s) - moments.z) / sigma_s);
 			}
 #ifdef FILTER_DIRECTIONAL

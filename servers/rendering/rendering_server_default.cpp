@@ -48,6 +48,7 @@
 int RenderingServerDefault::changes = 0;
 int RenderingServerDefault::self_repaints = 0;
 bool RenderingServerDefault::changes_at_draw = false;
+uint64_t RenderingServerDefault::repaint_deadline_usec = 0;
 
 /* FREE */
 
@@ -236,7 +237,25 @@ double RenderingServerDefault::get_frame_setup_time_cpu() const {
 }
 
 bool RenderingServerDefault::has_changed() const {
-	return changes > 0;
+	if (changes > 0) {
+		return true;
+	}
+	if (repaint_deadline_usec != 0 && OS::get_singleton()->get_ticks_usec() >= repaint_deadline_usec) {
+		// The delayed repaint is due: counted like an immediate one, so the
+		// draw it triggers reads as a repaint, not as a change.
+		repaint_deadline_usec = 0;
+		changes++;
+		self_repaints++;
+		return true;
+	}
+	return false;
+}
+
+void RenderingServerDefault::repaint_request_after(uint64_t p_delay_usec) {
+	uint64_t due = OS::get_singleton()->get_ticks_usec() + p_delay_usec;
+	if (repaint_deadline_usec == 0 || due < repaint_deadline_usec) {
+		repaint_deadline_usec = due;
+	}
 }
 
 void RenderingServerDefault::_init() {

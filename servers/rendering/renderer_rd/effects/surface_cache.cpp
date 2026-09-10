@@ -30,6 +30,8 @@
 
 #include "surface_cache.h"
 
+#include "core/config/engine.h"
+#include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
@@ -101,6 +103,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	rd->buffer_clear(relit_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
 	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
+	converge_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t));
+	rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
 	rd->buffer_clear(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer));
 	projector_tables_buffer = rd->storage_buffer_create(8 * RendererRD::LightStorage::CARD_PROJECTOR_TABLE_FLOATS * sizeof(float));
@@ -116,7 +120,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 SurfaceCache::~SurfaceCache() {
 	RD *rd = RD::get_singleton();
 	_free_atlases();
-	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
+	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, converge_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
 		if (rid.is_valid()) {
 			rd->free_rid(rid);
 		}
@@ -720,6 +724,59 @@ void SurfaceCache::finish_capture(const CaptureJob &p_job) {
 	print_verbose(vformat("Surface cache: captured set %d, longest edge %d texels (frame %d%s).", p_job.set, s.size, frame, s.skinned ? ", skinned" : ""));
 }
 
+bool SurfaceCache::converge_pending = false;
+uint32_t SurfaceCache::converge_young = 0;
+uint32_t SurfaceCache::converge_relit = 0;
+uint32_t SurfaceCache::converge_up = 0;
+uint32_t SurfaceCache::converge_down = 0;
+double SurfaceCache::converge_drift = 1.0;
+uint64_t SurfaceCache::converge_readback_frame = 0;
+
+void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
+	converge_pending = false;
+	if (p_data.size() < 16) {
+		return;
+	}
+	const uint32_t *c = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	converge_young = c[0];
+	converge_relit = c[1];
+	converge_up = c[2];
+	converge_down = c[3];
+	converge_readback_frame = Engine::get_singleton()->get_frames_drawn();
+	// The drift, smoothed over the readbacks: one count's share swings by
+	// a few percent between frames (which sets were relit), and a settled
+	// verdict that flickers would restart the editor's repaints.
+	double total = double(converge_up) + double(converge_down);
+	double drift = total > 0.0 ? Math::abs(double(converge_up) - double(converge_down)) / total : 0.0;
+	converge_drift = converge_young * 100 >= converge_relit ? 1.0 : Math::lerp(converge_drift, drift, 0.25);
+	if (OS::get_singleton()->has_environment("GODOT_CARD_CONVERGE_PRINT")) {
+		print_line(vformat("Surface cache convergence: %d of %d relit texels young, drift %+.1f%% of the movement (smoothed %.1f%%, %s)", converge_young, converge_relit, total > 0.0 ? 100.0 * (double(converge_up) - double(converge_down)) / total : 0.0, 100.0 * converge_drift, _settled() ? "settled" : "converging"));
+	}
+}
+
+bool SurfaceCache::is_settled() const {
+	return _settled();
+}
+
+bool SurfaceCache::_settled() {
+	// Nothing relit means nothing to wait for (a scene without cards, or
+	// the count not yet running). One texel in a hundred still short of its
+	// window is the noise floor (fresh captures, the youth filter's
+	// refreshes); the drift test catches the field that climbs through its
+	// bounces with every window full: a converged field's relights rise and
+	// fall alike, so the signed sum is a small share of the unsigned one.
+	if (converge_relit == 0) {
+		return true;
+	}
+	if (converge_young * 100 >= converge_relit) {
+		return false;
+	}
+	// The game room's bounce reads 5% under its converged level at a drift
+	// of 11-12% and 1-2% under it at 8-10%, where the smoothed drift then
+	// stays (section 33).
+	return converge_drift <= 0.10;
+}
+
 void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -974,6 +1031,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (dyn_young == "1" || (dyn_young != "0" && dyn_omni)) {
 		params.flags |= 64;
 	}
+	// The convergence count (converge_buffer), for the editor's idle
+	// repaints: only wanted in low processor usage mode, where frames stop
+	// on their own; a game draws every frame regardless.
+	bool count_convergence = OS::get_singleton()->is_in_low_processor_usage_mode() || OS::get_singleton()->has_environment("GODOT_CARD_CONVERGE_PRINT");
+	if (count_convergence) {
+		params.flags |= 4096;
+		rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
+	}
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
@@ -1107,15 +1172,21 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_projector_tables(RD::UNIFORM_TYPE_STORAGE_BUFFER, 32, Vector<RID>({ projector_tables_buffer }));
 	RD::Uniform l_indirect_dyn_filtered(RD::UNIFORM_TYPE_IMAGE, 33, Vector<RID>({ indirect_dyn_filtered_atlas }));
 	RD::Uniform l_indirect_filtered(RD::UNIFORM_TYPE_IMAGE, 34, Vector<RID>({ indirect_filtered_atlas }));
+	RD::Uniform l_converge(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ converge_buffer }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
+	if (count_convergence && !converge_pending && p_inputs.frame % 4 == 0) {
+		// One readback in flight; the count lands a few frames later.
+		converge_pending = true;
+		rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
+	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
 		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d", sets.size(), budget, push.round_robin_period));
 		print_line(vformat("Dynamic lights: %d, motion this frame %.4f m, change %.3f", dyn.count, RendererRD::LightStorage::get_singleton()->get_card_dynamic_motion(), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()));

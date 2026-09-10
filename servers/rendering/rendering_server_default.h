@@ -64,6 +64,7 @@ class RenderingServerDefault : public RenderingServer {
 	// as a scene change on the next frame.
 	static int self_repaints;
 	static bool changes_at_draw;
+	static uint64_t repaint_deadline_usec; // repaint_request_after: when the next delayed repaint is due (0: none).
 	RID test_cube;
 
 	List<Callable> frame_drawn_callbacks;
@@ -126,6 +127,11 @@ public:
 		changes++;
 		self_repaints++;
 	}
+
+	// The same, but no sooner than the delay: a slow convergence (the
+	// surface cache's bounce) need not run the editor at full rate. The
+	// frame it produces counts as a repaint, not a change.
+	static void repaint_request_after(uint64_t p_delay_usec);
 
 	// Whether the frame currently being drawn was asked for by an actual change,
 	// as opposed to one of those repaints. Temporal effects use it to know when

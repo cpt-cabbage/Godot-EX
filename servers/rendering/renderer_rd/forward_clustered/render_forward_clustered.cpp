@@ -758,7 +758,10 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// irradiance onto the fragment normal; bit 4: take specular occlusion from
 	// the traced bent normal; bit 5: re-fit reflection probes to the frame's
 	// irradiance.
-	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u)) : 0;
+	// Bit 128 (experiment, GODOT_GI_NO_AO): the ambient term without the
+	// material's and the screen-space occlusion (section 33).
+	static const bool rt_gi_no_ao = OS::get_singleton()->get_environment("GODOT_GI_NO_AO") == "1";
+	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u) | (rt_gi_no_ao ? 128u : 0u)) : 0;
 	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
@@ -2204,6 +2207,20 @@ void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_re
 	if (p_rb_data->rt_converged_frames < frames_needed) {
 		p_rb_data->rt_converged_frames++;
 		RenderingServerDefault::repaint_request();
+		return;
+	}
+	// The screen histories are full, but the surface cache's bounce settles
+	// over hundreds of relights (a bounce per window, one window after
+	// another), and the screen follows it: an editor that stopped here held
+	// a picture a fifth too dark and blurred, which only brightened while
+	// the camera moved (plan section 33). The cards report how many of the
+	// texels they relit are still converging; until that is nearly none the
+	// viewport keeps repainting, at a gentler rate (the tail is long and
+	// the change slow), and never past a cap.
+	RendererRD::SurfaceCache *cache = raytracing != nullptr ? raytracing->get_surface_cache() : nullptr;
+	if (cache != nullptr && !cache->is_settled() && p_rb_data->rt_converged_frames < frames_needed + 600) {
+		p_rb_data->rt_converged_frames++;
+		RenderingServerDefault::repaint_request_after(33000);
 	}
 }
 
@@ -2346,6 +2363,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	uint32_t color_pass_flags = 0;
 	Vector<Color> depth_pass_clear;
 	bool using_separate_specular = false;
+	// The ray traced GI's screen radiance taken from the diffuse target
+	// alone (see below, where the opaque pass is set up).
+	bool rt_diffuse_screen_radiance = false;
 	bool using_ssr = false;
 	bool using_sdfgi = false;
 	bool using_voxelgi = false;
@@ -2487,7 +2507,24 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		using_sss = false;
 	}
 
-	if ((using_sss || ce_needs_separate_specular) && !using_separate_specular) {
+	// The GI gather's on-screen hits read last frame's rendered colour, and
+	// a rendered pixel carries the camera's specular: the mirror floor's
+	// image of the beam, the glossy walls' highlights, none of which a
+	// bounce ray from elsewhere would see. Read as radiance they made the
+	// GI follow the camera (a flick left the ceiling's bounce 8% bright for
+	// fifty frames, plan section 33). With the specular kept in its own
+	// target the copy the gather reads is the diffuse light and emission
+	// alone. Measured (section 33): the flick's flash grew (+8% -> +12%) and
+	// the converged room lost 16%: the camera's view of the mirror floor's
+	// beam is the only account the gather has of the light the floor throws
+	// on the ceiling (the cards hold no specular), wrong in direction but
+	// not in kind. Off by default, GODOT_GI_SRAD_DIFFUSE=1 to try.
+	static const bool srad_diffuse = OS::get_singleton()->get_environment("GODOT_GI_SRAD_DIFFUSE") == "1";
+	if (srad_diffuse && use_rt_gi && use_rt_gi_screen_radiance && rb_data.is_valid() && !is_reflection_probe && !p_render_data->transparent_bg) {
+		rt_diffuse_screen_radiance = true;
+	}
+
+	if ((using_sss || ce_needs_separate_specular || rt_diffuse_screen_radiance) && !using_separate_specular) {
 		using_separate_specular = true;
 		color_pass_flags |= COLOR_PASS_FLAG_SEPARATE_SPECULAR;
 		color_framebuffer = rb_data->get_color_pass_fb(color_pass_flags);
@@ -3116,6 +3153,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		}
 
+		if (rt_diffuse_screen_radiance) {
+			// The diffuse target, before the specular is mixed back: what
+			// the GI gather reads as last frame's radiance (see above).
+			RENDER_TIMESTAMP("Copy Diffuse Framebuffer (RT GI)");
+			_copy_framebuffer_to_ss_effects(rb, false, false);
+		}
+
 		{
 			//just mix specular back
 			RENDER_TIMESTAMP("Merge Specular");
@@ -3267,7 +3311,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RD::get_singleton()->draw_command_end_label();
 
 	RD::get_singleton()->draw_command_begin_label("Copy Framebuffer for SSIL/SSR");
-	if (using_ssil || using_ssr || (use_rt_gi && use_rt_gi_screen_radiance && rb_data.is_valid())) {
+	if (using_ssil || using_ssr || (use_rt_gi && use_rt_gi_screen_radiance && rb_data.is_valid() && !rt_diffuse_screen_radiance)) {
 		RENDER_TIMESTAMP("Copy Final Framebuffer (SSIL/SSR)");
 		_copy_framebuffer_to_ss_effects(rb, using_ssil, using_ssr);
 	}

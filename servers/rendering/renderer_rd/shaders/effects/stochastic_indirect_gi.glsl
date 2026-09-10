@@ -60,6 +60,11 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
 	uint pad2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
+	// x: frames of history a hit's own pixel needs before its screen colour
+	// is trusted (the boost fades in from 0 to this; 0 trusts it at once);
+	// y: the firefly ceiling's ratio over the cache value; z: the allowance
+	// added above the ceiling.
+	vec4 screen_radiance_extra;
 }
 params;
 
@@ -739,18 +744,34 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// Weaker by a quarter per bounce: two pixels whose rays keep landing on
 	// each other would otherwise hand the mark back and forth forever.
 	pixel_change = max(pixel_change, textureLod(prev_gi_history, prev_uv, 0.0).a - 0.25);
+	// The colour a young pixel shows is its own one-sample guess, spread by
+	// the wide kernels its youth gets; read back here it fed the pixels whose
+	// rays land on it, and after a camera flick the whole screen restarted
+	// 8% too bright and took fifty frames to settle (section 33). The screen
+	// term fades in with the hit pixel's own history, the card standing in
+	// until then.
+	float settled = 1.0;
+	if (params.screen_radiance_extra.x > 0.0) {
+		float hit_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
+		settled = smoothstep(0.0, params.screen_radiance_extra.x, hit_frames);
+	}
 	float l = luminance(col);
 	// Both tiers for the same point: what the calibration is made of. The raw
 	// cache value, not the scaled one, or the estimate would chase itself.
 	// Sampled before the firefly ceiling, which is keyed to the very scale
 	// being estimated. Hits at the frame border are left out along with the
 	// rest of what the hand-back below distrusts.
-	if (calibrate_pixel && tier < 2u) {
+	// Diagnostics (GODOT_GI_CALIB_CARDS=1, read with RT_GI_CALIB_DEBUG): the
+	// cards' hits counted in the probe tier's slot, so the print shows the
+	// screen's colour against the card's radiance at the same points.
+	bool calib_cards = params.screen_radiance_extra.w > 0.0 && tier == CACHE_TIER_CARD;
+	if (calibrate_pixel && (tier < 2u || calib_cards)) {
+		uint slot = calib_cards ? CACHE_TIER_PROBE : tier;
 		vec2 border_c = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
 		if (min(border_c.x, border_c.y) >= params.screen_radiance_border_fade) {
-			atomicAdd(calibration.sum_screen[tier], uint(min(l, 64.0) * 1024.0));
-			atomicAdd(calibration.sum_cache[tier], uint(min(luminance(raw_cache_radiance), 64.0) * 1024.0));
-			atomicAdd(calibration.samples[tier], 1u);
+			atomicAdd(calibration.sum_screen[slot], uint(min(l, 64.0) * 1024.0));
+			atomicAdd(calibration.sum_cache[slot], uint(min(luminance(raw_cache_radiance), 64.0) * 1024.0));
+			atomicAdd(calibration.samples[slot], 1u);
 		}
 	}
 	// Firefly ceiling. Keying this to the cache alone closes a loop: the gather
@@ -759,7 +780,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// the next frame reads the dimmer image -- a wall lit only by bounce
 	// ratchets down to the cache value over the accumulation window. The
 	// absolute term is what the cache cannot drag down.
-	float clamp_l = max(luminance(cache_radiance) * 4.0, params.screen_radiance_clamp) + 0.5;
+	float clamp_l = max(luminance(cache_radiance) * params.screen_radiance_extra.y, params.screen_radiance_clamp) + params.screen_radiance_extra.z;
 	if (l > clamp_l) {
 		col *= clamp_l / l;
 	}
@@ -768,7 +789,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// an edge decides how much of the boost survives.
 	vec2 border = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
 	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
-	float screen_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y));
+	float screen_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)) * settled;
 	boost_from_screen = screen_share > 0.5;
 	return mix(cache_radiance, col, screen_share);
 }
