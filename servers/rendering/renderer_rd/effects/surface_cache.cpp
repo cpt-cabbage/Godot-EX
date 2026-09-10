@@ -103,6 +103,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
 	rd->buffer_clear(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer));
+	projector_tables_buffer = rd->storage_buffer_create(8 * RendererRD::LightStorage::CARD_PROJECTOR_TABLE_FLOATS * sizeof(float));
+	rd->buffer_clear(projector_tables_buffer, 0, 8 * RendererRD::LightStorage::CARD_PROJECTOR_TABLE_FLOATS * sizeof(float));
 	dispatch_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t), {}, RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 	params_ubo = rd->uniform_buffer_create(sizeof(LightParamsUBO));
 
@@ -114,7 +116,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 SurfaceCache::~SurfaceCache() {
 	RD *rd = RD::get_singleton();
 	_free_atlases();
-	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, dynamic_lights_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
+	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
 		if (rid.is_valid()) {
 			rd->free_rid(rid);
 		}
@@ -910,6 +912,16 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			dyn.weights[dyn.count] = weights[i];
 			dyn.data[dyn.count++] = data[i];
 		}
+		// The spots' cookie tables (pad[0]: bit i set where slot i has one).
+		const LocalVector<float> &tables = RendererRD::LightStorage::get_singleton()->get_card_dynamic_projector_tables();
+		const uint32_t table_floats = RendererRD::LightStorage::CARD_PROJECTOR_TABLE_FLOATS;
+		// GODOT_CARD_COOKIE_IS=0: the light rays sample the cone uniformly
+		// (the ablation of the cookie tables).
+		static const bool cookie_is = OS::get_singleton()->get_environment("GODOT_CARD_COOKIE_IS") != "0";
+		dyn.pad[0] = cookie_is ? (RendererRD::LightStorage::get_singleton()->get_card_dynamic_projector_mask() & ((1u << dyn.count) - 1u)) : 0u;
+		if (dyn.pad[0] != 0 && tables.size() >= dyn.count * table_floats) {
+			rd->buffer_update(projector_tables_buffer, 0, dyn.count * table_floats * sizeof(float), tables.ptr());
+		}
 	}
 	dynamic_light_count = dyn.count;
 	rd->buffer_update(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer), &dyn);
@@ -1082,12 +1094,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_area_atlas(RD::UNIFORM_TYPE_TEXTURE, 30, Vector<RID>({ p_inputs.area_light_atlas.is_valid() ? p_inputs.area_light_atlas : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK) }));
 	// The projector textures (never sampled without a projector rect).
 	RD::Uniform l_decal_atlas(RD::UNIFORM_TYPE_TEXTURE, 31, Vector<RID>({ p_inputs.decal_atlas.is_valid() ? p_inputs.decal_atlas : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK) }));
+	RD::Uniform l_projector_tables(RD::UNIFORM_TYPE_STORAGE_BUFFER, 32, Vector<RID>({ projector_tables_buffer }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

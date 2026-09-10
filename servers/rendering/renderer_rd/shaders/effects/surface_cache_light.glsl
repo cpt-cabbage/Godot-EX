@@ -257,6 +257,93 @@ layout(set = 0, binding = 30) uniform texture2D area_light_atlas;
 // The projector textures (a spot's cookie, an omni's dual paraboloid map),
 // sampled where a light's projector_rect is set (see projector_factor).
 layout(set = 0, binding = 31) uniform texture2D decal_atlas_srgb;
+// The dynamic spots' cookies as sampling tables (LightStorage::ProjectorTable,
+// one slot per dynamic light, dyn_lights.pad0 bit i set where slot i has
+// one): the marginal CDF over the 16 rows of the projector's frame, the
+// conditional CDF within each row, then the density (integrating to one
+// over the frame). The light rays draw their direction from it
+// (cookie_sample) and both estimators divide by its solid-angle density
+// (cookie_pdf_omega), so a cookie that transmits a fifth on average no
+// longer wastes four rays in five on its dark texels.
+layout(set = 0, binding = 32, std430) restrict readonly buffer ProjectorTables {
+	float data[];
+}
+proj_tables;
+#define PROJ_TABLE_N 16u
+#define PROJ_TABLE_FLOATS 528u
+
+bool cookie_table(uint i) {
+	return (dyn_lights.pad0 & (1u << i)) != 0u;
+}
+
+// Half the spot angle's tangent: the frame the cookie is projected through
+// (light_storage.cpp _fill_card_light_data, a perspective over twice the
+// spot angle, aspect one).
+float cookie_tan_half(LightData ld) {
+	float c = clamp(ld.cone_angle, 0.01, 0.9999);
+	return sqrt(1.0 - c * c) / c;
+}
+
+// The sampling's density in solid angle at a world point: the cell's
+// density over the frame times the perspective's Jacobian r^3 / (4 t^2)
+// (a frame cell of area du dv at NDC (x, y) covers the solid angle
+// 4 t^2 du dv / r^3, r the distance to the image plane's point). Zero
+// outside the frame.
+float cookie_pdf_omega(uint i, LightData ld, vec3 world_pos) {
+	vec4 sp = ld.shadow_matrix * vec4(world_pos, 1.0);
+	if (sp.w <= 0.0) {
+		return 0.0;
+	}
+	sp.xy /= sp.w;
+	if (any(lessThan(sp.xy, vec2(0.0))) || any(greaterThanEqual(sp.xy, vec2(1.0)))) {
+		return 0.0;
+	}
+	uvec2 cell = uvec2(clamp(sp.x * 16.0, 0.0, 15.0), clamp((1.0 - sp.y) * 16.0, 0.0, 15.0));
+	float density = proj_tables.data[i * PROJ_TABLE_FLOATS + 272u + cell.y * 16u + cell.x];
+	float t = cookie_tan_half(ld);
+	vec2 ndc = sp.xy * 2.0 - 1.0;
+	float r2 = 1.0 + dot(ndc * t, ndc * t);
+	return density * r2 * sqrt(r2) / (4.0 * t * t);
+}
+
+// A direction drawn from the table: r0 picks the row, r1 the column in it,
+// and what is left of each within its cell jitters the point. The frame's
+// rows run from the top (splane.y = 1) down, as the cookie is stored.
+vec3 cookie_sample(uint i, LightData ld, vec3 axis, float r0, float r1, out float r_pdf_omega) {
+	uint base = i * PROJ_TABLE_FLOATS;
+	uint j = 0u;
+	float c0 = 0.0;
+	for (; j < 15u; j++) {
+		float c1 = proj_tables.data[base + j];
+		if (r0 < c1) {
+			break;
+		}
+		c0 = c1;
+	}
+	float cj = proj_tables.data[base + j];
+	float jv = clamp((r0 - c0) / max(cj - c0, 1e-6), 0.0, 1.0);
+	uint rbase = base + 16u + j * 16u;
+	uint k = 0u;
+	float d0 = 0.0;
+	for (; k < 15u; k++) {
+		float d1 = proj_tables.data[rbase + k];
+		if (r1 < d1) {
+			break;
+		}
+		d0 = d1;
+	}
+	float dk = proj_tables.data[rbase + k];
+	float ju = clamp((r1 - d0) / max(dk - d0, 1e-6), 0.0, 1.0);
+	vec2 sp = vec2((float(k) + ju) / 16.0, 1.0 - (float(j) + jv) / 16.0);
+	float t = cookie_tan_half(ld);
+	vec2 ndc = sp * 2.0 - 1.0;
+	// Light space: the frame's right and up (the spot's area fields carry
+	// them), the axis at -z.
+	vec3 d_l = vec3(ndc * t, -1.0);
+	float r2 = dot(d_l, d_l);
+	r_pdf_omega = proj_tables.data[base + 272u + j * 16u + k] * r2 * sqrt(r2) / (4.0 * t * t);
+	return normalize(ld.area_width * d_l.x + ld.area_height * d_l.y + axis);
+}
 
 // Diagnostics (GODOT_CARD_ABLATE=stats): the dynamic rays' fate, counted
 // (see trace_dynamic; surface_cache.cpp prints and clears it).
@@ -992,14 +1079,24 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 		vec3 tng = abs(axis.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
 		vec3 b1 = normalize(cross(axis, tng));
 		vec3 b2 = cross(axis, b1);
+		bool cookie = is_spot && cookie_table(i);
 		for (uint sidx = 0u; sidx < n_rays; sidx++) {
 			float k = float(((params.frame & 63u) * n_rays + sidx) * (i + 1u));
 			float r0 = fract(o0 + k * 0.7548776662);
 			float r1 = fract(o1 + k * 0.5698402910);
-			float phi = r1 * 2.0 * M_PI;
-			float ct = 1.0 - r0 * (1.0 - cone_cos);
-			float st = sqrt(max(1.0 - ct * ct, 0.0));
-			vec3 dir = normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
+			vec3 dir;
+			float pdf_omega = pdf_dir;
+			if (cookie) {
+				dir = cookie_sample(i, ld, axis, r0, r1, pdf_omega);
+				if (pdf_omega <= 0.0) {
+					continue;
+				}
+			} else {
+				float phi = r1 * 2.0 * M_PI;
+				float ct = 1.0 - r0 * (1.0 - cone_cos);
+				float st = sqrt(max(1.0 - ct * ct, 0.0));
+				dir = normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
+			}
 			rayQueryEXT rq;
 			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, pos, 0.0, dir, range);
 			while (rayQueryProceedEXT(rq)) {
@@ -1031,7 +1128,7 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 			vec3 c_p = light_contribution_world(ld, is_spot, pos, axis, p, n_p, unused_geom);
 			// The landing's radiance from this light's direct term alone.
 			vec3 l_dyn = albedo_p * c_p * weight;
-			float pdf_area = pdf_dir * cos_pl / (d_lp * d_lp);
+			float pdf_area = pdf_omega * cos_pl / (d_lp * d_lp);
 			card_requests.frame[hit_set] = params.frame;
 			change_total = max(change_total, hit_change_total - 0.25);
 			// The texel connected to the landing. The estimator of the
@@ -1146,7 +1243,10 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 							float cos_hl = dot(n_hit, l);
 							float cone_cos = is_spot ? clamp(ld.cone_angle, -1.0, 0.9999) : -1.0;
 							if (d < 1.0 / ld.inv_radius && cos_hl > 0.0 && (!is_spot || dot(-l, axis) > cone_cos)) {
-								pdf_light = cos_hl / (2.0 * M_PI * (1.0 - cone_cos) * d * d);
+								// The light rays' density at this hit: cookie_sample's where
+								// the spot has a table, the uniform cone's otherwise.
+								float pdf_omega = (is_spot && cookie_table(i)) ? cookie_pdf_omega(i, ld, hit_pos) : 1.0 / (2.0 * M_PI * (1.0 - cone_cos));
+								pdf_light = pdf_omega * cos_hl / (d * d);
 							}
 						}
 						r_dyn1 += albedo_hit * c * vis_hit * (p_cos / (p_cos + n_light * pdf_light));

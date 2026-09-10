@@ -726,6 +726,78 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 
 // The fields of update_light_buffers' positional fill that the card lighting
 // reads (surface_cache_light.glsl): kept in step with it by hand.
+const LightStorage::ProjectorTable &LightStorage::_projector_table(RID p_texture) {
+	ProjectorTable *found = projector_tables.getptr(p_texture);
+	if (found != nullptr) {
+		return *found;
+	}
+	ProjectorTable &t = projector_tables.insert(p_texture, ProjectorTable())->value;
+	Ref<Image> img = RendererRD::TextureStorage::get_singleton()->texture_2d_get(p_texture);
+	if (img.is_null() || img->is_empty()) {
+		return t;
+	}
+	img = img->duplicate();
+	if (img->is_compressed()) {
+		if (img->decompress() != OK) {
+			return t;
+		}
+	}
+	img->convert(Image::FORMAT_RGBA8);
+	const uint32_t n = CARD_PROJECTOR_TABLE_N;
+	const int w = img->get_width();
+	const int h = img->get_height();
+	float lum[n * n] = {};
+	float cnt[n * n] = {};
+	for (int y = 0; y < h; y++) {
+		const uint32_t cy = MIN(uint32_t(y) * n / uint32_t(h), n - 1);
+		for (int x = 0; x < w; x++) {
+			const uint32_t cx = MIN(uint32_t(x) * n / uint32_t(w), n - 1);
+			// As the shaders read it: the sRGB atlas decoded, times alpha.
+			const Color c = img->get_pixel(x, y).srgb_to_linear();
+			lum[cy * n + cx] += (0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b) * c.a;
+			cnt[cy * n + cx] += 1.0f;
+		}
+	}
+	float mean = 0.0f;
+	for (uint32_t i = 0; i < n * n; i++) {
+		lum[i] = cnt[i] > 0.0f ? lum[i] / cnt[i] : 0.0f;
+		mean += lum[i];
+	}
+	mean /= float(n * n);
+	if (!(mean > 0.0f)) {
+		return t; // A black cookie: nothing to sample.
+	}
+	// A floor of a fiftieth of the mean: every cell the cookie can light
+	// must have a density, or the estimator would miss what lands there.
+	float total = 0.0f;
+	for (uint32_t i = 0; i < n * n; i++) {
+		lum[i] = MAX(lum[i], 0.02f * mean);
+		total += lum[i];
+	}
+	float *marginal = t.data;
+	float *conditional = t.data + n;
+	float *density = t.data + n + n * n;
+	float row_acc = 0.0f;
+	for (uint32_t j = 0; j < n; j++) {
+		float row = 0.0f;
+		for (uint32_t i = 0; i < n; i++) {
+			row += lum[j * n + i];
+		}
+		row_acc += row / total;
+		marginal[j] = row_acc;
+		float col_acc = 0.0f;
+		for (uint32_t i = 0; i < n; i++) {
+			col_acc += lum[j * n + i] / row;
+			conditional[j * n + i] = col_acc;
+			density[j * n + i] = lum[j * n + i] * float(n * n) / total;
+		}
+		conditional[j * n + n - 1] = 1.0f;
+	}
+	marginal[n - 1] = 1.0f;
+	t.valid = true;
+	return t;
+}
+
 void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const {
 	r_data = LightData();
 	const Transform3D light_transform = p_light_instance->transform;
@@ -772,6 +844,17 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 	r_data.direction[1] = direction.y;
 	r_data.direction[2] = direction.z;
 	r_data.size = p_light->param[RSE::LIGHT_PARAM_SIZE];
+	if (p_type == RSE::LIGHT_SPOT) {
+		// The spot's frame (its right and up, in the buffer's space) rides in
+		// the area fields a spot never uses: the cards' light rays map a
+		// sampled cookie cell back to a direction through it.
+		const Vector3 right = p_inverse_transform.basis.xform(light_transform.basis.xform(Vector3(1, 0, 0))).normalized();
+		const Vector3 up = p_inverse_transform.basis.xform(light_transform.basis.xform(Vector3(0, 1, 0))).normalized();
+		for (int i = 0; i < 3; i++) {
+			r_data.area_width[i] = right[i];
+			r_data.area_height[i] = up[i];
+		}
+	}
 	r_data.inv_spot_attenuation = 1.0f / p_light->param[RSE::LIGHT_PARAM_SPOT_ATTENUATION];
 	r_data.cos_spot_angle = Math::cos(Math::deg_to_rad(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
 	if (p_light->projector.is_valid() && p_type != RSE::LIGHT_AREA) {
@@ -808,6 +891,19 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 					printed++;
 					Projection stock = bias * correction * p_light_instance->shadow_transform[0].camera * Projection(light_transform.affine_inverse());
 					print_line(vformat("CARD_PROJ spot angle %.2f range %.2f\n  ours:  %s\n  stock: %s", p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE], radius, projector_mtx, stock));
+					// The round trip cookie_sample makes: a frame cell to a
+					// direction through the light's right, up and axis, and back
+					// through the matrix; the two frame positions must agree.
+					const float t = Math::tan(Math::deg_to_rad(p_light->param[RSE::LIGHT_PARAM_SPOT_ANGLE]));
+					const Vector2 sp(3.5f / 16.0f, 1.0f - 2.5f / 16.0f);
+					const Vector2 ndc = sp * 2.0f - Vector2(1, 1);
+					const Vector3 right = light_transform.basis.xform(Vector3(1, 0, 0)).normalized();
+					const Vector3 up = light_transform.basis.xform(Vector3(0, 1, 0)).normalized();
+					const Vector3 axis = light_transform.basis.xform(Vector3(0, 0, -1)).normalized();
+					const Vector3 dir = (right * (ndc.x * t) + up * (ndc.y * t) + axis).normalized();
+					const Vector3 sample_point = light_transform.origin + dir;
+					const Vector4 back = projector_mtx.xform(Vector4(sample_point.x, sample_point.y, sample_point.z, 1.0));
+					print_line(vformat("  cell (3.5, 2.5)/16 -> frame (%.4f, %.4f), back through the matrix (%.4f, %.4f)", sp.x, sp.y, back.x / back.w, back.y / back.w));
 				}
 			}
 		} else {
@@ -863,6 +959,8 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 	card_dynamic_lights.clear();
 	card_dynamic_light_data.clear();
 	card_dynamic_weights.clear();
+	card_dynamic_projector_tables.clear();
+	card_dynamic_projector_mask = 0;
 	card_dynamic_motion = 0.0f;
 	card_dynamic_change = 0.0f;
 	card_dynamic_join = 0.0f;
@@ -983,7 +1081,24 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 			LightData world;
 			_fill_card_light_data(world, light->type, light, light_instance, Transform3D(), distance, p_camera_attributes);
 			world.pad = light->type == RSE::LIGHT_SPOT ? 1.0f : 0.0f;
+			// A spot's cookie as a sampling table for the light rays.
+			const uint32_t entry = card_dynamic_light_data.size();
 			card_dynamic_light_data.push_back(world);
+			const uint32_t table_base = card_dynamic_projector_tables.size();
+			card_dynamic_projector_tables.resize(table_base + CARD_PROJECTOR_TABLE_FLOATS);
+			if (light->type == RSE::LIGHT_SPOT && light->projector.is_valid()) {
+				const ProjectorTable &table = _projector_table(light->projector);
+				if (table.valid) {
+					memcpy(&card_dynamic_projector_tables[table_base], table.data, sizeof(table.data));
+					card_dynamic_projector_mask |= 1u << entry;
+					// The perspective the rays come back through must be the
+					// one the cookie is projected with (see _fill_card_light_data).
+				} else {
+					memset(&card_dynamic_projector_tables[table_base], 0, sizeof(table.data));
+				}
+			} else {
+				memset(&card_dynamic_projector_tables[table_base], 0, CARD_PROJECTOR_TABLE_FLOATS * sizeof(float));
+			}
 		}
 		if (light->type == RSE::LIGHT_OMNI) {
 			card_omni_lights.push_back(data);

@@ -46,6 +46,10 @@ namespace RendererRD {
 
 class LightStorage : public RendererLightStorage {
 public:
+	// The cards' cookie sampling table of a dynamic spot (see ProjectorTable).
+	static const uint32_t CARD_PROJECTOR_TABLE_N = 16;
+	static const uint32_t CARD_PROJECTOR_TABLE_FLOATS = CARD_PROJECTOR_TABLE_N + 2 * CARD_PROJECTOR_TABLE_N * CARD_PROJECTOR_TABLE_N;
+
 	enum ShadowAtlastQuadrant : uint32_t {
 		QUADRANT_SHIFT = 27,
 		OMNI_LIGHT_FLAG = 1 << 26,
@@ -228,6 +232,21 @@ private:
 	LocalVector<uint32_t> card_dynamic_lights;
 	LocalVector<LightData> card_dynamic_light_data; // The same lights in world space, pad 1 for a spot (the cards' DynamicLights buffer).
 	LocalVector<float> card_dynamic_weights; // Per entry: 1 within the hold, fading to 0 over GODOT_CARD_DYN_FADE frames after it.
+	// A spot's projector as a sampling table for the cards' light rays
+	// (surface_cache_light.glsl trace_dynamic): 16x16 cells of the cookie's
+	// linear luminance over the projector's frame, as the marginal CDF over
+	// the rows (16), the conditional CDF within each row (16x16) and the
+	// density normalized to integrate to one over the frame (16x16). Built
+	// once per texture from a readback and kept (a cookie edited live keeps
+	// its old table).
+	struct ProjectorTable {
+		float data[CARD_PROJECTOR_TABLE_FLOATS] = {};
+		bool valid = false;
+	};
+	HashMap<RID, ProjectorTable> projector_tables;
+	const ProjectorTable &_projector_table(RID p_texture);
+	LocalVector<float> card_dynamic_projector_tables; // CARD_PROJECTOR_TABLE_FLOATS per dynamic entry (zeros without a table).
+	uint32_t card_dynamic_projector_mask = 0; // Bit i: dynamic entry i has a table.
 	float card_dynamic_motion = 0.0f; // The most any dynamic light moved this frame, in metres (its origin, and its axis three metres out).
 	float card_dynamic_change = 0.0f; // The most any light's intensity or colour changed this frame, relative (1 = whole).
 	uint32_t card_dynamic_generation = 0; // Counts the frames a light joined or left the dynamic set (the cards relight everything then).
@@ -885,6 +904,8 @@ public:
 	const LocalVector<uint32_t> &get_card_dynamic_lights() const { return card_dynamic_lights; }
 	const LocalVector<float> &get_card_dynamic_weights() const { return card_dynamic_weights; }
 	const LocalVector<LightData> &get_card_dynamic_light_data() const { return card_dynamic_light_data; }
+	const LocalVector<float> &get_card_dynamic_projector_tables() const { return card_dynamic_projector_tables; }
+	uint32_t get_card_dynamic_projector_mask() const { return card_dynamic_projector_mask; }
 	float get_card_dynamic_motion() const { return card_dynamic_motion; }
 	float get_card_dynamic_change() const { return card_dynamic_change; }
 	uint32_t get_card_dynamic_generation() const { return card_dynamic_generation; }

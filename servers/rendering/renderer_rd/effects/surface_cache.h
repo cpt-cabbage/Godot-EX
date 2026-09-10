@@ -259,6 +259,7 @@ private:
 	RID active_buffer; // uint count, then the active set list.
 	RID dyn_stats_buffer; // Diagnostics (GODOT_CARD_ABLATE=stats): 16 counters of the dynamic rays' fate.
 	RID dynamic_lights_buffer; // DynamicLightsBuffer, uploaded every lighting update.
+	RID projector_tables_buffer; // The dynamic spots' cookie sampling tables (LightStorage::ProjectorTable), 8 slots.
 	uint32_t dynamic_light_count = 0;
 	uint32_t dynamic_generation = 0; // LightStorage::get_card_dynamic_generation as last seen; a change relights every set this frame.
 	RID relit_buffer; // Per set, two uints: the frame of the relight before the last, and of the last (the bounce gradient re-traces the previous relight's ray).
