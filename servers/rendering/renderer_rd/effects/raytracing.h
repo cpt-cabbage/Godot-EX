@@ -342,6 +342,8 @@ private:
 		uint32_t flags; // 1: light guiding, 2: screen traces.
 		float cluster_z0; // Nonzero: the cluster's depth slices are exponential from this depth (see ClusterBuilderRD).
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
+		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype) in view space: xyz normal, w offset; zero normal off.
+		float mirror_params[4]; // x F0.
 	};
 	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
 	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;

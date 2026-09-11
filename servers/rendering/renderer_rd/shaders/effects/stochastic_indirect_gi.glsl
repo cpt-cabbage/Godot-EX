@@ -1657,9 +1657,8 @@ void main() {
 		// cookies come along), times the Fresnel at the crossing, seen
 		// through a shadow ray in two legs (to a centimetre above the
 		// plane measured along the normal, then from the plane to the
-		// light). The knob's own light, and the dynamic lights (their
-		// weights included); the static local lights reach the pixel only
-		// through the cards for now.
+		// light). The knob's own light (a scene without the stochastic
+		// direct pass, the box); the scene's lights are imaged by that pass.
 		vec3 n = params.mirror_plane.xyz;
 		vec3 world_pos = rel_pos + params.world_from_view[3].xyz;
 		float hp = dot(n, world_pos) - params.mirror_plane.w;
@@ -1671,9 +1670,12 @@ void main() {
 			vec3 start = world_pos + world_geo_normal * params.ray_bias;
 			vec3 p_img = world_pos - 2.0 * hp * n;
 			vec3 n_img = world_normal - 2.0 * dot(world_normal, n) * n;
-			uint count = dyn_lights.count + (params.mirror_light.w > 0.0 ? 1u : 0u);
+			// The knob's own light only: the scene's lights, the dynamic ones
+			// included, are imaged by the stochastic direct pass (their
+			// caustic is direct light), so they are not imaged twice here.
+			uint count = params.mirror_light.w > 0.0 ? 1u : 0u;
 			for (uint i = 0u; i < count; i++) {
-				bool knob = i == dyn_lights.count;
+				bool knob = true;
 				vec3 light = knob ? params.mirror_light.xyz : dyn_lights.data[i].position;
 				float hl = dot(n, light) - params.mirror_plane.w;
 				if (hl <= 0.0) {

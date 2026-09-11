@@ -79,6 +79,13 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint flags; // FLAG_*.
 	float cluster_z0; // Nonzero: exponential depth slices from this depth (see ClusterBuilderRD).
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
+	// A planar mirror (GODOT_GI_MIRROR, plan section 43, a prototype), in
+	// view space: xyz its normal, w its offset (n . p = w; a zero normal is
+	// off), and x its F0. Every local light then has an image entry beside
+	// it (IMAGE_BIT): the light evaluated at the mirrored point with the
+	// mirrored normal and view vector, times the Fresnel at the crossing.
+	vec4 mirror_plane;
+	vec4 mirror_params;
 }
 params;
 
@@ -156,8 +163,9 @@ layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ana
 #define AREA_BIT 0x40000000u
 #define QUAD_MASK_SHIFT 26u
 #define QUAD_MASK_BITS (0xFu << QUAD_MASK_SHIFT)
-#define ENTRY_ID_MASK 0x03FFFFFFu
-#define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | ENTRY_ID_MASK)
+#define IMAGE_BIT 0x02000000u // The light's image through the planar mirror (see params.mirror_plane).
+#define ENTRY_ID_MASK 0x01FFFFFFu
+#define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | IMAGE_BIT | ENTRY_ID_MASK)
 // Candidate set: the guided (visible list) candidates plus a strided subset of
 // the cluster cell. Keeping the per-pixel candidate count fixed is what makes
 // the cost independent of the total light count (MegaLights' central promise);
@@ -406,7 +414,7 @@ vec3 bound_analytic(vec3 c) {
 
 // Unshadowed diffuse (radiance, no albedo) and specular contribution of a
 // light at a view-space point. Zero when out of range or facing away.
-void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split, out vec3 light_rel_vec) {
+void light_eval_at(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, vec3 v, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split, out vec3 light_rel_vec) {
 	spec_split = vec4(0.0);
 	LightData ld = is_spot ? spot_lights.data[idx] : omni_lights.data[idx];
 	light_rel_vec = ld.position - view_pos;
@@ -457,7 +465,6 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 
 	float ndotl = clamp(size_A + dot(view_normal, l), 0.0, 1.0);
 
-	vec3 v = normalize(-view_pos);
 	vec3 h = normalize(v + l);
 	float ndotv = max(dot(view_normal, v), 1e-4);
 	// The size term folded into every cosine, as light_compute does with its
@@ -508,11 +515,56 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	specular = spec_base * (f0 + (1.0 - f0) * fc);
 }
 
+void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split, out vec3 light_rel_vec) {
+	light_eval_at(is_spot, idx, view_pos, view_normal, normalize(-view_pos), roughness, diffuse, specular, spec_split, light_rel_vec);
+}
+
+// The planar mirror (params.mirror_plane): whether it is on, and its Fresnel.
+bool mirror_on() {
+	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5;
+}
+
+float mirror_fresnel(float c) {
+	float k = 1.0 - clamp(c, 0.0, 1.0);
+	float k2 = k * k;
+	return params.mirror_params.x + (1.0 - params.mirror_params.x) * k2 * k2 * k;
+}
+
+// A light's image through the planar mirror at a point: the light itself
+// at the mirrored point with the mirrored normal and view vector (the
+// attenuation, the cone, the cookie and the lobes come along), times the
+// Fresnel at the crossing. Nothing when the point or the light is behind
+// the plane.
+void light_eval_image(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+	diffuse = vec3(0.0);
+	specular = vec3(0.0);
+	spec_split = vec4(0.0);
+	vec3 n = params.mirror_plane.xyz;
+	float hp = dot(n, view_pos) - params.mirror_plane.w;
+	vec3 light_pos = is_spot ? spot_lights.data[idx].position : omni_lights.data[idx].position;
+	float hl = dot(n, light_pos) - params.mirror_plane.w;
+	if (hp <= 0.005 || hl <= 0.0) {
+		return;
+	}
+	vec3 p_img = view_pos - 2.0 * hp * n;
+	vec3 n_img = view_normal - 2.0 * dot(view_normal, n) * n;
+	vec3 v = normalize(-view_pos);
+	vec3 v_img = v - 2.0 * dot(v, n) * n;
+	vec3 rel_unused;
+	light_eval_at(is_spot, idx, p_img, n_img, v_img, roughness, diffuse, specular, spec_split, rel_unused);
+	vec3 img = light_pos - 2.0 * hl * n;
+	float cos_p = abs(dot(n, normalize(img - view_pos)));
+	float f = mirror_fresnel(cos_p);
+	diffuse *= f;
+	specular *= f;
+	spec_split.rgb *= f;
+}
+
 // Unshadowed LTC diffuse and specular contribution of an area light, the
 // analytic core of the scene shader's light_process_area (clearcoat,
 // transmittance and material-dependent terms cannot apply here: the prepass
 // carries only normal and roughness, so the specular assumes a dielectric).
-void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+void area_light_eval_at(uint idx, vec3 view_pos, vec3 view_normal, vec3 eye_vec, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	diffuse = vec3(0.0);
 	specular = vec3(0.0);
 	spec_split = vec4(0.0);
@@ -550,7 +602,6 @@ void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness,
 	points[2] = ld.position + hw + hh - view_pos;
 	points[3] = ld.position - hw + hh - view_pos;
 
-	vec3 eye_vec = normalize(-view_pos);
 	float max_mipmap = ld.cone_angle;
 
 	float ltc_diffuse = 0.0;
@@ -573,13 +624,49 @@ void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness,
 	specular = spec_base * (f0 * fx + (1.0 - f0) * fy);
 }
 
+void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+	area_light_eval_at(idx, view_pos, view_normal, normalize(-view_pos), roughness, diffuse, specular, spec_split);
+}
+
+// An area light's image through the planar mirror (see light_eval_image).
+void area_light_eval_image(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+	diffuse = vec3(0.0);
+	specular = vec3(0.0);
+	spec_split = vec4(0.0);
+	vec3 n = params.mirror_plane.xyz;
+	float hp = dot(n, view_pos) - params.mirror_plane.w;
+	vec3 light_pos = area_lights.data[idx].position;
+	float hl = dot(n, light_pos) - params.mirror_plane.w;
+	if (hp <= 0.005 || hl <= 0.0) {
+		return;
+	}
+	vec3 p_img = view_pos - 2.0 * hp * n;
+	vec3 n_img = view_normal - 2.0 * dot(view_normal, n) * n;
+	vec3 v = normalize(-view_pos);
+	vec3 v_img = v - 2.0 * dot(v, n) * n;
+	area_light_eval_at(idx, p_img, n_img, v_img, roughness, diffuse, specular, spec_split);
+	vec3 img = light_pos - 2.0 * hl * n;
+	float f = mirror_fresnel(abs(dot(n, normalize(img - view_pos))));
+	diffuse *= f;
+	specular *= f;
+	spec_split.rgb *= f;
+}
+
 // Unshadowed contribution of any encoded light entry.
 void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
-		area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+		if ((entry & IMAGE_BIT) != 0u) {
+			area_light_eval_image(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+		} else {
+			area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+		}
 	} else {
 		vec3 unused_rel;
-		light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split, unused_rel);
+		if ((entry & IMAGE_BIT) != 0u) {
+			light_eval_image((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+		} else {
+			light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split, unused_rel);
+		}
 	}
 }
 
@@ -944,6 +1031,7 @@ void main() {
 		guided_count++;
 	}
 	float hidden_weight_sum = 0.0;
+	bool mirror_here = mirror_on() && dot(params.mirror_plane.xyz, view_pos) - params.mirror_plane.w > 0.005;
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
 	// newly visible lights are still found, at a per-pixel cost that does not
@@ -1041,47 +1129,54 @@ void main() {
 						continue;
 					}
 
-					vec3 f, s;
-					vec4 ss;
-					entry_eval(entry, view_pos, view_normal, roughness, f, s, ss);
-					// One evaluation serves both the analytic sum and, below,
-					// the candidate set. The analytic sum takes every cell light
-					// unscaled when exact, and the stride-scaled sampled subset
-					// otherwise -- unconditionally either way, so a full
-					// candidate array cannot darken the lighting.
-					float analytic_scale = analytic_exact ? 1.0 : stride_mult;
-					analytic_diffuse += f * analytic_scale;
-					analytic_specular += s * analytic_scale;
-					analytic_spec_base += ss.rgb * analytic_scale;
-					float ss_lum = abs(luminance(ss.rgb)) * analytic_scale;
-					analytic_fc_num += ss_lum * ss.a;
-					analytic_fc_den += ss_lum;
-					analytic_lum_d += abs(luminance(f)) * analytic_scale;
-					analytic_lum_s += abs(luminance(s)) * analytic_scale;
-					if (!sampled) {
-						continue;
-					}
-
-					// Skip lights already on the guided list.
-					bool listed = false;
-					for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
-						listed = listed || (guided_keys[j] == entry);
-					}
-					if (listed) {
-						continue;
-					}
-					float lum = abs(luminance(f + s));
-					float w = light_weight(lum) * stride_mult;
-					if (w <= 0.0) {
-						continue;
-					}
-					for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
-						if (r < params.reservoir_count) {
-							reservoir_update(discovery[r], entry, w, lum, rngs[r]);
+					// The light, and beside it its image through the planar
+					// mirror (a candidate and an analytic term of its own,
+					// sharing the light's draw in the stride).
+					uint variants = mirror_here ? 2u : 1u;
+					for (uint variant = 0u; variant < variants; variant++) {
+						uint e = variant == 0u ? entry : (entry | IMAGE_BIT);
+						vec3 f, s;
+						vec4 ss;
+						entry_eval(e, view_pos, view_normal, roughness, f, s, ss);
+						// One evaluation serves both the analytic sum and, below,
+						// the candidate set. The analytic sum takes every cell light
+						// unscaled when exact, and the stride-scaled sampled subset
+						// otherwise -- unconditionally either way, so a full
+						// candidate array cannot darken the lighting.
+						float analytic_scale = analytic_exact ? 1.0 : stride_mult;
+						analytic_diffuse += f * analytic_scale;
+						analytic_specular += s * analytic_scale;
+						analytic_spec_base += ss.rgb * analytic_scale;
+						float ss_lum = abs(luminance(ss.rgb)) * analytic_scale;
+						analytic_fc_num += ss_lum * ss.a;
+						analytic_fc_den += ss_lum;
+						analytic_lum_d += abs(luminance(f)) * analytic_scale;
+						analytic_lum_s += abs(luminance(s)) * analytic_scale;
+						if (!sampled) {
+							continue;
 						}
+
+						// Skip lights already on the guided list.
+						bool listed = false;
+						for (uint j = 0u; j < MAX_GUIDED_CANDIDATES; j++) {
+							listed = listed || (guided_keys[j] == e);
+						}
+						if (listed) {
+							continue;
+						}
+						float lum = abs(luminance(f + s));
+						float w = light_weight(lum) * stride_mult;
+						if (w <= 0.0) {
+							continue;
+						}
+						for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+							if (r < params.reservoir_count) {
+								reservoir_update(discovery[r], e, w, lum, rngs[r]);
+							}
+						}
+						hidden_weight_sum += w;
+						total_lum += lum * stride_mult;
 					}
-					hidden_weight_sum += w;
-					total_lum += lum * stride_mult;
 				}
 			}
 		}
@@ -1219,9 +1314,17 @@ void main() {
 				vec2 rnd = sample_rnd;
 				quadrant = (rnd.x < 0.5 ? 0u : 1u) | (rnd.y < 0.5 ? 0u : 2u);
 				view_target = ld.position + ld.area_width * (rnd.x - 0.5) + ld.area_height * (rnd.y - 0.5);
+				if ((entry & IMAGE_BIT) != 0u) {
+					vec3 n = params.mirror_plane.xyz;
+					view_target -= 2.0 * (dot(n, view_target) - params.mirror_plane.w) * n;
+				}
 			} else {
 				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
 				view_target = ld.position;
+				if ((entry & IMAGE_BIT) != 0u) {
+					vec3 n = params.mirror_plane.xyz;
+					view_target = ld.position - 2.0 * (dot(n, ld.position) - params.mirror_plane.w) * n;
+				}
 				// Light size drives the penumbra: sample a disk of that
 				// radius perpendicular to the shadow ray, like the paper's
 				// area sampling but for the sphere approximation.
@@ -1255,6 +1358,22 @@ void main() {
 			}
 			if (shadow_opacity < 0.001 || caster_mask == 0u) {
 				visibility = 1.0;
+			} else if ((entry & IMAGE_BIT) != 0u) {
+				// The image's shadow in two legs: to a centimetre above the
+				// plane (along its normal), then from the plane to the real
+				// light (the jittered target mirrored back).
+				vec3 n = params.mirror_plane.xyz;
+				float hp = dot(n, view_pos) - params.mirror_plane.w;
+				vec3 dir = normalize(view_target - view_pos);
+				float cos_p = max(-dot(n, dir), 1e-3);
+				vec3 leg_end = view_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
+				vec3 m = view_pos + dir * (hp / cos_p) + n * 0.01;
+				vec3 real_target = view_target - 2.0 * (dot(n, view_target) - params.mirror_plane.w) * n;
+				vec3 w_leg_end = world_pos + world_basis * (leg_end - view_pos);
+				vec3 w_m = world_pos + world_basis * (m - view_pos);
+				vec3 w_real = world_pos + world_basis * (real_target - view_pos);
+				bool occluded = !trace_visible(world_pos, w_leg_end, caster_mask) || !trace_visible(w_m, w_real, caster_mask);
+				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			} else {
 				bool occluded;
 				// Screen traces cannot honor caster masks; skip them when the

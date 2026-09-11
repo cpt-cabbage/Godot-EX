@@ -850,6 +850,20 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	StochasticParamsUBO params = {};
 	_set_luma_weights(params.luma_weights);
+	{
+		// GODOT_GI_MIRROR (see process_rt_gi): the plane in view space, so
+		// every local light gets an image entry beside it in this pass.
+		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
+		if (mirror.size() >= 7) {
+			Vector3 n_world(mirror[0], mirror[1], mirror[2]);
+			Vector3 n_view = p_world_from_view.basis.xform_inv(n_world);
+			params.mirror_plane[0] = n_view.x;
+			params.mirror_plane[1] = n_view.y;
+			params.mirror_plane[2] = n_view.z;
+			params.mirror_plane[3] = mirror[3] - n_world.dot(p_world_from_view.origin);
+			params.mirror_params[0] = mirror[4];
+		}
+	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	for (int col = 0; col < 4; col++) {
 		for (int row = 0; row < 4; row++) {

@@ -1030,6 +1030,33 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		vec3 pos;
 		float geom;
 		vec3 c = light_contribution(ld, is_spot, t.world_pos, t.n_world, pos, geom);
+		if (mirror_here && dot(mirror_n, pos) - params.mirror_plane.w > 0.0) {
+			// The light's image (evaluated whether or not the light itself
+			// reaches the texel: a ceiling sees its own lights only in the
+			// floor).
+			vec3 pos_img;
+			float geom_img;
+			vec3 ci = light_contribution(ld, is_spot, mirror_p, mirror_nrm, pos_img, geom_img);
+			vec3 img = pos - 2.0 * (dot(mirror_n, pos) - params.mirror_plane.w) * mirror_n;
+			vec3 dir = normalize(img - t.world_pos);
+			float cos_p = -dot(mirror_n, dir);
+			ci *= cos_p > 1e-3 ? mirror_fresnel(cos_p) : 0.0;
+			float wi = luminance(abs(ci));
+			if (wi > 0.0) {
+				sum += ci;
+				d.local_geom += geom_img;
+				weight_sum += wi;
+				seed = pcg_hash(seed);
+				if (hash_to_float(seed) * weight_sum < wi) {
+					selected = true;
+					sel_image = true;
+					sel_pos = img;
+					sel_real = pos;
+					sel_opacity = ld.shadow_opacity;
+					sel_mask = ld.shadow_caster_mask & 0xFFu;
+				}
+			}
+		}
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
 			continue;
@@ -1044,34 +1071,6 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 			sel_pos = pos;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
-		}
-		if (mirror_here && dot(mirror_n, pos) - params.mirror_plane.w > 0.0) {
-			vec3 pos_img;
-			float geom_img;
-			vec3 ci = light_contribution(ld, is_spot, mirror_p, mirror_nrm, pos_img, geom_img);
-			vec3 img = pos - 2.0 * (dot(mirror_n, pos) - params.mirror_plane.w) * mirror_n;
-			vec3 dir = normalize(img - t.world_pos);
-			float cos_p = -dot(mirror_n, dir);
-			if (cos_p <= 1e-3) {
-				continue;
-			}
-			ci *= mirror_fresnel(cos_p);
-			float wi = luminance(abs(ci));
-			if (wi <= 0.0) {
-				continue;
-			}
-			sum += ci;
-			d.local_geom += geom_img;
-			weight_sum += wi;
-			seed = pcg_hash(seed);
-			if (hash_to_float(seed) * weight_sum < wi) {
-				selected = true;
-				sel_image = true;
-				sel_pos = img;
-				sel_real = pos;
-				sel_opacity = ld.shadow_opacity;
-				sel_mask = ld.shadow_caster_mask & 0xFFu;
-			}
 		}
 	}
 	// Area lights, in the same estimator: their LTC diffuse term, with the
@@ -1088,6 +1087,32 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		float geom;
 		vec3 point;
 		vec3 c = area_light_contribution(ld, params.world_from_view, t.world_pos, t.n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
+		if (mirror_here) {
+			// The area light's image: the rect stays, the texel mirrors.
+			float geom_img;
+			vec3 point_img;
+			vec3 ci = area_light_contribution(ld, params.world_from_view, mirror_p, mirror_nrm, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom_img, point_img);
+			float hl = dot(mirror_n, point_img) - params.mirror_plane.w;
+			vec3 img = point_img - 2.0 * hl * mirror_n;
+			vec3 dir = normalize(img - t.world_pos);
+			float cos_p = -dot(mirror_n, dir);
+			ci *= (hl > 0.0 && cos_p > 1e-3) ? mirror_fresnel(cos_p) : 0.0;
+			float wi = luminance(abs(ci));
+			if (wi > 0.0) {
+				sum += ci;
+				d.local_geom += geom_img;
+				weight_sum += wi;
+				seed = pcg_hash(seed);
+				if (hash_to_float(seed) * weight_sum < wi) {
+					selected = true;
+					sel_image = true;
+					sel_pos = img;
+					sel_real = point_img;
+					sel_opacity = ld.shadow_opacity;
+					sel_mask = ld.shadow_caster_mask & 0xFFu;
+				}
+			}
+		}
 		float w = luminance(abs(c));
 		// Written as the negation so a NaN term is rejected too (every
 		// comparison with a NaN is false): the accumulation below keeps
