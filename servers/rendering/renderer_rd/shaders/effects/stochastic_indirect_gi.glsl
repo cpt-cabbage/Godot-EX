@@ -70,6 +70,11 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// turn converges in a few frames instead of thirty. ray_count above is
 	// the larger of the two: the hit slots are sized by it.
 	uvec4 ray_params;
+	// The control variate (GODOT_GI_CV, plan section 39): x its weight (0
+	// off, 1 the cards' field under the surface as the base estimate, the
+	// rays carrying only the screen's excess over the cards), y the card
+	// relights at which the field is trusted fully.
+	vec4 cv_params;
 }
 params;
 
@@ -204,6 +209,11 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	// answered them (SPEC_SRC_*), and in [7] the memory's writes.
 	uint spec_count[8];
 	uint spec_lum[8];
+	// Diagnostics (FLAG_TIER_STATS, the control variate): the field times
+	// the card rays' share, the rays' own card mean (the control) and the
+	// mean the rays used, summed as luminance in 1/1024 units over the
+	// pixels the variate applied to, and their count.
+	uint cv_sums[4];
 }
 calibration;
 
@@ -635,6 +645,10 @@ vec3 sdfgi_hit_normal(vec3 rel_pos, vec3 ray_dir) {
 #define CACHE_TIER_PROBE 1u
 #define CACHE_TIER_CARD 2u // Surface cache: already outgoing radiance, never calibrated.
 uint cache_tier = CACHE_TIER_PROBE;
+// The control variate: the card's own radiance at the last hit that read a
+// card (before the screen radiance replaced it), and whether the hit did.
+vec3 ray_control = vec3(0.0);
+bool ray_card = false;
 
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	cache_tier = CACHE_TIER_PROBE;
@@ -1191,6 +1205,33 @@ vec3 fold_above(vec3 dir, vec3 geo_normal) {
 // world_geo_normal is the geometric normal: the ray origins are pushed off
 // the surface along it, and the shading normal, which may lean into the
 // surface, has no say in that.
+// The control variate's value for a ray the screen trace answered: what
+// the cards' own bounce ray would have read in that direction, the card at
+// the hit (found by the query the screen trace saved) or the probes there.
+void cv_control_screen(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, float t_hit, vec3 rel_hit) {
+	vec3 origin = rel_origin + world_geo_normal * params.ray_bias;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, t_hit * 1.05 + 0.05);
+	while (rayQueryProceedEXT(rq)) {
+	}
+	ray_control = max(sdfgi_cache_radiance(rel_hit, world_dir), vec3(0.0));
+	ray_card = true;
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT && bool(params.flags & FLAG_SURFACE_CACHE)) {
+		uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+		float t = rayQueryGetIntersectionTEXT(rq, true);
+		vec3 world_hit = origin + world_dir * t + params.world_from_view[3].xyz;
+		float change_before = pixel_change;
+		card_lookup_footprint = t * abs(params.card_cone_tan);
+		vec3 card_radiance;
+		uint card_set;
+		if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
+			card_requests.frame[card_set] = params.surface_cache_frame;
+			ray_control = max(card_radiance, vec3(0.0));
+		}
+		pixel_change = change_before;
+	}
+}
+
 vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
 	r_hit_distance = params.ao_range; // Nothing hit within range.
 	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
@@ -1200,6 +1241,9 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 			mat3 world_basis = mat3(params.world_from_view);
 			vec3 rel_hit = world_basis * hit_view;
 			r_hit_distance = length(hit_view - view_origin);
+			if (params.cv_params.x > 0.0 && !hit_specular) {
+				cv_control_screen(rel_origin, world_geo_normal, world_dir, r_hit_distance, rel_hit);
+			}
 			return screen_radiance_boost(hit_view, sdfgi_cache_radiance(rel_hit, world_dir));
 		}
 	}
@@ -1267,6 +1311,8 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
 					card_requests.frame[card_set] = params.surface_cache_frame;
 					cache_tier = CACHE_TIER_CARD;
+					ray_control = card_radiance;
+					ray_card = true;
 					return screen_radiance_boost(view_hit, card_radiance);
 				}
 			}
@@ -1298,6 +1344,9 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 							hit_results.data[uint(hit_pixel.y * params.screen_size.x + hit_pixel.x) * (params.ray_count + 1u) + hit_slot] = uvec4(0u, 0u, rt_hit_pack_dir(world_dir), RT_HIT_RESULT_PENDING);
 							// Nothing now; the resolve adds the material's answer.
 							trace_source = TIER_SRC_HIT_SHADED;
+							// The control variate: the cards' bounce ray reads the probes at a hit without a card.
+							ray_control = max(sdfgi_cache_radiance(rel_hit, world_dir), vec3(0.0));
+							ray_card = true;
 							return vec3(0.0);
 						} else {
 							atomicAdd(hit_counts.data[RT_HIT_COUNT_OVERFLOW], 1u);
@@ -1311,6 +1360,8 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
 					card_requests.frame[card_set] = params.surface_cache_frame;
 					cache_tier = CACHE_TIER_CARD;
+					ray_control = card_radiance;
+					ray_card = true;
 					return screen_radiance_boost(view_hit, card_radiance);
 				}
 			}
@@ -1333,6 +1384,12 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 	boost_source = SPEC_SRC_OTHER;
 	cache_tier = CACHE_TIER_PROBE;
 	vec3 radiance = trace_radiance_chain(rel_origin, world_geo_normal, world_dir, view_origin, view_dir, jitter, r_hit_distance);
+	if (!ray_card) {
+		// The control variate: the probe and sky tiers are what the cards'
+		// bounce ray reads there too, so the ray carries no correction.
+		ray_control = max(radiance, vec3(0.0));
+		ray_card = true;
+	}
 	if (bool(params.flags & FLAG_TIER_STATS)) {
 		uint src = trace_source;
 		if (src == TIER_SRC_UNSET) {
@@ -1450,17 +1507,22 @@ void main() {
 	hit_pixel = pixel;
 	hit_mirror = false;
 	hit_specular = false;
+	// The control variate's sum: what the cards' bounce rays would have
+	// read in each ray's direction (see ray_control).
+	vec3 control = vec3(0.0);
 	for (uint r = 0u; r < rays; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
 		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float t_hit;
 		hit_slot = r;
+		ray_card = false;
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
 		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
 		irradiance += radiance;
+		control += ray_control;
 		moment += luminance(radiance) * dir;
 		// Only nearby geometry occludes: in an open scene nearly every ray
 		// hits something eventually, and counting those would report near
@@ -1552,11 +1614,9 @@ void main() {
 			atomicAdd(calibration.tier_count[7], 1u); // Diagnostics (GODOT_GI_TIER_PRINT): the pixels whose gather went non-finite.
 		}
 	}
-	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_spec_ray, pixel, spec_ray);
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
-	imageStore(out_directional, pixel, directional_out);
 
 	// The young pixel's stand-in. A fast turn refreshes most of the screen
 	// within a few frames, and the entering band is one-sample pixels among
@@ -1571,7 +1631,7 @@ void main() {
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
 	if (bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF)) {
-		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & (FLAG_FALLBACK_ALL | FLAG_FALLBACK_EVERY))) {
+		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & (FLAG_FALLBACK_ALL | FLAG_FALLBACK_EVERY)) || params.cv_params.x > 0.0) {
 			float view_len = length(rel_pos);
 			vec3 eye_dir = rel_pos / max(view_len, 1e-4);
 			rayQueryEXT rq;
@@ -1636,4 +1696,36 @@ void main() {
 		}
 	}
 	imageStore(out_fallback, pixel, fallback);
+
+	// The control variate (GODOT_GI_CV): the cards' field under the surface
+	// is the expectation of what the cards' bounce rays read from here, and
+	// every ray carries that same read as its control (the card at its hit,
+	// the probes or the sky where there is none), so the field stands in
+	// for the control's mean and the rays carry only their excess over it:
+	// the screen's specular, textures, emissives and further bounces, and
+	// the materials' answers at the deferred hits. The same expectation as
+	// the plain mean when the field is converged, with the cards' sampling
+	// noise gone from every sample, young or settled. Trusted as the
+	// field's relights grow, and only where a card lies under the pixel.
+	if (params.cv_params.x > 0.0 && fallback.a > 0.0) {
+		float trust = clamp(fallback.a * 64.0 / max(params.cv_params.y, 1.0), 0.0, 1.0);
+		float cv = params.cv_params.x * trust;
+		vec3 corrected = max(irradiance + cv * (fallback.rgb - control * inv_rays), vec3(0.0));
+		if (bool(params.flags & FLAG_TIER_STATS)) {
+			atomicAdd(calibration.cv_sums[0], uint(min(luminance(fallback.rgb), 64.0) * 1024.0));
+			atomicAdd(calibration.cv_sums[1], uint(min(luminance(control) * inv_rays, 64.0) * 1024.0));
+			atomicAdd(calibration.cv_sums[2], uint(min(luminance(irradiance), 64.0) * 1024.0));
+			atomicAdd(calibration.cv_sums[3], 1u);
+		}
+		if (!any(isnan(corrected)) && !any(isinf(corrected))) {
+			// The moment follows the level, or the |moment| <= luminance bound breaks.
+			float l0 = luminance(irradiance);
+			if (l0 > 1e-6) {
+				directional_out.xyz *= min(luminance(corrected) / l0, 1.0);
+			}
+			irradiance = corrected;
+		}
+	}
+	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
+	imageStore(out_directional, pixel, directional_out);
 }

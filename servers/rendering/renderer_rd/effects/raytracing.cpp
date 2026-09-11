@@ -1252,7 +1252,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(160); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own.
+		c.buffer = rd->storage_buffer_create(176); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own.
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -1290,6 +1290,15 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.ray_count = MAX(base_rays, young_rays);
 	params.ray_params[0] = base_rays;
 	params.ray_params[1] = young_rays;
+	// GODOT_GI_CV=<weight> (plan section 39): the cards' field under the
+	// surface as the gather's base estimate, the rays carrying the screen's
+	// excess over the cards; GODOT_GI_CV_RAMP=<relights> (8) the field's
+	// accumulation at which it is trusted fully. Every pixel then looks its
+	// field up each frame (the young pixels' stand-in did already).
+	static const float cv_weight = OS::get_singleton()->get_environment("GODOT_GI_CV") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_CV").to_float());
+	static const float cv_ramp = OS::get_singleton()->get_environment("GODOT_GI_CV_RAMP") == "" ? 8.0f : float(OS::get_singleton()->get_environment("GODOT_GI_CV_RAMP").to_float());
+	params.cv_params[0] = CLAMP(cv_weight, 0.0f, 1.0f);
+	params.cv_params[1] = cv_ramp;
 	params.ray_params[2] = 0;
 	params.ray_params[3] = 0;
 	params.flags = 0;
@@ -1582,7 +1591,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
 	if (calibrate || tier_stats) {
-		rd->buffer_clear(calibration.buffer, 0, 160);
+		rd->buffer_clear(calibration.buffer, 0, 176);
 	}
 	RENDER_TIMESTAMP("RT GI Gather");
 	rd->draw_command_begin_label("RT GI Gather");
@@ -1605,7 +1614,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_TIER_PRINT=<frames> sets the interval (60 when unset or 0).
 	static const int64_t tier_interval = MAX(OS::get_singleton()->get_environment("GODOT_GI_TIER_PRINT").to_int(), int64_t(0));
 	if (tier_stats && (rb_state->frame_index % (tier_interval > 0 ? uint32_t(tier_interval) : 60u)) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 128);
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 152);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -2326,5 +2335,14 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 		}
 		spec_line += vformat("  | memory writes %d", s[7]);
 		print_line(spec_line);
+	}
+	if (p_data.size() >= 152) {
+		// The control variate's sums (GODOT_GI_CV): the field times the card
+		// against the rays' own control mean, and the mean used.
+		const uint32_t *v = t + 32;
+		if (v[3] > 0) {
+			double k = 1.0 / 1024.0 / double(v[3]);
+			print_line(vformat("RT_GI_CV pixels %d  field %.4f  control %.4f  used %.4f  (control / field %.3f, used / field %.3f)", v[3], v[0] * k, v[1] * k, v[2] * k, v[0] > 0 ? double(v[1]) / double(v[0]) : 0.0, v[0] > 0 ? double(v[2]) / double(v[0]) : 0.0));
+		}
 	}
 }
