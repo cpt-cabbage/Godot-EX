@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_hiz.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/translucency_volume.glsl.gen.h"
@@ -107,6 +108,7 @@
 // The rough reflection ray's direction and density (the gather), and the reflection resolved over the neighbourhood's rays (the resolve pass, what the temporal pass accumulates).
 #define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
+#define RB_RT_GI_HIZ SNAME("hiz") // The depth pyramid the gather's screen traces walk (level 0 = the depth halved), nearest depth per cell.
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 
@@ -307,6 +309,12 @@ private:
 	RID ltc_lut1_texture;
 	RID ltc_lut2_texture;
 	RID material_sampler; // Linear, for LTC LUTs and the area light atlas.
+	// The depth pyramid for the gather's screen traces (screen_space_reflection_hiz.glsl,
+	// the SSR's shader: the nearest depth of the four under each texel).
+	ScreenSpaceReflectionHizShaderRD hiz_shader;
+	RID hiz_shader_version;
+	RID hiz_pipelines[4]; // Default, odd width, odd height, both.
+	void _build_hiz(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, uint32_t p_levels);
 
 	StochasticDirectLightingShaderRD stochastic_shader;
 	RID stochastic_shader_version;
@@ -391,6 +399,9 @@ private:
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
 		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
+		uint32_t hiz_levels; // Levels of the depth pyramid the screen traces may walk (0: the linear march).
+		float screen_trace_distance; // How far a screen trace goes before the BVH ray takes over (metres).
+		float hiz_pad[2];
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;

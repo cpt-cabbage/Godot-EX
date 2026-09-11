@@ -196,6 +196,19 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 
 	{
+		Vector<String> hiz_modes;
+		hiz_modes.push_back("\n");
+		hiz_modes.push_back("\n#define MODE_ODD_WIDTH\n");
+		hiz_modes.push_back("\n#define MODE_ODD_HEIGHT\n");
+		hiz_modes.push_back("\n#define MODE_ODD_WIDTH\n#define MODE_ODD_HEIGHT\n");
+		hiz_shader.initialize(hiz_modes);
+		hiz_shader_version = hiz_shader.version_create();
+		for (int i = 0; i < 4; i++) {
+			hiz_pipelines[i] = RD::get_singleton()->compute_pipeline_create(hiz_shader.version_get_shader(hiz_shader_version, i));
+		}
+	}
+
+	{
 		// Spatio-temporal blue noise driving the stochastic sampling pass
 		// (one 64x64 RG slice per frame over a 16 frame cycle).
 		RD::TextureFormat tf;
@@ -268,6 +281,7 @@ Raytracing::~Raytracing() {
 	RD::get_singleton()->free_rid(material_sampler);
 	shader.version_free(shader_version);
 	rt_gi_shader.version_free(rt_gi_shader_version);
+	hiz_shader.version_free(hiz_shader_version);
 	blur_shader.version_free(blur_shader_version);
 	temporal_shader.version_free(temporal_shader_version);
 	stochastic_shader.version_free(stochastic_shader_version);
@@ -1159,6 +1173,20 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
+		{
+			// The depth pyramid the screen traces walk: level 0 is the depth
+			// halved, and the chain goes down to a single texel.
+			Size2i hiz_size((full_size.x + 1) / 2, (full_size.y + 1) / 2);
+			uint32_t hiz_mips = 1;
+			Size2i hs = hiz_size;
+			while (hs.x > 1 && hs.y > 1) {
+				hs.x = MAX(1, hs.x / 2);
+				hs.y = MAX(1, hs.y / 2);
+				hiz_mips++;
+			}
+			p_render_buffers->create_texture(RB_SCOPE_RT_GI, RB_RT_GI_HIZ, RD::DATA_FORMAT_R32_SFLOAT,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, hiz_size, p_render_buffers->get_view_count(), hiz_mips);
+		}
 		const StringName directional_names[] = {
 			RB_RT_GI_DIRECTIONAL, RB_RT_GI_RAW_DIRECTIONAL,
 			RB_RT_GI_HIST_DIRECTIONAL_0, RB_RT_GI_HIST_DIRECTIONAL_1
@@ -1313,6 +1341,19 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	if (p_quality.screen_traces) {
 		params.flags |= 32; // FLAG_SCREEN_TRACES
+		// The depth pyramid walk for the diffuse rays (GODOT_GI_HIZ=1; off by
+		// default: measured on the game project it moves the screen tier from
+		// 22.8% to 23.2% of the rays indoors, 36% to 40% from outside, for the
+		// pyramid's 0.65 ms against 0.2 ms less in the gather) and how far a
+		// screen trace goes (GODOT_GI_STRACE_DIST, metres; the linear march's
+		// 0.4 m is contact occlusion only).
+		static const bool use_hiz = OS::get_singleton()->get_environment("GODOT_GI_HIZ") == "1";
+		static const float strace_dist = OS::get_singleton()->get_environment("GODOT_GI_STRACE_DIST") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_STRACE_DIST").to_float());
+		// GODOT_GI_HIZ_LEVELS caps the pyramid (4: cells up to 32 texels; the walk
+		// seldom needs coarser at a few metres, and every level is a dispatch).
+		static const uint32_t hiz_levels_cap = OS::get_singleton()->get_environment("GODOT_GI_HIZ_LEVELS") == "" ? 4u : uint32_t(OS::get_singleton()->get_environment("GODOT_GI_HIZ_LEVELS").to_int());
+		params.hiz_levels = use_hiz && p_render_buffers->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_HIZ) ? MIN(p_render_buffers->get_texture_format(RB_SCOPE_RT_GI, RB_RT_GI_HIZ).mipmaps, hiz_levels_cap) : 0;
+		params.screen_trace_distance = strace_dist > 0.0f ? strace_dist : (params.hiz_levels > 0 ? 4.0f : 0.4f);
 	}
 	if (p_cascades.voxel_gi_count > 0) {
 		params.flags |= 64; // FLAG_VOXEL_GI
@@ -1536,11 +1577,15 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (calibrate || tier_stats) {
 		rd->buffer_clear(calibration.buffer, 0, 160);
 	}
+	RD::Uniform u_hiz(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 39, Vector<RID>({ sampler, params.hiz_levels > 0 ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_HIZ, p_view, 0, 1, params.hiz_levels) : depth }));
+	if (params.hiz_levels > 0) {
+		_build_hiz(p_render_buffers, p_view, params.hiz_levels);
+	}
 	RENDER_TIMESTAMP("RT GI Gather");
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen, u_hiz), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -2264,4 +2309,40 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 		spec_line += vformat("  | memory writes %d", s[7]);
 		print_line(spec_line);
 	}
+}
+
+// The depth pyramid for the screen traces: the nearest (largest reverse-Z)
+// depth of the texels under each one, level after level, so a walk can
+// skip a whole cell when the ray passes in front of everything in it.
+void Raytracing::_build_hiz(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, uint32_t p_levels) {
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	uint32_t mips = p_levels;
+	RENDER_TIMESTAMP("RT GI Hi-Z");
+	rd->draw_command_begin_label("RT GI Hi-Z");
+	RD::ComputeListID list = rd->compute_list_begin();
+	for (uint32_t m = 0; m < mips; m++) {
+		RID source = m == 0 ? p_render_buffers->get_depth_texture(p_view) : p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_HIZ, p_view, m - 1);
+		RID dest = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_HIZ, p_view, m);
+		Size2i source_size = rd->texture_size(source);
+		Size2i dest_size = rd->texture_size(dest);
+		int mode = ((source_size.width % 2) != 0 ? 1 : 0) | ((source_size.height % 2) != 0 ? 2 : 0);
+		struct HizPush {
+			int32_t screen_size[2];
+			int32_t pad[2];
+		} push;
+		push.screen_size[0] = dest_size.width;
+		push.screen_size[1] = dest_size.height;
+		push.pad[0] = 0;
+		push.pad[1] = 0;
+		RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, source }));
+		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ dest }));
+		rd->compute_list_bind_compute_pipeline(list, hiz_pipelines[mode]);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(hiz_shader.version_get_shader(hiz_shader_version, mode), 0, u_source, u_dest), 0);
+		rd->compute_list_set_push_constant(list, &push, sizeof(push));
+		rd->compute_list_dispatch_threads(list, dest_size.width, dest_size.height, 1);
+		rd->compute_list_add_barrier(list);
+	}
+	rd->compute_list_end();
+	rd->draw_command_end_label();
 }
