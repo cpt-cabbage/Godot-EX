@@ -807,7 +807,8 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
 	// Weaker by a quarter per bounce: two pixels whose rays keep landing on
 	// each other would otherwise hand the mark back and forth forever.
-	pixel_change = max(pixel_change, textureLod(prev_gi_history, prev_uv, 0.0).a - 0.25);
+	float hit_mark = textureLod(prev_gi_history, prev_uv, 0.0).a;
+	pixel_change = max(pixel_change, hit_mark - 0.25);
 	// The colour a young pixel shows is its own one-sample guess, spread by
 	// the wide kernels its youth gets; read back here it fed the pixels whose
 	// rays land on it, and after a camera flick the whole screen restarted
@@ -824,6 +825,16 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		// mismatch test).
 		hit_frames = (params.memory_rate > 0.0 ? min(hit_meta.r, hit_meta.g) : hit_meta.r) * 64.0;
 		settled = smoothstep(0.0, params.screen_radiance_extra.x, hit_frames);
+		// A pixel young because the light on it changed (its history's
+		// change mark is live for eight frames after the restart) shows the
+		// new light, which the memory does not hold yet: its colour is
+		// trusted, and it teaches. Measured without this (section 34): the
+		// lab's colour and orbit cases 15-20% worse from stop + 8, the
+		// old excess serving until sixteen settled frames.
+		if (params.memory_rate > 0.0 && hit_mark > 0.02) {
+			settled = 1.0;
+			hit_frames = 64.0;
+		}
 	}
 	float l = luminance(col);
 	// Both tiers for the same point: what the calibration is made of. The raw
