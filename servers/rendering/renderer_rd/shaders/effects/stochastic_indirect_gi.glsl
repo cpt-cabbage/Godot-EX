@@ -81,7 +81,8 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// x its F0, y the light's range.
 	vec4 mirror_plane;
 	vec4 mirror_light;
-	vec4 mirror_params;
+	vec4 mirror_params; // x F0, y the knob light's range, z debug bits, w the plane's roughness.
+	vec4 mirror_extra; // x: the plane's diffuse share (what its texels keep of their albedo).
 }
 params;
 
@@ -397,9 +398,19 @@ float card_dynamic_age(ivec2 tex0, vec3 static_bounce) {
 
 // The dynamic lights' unshadowed direct term at a point (the card lighting's
 // light_contribution_world, over pi).
+vec3 dyn_light_direct(uint i, vec3 world_pos, vec3 n);
+
 vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
 	vec3 sum = vec3(0.0);
 	for (uint i = 0u; i < dyn_lights.count; i++) {
+		sum += dyn_light_direct(i, world_pos, n);
+	}
+	return sum;
+}
+
+// One dynamic light's unshadowed direct term at a point, times its weight.
+vec3 dyn_light_direct(uint i, vec3 world_pos, vec3 n) {
+	{
 		LightData ld = dyn_lights.data[i];
 		vec3 rel = ld.position - world_pos;
 		float len = length(rel);
@@ -413,7 +424,7 @@ vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
 		}
 		float geom = max(dot(n, l), 0.0) * attenuation;
 		if (geom <= 0.0) {
-			continue;
+			return vec3(0.0);
 		}
 		vec3 color = ld.color;
 		// The projector texture, as the card lighting reads it
@@ -439,9 +450,8 @@ vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
 			}
 			color *= proj.rgb * proj.a;
 		}
-		sum += color * (geom * (1.0 / 3.14159265359)) * dyn_lights.weights[i >> 2u][i & 3u];
+		return color * (geom * (1.0 / 3.14159265359)) * dyn_lights.weights[i >> 2u][i & 3u];
 	}
-	return sum;
 }
 
 layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_directional;
@@ -663,6 +673,24 @@ float mirror_fresnel(float c) {
 // Whether a world point lies on the mirror plane.
 bool on_mirror_plane(vec3 world_pos) {
 	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5 && abs(dot(params.mirror_plane.xyz, world_pos) - params.mirror_plane.w) < 0.02;
+}
+
+// The plane's reflection of a direction through a GGX lobe of its
+// roughness (a mirror at 0): the half vector sampled around the normal.
+vec3 mirror_reflect(vec3 dir_in, vec3 n, vec2 u) {
+	float a = params.mirror_params.w * params.mirror_params.w;
+	if (a < 1e-4) {
+		return reflect(dir_in, n);
+	}
+	float phi = u.x * 2.0 * M_PI;
+	float ct = sqrt((1.0 - u.y) / (1.0 + (a * a - 1.0) * u.y));
+	float st = sqrt(max(1.0 - ct * ct, 0.0));
+	vec3 h = normalize(basis_around(n) * vec3(st * cos(phi), st * sin(phi), ct));
+	vec3 r = reflect(dir_in, h);
+	if (dot(r, n) <= 1e-3) {
+		r = reflect(dir_in, n);
+	}
+	return r;
 }
 
 // A shadow segment: anything opaque between the two points.
@@ -1338,8 +1366,19 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				// own card is diffuse-only (the light pass zeroes it on the
 				// plane), so nothing is counted twice.
 				vec3 n = params.mirror_plane.xyz;
-				vec3 rdir = reflect(world_dir, n);
+				vec3 rdir = mirror_reflect(world_dir, n, stbn_sample(hit_pixel, 9u));
 				float f = mirror_fresnel(abs(dot(n, world_dir)));
+				// The plane's own card: its diffuse part (its texels keep that share).
+				vec3 plane_diffuse = vec3(0.0);
+				if (params.mirror_extra.x > 0.0) {
+					card_lookup_footprint = t_hit * abs(params.card_cone_tan);
+					vec3 plane_radiance;
+					uint plane_set;
+					if (surface_cache_lookup(instance_id, world_hit, world_dir, plane_radiance, plane_set)) {
+						card_requests.frame[plane_set] = params.surface_cache_frame;
+						plane_diffuse = max(plane_radiance, vec3(0.0));
+					}
+				}
 				rayQueryEXT rq2;
 				rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, world_hit + n * params.ray_bias, params.ray_bias, rdir, t_max);
 				while (rayQueryProceedEXT(rq2)) {
@@ -1362,15 +1401,16 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 					}
 				}
 				cache_tier = CACHE_TIER_CARD;
-				ray_control = bounced * f;
+				vec3 answer = plane_diffuse + bounced * f;
+				ray_control = answer;
 				ray_card = true;
 				if (bool(params.flags & FLAG_TIER_STATS)) {
 					// Diagnostics (the RT_GI_CV line while the mirror is on): continuations, their lookups that found a card, their luminance.
 					atomicAdd(calibration.cv_sums[3], 1u);
-					atomicAdd(calibration.cv_sums[0], uint(min(luminance(bounced * f), 64.0) * 1024.0));
+					atomicAdd(calibration.cv_sums[0], uint(min(luminance(answer), 64.0) * 1024.0));
 					atomicAdd(calibration.cv_sums[1], card_hit ? 1024u : 0u);
 				}
-				return bounced * f;
+				return answer;
 			}
 			// The ray's footprint at the hit: the diffuse cone, or the lobe's
 			// for the reflection ray (a mirror's is a point).
@@ -1609,47 +1649,71 @@ void main() {
 	moment *= inv_rays;
 	visibility *= inv_rays;
 	if (dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5) {
-		// The light's image through the planar mirror: direct light the
+		// The lights' images through the planar mirror: direct light the
 		// mirror throws onto this surface, which no ray can find (a point
 		// seen through a delta), so it is evaluated here, the way the box's
-		// image solve does: the mirrored light, Fresnel at the crossing,
-		// and a shadow ray in two legs (to the plane, then from the plane
-		// to the light).
+		// image solve does. A light's image at a point is the light itself
+		// at the mirrored point with the mirrored normal (spots, cones and
+		// cookies come along), times the Fresnel at the crossing, seen
+		// through a shadow ray in two legs (to a centimetre above the
+		// plane measured along the normal, then from the plane to the
+		// light). The knob's own light, and the dynamic lights (their
+		// weights included); the static local lights reach the pixel only
+		// through the cards for now.
 		vec3 n = params.mirror_plane.xyz;
 		vec3 world_pos = rel_pos + params.world_from_view[3].xyz;
 		float hp = dot(n, world_pos) - params.mirror_plane.w;
-		vec3 light = params.mirror_light.xyz;
-		float hl = dot(n, light) - params.mirror_plane.w;
-		if (hp > 0.005 && hl > 0.0) {
-			vec3 img = light - 2.0 * hl * n;
-			vec3 rel = img - world_pos;
-			float d = length(rel);
-			vec3 dir = rel / d;
-			float cos_n = dot(world_normal, dir);
-			float cos_p = -dot(n, dir);
-			if (cos_n > 0.0 && cos_p > 1e-3 && d < params.mirror_params.y) {
-				float tm = hp / cos_p;
-				vec3 m = world_pos + dir * tm;
-				vec3 start = world_pos + world_geo_normal * params.ray_bias;
-				// The first leg ends a centimetre above the plane (measured
-				// along the normal: along the ray it is a fraction of a
-				// millimetre at a grazing angle, and the slab's face caught it).
-				vec3 leg_end = world_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
-				if (!mirror_occluded(start, leg_end) && !mirror_occluded(m + n * 0.01, light)) {
+		if ((uint(params.mirror_params.z) & 1u) != 0u) {
+			irradiance = vec3(0.0); // Diagnostics: the image terms alone.
+			moment = vec3(0.0);
+		}
+		if (hp > 0.005) {
+			vec3 start = world_pos + world_geo_normal * params.ray_bias;
+			vec3 p_img = world_pos - 2.0 * hp * n;
+			vec3 n_img = world_normal - 2.0 * dot(world_normal, n) * n;
+			uint count = dyn_lights.count + (params.mirror_light.w > 0.0 ? 1u : 0u);
+			for (uint i = 0u; i < count; i++) {
+				bool knob = i == dyn_lights.count;
+				vec3 light = knob ? params.mirror_light.xyz : dyn_lights.data[i].position;
+				float hl = dot(n, light) - params.mirror_plane.w;
+				if (hl <= 0.0) {
+					continue;
+				}
+				vec3 img = light - 2.0 * hl * n;
+				vec3 rel = img - world_pos;
+				float d = length(rel);
+				vec3 dir = rel / max(d, 1e-4);
+				float cos_n = dot(world_normal, dir);
+				float cos_p = -dot(n, dir);
+				if (cos_n <= 0.0 || cos_p <= 1e-3) {
+					continue;
+				}
+				vec3 c;
+				if (knob) {
+					if (d >= params.mirror_params.y) {
+						continue;
+					}
 					float nd = d / params.mirror_params.y;
 					nd *= nd;
 					nd *= nd;
 					nd = max(1.0 - nd, 0.0);
 					nd *= nd;
-					float att = nd / max(d, 1e-4);
-					float e = params.mirror_light.w * att * cos_n * mirror_fresnel(cos_p);
-					if ((uint(params.mirror_params.z) & 1u) != 0u) {
-						irradiance = vec3(0.0); // Diagnostics: the image term alone.
-						moment = vec3(0.0);
-					}
-					irradiance += vec3(e);
-					moment += e * dir;
+					c = vec3(params.mirror_light.w * nd / max(d, 1e-4) * cos_n);
+				} else {
+					c = dyn_light_direct(i, p_img, n_img);
 				}
+				c *= mirror_fresnel(cos_p);
+				if (luminance(c) <= 0.0) {
+					continue;
+				}
+				float tm = hp / cos_p;
+				vec3 m = world_pos + dir * tm;
+				vec3 leg_end = world_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
+				if (mirror_occluded(start, leg_end) || mirror_occluded(m + n * 0.01, light)) {
+					continue;
+				}
+				irradiance += c;
+				moment += luminance(c) * dir;
 			}
 		}
 	}

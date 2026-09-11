@@ -370,7 +370,8 @@ private:
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz normal, w offset; its texels bounce nothing diffusely.
 		float mirror_light[4]; // The one omni light it images: xyz world position, w energy.
-		float mirror_params[4]; // x F0, y the light's range.
+		float mirror_params[4]; // x F0, w the plane's roughness.
+		float mirror_extra[4]; // x the plane's diffuse share.
 	};
 
 	// The dynamic lights, as the card lighting and the GI gather read them

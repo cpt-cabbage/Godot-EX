@@ -910,14 +910,12 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		// mirror's texels bounce nothing diffusely.
 		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 		if (mirror.size() >= 7) {
-			params.mirror_plane[1] = 1.0f;
-			params.mirror_plane[3] = mirror[0];
-			params.mirror_params[0] = mirror[1];
-			params.mirror_light[0] = mirror[2];
-			params.mirror_light[1] = mirror[3];
-			params.mirror_light[2] = mirror[4];
-			params.mirror_light[3] = mirror[5];
-			params.mirror_params[1] = mirror[6];
+			for (int i = 0; i < 4; i++) {
+				params.mirror_plane[i] = mirror[i];
+			}
+			params.mirror_params[0] = mirror[4];
+			params.mirror_params[3] = mirror[5];
+			params.mirror_extra[0] = mirror[6];
 		}
 	}
 	Projection world_from_view(p_inputs.world_from_view);

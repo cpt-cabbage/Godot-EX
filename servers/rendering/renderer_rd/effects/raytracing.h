@@ -399,7 +399,8 @@ private:
 		float cv_params[4]; // The control variate (GODOT_GI_CV): x its weight (0 off), y the card relights at which the field is trusted fully (GODOT_GI_CV_RAMP).
 		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz normal, w offset (zero normal: off).
 		float mirror_light[4]; // The light it images: xyz world position, w energy.
-		float mirror_params[4]; // x F0, y the light's range.
+		float mirror_params[4]; // x F0, y the knob light's range, z debug bits, w the plane's roughness.
+		float mirror_extra[4]; // x the plane's diffuse share.
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;

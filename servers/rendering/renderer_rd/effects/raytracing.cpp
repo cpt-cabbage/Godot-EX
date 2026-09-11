@@ -1261,22 +1261,26 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RtGiParamsUBO params = {};
 	_set_luma_weights(params.luma_weights);
 	{
-		// GODOT_GI_MIRROR="plane_y,F0,lx,ly,lz,energy,range" (plan section
-		// 41, a prototype): a horizontal planar mirror at that height with
-		// that F0, and the one omni light it images.
+		// GODOT_GI_MIRROR="nx,ny,nz,w,F0,roughness,diffuse_share[,lx,ly,lz,energy,range][,debug]"
+		// (plan sections 41-42, a prototype): a planar mirror (n . p = w)
+		// with that F0, roughness and diffuse share, an optional omni light
+		// of its own to image (the dynamic lights are imaged always), and
+		// diagnostics bits (1 the image terms alone, 2 no continuation).
 		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 		if (mirror.size() >= 7) {
-			params.mirror_plane[0] = 0.0f;
-			params.mirror_plane[1] = 1.0f;
-			params.mirror_plane[2] = 0.0f;
-			params.mirror_plane[3] = mirror[0];
-			params.mirror_params[0] = mirror[1];
-			params.mirror_light[0] = mirror[2];
-			params.mirror_light[1] = mirror[3];
-			params.mirror_light[2] = mirror[4];
-			params.mirror_light[3] = mirror[5];
-			params.mirror_params[1] = mirror[6];
-			params.mirror_params[2] = mirror.size() >= 8 ? mirror[7] : 0.0f; // Diagnostics bits: 1 the image term alone, 2 no continuation at the plane.
+			for (int i = 0; i < 4; i++) {
+				params.mirror_plane[i] = mirror[i];
+			}
+			params.mirror_params[0] = mirror[4];
+			params.mirror_params[3] = mirror[5];
+			params.mirror_extra[0] = mirror[6];
+			if (mirror.size() >= 12) {
+				for (int i = 0; i < 4; i++) {
+					params.mirror_light[i] = mirror[7 + i];
+				}
+				params.mirror_params[1] = mirror[11];
+			}
+			params.mirror_params[2] = mirror.size() >= 13 ? mirror[12] : 0.0f;
 		}
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();

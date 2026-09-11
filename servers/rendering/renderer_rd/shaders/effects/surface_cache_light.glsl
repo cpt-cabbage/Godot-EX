@@ -92,8 +92,9 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float pad_join2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	vec4 mirror_plane; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz its normal, w its offset; a texel on it bounces nothing diffusely (its transport is the image light and the continuation below).
-	vec4 mirror_light; // The one omni light it images: xyz world position, w energy.
-	vec4 mirror_params; // x F0, y the light's range.
+	vec4 mirror_light; // (The gather's knob light; unused here: the cards image the lights in their lists.)
+	vec4 mirror_params; // x F0, w the plane's roughness.
+	vec4 mirror_extra; // x: the plane's diffuse share (what its texels keep of their albedo).
 }
 params;
 
@@ -795,6 +796,26 @@ bool mirror_on() {
 	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5;
 }
 
+// The plane's reflection of a direction through a GGX lobe of its
+// roughness (a mirror at 0).
+vec3 mirror_reflect(vec3 dir_in, vec3 n, vec2 u) {
+	float a = params.mirror_params.w * params.mirror_params.w;
+	if (a < 1e-4) {
+		return reflect(dir_in, n);
+	}
+	vec3 t0 = normalize(abs(n.x) < 0.9 ? cross(n, vec3(1.0, 0.0, 0.0)) : cross(n, vec3(0.0, 1.0, 0.0)));
+	vec3 t1 = cross(n, t0);
+	float phi = u.x * 2.0 * M_PI;
+	float ct = sqrt((1.0 - u.y) / (1.0 + (a * a - 1.0) * u.y));
+	float st = sqrt(max(1.0 - ct * ct, 0.0));
+	vec3 h = normalize(t0 * (st * cos(phi)) + t1 * (st * sin(phi)) + n * ct);
+	vec3 r = reflect(dir_in, h);
+	if (dot(r, n) <= 1e-3) {
+		r = reflect(dir_in, n);
+	}
+	return r;
+}
+
 bool occluded_opaque(vec3 origin, vec3 dir, float t_max) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, origin, 0.0, dir, t_max);
@@ -930,7 +951,7 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 	vec3 n_local = u * n_cam.x + v * n_cam.y + axis * n_cam.z;
 	t.world_pos = (s.world_from_local * vec4(local_pos, 1.0)).xyz;
 	if (dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5 && abs(dot(params.mirror_plane.xyz, t.world_pos) - params.mirror_plane.w) < 0.02) {
-		t.albedo = vec3(0.0); // The planar mirror's texel: its reflection is carried by the gather's image light and continuation.
+		t.albedo *= params.mirror_extra.x; // The planar mirror's texel keeps its diffuse share; its reflection is the image lights and the continuations.
 	}
 	t.n_world = normalize(mat3(s.world_from_local) * n_local);
 	t.origin = t.world_pos + t.n_world * params.ray_bias;
@@ -980,56 +1001,24 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		float vis = mix(1.0, occluded(t.origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
 		direct += c * vis;
 	}
-	if (mirror_on()) {
-		// The light's image through the planar mirror (see the gather's
-		// term): an exact, shadowed term like the directional lights',
-		// the shadow ray in two legs (to the plane, then to the light).
-		vec3 n = params.mirror_plane.xyz;
-		float hp = dot(n, t.world_pos) - params.mirror_plane.w;
-		vec3 light = params.mirror_light.xyz;
-		float hl = dot(n, light) - params.mirror_plane.w;
-		if (hp > 0.005 && hl > 0.0) {
-			vec3 img = light - 2.0 * hl * n;
-			vec3 rel = img - t.world_pos;
-			float dist = length(rel);
-			vec3 dir = rel / max(dist, 1e-4);
-			float cos_n = dot(t.n_world, dir);
-			float cos_p = -dot(n, dir);
-			if (cos_n > 0.0 && cos_p > 1e-3 && dist < params.mirror_params.y) {
-				float nd = dist / params.mirror_params.y;
-				nd *= nd;
-				nd *= nd;
-				nd = max(1.0 - nd, 0.0);
-				nd *= nd;
-				float att = nd / max(dist, 1e-4);
-				// In the light terms' units: ld.color carries Godot's pi, which
-				// their 1/pi cancels; the knob's energy is the light's own.
-				vec3 c = vec3(params.mirror_light.w * att * cos_n * mirror_fresnel(cos_p));
-				direct_unshadowed += c;
-				float tm = hp / cos_p;
-				vec3 m = t.world_pos + dir * tm;
-				vec3 to_light = light - m;
-				float dl = length(to_light);
-				// The first leg ends a centimetre above the plane, measured along the normal.
-				float leg = max(hp - 0.01, 0.0) / cos_p;
-				bool vis = (params.debug & 2u) != 0u || (!occluded_opaque(t.origin, dir, leg) && !occluded_opaque(m + n * 0.01, to_light / max(dl, 1e-4), max(dl - 0.01, 0.0)));
-				if (vis) {
-					direct += c;
-				}
-			}
-		}
-	}
-
-	// Omni and spot lights overlapping the set's box: the full analytic sum,
-	// times the visibility of one light drawn in proportion to its
-	// contribution. With the weights equal to the contributions the ratio is
-	// the drawn light's visibility, as in the direct pass.
 	vec3 sum = vec3(0.0);
 	float weight_sum = 0.0;
 	vec3 sel_pos = vec3(0.0);
 	float sel_opacity = 0.0;
 	uint sel_mask = 0u;
 	bool selected = false;
+	// The planar mirror: every local light's image joins the sum and the
+	// draw below (a light's image at a point is the light at the mirrored
+	// point with the mirrored normal, times the Fresnel at the crossing);
+	// a drawn image is shadowed in two legs (to the plane, then to the
+	// light).
+	bool sel_image = false;
+	vec3 sel_real = vec3(0.0);
+	vec3 mirror_n = params.mirror_plane.xyz;
+	float mirror_hp = dot(mirror_n, t.world_pos) - params.mirror_plane.w;
+	bool mirror_here = mirror_on() && mirror_hp > 0.005;
+	vec3 mirror_p = t.world_pos - 2.0 * mirror_hp * mirror_n;
+	vec3 mirror_nrm = t.n_world - 2.0 * dot(t.n_world, mirror_n) * mirror_n;
 
 	uint base;
 	uint light_count;
@@ -1051,9 +1040,38 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
+			sel_image = false;
 			sel_pos = pos;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
+		}
+		if (mirror_here && dot(mirror_n, pos) - params.mirror_plane.w > 0.0) {
+			vec3 pos_img;
+			float geom_img;
+			vec3 ci = light_contribution(ld, is_spot, mirror_p, mirror_nrm, pos_img, geom_img);
+			vec3 img = pos - 2.0 * (dot(mirror_n, pos) - params.mirror_plane.w) * mirror_n;
+			vec3 dir = normalize(img - t.world_pos);
+			float cos_p = -dot(mirror_n, dir);
+			if (cos_p <= 1e-3) {
+				continue;
+			}
+			ci *= mirror_fresnel(cos_p);
+			float wi = luminance(abs(ci));
+			if (wi <= 0.0) {
+				continue;
+			}
+			sum += ci;
+			d.local_geom += geom_img;
+			weight_sum += wi;
+			seed = pcg_hash(seed);
+			if (hash_to_float(seed) * weight_sum < wi) {
+				selected = true;
+				sel_image = true;
+				sel_pos = img;
+				sel_real = pos;
+				sel_opacity = ld.shadow_opacity;
+				sel_mask = ld.shadow_caster_mask & 0xFFu;
+			}
 		}
 	}
 	// Area lights, in the same estimator: their LTC diffuse term, with the
@@ -1089,6 +1107,7 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
+			sel_image = false;
 			sel_pos = point;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
@@ -1100,7 +1119,20 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		if (sel_opacity > 0.001 && sel_mask != 0u && (params.debug & 2u) == 0u) {
 			vec3 to_light = sel_pos - t.origin;
 			float dist = length(to_light);
-			vis = mix(1.0, occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask) ? 0.0 : 1.0, sel_opacity);
+			bool blocked;
+			if (sel_image) {
+				// Two legs: to a centimetre above the plane (along the normal), then from the plane to the real light.
+				vec3 dir = to_light / max(dist, 1e-5);
+				float cos_p = max(-dot(mirror_n, dir), 1e-3);
+				float leg = max(mirror_hp - 0.01, 0.0) / cos_p;
+				vec3 m = t.world_pos + dir * (mirror_hp / cos_p);
+				vec3 to_real = sel_real - m;
+				float dr = length(to_real);
+				blocked = occluded(t.origin, dir, leg, sel_mask) || occluded(m + mirror_n * 0.01, to_real / max(dr, 1e-5), max(dr - 0.01, 0.0), sel_mask);
+			} else {
+				blocked = occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask);
+			}
+			vis = mix(1.0, blocked ? 0.0 : 1.0, sel_opacity);
 		}
 		d.vis = vis;
 		d.sampled = true;
@@ -1331,6 +1363,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		vec3 ray_origin = t.origin;
 		float t_base = 0.0;
 		float mirror_f = 1.0; // The planar mirror's Fresnel, per reflection the ray took.
+		vec3 plane_diffuse = vec3(0.0); // The plane's own diffuse card, read on the way.
 		for (uint layer = 0u; layer < 4u; layer++) {
 			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
 			while (rayQueryProceedEXT(rq)) {
@@ -1342,11 +1375,20 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 			hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			hit_pos = ray_origin + ray_dir * (t_hit - t_base);
 			if (mirror_on() && abs(dot(params.mirror_plane.xyz, hit_pos) - params.mirror_plane.w) < 0.02) {
-				// The planar mirror: reflect and go on (its texel bounces
-				// nothing diffusely), weighted by the Fresnel at the bounce.
+				// The planar mirror: its texel's diffuse share is read, then
+				// the ray reflects through the plane's lobe and goes on,
+				// weighted by the Fresnel at the bounce.
 				vec3 n = params.mirror_plane.xyz;
+				if (params.mirror_extra.x > 0.0 && card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
+					plane_diffuse += mirror_f * max(card_radiance, vec3(0.0));
+					card_requests.frame[hit_set] = params.frame;
+				}
 				mirror_f *= mirror_fresnel(abs(dot(n, ray_dir)));
-				ray_dir = reflect(ray_dir, n);
+				seed = pcg_hash(seed);
+				float u0 = hash_to_float(seed);
+				seed = pcg_hash(seed);
+				float u1 = hash_to_float(seed);
+				ray_dir = mirror_reflect(ray_dir, n, vec2(u0, u1));
 				t_base = t_hit + params.ray_bias;
 				ray_origin = hit_pos + n * params.ray_bias;
 				continue;
@@ -1442,7 +1484,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 			indirect_sample = sky_eval(ray_dir);
 			tier_stat(3u, indirect_sample);
 		}
-		indirect_sample *= mirror_f;
+		indirect_sample = indirect_sample * mirror_f + plane_diffuse;
 		r_dyn1 *= mirror_f;
 		r_dyn2 *= mirror_f;
 	}
