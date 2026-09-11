@@ -3724,6 +3724,19 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef MODE_RENDER_MATERIAL
 
 	albedo_output_buffer.rgb = albedo;
+	if (!bool(scene_data.flags & SCENE_DATA_FLAGS_USE_UV2_MATERIAL)) {
+		// The surface cache's card capture: the cards bounce diffusely and
+		// hold one radiance per texel, so a surface's specular reflectance
+		// (its F0: the metal's albedo, a dielectric's 4%) joins its diffuse
+		// albedo as if Lambertian -- the energy right, the direction not.
+		// Measured (plan section 40): a metal mirror floor's cards taken as
+		// its raw albedo lit the radiosity box's walls to 0.85-0.89 of the
+		// image-method truth, taken as diffuse alone (albedo * (1 - metallic))
+		// to 0.39-0.56; the game's floor is metallic 0.45 and read 21% darker
+		// on diffuse alone. The lightmapper's UV2 capture keeps the raw albedo.
+		vec3 f0 = mix(vec3(0.16 * specular * specular), albedo, metallic);
+		albedo_output_buffer.rgb = albedo * (1.0 - metallic) + f0;
+	}
 	albedo_output_buffer.a = alpha;
 
 	normal_output_buffer.rgb = encode24(normal) * 0.5 + 0.5;
