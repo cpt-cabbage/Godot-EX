@@ -93,6 +93,10 @@
 #define RB_RT_GI_MOMENTS_0 SNAME("moments_0")
 #define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
 #define RB_RT_GI_MOMENTS_SCRATCH SNAME("moments_scratch")
+// The split history (GODOT_GI_SPLIT): the even and odd frames' luminance
+// means, ping-ponged with the moments.
+#define RB_RT_GI_SPLIT_0 SNAME("split_0")
+#define RB_RT_GI_SPLIT_1 SNAME("split_1")
 #define RB_RT_GI_META_0 SNAME("meta_0")
 #define RB_RT_GI_META_1 SNAME("meta_1")
 // Ping-ponged: the previous frame's copy validates history reprojection.
@@ -461,7 +465,21 @@ private:
 		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
 		float borrow_band; // The frame-edge history borrow's reach outside the frame, in UV (GODOT_GI_BORROW; 0 off).
 		float young_rays; // Diffuse rays the gather spends on a pixel whose history is under 8 frames (GODOT_GI_YOUNG_RAYS): the temporal pass weighs that frame's sample by as many.
-		float pad[1];
+		float frame_parity; // 0 or 1: the half of the split history this frame's sample joins.
+		// The split history (GODOT_GI_SPLIT: 0 off, 1 the pixel's halves, 2
+		// the 3x3 neighbourhood's), and the relative variance of the mean
+		// under which a settled pixel's kernel is halved (GODOT_GI_SPLIT_THRESH)
+		// or the pixel is not filtered at all (GODOT_GI_SPLIT_SKIP).
+		float split_mode;
+		float split_threshold;
+		float split_skip;
+		// The luminance stop's width (GODOT_GI_SPLIT_SIGMA: 0 the samples'
+		// deviation as SVGF, 1 the mean's from the moments over the frames,
+		// 2 the mean's from the split history), times GODOT_GI_SPLIT_K.
+		float split_sigma_mode;
+		float split_sigma_k;
+		float split_spec; // The reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: filtered as before).
+		float pad[2];
 	};
 
 public:

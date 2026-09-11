@@ -93,6 +93,14 @@ static bool _luma_compress() {
 	return compress;
 }
 
+// The split history (RAYTRACING_PLAN.md section 36, measured and left
+// off): its textures exist only while GODOT_GI_SPLIT (the kernel verdicts)
+// or GODOT_GI_SPLIT_SIGMA=2 (the luminance stop) reads it.
+static bool _split_history() {
+	static const bool split = (OS::get_singleton()->get_environment("GODOT_GI_SPLIT") != "" && OS::get_singleton()->get_environment("GODOT_GI_SPLIT") != "0") || OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SIGMA") == "2";
+	return split;
+}
+
 Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	Vector<String> shader_modes;
 	shader_modes.push_back("");
@@ -477,6 +485,31 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// temporal pass weighs such a frame's sample by as many.
 		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
 		ubo.young_rays = float(CLAMP(young_rays, 1, 4));
+		// The split history (RAYTRACING_PLAN.md section 36): GODOT_GI_SPLIT=
+		// 1 reads the pixel's own halves, 2 the 3x3 neighbourhood's (0
+		// off); GODOT_GI_SPLIT_THRESH the relative variance of the mean
+		// under which a settled pixel's kernel is halved, GODOT_GI_SPLIT_SKIP
+		// the one under which it is not filtered at all.
+		static const int64_t split_mode = OS::get_singleton()->get_environment("GODOT_GI_SPLIT") == "" ? 0 : OS::get_singleton()->get_environment("GODOT_GI_SPLIT").to_int();
+		static const float split_threshold = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_THRESH") == "" ? 0.004f : float(OS::get_singleton()->get_environment("GODOT_GI_SPLIT_THRESH").to_float());
+		static const float split_skip = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SKIP") == "" ? 0.001f : float(OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SKIP").to_float());
+		ubo.frame_parity = float(rb_state->frame_index & 1u);
+		ubo.split_mode = float(CLAMP(split_mode, 0, 3)); // 3: the verdict painted (diagnostics).
+		ubo.split_threshold = split_threshold;
+		ubo.split_skip = split_skip;
+		// GODOT_GI_SPLIT_SIGMA=<mode>: the spatial luminance stop's width
+		// from the samples' deviation (0, SVGF), the mean's over the frames
+		// (1) or the split history's disagreement (2); GODOT_GI_SPLIT_K its
+		// multiple (4).
+		static const int64_t split_sigma_mode = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SIGMA") == "" ? 0 : OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SIGMA").to_int();
+		static const float split_sigma_k = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_K") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPLIT_K").to_float());
+		ubo.split_sigma_mode = float(CLAMP(split_sigma_mode, 0, 2));
+		ubo.split_sigma_k = split_sigma_k;
+		// GODOT_GI_SPLIT_SPEC=1: the reflection's kernel takes the verdicts
+		// too (measured: its unfiltered settled pixels read 3.5% brighter
+		// and noisier on the glossy ceiling, so off).
+		static const bool split_spec = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SPEC") == "1";
+		ubo.split_spec = split_spec ? 1.0f : 0.0f;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
@@ -1172,6 +1205,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
 		}
+		if (_split_history()) {
+			const StringName split_names[] = { RB_RT_GI_SPLIT_0, RB_RT_GI_SPLIT_1 };
+			for (const StringName &name : split_names) {
+				_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+						RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
+			}
+		}
 		const StringName meta_names[] = { RB_RT_GI_META_0, RB_RT_GI_META_1 };
 		for (const StringName &name : meta_names) {
 			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_GI, name, RD::DATA_FORMAT_R8G8B8A8_UNORM,
@@ -1573,6 +1613,11 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RID hist_write_r = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_REFLECTION_0 : RB_RT_GI_HIST_REFLECTION_1, p_view, 0);
 	RID moments_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_MOMENTS_1 : RB_RT_GI_MOMENTS_0, p_view, 0);
 	RID moments_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_MOMENTS_0 : RB_RT_GI_MOMENTS_1, p_view, 0);
+	// Off (the default): the temporal pass reads black and writes into the
+	// moments scratch, which the spatial iterations overwrite before they
+	// read it, and the spatial pass never reads the split.
+	RID split_read = _split_history() ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_SPLIT_1 : RB_RT_GI_SPLIT_0, p_view, 0) : default_black;
+	RID split_write = _split_history() ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_SPLIT_0 : RB_RT_GI_SPLIT_1, p_view, 0) : p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_MOMENTS_SCRATCH, p_view, 0);
 	RID meta_read = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_1 : RB_RT_GI_META_0, p_view, 0);
 	RID meta_write = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_META_0 : RB_RT_GI_META_1, p_view, 0);
 	RID final_directional = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_DIRECTIONAL, p_view, 0);
@@ -1707,6 +1752,8 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_nr_temporal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, p_normal_roughness }));
 		RD::Uniform u_fb_now(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, raw_fallback }));
 		RD::Uniform u_fb_prev(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, prev_fallback }));
+		RD::Uniform u_hist_split(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, split_read }));
+		RD::Uniform u_out_split(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ split_write }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ hist_write_a }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ hist_write_r }));
 		RD::Uniform u_out_m(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ moments_write }));
@@ -1718,8 +1765,8 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Temporal");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL_VALIDATE]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal, u_fb_now, u_fb_prev), 0);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_m, u_out_meta, u_reproject, u_out_d), 1);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal, u_fb_now, u_fb_prev, u_hist_split), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_m, u_out_meta, u_reproject, u_out_d, u_out_split), 1);
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 		rd->compute_list_end();
@@ -1771,6 +1818,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_in_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, in_directional }));
 		// The cards' bounce irradiance the last iteration fades young pixels in from.
 		RD::Uniform u_fallback(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, raw_fallback }));
+		// The temporal pass's split history and, for its parameters, the
+		// reprojection UBO (the spatial pass reads nothing else of it).
+		RD::Uniform u_split(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ sampler, split_write }));
+		RD::Uniform u_split_ubo(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 4, Vector<RID>({ reproject_ubo }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ out_ambient }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_reflection }));
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ out_directional }));
@@ -1779,12 +1830,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Spatial");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d, u_fallback), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d, u_fallback, u_split), 0);
 		if (last) {
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d), 1);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d, u_split_ubo), 1);
 		} else {
 			RD::Uniform u_out_moments(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ out_moments }));
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d, u_out_moments), 1);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d, u_out_moments, u_split_ubo), 1);
 		}
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);

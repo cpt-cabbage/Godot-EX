@@ -151,10 +151,60 @@ layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_mom
 // r: diffuse frames / 64, g: specular frames / 64, b: shading confidence,
 // a: disocclusion mark (decays over a few frames).
 layout(set = 1, binding = 3, rgba8) uniform restrict writeonly image2D out_meta;
+#ifdef HAS_DIRECTIONAL
+layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_directional;
+// The cards' bounce irradiance under the surface, this frame's and last
+// frame's (the gather's fallback output: rgb, and in a its relights / 64
+// times the lookup's confidence, 0 without a card). The card correction
+// replaces the changed fraction of the history by it (see that block).
+layout(set = 0, binding = 13) uniform sampler2D fallback_current;
+layout(set = 0, binding = 14) uniform sampler2D fallback_prev;
+// The split history (GODOT_GI_SPLIT, see the spatial pass): the luminance
+// mean of the even frames' samples and of the odd frames', for the diffuse
+// (xy) and the reflection (zw). Two independent estimates of the same
+// mean: their disagreement is the error of the accumulated value itself,
+// which the moments (the samples' variance) never reach.
+layout(set = 0, binding = 15) uniform sampler2D history_split;
+layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_split;
+#endif
+#else // MODE_SPATIAL
+layout(set = 0, binding = 3) uniform sampler2D moments_texture;
+layout(set = 0, binding = 4) uniform sampler2D normal_roughness_texture;
+layout(set = 0, binding = 5) uniform sampler2D meta_texture;
+// Unshadowed analytic lighting, multiplied back into the filtered ratios when
+// FLAG_MODULATE_ANALYTIC is set (dummy bindings otherwise, never fetched).
+layout(set = 0, binding = 6) uniform sampler2D analytic_diffuse;
+layout(set = 0, binding = 7) uniform sampler2D analytic_specular;
+#ifdef FILTER_DIRECTIONAL
+layout(set = 0, binding = 8) uniform sampler2D in_directional;
+// The gather's fallback for young pixels: the card's bounce irradiance
+// under the surface (rgb) and its relight count (a, / 64); see out_fallback
+// there.
+layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
+// The temporal pass's split history (see there and the kernel decision).
+layout(set = 0, binding = 10) uniform sampler2D split_texture;
+#endif
+
+// The spatial pass writes the final buffers, which stay packed on both paths:
+// they are written once and read four times per fragment by the upsample, so
+// the rounding never compounds. Intermediate a-trous iterations keep the
+// accumulation format instead (SPATIAL_HDR_OUT).
+layout(set = 1, binding = 0, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_diffuse;
+layout(set = 1, binding = 1, SPATIAL_SPEC_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
+#ifdef FILTER_DIRECTIONAL
+layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
+#endif
+#ifdef MOMENTS_OUTPUT
+layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_moments;
+#endif
+#endif
+
+#if defined(MODE_TEMPORAL) || defined(FILTER_DIRECTIONAL)
 // The previous frame pair's reprojection (previous NDC -> the frame before).
 // The velocity buffer is one frame stale (written by the previous color pass),
 // so this is the camera-only motion it was rendered with: static pixels match
-// it and only genuinely moving objects deviate.
+// it and only genuinely moving objects deviate. The GI's spatial pass binds
+// the same buffer for the split-history parameters (it reads nothing else).
 layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	mat4 prev_reproject;
 	// Temporal (GI): the card correction's strength (0 off, 1 the field's
@@ -172,46 +222,24 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	float spec_fix;
 	float borrow_band; // How far outside the frame (UV) a history may lie and still borrow the edge's (GODOT_GI_BORROW; 0 never borrows).
 	float young_rays; // The gather's diffuse rays for a pixel whose history is under 8 frames: that frame's sample counts for as many.
-	float pad3;
+	float frame_parity; // 0 or 1: which half of the split history this frame's sample joins.
+	// The split history (GODOT_GI_SPLIT): 0 off, 1 the pixel's own halves,
+	// 2 the 3x3 neighbourhood's; the relative variance of the mean under
+	// which a settled pixel's kernel is halved (GODOT_GI_SPLIT_THRESH), and
+	// under which it is not filtered at all (GODOT_GI_SPLIT_SKIP).
+	float split_mode;
+	float split_threshold;
+	float split_skip;
+	// The luminance stop's width (GODOT_GI_SPLIT_SIGMA): 0 the samples'
+	// standard deviation (SVGF), 1 the mean's from the moments over the
+	// frames, 2 the mean's from the split history; times split_sigma_k.
+	float split_sigma_mode;
+	float split_sigma_k;
+	float split_spec; // Whether the reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: the reflection is filtered as before).
+	float pad1;
+	float pad2;
 }
 reprojection;
-#ifdef HAS_DIRECTIONAL
-layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_directional;
-// The cards' bounce irradiance under the surface, this frame's and last
-// frame's (the gather's fallback output: rgb, and in a its relights / 64
-// times the lookup's confidence, 0 without a card). The card correction
-// replaces the changed fraction of the history by it (see that block).
-layout(set = 0, binding = 13) uniform sampler2D fallback_current;
-layout(set = 0, binding = 14) uniform sampler2D fallback_prev;
-#endif
-#else // MODE_SPATIAL
-layout(set = 0, binding = 3) uniform sampler2D moments_texture;
-layout(set = 0, binding = 4) uniform sampler2D normal_roughness_texture;
-layout(set = 0, binding = 5) uniform sampler2D meta_texture;
-// Unshadowed analytic lighting, multiplied back into the filtered ratios when
-// FLAG_MODULATE_ANALYTIC is set (dummy bindings otherwise, never fetched).
-layout(set = 0, binding = 6) uniform sampler2D analytic_diffuse;
-layout(set = 0, binding = 7) uniform sampler2D analytic_specular;
-#ifdef FILTER_DIRECTIONAL
-layout(set = 0, binding = 8) uniform sampler2D in_directional;
-// The gather's fallback for young pixels: the card's bounce irradiance
-// under the surface (rgb) and its relight count (a, / 64); see out_fallback
-// there.
-layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
-#endif
-
-// The spatial pass writes the final buffers, which stay packed on both paths:
-// they are written once and read four times per fragment by the upsample, so
-// the rounding never compounds. Intermediate a-trous iterations keep the
-// accumulation format instead (SPATIAL_HDR_OUT).
-layout(set = 1, binding = 0, SPATIAL_OUT_FORMAT) uniform restrict writeonly image2D out_diffuse;
-layout(set = 1, binding = 1, SPATIAL_SPEC_OUT_FORMAT) uniform restrict writeonly image2D out_specular;
-#ifdef FILTER_DIRECTIONAL
-layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_directional;
-#endif
-#ifdef MOMENTS_OUTPUT
-layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_moments;
-#endif
 #endif
 
 layout(push_constant, std430) uniform Params {
@@ -348,6 +376,7 @@ void main() {
 		imageStore(out_meta, pixel, vec4(0.0));
 #ifdef HAS_DIRECTIONAL
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+		imageStore(out_split, pixel, vec4(0.0));
 #endif
 		return;
 	}
@@ -412,6 +441,9 @@ void main() {
 	vec3 result_diffuse = current_diffuse;
 	vec3 result_specular = current_specular;
 	vec4 moments = vec4(0.0);
+#ifdef HAS_DIRECTIONAL
+	vec4 split = vec4(0.0);
+#endif
 	float frames_d = 1.0;
 	float samples_d = 1.0; // Samples this frame's diffuse carries (the gather's young rays).
 	float frames_s = 1.0;
@@ -516,6 +548,7 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 		vec4 hist_dir = vec4(0.0);
 		vec4 hist_fb = vec4(0.0);
+		vec4 hist_split = vec4(0.0);
 #endif
 #ifdef DEPTH_HISTORY
 		if (history_usable) {
@@ -559,6 +592,7 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 				hist_dir += texelFetch(history_directional, tp, 0) * w;
 				hist_fb += texelFetch(fallback_prev, tp, 0) * w;
+				hist_split += texelFetch(history_split, tp, 0) * w;
 #endif
 				hist_weight += w;
 			}
@@ -575,6 +609,7 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 				hist_dir *= inv_weight;
 				hist_fb *= inv_weight;
+				hist_split *= inv_weight;
 #endif
 			}
 		}
@@ -587,6 +622,7 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 			hist_dir = textureLod(history_directional, prev_uv, 0.0);
 			hist_fb = textureLod(fallback_prev, prev_uv, 0.0);
+			hist_split = textureLod(history_split, prev_uv, 0.0);
 #endif
 		}
 #endif
@@ -858,6 +894,24 @@ void main() {
 #endif
 			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_d),
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
+#ifdef HAS_DIRECTIONAL
+			// The split history: this frame's sample joins one half, at
+			// twice the blend (each half sees every other frame, so its
+			// window is half the mean's). A restart reaches the other half
+			// a frame later (its alpha is then 1 too), so the halves
+			// disagree for a frame or two after every restart, which the
+			// spatial pass reads as "not settled": the right verdict.
+			split = hist_split;
+			float alpha_hd = min(2.0 * alpha_d, 1.0);
+			float alpha_hs = min(2.0 * alpha_s, 1.0);
+			if (reprojection.frame_parity < 0.5) {
+				split.x = mix(hist_split.x, lum_d, alpha_hd);
+				split.z = mix(hist_split.z, lum_s, alpha_hs);
+			} else {
+				split.y = mix(hist_split.y, lum_d, alpha_hd);
+				split.w = mix(hist_split.w, lum_s, alpha_hs);
+			}
+#endif
 			dominance = mix(hist_meta.b, dominance, alpha_d);
 			// A usable history clears the disocclusion mark over a few frames.
 			// A borrowed one is still young enough to want the widened kernel
@@ -869,6 +923,11 @@ void main() {
 		float lum_d = weight_lum(current_diffuse);
 		float lum_s = weight_lum(current_specular);
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
+#ifdef HAS_DIRECTIONAL
+		// Both halves start from the one sample: they agree, but a revealed
+		// pixel is young for longer than the spatial pass consults them.
+		split = vec4(lum_d, lum_d, lum_s, lum_s);
+#endif
 	}
 
 	// The history never holds a non-finite value: it would keep it for the
@@ -887,6 +946,10 @@ void main() {
 		moments = vec4(0.0);
 	}
 #ifdef HAS_DIRECTIONAL
+	if (any(isnan(split)) || any(isinf(split))) {
+		split = vec4(0.0);
+	}
+	imageStore(out_split, pixel, split);
 	if (any(isnan(result_directional)) || any(isinf(result_directional))) {
 		result_directional = vec4(0.0, 0.0, 0.0, 1.0);
 	}
@@ -1056,6 +1119,66 @@ void main() {
 #endif
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
 	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
+	// The split history (GODOT_GI_SPLIT): the moments' variance is that of
+	// the samples, which a one-ray GI signal never brings under the
+	// threshold above, so a settled pixel is filtered at the full stride for
+	// ever. The even and odd frames' means are two independent estimates of
+	// the accumulated value; (a - b)^2 / 4 is one draw of its error, and a
+	// settled pixel whose halves agree needs less of its neighbours: half
+	// the stride under split_threshold, none under split_skip. A single
+	// draw reads low a quarter of the time, so mode 2 averages the 3x3
+	// neighbourhood's draws. Young histories (both halves a few samples)
+	// keep the verdicts above.
+	bool split_tight_d = false;
+	bool split_tight_s = false;
+#ifdef FILTER_DIRECTIONAL
+	// The mean's variance from the split history (-1: not read).
+	float var_mean_d = -1.0;
+	float var_mean_s = -1.0;
+	if ((reprojection.split_mode > 0.5 || reprojection.split_sigma_mode > 1.5) && !newly_revealed) {
+		float sq_d = 0.0;
+		float sq_s = 0.0;
+		float n = 0.0;
+		int radius = reprojection.split_mode > 1.5 || reprojection.split_sigma_mode > 1.5 ? 1 : 0;
+		for (int y = -radius; y <= radius; y++) {
+			for (int x = -radius; x <= radius; x++) {
+				ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
+				vec4 sh = texelFetch(split_texture, sp, 0);
+				float dd = sh.x - sh.y;
+				float ds = sh.z - sh.w;
+				sq_d += dd * dd;
+				sq_s += ds * ds;
+				n += 1.0;
+			}
+		}
+		var_mean_d = 0.25 * sq_d / n;
+		var_mean_s = 0.25 * sq_s / n;
+		float rel_mean_d = var_mean_d / max(moments.x * moments.x, 1e-6);
+		float rel_mean_s = var_mean_s / max(moments.z * moments.z, 1e-6);
+		if (frames_d >= YOUNG_FRAMES && reprojection.split_mode > 0.5) {
+			if (rel_mean_d < reprojection.split_skip) {
+				filter_d = false;
+			} else if (rel_mean_d < reprojection.split_threshold) {
+				split_tight_d = true;
+			}
+		}
+		if (frames_s >= YOUNG_FRAMES && reprojection.split_mode > 0.5 && reprojection.split_spec > 0.5) {
+			if (rel_mean_s < reprojection.split_skip) {
+				filter_s = false;
+			} else if (rel_mean_s < reprojection.split_threshold) {
+				split_tight_s = true;
+			}
+		}
+		if (reprojection.split_mode > 2.5) {
+			// Diagnostics (GODOT_GI_SPLIT=3): the diffuse verdict as a
+			// colour: black young, red skipped, green halved, blue filtered
+			// as before; the reflection channel black.
+			vec3 paint = frames_d < YOUNG_FRAMES ? vec3(0.0) : (rel_mean_d < reprojection.split_skip ? vec3(1.0, 0.0, 0.0) : (rel_mean_d < reprojection.split_threshold ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0)));
+			store_result(pixel, paint, vec3(0.0), center_dir, 1.0, 0.0);
+			return;
+		}
+	}
+#endif
 	// Ramp the directional term in over the first frames of accumulation.
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	// And the cards' stand-in out (GI only; see store_result).
@@ -1080,6 +1203,24 @@ void main() {
 	vec3 center_normal = normalize(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).xyz * 2.0 - 1.0);
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
+#ifdef FILTER_DIRECTIONAL
+	// GODOT_GI_SPLIT_SIGMA: the luminance stop measured against the error
+	// of the accumulated mean (from the moments over the frames, or the
+	// split history's disagreement) rather than the samples' spread, which
+	// a settled one-ray signal exceeds only at a real edge. Young pixels
+	// keep the samples' (their stop is off anyway).
+	if (reprojection.split_sigma_mode > 0.5) {
+		bool from_split = reprojection.split_sigma_mode > 1.5 && var_mean_d >= 0.0;
+		float vm_d = from_split ? var_mean_d : var_d / max(frames_d, 1.0);
+		float vm_s = from_split ? var_mean_s : var_s / max(frames_s, 1.0);
+		if (frames_d >= YOUNG_FRAMES) {
+			sigma_d = reprojection.split_sigma_k * sqrt(vm_d) + 1e-4;
+		}
+		if (frames_s >= YOUNG_FRAMES) {
+			sigma_s = reprojection.split_sigma_k * sqrt(vm_s) + 1e-4;
+		}
+	}
+#endif
 
 	// Newly revealed pixels have no usable variance estimate yet, so widen the
 	// kernel and ignore the luminance stopping function for a few frames.
@@ -1105,6 +1246,14 @@ void main() {
 			filter_s = false;
 		}
 		stride_s = max(1, int(round(float(stride_s) * spec_scale)));
+	}
+	// The split history's verdict (above): a settled pixel whose halves
+	// agree reaches half as far.
+	if (split_tight_d) {
+		stride = max(1, stride >> 1);
+	}
+	if (split_tight_s) {
+		stride_s = max(1, stride_s >> 1);
 	}
 	if (!filter_d && !filter_s) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight);
