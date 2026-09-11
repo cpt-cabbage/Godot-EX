@@ -292,6 +292,7 @@ private:
 		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
 		DENOISE_FLAG_MOD_PAINT = 4096, // Temporal (GI, diagnostics, GODOT_GI_MOD_PAINT): the card correction as a colour.
 		DENOISE_FLAG_NO_LUM_STOP = 8192, // Spatial (GI, experiment, GODOT_GI_LUMSTOP=0): the luminance stop off for settled pixels too.
+		DENOISE_FLAG_FIREFLY_PAINT = 16384, // Temporal (GI, diagnostics, GODOT_GI_FIREFLY_PAINT=1): the samples the firefly test scaled, painted.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -479,7 +480,8 @@ private:
 		float split_sigma_mode;
 		float split_sigma_k;
 		float split_spec; // The reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: filtered as before).
-		float pad[2];
+		float firefly_k; // Temporal (GI): a raw sample above its neighbours' mean by this many deviations is scaled to that bound (GODOT_GI_FIREFLY; 0 off).
+		float firefly_rough; // The roughness from which the reflection takes the firefly test too (GODOT_GI_FIREFLY_ROUGH).
 	};
 
 public:

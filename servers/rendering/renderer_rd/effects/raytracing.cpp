@@ -510,6 +510,14 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// and noisier on the glossy ceiling, so off).
 		static const bool split_spec = OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SPEC") == "1";
 		ubo.split_spec = split_spec ? 1.0f : 0.0f;
+		// GODOT_GI_FIREFLY=<k> (plan item A4(c)): the GI temporal pass scales
+		// a raw sample more than k neighbourhood deviations above its 24
+		// neighbours' mean down to that bound; GODOT_GI_FIREFLY_ROUGH the
+		// roughness from which the reflection takes the test too (0.35).
+		static const float firefly_k = OS::get_singleton()->get_environment("GODOT_GI_FIREFLY") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_FIREFLY").to_float());
+		static const float firefly_rough = OS::get_singleton()->get_environment("GODOT_GI_FIREFLY_ROUGH") == "" ? 0.35f : float(OS::get_singleton()->get_environment("GODOT_GI_FIREFLY_ROUGH").to_float());
+		ubo.firefly_k = MAX(firefly_k, 0.0f);
+		ubo.firefly_rough = firefly_rough;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
@@ -1735,6 +1743,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		static const bool mod_paint = OS::get_singleton()->get_environment("GODOT_GI_MOD_PAINT") == "1";
 		if (mod_paint) {
 			denoise_push_constant.flags |= DENOISE_FLAG_MOD_PAINT;
+		}
+		static const bool firefly_paint = OS::get_singleton()->get_environment("GODOT_GI_FIREFLY_PAINT") == "1";
+		if (firefly_paint) {
+			denoise_push_constant.flags |= DENOISE_FLAG_FIREFLY_PAINT;
 		}
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL_VALIDATE);
 		RD::Uniform u_raw_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_ambient }));

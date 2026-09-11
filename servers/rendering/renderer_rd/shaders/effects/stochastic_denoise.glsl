@@ -29,6 +29,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
 #define FLAG_MOD_PAINT 4096u // Diagnostics (GODOT_GI_MOD_PAINT): the card correction as a colour (red its change, green the field's confidence, blue the mark).
 #define FLAG_NO_LUM_STOP 8192u // Experiment (GODOT_GI_LUMSTOP=0): the spatial pass's luminance stop off for settled pixels too.
+#define FLAG_FIREFLY_PAINT 16384u // Diagnostics (GODOT_GI_FIREFLY_PAINT=1): the temporal pass paints the samples the firefly test scaled.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
 // How far outside the previous frame (in UV) a pixel's history may lie and
@@ -236,8 +237,11 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	float split_sigma_mode;
 	float split_sigma_k;
 	float split_spec; // Whether the reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: the reflection is filtered as before).
-	float pad1;
-	float pad2;
+	// Temporal (GI): the firefly test's bound in neighbourhood deviations
+	// (GODOT_GI_FIREFLY; 0 off) and the roughness from which the reflection
+	// takes it too (GODOT_GI_FIREFLY_ROUGH).
+	float firefly_k;
+	float firefly_rough;
 }
 reprojection;
 #endif
@@ -407,6 +411,11 @@ void main() {
 	vec3 m2_d = vec3(0.0);
 	vec3 m2_s = vec3(0.0);
 	float count = 0.0;
+#ifdef HAS_DIRECTIONAL
+	// The neighbours' luminance without the centre (the firefly test below).
+	vec2 nl_d = vec2(0.0); // sum, sum of squares
+	vec2 nl_s = vec2(0.0);
+#endif
 	for (int y = -2; y <= 2; y++) {
 		for (int x = -2; x <= 2; x++) {
 			ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
@@ -417,12 +426,54 @@ void main() {
 			m2_d += d * d;
 			m2_s += s * s;
 			count += 1.0;
+#ifdef HAS_DIRECTIONAL
+			if (reprojection.firefly_k > 0.0 && (x != 0 || y != 0)) {
+				float ld = weight_lum(d);
+				float ls = weight_lum(s);
+				nl_d += vec2(ld, ld * ld);
+				nl_s += vec2(ls, ls * ls);
+			}
+#endif
 		}
 	}
 	mean_d /= count;
 	mean_s /= count;
 	vec3 stddev_d = sqrt(max(m2_d / count - mean_d * mean_d, vec3(0.0)));
 	vec3 stddev_s = sqrt(max(m2_s / count - mean_s * mean_s, vec3(0.0)));
+#ifdef HAS_DIRECTIONAL
+	// The firefly test (GODOT_GI_FIREFLY=<k>, plan item A4(c)): a raw sample
+	// whose luminance stands more than k deviations above its 24 neighbours'
+	// mean is scaled down to that bound before it enters the history (its
+	// colour and its share of the directional moment kept), where it would
+	// otherwise sit for the whole temporal window and be spread a stride
+	// further by every spatial iteration. The diffuse, and the reflection
+	// only on rough surfaces (a mirror's bright image is not an outlier).
+	bool firefly_hit = false;
+	if (reprojection.firefly_k > 0.0) {
+		float n = count - 1.0;
+		float mean_n = nl_d.x / n;
+		float std_n = sqrt(max(nl_d.y / n - mean_n * mean_n, 0.0));
+		float bound = mean_n + reprojection.firefly_k * std_n;
+		float l = weight_lum(current_diffuse);
+		if (l > bound && l > 1e-6) {
+			float f = bound / l;
+			current_diffuse *= f;
+			current_directional.xyz *= f;
+			result_directional = current_directional;
+			firefly_hit = true;
+		}
+		if (nr_roughness >= reprojection.firefly_rough) {
+			mean_n = nl_s.x / n;
+			std_n = sqrt(max(nl_s.y / n - mean_n * mean_n, 0.0));
+			bound = mean_n + reprojection.firefly_k * std_n;
+			l = weight_lum(current_specular);
+			if (l > bound && l > 1e-6) {
+				current_specular *= bound / l;
+				firefly_hit = true;
+			}
+		}
+	}
+#endif
 
 	// Dense bounded signals (the visibility ratios) also clamp the CURRENT
 	// sample into the neighborhood ellipsoid: a pixel whose reservoirs keep
@@ -955,6 +1006,11 @@ void main() {
 	}
 	if ((params.flags & FLAG_MOD_PAINT) != 0u) {
 		result_diffuse = vec3(paint_change, paint_field, clamp(change_age, 0.0, 1.0));
+	}
+	if ((params.flags & FLAG_FIREFLY_PAINT) != 0u) {
+		// Diagnostics: red where this frame's sample was scaled down.
+		result_diffuse = firefly_hit ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
+		result_specular = vec3(0.0);
 	}
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, clamp(change_age, 0.0, 1.0)));
 #else
