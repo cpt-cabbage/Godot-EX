@@ -303,6 +303,12 @@ private:
 	SurfaceCacheMipShaderRD mip_shader;
 	RID mip_shader_version;
 	RID mip_pipeline;
+	// The atlas tiles (MIP_TILE texels square, one texel at the coarsest
+	// level) the lighting pass wrote this frame: the mip chain rebuilds those
+	// and skips the rest. A capture or a fresh atlas rebuilds everything once.
+	static const uint32_t MIP_TILE_SHIFT = 5; // 32 texels: LIGHTING_MIPS - 1 halvings.
+	RID mip_dirty_buffer; // One uint per tile.
+	bool mip_full_rebuild = true;
 	RID grid_buffer; // GRID_N^3 cells of 1 + GRID_CAP uints.
 	bool last_grid_built = false; // The grid's state after the last update_lighting, for the hit shading.
 	Vector3 last_grid_origin;

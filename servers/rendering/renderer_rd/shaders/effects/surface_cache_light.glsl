@@ -283,6 +283,12 @@ layout(set = 0, binding = 34, rgba16f) uniform restrict image2D indirect_filtere
 // The gather's screen memory of each texel (stochastic_indirect_gi.glsl
 // screen_radiance_boost); only zeroed here, on a fresh capture.
 layout(set = 0, binding = 36, rgba16f) uniform restrict writeonly image2D screen_atlas;
+// The atlas tiles written this relight (32 texels square), for the mip
+// chain to rebuild only those (surface_cache.cpp update_lighting).
+layout(set = 0, binding = 37, std430) restrict writeonly buffer MipDirty {
+	uint tiles[];
+}
+mip_dirty;
 
 // How settled the cards are, for the editor's idle repaints (see
 // RenderForwardClustered::_request_ray_tracing_convergence): of the texels
@@ -1894,6 +1900,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	}
 	imageStore(static_atlas, texel, vec4(static_radiance, vis_dyn));
 	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
+	mip_dirty.tiles[uint(texel.y >> 5) * (params.atlas_size >> 5u) + uint(texel.x >> 5)] = 1u;
 }
 
 void main() {

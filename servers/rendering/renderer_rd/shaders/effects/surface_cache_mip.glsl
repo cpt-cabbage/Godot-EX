@@ -16,17 +16,30 @@
 // the one bright thing the cards held. Level 0's alpha is the relight
 // count, so its coverage comes from the depth atlas (a captured texel has
 // a depth; an unfilled one is zero).
+//
+// Only the tiles the lighting pass wrote this frame are rebuilt: a tile is
+// 32 level-0 texels square, one texel at the coarsest level, so each mip
+// texel belongs to exactly one tile and a chain rebuilt tile by tile stays
+// consistent. The dispatch still covers the whole level; a clean tile's
+// thread returns at once.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform texture2D source; // The finer level.
 layout(set = 0, binding = 1) uniform texture2D depth_atlas; // Level 0's coverage.
 layout(set = 0, binding = 2, rgba16f) uniform restrict writeonly image2D destination;
+layout(set = 0, binding = 3, std430) restrict readonly buffer MipDirty {
+	uint tiles[];
+}
+mip_dirty;
 
 layout(push_constant, std430) uniform Params {
 	uvec2 size; // The destination's.
 	uint source_is_level0;
-	uint pad;
+	uint level; // The destination's mip level.
+	uint tiles_x; // Tiles across the atlas.
+	uint full; // 1: rebuild every tile.
+	uint pad[2];
 }
 params;
 
@@ -34,6 +47,12 @@ void main() {
 	uvec2 p = gl_GlobalInvocationID.xy;
 	if (any(greaterThanEqual(p, params.size))) {
 		return;
+	}
+	if (params.full == 0u) {
+		uvec2 tile = (p << params.level) >> 5u;
+		if (mip_dirty.tiles[tile.y * params.tiles_x + tile.x] == 0u) {
+			return;
+		}
 	}
 	ivec2 base = ivec2(p) * 2;
 	vec3 sum = vec3(0.0);

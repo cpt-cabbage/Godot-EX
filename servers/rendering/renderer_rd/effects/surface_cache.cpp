@@ -171,6 +171,12 @@ void SurfaceCache::_create_atlases() {
 	for (uint32_t i = 0; i < LIGHTING_MIPS; i++) {
 		lighting_atlas_mips[i] = rd->texture_create_shared_from_slice(RD::TextureView(), lighting_atlas, 0, i, 1, RD::TEXTURE_SLICE_2D);
 	}
+	{
+		uint32_t tiles = settings.atlas_size >> MIP_TILE_SHIFT;
+		mip_dirty_buffer = rd->storage_buffer_create(tiles * tiles * sizeof(uint32_t));
+		rd->buffer_clear(mip_dirty_buffer, 0, tiles * tiles * sizeof(uint32_t));
+		mip_full_rebuild = true;
+	}
 	tf.mipmaps = 1;
 	indirect_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(indirect_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
@@ -244,7 +250,7 @@ void SurfaceCache::_free_atlases() {
 			rid = RID();
 		}
 	}
-	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &mip_dirty_buffer, &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -715,6 +721,8 @@ void SurfaceCache::commit_capture(const CaptureJob &p_job, uint32_t p_card) {
 	rd->texture_copy(scratch_normal, normal_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_emission, emission_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_depth_out, depth_atlas, from, to, size, 0, 0, 0, 0);
+	// The coverage the mip chain weights by changed here: rebuild it whole.
+	mip_full_rebuild = true;
 }
 
 void SurfaceCache::finish_capture(const CaptureJob &p_job) {
@@ -1187,12 +1195,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect_filtered(RD::UNIFORM_TYPE_IMAGE, 34, Vector<RID>({ indirect_filtered_atlas }));
 	RD::Uniform l_converge(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ converge_buffer }));
 	RD::Uniform l_screen(RD::UNIFORM_TYPE_IMAGE, 36, Vector<RID>({ screen_atlas }));
+	RD::Uniform l_mip_dirty(RD::UNIFORM_TYPE_STORAGE_BUFFER, 37, Vector<RID>({ mip_dirty_buffer }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen, l_mip_dirty), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1250,10 +1259,16 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 
 	// The lighting atlas's mip chain, for the gather's cone-filtered reads.
-	// The whole atlas, every frame: the relit cards are scattered through it.
 	// Weighted by coverage (surface_cache_mip.glsl): a plain box downsample
 	// averaged the cards with the black between them, and the gather's
 	// cone reads lost 6-12% of a flashlight's bounce in the game room.
+	// The relit cards are scattered through the atlas, so the dispatch
+	// covers the whole of it, but a thread whose tile the lighting pass did
+	// not write this frame returns at once (the tile is a texel at the
+	// coarsest level, so every mip texel belongs to one tile); a capture
+	// (new coverage) or a fresh atlas rebuilds everything once.
+	// GODOT_CARD_MIPS=full rebuilds every frame, for the comparison.
+	static const bool mips_always_full = OS::get_singleton()->get_environment("GODOT_CARD_MIPS") == "full";
 	RENDER_TIMESTAMP("Surface Cache Lighting Mips");
 	rd->draw_command_begin_label("Surface Cache Lighting Mips");
 	{
@@ -1265,16 +1280,24 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			RD::Uniform m_source(RD::UNIFORM_TYPE_TEXTURE, 0, Vector<RID>({ lighting_atlas_mips[i - 1] }));
 			RD::Uniform m_depth(RD::UNIFORM_TYPE_TEXTURE, 1, Vector<RID>({ depth_atlas }));
 			RD::Uniform m_dest(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ lighting_atlas_mips[i] }));
-			rd->compute_list_bind_uniform_set(mip_list, uniform_set_cache->get_cache(mip_rid, 0, m_source, m_depth, m_dest), 0);
+			RD::Uniform m_dirty(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ mip_dirty_buffer }));
+			rd->compute_list_bind_uniform_set(mip_list, uniform_set_cache->get_cache(mip_rid, 0, m_source, m_depth, m_dest, m_dirty), 0);
 			struct MipPush {
 				uint32_t size[2];
 				uint32_t source_is_level0;
-				uint32_t pad;
+				uint32_t level;
+				uint32_t tiles_x;
+				uint32_t full;
+				uint32_t pad[2];
 			} push;
 			push.size[0] = mip_size;
 			push.size[1] = mip_size;
 			push.source_is_level0 = i == 1 ? 1 : 0;
-			push.pad = 0;
+			push.level = i;
+			push.tiles_x = settings.atlas_size >> MIP_TILE_SHIFT;
+			push.full = (mip_full_rebuild || mips_always_full) ? 1 : 0;
+			push.pad[0] = 0;
+			push.pad[1] = 0;
 			rd->compute_list_set_push_constant(mip_list, &push, sizeof(push));
 			rd->compute_list_dispatch_threads(mip_list, mip_size, mip_size, 1);
 			rd->compute_list_add_barrier(mip_list);
@@ -1282,4 +1305,9 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->compute_list_end();
 	}
 	rd->draw_command_end_label();
+	{
+		uint32_t tiles = settings.atlas_size >> MIP_TILE_SHIFT;
+		rd->buffer_clear(mip_dirty_buffer, 0, tiles * tiles * sizeof(uint32_t));
+		mip_full_rebuild = false;
+	}
 }
