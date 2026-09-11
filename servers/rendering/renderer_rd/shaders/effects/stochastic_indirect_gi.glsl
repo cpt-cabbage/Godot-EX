@@ -75,6 +75,13 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// rays carrying only the screen's excess over the cards), y the card
 	// relights at which the field is trusted fully.
 	vec4 cv_params;
+	// A planar mirror (GODOT_GI_MIRROR, plan section 41, a prototype): the
+	// plane (xyz its normal, w its offset: n . p = w; a zero normal is
+	// off), the one light it images (xyz world position, w energy) and
+	// x its F0, y the light's range.
+	vec4 mirror_plane;
+	vec4 mirror_light;
+	vec4 mirror_params;
 }
 params;
 
@@ -645,6 +652,33 @@ vec3 sdfgi_hit_normal(vec3 rel_pos, vec3 ray_dir) {
 #define CACHE_TIER_PROBE 1u
 #define CACHE_TIER_CARD 2u // Surface cache: already outgoing radiance, never calibrated.
 uint cache_tier = CACHE_TIER_PROBE;
+
+// The planar mirror's Fresnel (Schlick over its F0).
+float mirror_fresnel(float c) {
+	float k = 1.0 - clamp(c, 0.0, 1.0);
+	float k2 = k * k;
+	return params.mirror_params.x + (1.0 - params.mirror_params.x) * k2 * k2 * k;
+}
+
+// Whether a world point lies on the mirror plane.
+bool on_mirror_plane(vec3 world_pos) {
+	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5 && abs(dot(params.mirror_plane.xyz, world_pos) - params.mirror_plane.w) < 0.02;
+}
+
+// A shadow segment: anything opaque between the two points.
+bool mirror_occluded(vec3 from_world, vec3 to_world) {
+	vec3 d = to_world - from_world;
+	float len = length(d);
+	if (len < 1e-4) {
+		return false;
+	}
+	rayQueryEXT sq;
+	rayQueryInitializeEXT(sq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, from_world, 0.0, d / len, len);
+	while (rayQueryProceedEXT(sq)) {
+	}
+	return rayQueryGetIntersectionTypeEXT(sq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+
 // The control variate: the card's own radiance at the last hit that read a
 // card (before the screen radiance replaced it), and whether the hit did.
 vec3 ray_control = vec3(0.0);
@@ -1297,6 +1331,47 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
+			if (!hit_specular && on_mirror_plane(world_hit) && (uint(params.mirror_params.z) & 2u) == 0u) {
+				// The planar mirror: the diffuse ray reflects and goes on, and
+				// reads the card where it lands (the probes without one),
+				// weighted by the plane's Fresnel at the bounce. The mirror's
+				// own card is diffuse-only (the light pass zeroes it on the
+				// plane), so nothing is counted twice.
+				vec3 n = params.mirror_plane.xyz;
+				vec3 rdir = reflect(world_dir, n);
+				float f = mirror_fresnel(abs(dot(n, world_dir)));
+				rayQueryEXT rq2;
+				rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, world_hit + n * params.ray_bias, params.ray_bias, rdir, t_max);
+				while (rayQueryProceedEXT(rq2)) {
+				}
+				vec3 bounced = vec3(0.0);
+				bool card_hit = false;
+				if (rayQueryGetIntersectionTypeEXT(rq2, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					uint inst2 = rayQueryGetIntersectionInstanceCustomIndexEXT(rq2, true);
+					float t2 = rayQueryGetIntersectionTEXT(rq2, true);
+					vec3 hit2 = world_hit + n * params.ray_bias + rdir * t2;
+					card_lookup_footprint = (t_hit + t2) * abs(params.card_cone_tan);
+					vec3 card_radiance;
+					uint card_set;
+					if (surface_cache_lookup(inst2, hit2, rdir, card_radiance, card_set)) {
+						card_requests.frame[card_set] = params.surface_cache_frame;
+						bounced = max(card_radiance, vec3(0.0));
+						card_hit = true;
+					} else {
+						bounced = max(sdfgi_cache_radiance(hit2 - params.world_from_view[3].xyz, rdir), vec3(0.0));
+					}
+				}
+				cache_tier = CACHE_TIER_CARD;
+				ray_control = bounced * f;
+				ray_card = true;
+				if (bool(params.flags & FLAG_TIER_STATS)) {
+					// Diagnostics (the RT_GI_CV line while the mirror is on): continuations, their lookups that found a card, their luminance.
+					atomicAdd(calibration.cv_sums[3], 1u);
+					atomicAdd(calibration.cv_sums[0], uint(min(luminance(bounced * f), 64.0) * 1024.0));
+					atomicAdd(calibration.cv_sums[1], card_hit ? 1024u : 0u);
+				}
+				return bounced * f;
+			}
 			// The ray's footprint at the hit: the diffuse cone, or the lobe's
 			// for the reflection ray (a mirror's is a point).
 			card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
@@ -1533,6 +1608,51 @@ void main() {
 	irradiance *= inv_rays;
 	moment *= inv_rays;
 	visibility *= inv_rays;
+	if (dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5) {
+		// The light's image through the planar mirror: direct light the
+		// mirror throws onto this surface, which no ray can find (a point
+		// seen through a delta), so it is evaluated here, the way the box's
+		// image solve does: the mirrored light, Fresnel at the crossing,
+		// and a shadow ray in two legs (to the plane, then from the plane
+		// to the light).
+		vec3 n = params.mirror_plane.xyz;
+		vec3 world_pos = rel_pos + params.world_from_view[3].xyz;
+		float hp = dot(n, world_pos) - params.mirror_plane.w;
+		vec3 light = params.mirror_light.xyz;
+		float hl = dot(n, light) - params.mirror_plane.w;
+		if (hp > 0.005 && hl > 0.0) {
+			vec3 img = light - 2.0 * hl * n;
+			vec3 rel = img - world_pos;
+			float d = length(rel);
+			vec3 dir = rel / d;
+			float cos_n = dot(world_normal, dir);
+			float cos_p = -dot(n, dir);
+			if (cos_n > 0.0 && cos_p > 1e-3 && d < params.mirror_params.y) {
+				float tm = hp / cos_p;
+				vec3 m = world_pos + dir * tm;
+				vec3 start = world_pos + world_geo_normal * params.ray_bias;
+				// The first leg ends a centimetre above the plane (measured
+				// along the normal: along the ray it is a fraction of a
+				// millimetre at a grazing angle, and the slab's face caught it).
+				vec3 leg_end = world_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
+				if (!mirror_occluded(start, leg_end) && !mirror_occluded(m + n * 0.01, light)) {
+					float nd = d / params.mirror_params.y;
+					nd *= nd;
+					nd *= nd;
+					nd = max(1.0 - nd, 0.0);
+					nd *= nd;
+					float att = nd / max(d, 1e-4);
+					float e = params.mirror_light.w * att * cos_n * mirror_fresnel(cos_p);
+					if ((uint(params.mirror_params.z) & 1u) != 0u) {
+						irradiance = vec3(0.0); // Diagnostics: the image term alone.
+						moment = vec3(0.0);
+					}
+					irradiance += vec3(e);
+					moment += e * dir;
+				}
+			}
+		}
+	}
 	vec3 reflection = vec3(0.0);
 	// Where the reflected image lives: the virtual point behind the surface,
 	// at the hit distance beyond it along the view ray, expressed as a view

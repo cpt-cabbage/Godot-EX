@@ -1260,6 +1260,25 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 
 	RtGiParamsUBO params = {};
 	_set_luma_weights(params.luma_weights);
+	{
+		// GODOT_GI_MIRROR="plane_y,F0,lx,ly,lz,energy,range" (plan section
+		// 41, a prototype): a horizontal planar mirror at that height with
+		// that F0, and the one omni light it images.
+		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
+		if (mirror.size() >= 7) {
+			params.mirror_plane[0] = 0.0f;
+			params.mirror_plane[1] = 1.0f;
+			params.mirror_plane[2] = 0.0f;
+			params.mirror_plane[3] = mirror[0];
+			params.mirror_params[0] = mirror[1];
+			params.mirror_light[0] = mirror[2];
+			params.mirror_light[1] = mirror[3];
+			params.mirror_light[2] = mirror[4];
+			params.mirror_light[3] = mirror[5];
+			params.mirror_params[1] = mirror[6];
+			params.mirror_params[2] = mirror.size() >= 8 ? mirror[7] : 0.0f; // Diagnostics bits: 1 the image term alone, 2 no continuation at the plane.
+		}
+	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	Projection world_from_view_proj = Projection(p_world_from_view);
 	for (int col = 0; col < 4; col++) {

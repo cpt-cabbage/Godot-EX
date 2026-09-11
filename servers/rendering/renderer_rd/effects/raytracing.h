@@ -397,6 +397,9 @@ private:
 		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
 		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
 		float cv_params[4]; // The control variate (GODOT_GI_CV): x its weight (0 off), y the card relights at which the field is trusted fully (GODOT_GI_CV_RAMP).
+		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz normal, w offset (zero normal: off).
+		float mirror_light[4]; // The light it images: xyz world position, w energy.
+		float mirror_params[4]; // x F0, y the light's range.
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
