@@ -929,6 +929,10 @@ float specular_cone_tan = 0.0; // The reflection ray's, from the lobe (main).
 // How squarely the chosen card faced the lookup direction, and how far
 // inside its depth tolerance the surface sat: the fallback's confidence.
 float card_lookup_confidence = 0.0;
+// The captured coverage (the albedo's alpha) at the texel the last successful
+// lookup read: under a half, the hit is a hole in an alpha-tested caster or a
+// mesh its material never draws, and the ray goes on through it.
+float card_alpha = 1.0;
 
 // The cards' screen memory over the card's radiance (see the note at the
 // prototype above screen_radiance_boost; the globals it reads are declared
@@ -1041,6 +1045,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float margin = 0.5 * exp2(lod);
 	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
 	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), lod).rgb;
+	card_alpha = texelFetch(card_albedo_atlas, card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1)), 0).a;
 	if (dyn_lights.count > 0u) {
 		// The dynamic lights' direct term at the hit (see the buffer above):
 		// the card's albedo and normal at the texel, its accumulated
@@ -1231,35 +1236,63 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 	// The opaque flag: alpha-tested casters (non-opaque instances) occlude
 	// the bounce ray whole. Confirming their hits from the cards' coverage,
 	// as the direct pass does, cost 5.5 ms on the game project for a diffuse
-	// term that cannot show the holes.
-	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, t_max);
-	while (rayQueryProceedEXT(rq)) {
+	// term that cannot show the holes. What the ray does instead is look the
+	// hit up (it would anyway) and, where the card's texel is under half
+	// alpha -- a hole in a leaf, a mesh whose material draws nothing (a
+	// room's invisible dome carried a flashlight's light from inside to the
+	// walls outside) -- go on from the hit, a few layers at most: a ray more
+	// per hole hit and nothing for the rest.
+	float t_hit = 0.0;
+	float t_base = 0.0;
+	vec3 ray_origin = origin;
+	vec3 rel_hit = origin;
+	vec3 world_hit = origin;
+	uint instance_id = SURFACE_CACHE_INVALID;
+	vec3 card_radiance = vec3(0.0);
+	uint card_set = SURFACE_CACHE_INVALID;
+	bool blocked = false;
+	bool on_card = false;
+	for (uint layer = 0u; layer < 4u; layer++) {
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ray_origin + params.world_from_view[3].xyz, layer == 0u ? params.ray_bias : 0.0, world_dir, t_max - t_base);
+		while (rayQueryProceedEXT(rq)) {
+		}
+		if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+			break;
+		}
+		t_hit = t_base + rayQueryGetIntersectionTEXT(rq, true);
+		rel_hit = origin + world_dir * t_hit;
+		blocked = true;
+		if (!bool(params.flags & FLAG_SURFACE_CACHE)) {
+			break;
+		}
+		instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+		world_hit = rel_hit + params.world_from_view[3].xyz;
+		// The ray's footprint at the hit: the diffuse cone, or the lobe's
+		// for the reflection ray (a mirror's is a point).
+		card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
+		on_card = surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set);
+		if (!(on_card && card_alpha < 0.5)) {
+			break;
+		}
+		blocked = false;
+		on_card = false;
+		t_base = t_hit + params.ray_bias;
+		ray_origin = origin + world_dir * t_base;
 	}
-	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-		float t_hit = rayQueryGetIntersectionTEXT(rq, true);
+	if (blocked) {
 		r_hit_distance = t_hit;
-		vec3 rel_hit = origin + world_dir * t_hit;
 		mat3 view_basis = transpose(mat3(params.world_from_view));
 		vec3 view_hit = view_basis * rel_hit;
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
-			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
-			// The ray's footprint at the hit: the diffuse cone, or the lobe's
-			// for the reflection ray (a mirror's is a point).
-			card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
 			// The hit goes to its material rather than the cards: for every
 			// hit, for the mirror ray's (a card's texel cannot carry the
 			// detail a mirror shows), or, the usual case, for a hit the
 			// cards cannot shade.
 			bool defer_first = bool(params.flags & FLAG_HIT_ALL) || (hit_mirror && bool(params.flags & FLAG_HIT_MIRROR));
-			if (!defer_first) {
-				vec3 card_radiance;
-				uint card_set;
-				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
-					card_requests.frame[card_set] = params.surface_cache_frame;
-					cache_tier = CACHE_TIER_CARD;
-					return screen_radiance_boost(view_hit, card_radiance);
-				}
+			if (!defer_first && on_card) {
+				card_requests.frame[card_set] = params.surface_cache_frame;
+				cache_tier = CACHE_TIER_CARD;
+				return screen_radiance_boost(view_hit, card_radiance);
 			}
 			if (bool(params.flags & FLAG_HIT_SHADING) && instance_id != SURFACE_CACHE_INVALID) {
 				uint geometry_base = card_instances.data[instance_id].geometry_base;
@@ -1296,14 +1329,10 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 					}
 				}
 			}
-			if (defer_first) {
-				vec3 card_radiance;
-				uint card_set;
-				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
-					card_requests.frame[card_set] = params.surface_cache_frame;
-					cache_tier = CACHE_TIER_CARD;
-					return screen_radiance_boost(view_hit, card_radiance);
-				}
+			if (defer_first && on_card) {
+				card_requests.frame[card_set] = params.surface_cache_frame;
+				cache_tier = CACHE_TIER_CARD;
+				return screen_radiance_boost(view_hit, card_radiance);
 			}
 		}
 		return screen_radiance_boost(view_hit, sdfgi_cache_radiance(rel_hit, world_dir));

@@ -143,6 +143,7 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 
 	thread_local LocalVector<RD::AccelerationStructureGeometry> geometries;
 	geometries.clear();
+	static const bool blas_print = OS::get_singleton()->get_environment("GODOT_TLAS_PRINT") != "";
 
 	for (uint32_t i = 0; i < surface_count; i++) {
 		if (i < 32 && (p_surface_mask & (1u << i)) == 0) {
@@ -150,6 +151,9 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 		}
 		void *surface = mesh_storage->mesh_get_surface(p_mesh, i);
 		if (mesh_storage->mesh_surface_get_primitive(surface) != RSE::PRIMITIVE_TRIANGLES) {
+			if (blas_print) {
+				print_line(vformat("BLAS skip: mesh %d surface %d not triangles", p_mesh.get_id(), i));
+			}
 			continue;
 		}
 		uint64_t format = mesh_storage->mesh_surface_get_format(surface);
@@ -159,6 +163,9 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 		uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(surface);
 		uint32_t index_count = mesh_storage->mesh_surface_get_index_count(surface);
 		if (index_count > 0 ? (index_count % 3) != 0 : (vertex_count % 3) != 0) {
+			if (blas_print) {
+				print_line(vformat("BLAS skip: mesh %d surface %d counts %d/%d", p_mesh.get_id(), i, vertex_count, index_count));
+			}
 			continue;
 		}
 		RID vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(p_mesh, i);
@@ -172,6 +179,9 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 			}
 		}
 		if (vertex_buffer.is_null()) {
+			if (blas_print) {
+				print_line(vformat("BLAS skip: mesh %d surface %d no vertex buffer", p_mesh.get_id(), i));
+			}
 			continue;
 		}
 
@@ -209,6 +219,9 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 		r_entry.geometry_surfaces.push_back(i); // The geometry index a ray query reports is this surface.
 	}
 
+	if (blas_print) {
+		print_line(vformat("BLAS: mesh %d surfaces %d geometries %d (first: %d verts %d indices, format 0x%x)", p_mesh.get_id(), surface_count, geometries.size(), geometries.is_empty() ? 0 : geometries[0].vertex_count, geometries.is_empty() ? 0 : geometries[0].index_count, geometries.is_empty() ? 0 : (uint32_t)mesh_storage->mesh_surface_get_format(mesh_storage->mesh_get_surface(p_mesh, r_entry.geometry_surfaces[0]))));
+	}
 	if (geometries.is_empty()) {
 		return;
 	}
@@ -379,6 +392,16 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 		};
 		if (alpha_tested != 0) {
 			alpha_tested_instances++;
+		}
+		// Diagnostics (GODOT_TLAS_PRINT=<n>): every instance's facing classes
+		// and bounds, on the n-th scene update.
+		static const int tlas_print_at = OS::get_singleton()->get_environment("GODOT_TLAS_PRINT").to_int();
+		static int tlas_update_count = 0;
+		if (tlas_print_at > 0 && i == 0) {
+			tlas_update_count++;
+		}
+		if (tlas_print_at > 0 && tlas_update_count == tlas_print_at) {
+			print_line(vformat("TLAS inst %d: casting 0x%x double 0x%x front 0x%x alpha 0x%x layers 0x%x det %.3f aabb %s", (int)i, casting_mask, double_sided, front_cull, alpha_tested, inst->layer_mask, inst->transform.basis.determinant(), inst->transformed_aabb));
 		}
 
 		for (const FacingClass &facing : classes) {

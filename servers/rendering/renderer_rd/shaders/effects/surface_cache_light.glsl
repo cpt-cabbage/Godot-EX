@@ -573,6 +573,10 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 // captured yet (or too small), 3 no card faces the ray with a filled texel
 // under the hit, 4 a card does but its stored depth disagrees with the hit.
 uint card_reject = 0u;
+// The captured coverage at the texel the last successful card_lookup read
+// (the albedo's alpha): under a half it is a hole in an alpha-tested caster,
+// or a mesh its material never draws, the way card_covers reads it.
+float card_alpha = 1.0;
 
 bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change, out float r_change_total, out vec3 r_n_world, out vec3 r_albedo, out ivec2 r_texel) {
 	r_radiance = vec3(0.0);
@@ -671,7 +675,9 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
 	r_change = change_load_gradient(best_texel);
 	r_change_total = change_load_total(best_texel);
-	r_albedo = texelFetch(albedo_atlas, best_texel, 0).rgb;
+	vec4 albedo_alpha = texelFetch(albedo_atlas, best_texel, 0);
+	r_albedo = albedo_alpha.rgb;
+	card_alpha = albedo_alpha.a;
 	r_texel = best_texel;
 	// The captured normal, as read_texel decodes it: the dynamic bounce needs
 	// the surface's orientation at the hit for its geometry terms.
@@ -1128,24 +1134,46 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 				dir = normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
 			}
 			rayQueryEXT rq;
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, pos, 0.0, dir, range);
-			while (rayQueryProceedEXT(rq)) {
-			}
 			dyn_stat(0u, ceiling);
-			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+			// As the bounce ray: a hit whose card texel is under half alpha
+			// is a hole, and the ray goes on through it.
+			float d_lp = 0.0;
+			vec3 p = pos;
+			vec3 unused_radiance;
+			uint hit_set = SURFACE_CACHE_INVALID;
+			float unused_change;
+			float hit_change_total = 0.0;
+			vec3 n_p = axis;
+			vec3 albedo_p = vec3(0.0);
+			ivec2 texel_p = ivec2(0);
+			bool blocked = false;
+			bool landed_on_card = false;
+			vec3 ray_origin = pos;
+			float d_base = 0.0;
+			for (uint layer = 0u; layer < 4u; layer++) {
+				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, range - d_base);
+				while (rayQueryProceedEXT(rq)) {
+				}
+				if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+					break;
+				}
+				d_lp = d_base + rayQueryGetIntersectionTEXT(rq, true);
+				p = pos + dir * d_lp;
+				blocked = true;
+				landed_on_card = card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p);
+				if (!(landed_on_card && card_alpha < 0.5)) {
+					break;
+				}
+				blocked = false;
+				landed_on_card = false;
+				d_base = d_lp + params.ray_bias;
+				ray_origin = pos + dir * d_base;
+			}
+			if (!blocked) {
 				continue;
 			}
 			dyn_stat(1u, ceiling);
-			float d_lp = rayQueryGetIntersectionTEXT(rq, true);
-			vec3 p = pos + dir * d_lp;
-			vec3 unused_radiance;
-			uint hit_set;
-			float unused_change;
-			float hit_change_total;
-			vec3 n_p;
-			vec3 albedo_p;
-			ivec2 texel_p;
-			if (!card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p)) {
+			if (!landed_on_card) {
 				continue;
 			}
 			dyn_stat(2u, ceiling);
@@ -1213,24 +1241,51 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		vec3 ray_dir = basis_around(t.n_world, vec2(r0, r1));
 		rayQueryEXT rq;
 		// Opaque: alpha-tested casters occlude the bounce ray whole (the
-		// shadow rays above consult the cards' coverage; the bounce is a
-		// diffuse term and the lookups cost a millisecond on the game project).
-		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, t.origin, 0.0, ray_dir, 1e4);
-		while (rayQueryProceedEXT(rq)) {
+		// shadow rays above consult the cards' coverage at every candidate;
+		// the bounce is a diffuse term and those lookups cost a millisecond
+		// on the game project). But a hit whose card texel is under half
+		// alpha is no surface at all -- a hole in a leaf, or a mesh whose
+		// material draws nothing (a room's invisible dome carried a
+		// flashlight's light from inside to the walls outside) -- so the ray
+		// goes on from it, a few layers at most: a ray more per hole hit,
+		// and the lookup it needed anyway.
+		float t_hit = 0.0;
+		uint hit_instance = SURFACE_CACHE_INVALID;
+		vec3 hit_pos = t.origin;
+		vec3 card_radiance = vec3(0.0);
+		uint hit_set = SURFACE_CACHE_INVALID;
+		float hit_change = 0.0;
+		float hit_change_total = 0.0;
+		vec3 n_hit = t.n_world;
+		vec3 albedo_hit = vec3(0.0);
+		ivec2 texel_hit = ivec2(0);
+		bool blocked = false;
+		bool on_card = false;
+		vec3 ray_origin = t.origin;
+		float t_base = 0.0;
+		for (uint layer = 0u; layer < 4u; layer++) {
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
+			while (rayQueryProceedEXT(rq)) {
+			}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+				break;
+			}
+			t_hit = t_base + rayQueryGetIntersectionTEXT(rq, true);
+			hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+			hit_pos = t.origin + ray_dir * t_hit;
+			blocked = true;
+			on_card = card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit);
+			if (!(on_card && card_alpha < 0.5)) {
+				break;
+			}
+			blocked = false;
+			on_card = false;
+			t_base = t_hit + params.ray_bias;
+			ray_origin = t.origin + ray_dir * t_base;
 		}
-		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-			float t_hit = rayQueryGetIntersectionTEXT(rq, true);
-			uint hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-			vec3 card_radiance;
-			uint hit_set;
-			float hit_change;
-			float hit_change_total;
-			vec3 n_hit;
-			vec3 albedo_hit;
-			ivec2 texel_hit;
+		if (blocked) {
 			hit_t = t_hit;
-			vec3 hit_pos = t.origin + ray_dir * t_hit;
-			if (card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
+			if (on_card) {
 				hit_set_id = hit_set & 0xFFFFu;
 				if (dyn_lights.count > 0u) {
 					// The atlas holds no dynamic light's direct term (see
@@ -1807,6 +1862,13 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn_read = vec3(0.0);
 		dyn_read_age = 0.0;
 	}
+	if ((params.debug & 262144u) != 0u) {
+		// (paintn) The captured world-space normal as colour, in the bounce
+		// the gather's fallback reads (GODOT_GI_FALLBACK=all shows every
+		// pixel's own texel): a texel captured from the wrong side shows here.
+		ind_read = t.n_world * 0.5 + 0.5;
+		dyn_read = vec3(0.0);
+	}
 	imageStore(indirect_filtered_atlas, texel, vec4(ind_read, ind_read_age / 64.0));
 	imageStore(indirect_dyn_filtered_atlas, texel, vec4(dyn_read, dyn_read_age / 64.0));
 
@@ -1817,6 +1879,11 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// subtracting it where it is now.
 	vec3 direct = d.exact + max(d.local_sum - d.dyn_sum, vec3(0.0)) * vis;
 	vec3 radiance = max(t.albedo * (direct + ind_read + dyn_read) + t.emission, vec3(0.0));
+	if ((params.debug & 262144u) != 0u) {
+		// (paintn) The captured world-space normal, as colour (seen through
+		// GODOT_GI_FALLBACK=all): a texel lit from the wrong side shows here.
+		radiance = t.n_world * 0.5 + 0.5;
+	}
 	vec3 static_radiance = max(t.albedo * (direct + ind_read) + t.emission, vec3(0.0));
 	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(static_radiance)) || any(isinf(static_radiance))) {
 		radiance = vec3(0.0);

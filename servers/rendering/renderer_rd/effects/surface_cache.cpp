@@ -944,7 +944,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		uint32_t bits = 0;
 		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
 			const String name = part.strip_edges().to_lower();
-			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : name == "paint3" ? 512 : name == "paint5" ? 2048 : name == "stats" ? 4096 : name == "strict" ? 16384 : name == "paint8" ? 131072 : 0;
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : name == "paint3" ? 512 : name == "paint5" ? 2048 : name == "stats" ? 4096 : name == "strict" ? 16384 : name == "paint8" ? 131072 : name == "paintn" ? 262144 : 0;
 		}
 		if (bits != 0) {
 			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
