@@ -86,6 +86,7 @@ private:
 		bool area_normalize_energy = true;
 		RID area_texture;
 		uint64_t version = 0;
+		bool allow_contact_shadows = true;
 
 		Dependency dependency;
 	};
@@ -271,7 +272,8 @@ private:
 		float shadow_opacity;
 		float fade_from;
 		float fade_to;
-		uint32_t pad[2];
+		uint32_t sscs_index;
+		uint32_t pad;
 		uint32_t bake_mode;
 		float volumetric_fog_energy;
 		float shadow_bias[4];
@@ -577,6 +579,8 @@ public:
 	virtual uint32_t light_get_shadow_caster_mask(RID p_light) const override;
 	virtual void light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mode) override;
 	virtual void light_set_max_sdfgi_cascade(RID p_light, uint32_t p_cascade) override;
+	virtual void light_set_allow_contact_shadows(RID p_light, bool p_enable) override;
+	virtual bool light_get_allow_contact_shadows(RID p_light) const override;
 
 	virtual void light_omni_set_shadow_mode(RID p_light, RSE::LightOmniShadowMode p_mode) override;
 
@@ -940,7 +944,11 @@ public:
 		}
 		return false;
 	}
-	void update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows);
+	// p_ray_traced_shadow_light: the directional light whose shadow is ray
+	// traced this frame. It takes no contact-shadow layer (the ray already
+	// resolves contact), so the layer indices stay in step with the layers
+	// the renderer actually computes for the remaining lights.
+	void update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows, RID p_ray_traced_shadow_light = RID());
 
 	/* REFLECTION PROBE */
 

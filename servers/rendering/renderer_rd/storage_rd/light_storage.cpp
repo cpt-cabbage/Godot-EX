@@ -164,6 +164,8 @@ void LightStorage::_light_initialize(RID p_light, RSE::LightType p_type) {
 	light.param[RSE::LIGHT_PARAM_SHADOW_PANCAKE_SIZE] = 20.0;
 	light.param[RSE::LIGHT_PARAM_TRANSMITTANCE_BIAS] = 0.05;
 	light.param[RSE::LIGHT_PARAM_INTENSITY] = p_type == RSE::LIGHT_DIRECTIONAL ? 100000.0 : 1000.0;
+	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_OPACITY] = 1.0;
+	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_BLUR] = 1.0;
 
 	light_owner.initialize_rid(p_light, light);
 }
@@ -358,6 +360,20 @@ void LightStorage::light_set_max_sdfgi_cascade(RID p_light, uint32_t p_cascade) 
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+void LightStorage::light_set_allow_contact_shadows(RID p_light, bool p_enable) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	light->allow_contact_shadows = p_enable;
+}
+
+bool LightStorage::light_get_allow_contact_shadows(RID p_light) const {
+	const Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL_V(light, true);
+
+	return light->allow_contact_shadows;
 }
 
 void LightStorage::light_omni_set_shadow_mode(RID p_light, RSE::LightOmniShadowMode p_mode) {
@@ -1130,7 +1146,7 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 	}
 }
 
-void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows) {
+void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows, RID p_ray_traced_shadow_light) {
 	ForwardIDStorage *forward_id_storage = ForwardIDStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -1142,6 +1158,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	omni_light_count = 0;
 	spot_light_count = 0;
 	area_light_count = 0;
+	uint32_t directional_contact_shadows_count = 0;
 
 	r_directional_light_soft_shadows = false;
 
@@ -1200,6 +1217,10 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				light_data.shadow_opacity = (p_using_shadows && light->shadow)
 						? light->param[RSE::LIGHT_PARAM_SHADOW_OPACITY]
 						: 0.0;
+				// The ray traced sun is never queued for a contact-shadow layer
+				// (its shadow ray already resolves contact), so it must not take
+				// an index either, or every later light would read the wrong layer.
+				light_data.sscs_index = (light->allow_contact_shadows && light_instance->light != p_ray_traced_shadow_light) ? directional_contact_shadows_count++ : 0xffffffff;
 
 				float angular_diameter = light->param[RSE::LIGHT_PARAM_SIZE];
 				if (angular_diameter > 0.0) {
