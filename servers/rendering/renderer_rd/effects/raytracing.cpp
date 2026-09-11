@@ -262,6 +262,9 @@ Raytracing::~Raytracing() {
 	if (rt_gi_dummy_rw_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(rt_gi_dummy_rw_buffer);
 	}
+	if (rt_gi_dummy_image.is_valid()) {
+		RD::get_singleton()->free_rid(rt_gi_dummy_image);
+	}
 	RD::get_singleton()->free_rid(material_sampler);
 	shader.version_free(shader_version);
 	rt_gi_shader.version_free(rt_gi_shader_version);
@@ -1201,7 +1204,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(96); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT).
+		c.buffer = rd->storage_buffer_create(160); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own.
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -1256,7 +1259,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// off the flash and nothing off the settle, so it is off by default.
 	static const float srad_young = OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG").to_float());
 	static const float srad_ratio = OS::get_singleton()->get_environment("GODOT_GI_SRAD_RATIO") == "" ? 4.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_RATIO").to_float());
-	params.screen_radiance_extra[0] = srad_young;
+	// GODOT_GI_MEMORY=<rate>: the cards' screen memory (see memory_base in
+	// the shader): a texel remembers what the settled screen showed over the
+	// card, blended in at this rate per hit, and a hit that cannot read the
+	// screen (off frame, or a pixel whose history is under eight frames)
+	// reads the card plus the memory. 0 off (section 34).
+	static const float memory_rate = OS::get_singleton()->get_environment("GODOT_GI_MEMORY") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_MEMORY").to_float());
+	params.screen_radiance_extra[0] = memory_rate > 0.0f ? MAX(srad_young, 8.0f) : srad_young;
 	params.screen_radiance_extra[1] = srad_ratio;
 	params.screen_radiance_extra[2] = srad_floor;
 	// GODOT_GI_CALIB_CARDS=1 (diagnostics): the cards' hits join the
@@ -1327,6 +1336,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		}
 		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
 	}
+	params.memory_rate = use_cards ? CLAMP(memory_rate, 0.0f, 1.0f) : 0.0f;
 	params.surface_cache_frame = scene.get_frame();
 	// Diagnostics: GODOT_GI_FALLBACK=all shows the cards' bounce fallback at
 	// every pixel in place of the gathered GI (its bias and coverage against
@@ -1505,6 +1515,17 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// projector rect, so the atlas may be absent).
 	RID gather_decal_atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
 	RD::Uniform u_sc_decal_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 37, Vector<RID>({ material_sampler, gather_decal_atlas.is_valid() ? gather_decal_atlas : default_black }));
+	// The cards' screen memory, read and written by the hits (a storage
+	// image, so the dummy is one of its own).
+	if (rt_gi_dummy_image.is_null()) {
+		RD::TextureFormat dtf;
+		dtf.width = 1;
+		dtf.height = 1;
+		dtf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		dtf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+		rt_gi_dummy_image = rd->texture_create(dtf, RD::TextureView());
+	}
+	RD::Uniform u_sc_screen(RD::UNIFORM_TYPE_IMAGE, 38, Vector<RID>({ use_cards ? surface_cache->get_screen_atlas() : rt_gi_dummy_image }));
 	RD::Uniform u_out_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 	RD::Uniform u_out_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 	RD::Uniform u_out_depth(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ view_depth }));
@@ -1513,13 +1534,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
 	if (calibrate || tier_stats) {
-		rd->buffer_clear(calibration.buffer, 0, 96);
+		rd->buffer_clear(calibration.buffer, 0, 160);
 	}
 	RENDER_TIMESTAMP("RT GI Gather");
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1533,8 +1554,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		calibration.state->pending = true;
 		rd->buffer_get_data_async(calibration.buffer, callable_mp(calibration.state.ptr(), &RenderBuffersRT::RtGiCacheCalibration::on_readback), 0, 32);
 	}
-	if (tier_stats && (rb_state->frame_index % 60) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 64);
+	// GODOT_GI_TIER_PRINT=<frames> sets the interval (60 when unset or 0).
+	static const int64_t tier_interval = MAX(OS::get_singleton()->get_environment("GODOT_GI_TIER_PRINT").to_int(), int64_t(0));
+	if (tier_stats && (rb_state->frame_index % (tier_interval > 0 ? uint32_t(tier_interval) : 60u)) == 0) {
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 128);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -2224,4 +2247,21 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 	// (a NaN anywhere in the ray tiers; the growing-black-voids guard).
 	line += vformat("  | non-finite pixels zeroed: %d", t[7]);
 	print_line(line);
+	if (p_data.size() >= 128) {
+		// The reflection rays by what answered them (SPEC_SRC_* in the
+		// shader), with the mean luminance each source handed back, and the
+		// cards' screen memory's writes this frame.
+		const uint32_t *s = t + 16;
+		double sn = 0.0;
+		for (int i = 0; i < 7; i++) {
+			sn += s[i];
+		}
+		const char *spec_names[7] = { "screen", "partial", "memory", "card", "hit-shaded", "sky", "other" };
+		String spec_line = vformat("RT_GI_TIERS reflection: %d rays", int(sn));
+		for (int i = 0; i < 7; i++) {
+			spec_line += vformat("  %s %.1f%% (mean lum %.3f)", spec_names[i], sn > 0.0 ? 100.0 * s[i] / sn : 0.0, s[i] > 0 ? double(s[8 + i]) / 16.0 / double(s[i]) : 0.0);
+		}
+		spec_line += vformat("  | memory writes %d", s[7]);
+		print_line(spec_line);
+	}
 }

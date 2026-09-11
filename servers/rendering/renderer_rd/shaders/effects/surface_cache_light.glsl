@@ -280,6 +280,9 @@ layout(set = 0, binding = 33, rgba16f) uniform restrict image2D indirect_dyn_fil
 // the readers (the gather's fallback and youth, the hit shader), the
 // accumulation itself staying raw in indirect_atlas. Alpha: its relights.
 layout(set = 0, binding = 34, rgba16f) uniform restrict image2D indirect_filtered_atlas;
+// The gather's screen memory of each texel (stochastic_indirect_gi.glsl
+// screen_radiance_boost); only zeroed here, on a fresh capture.
+layout(set = 0, binding = 36, rgba16f) uniform restrict writeonly image2D screen_atlas;
 
 // How settled the cards are, for the editor's idle repaints (see
 // RenderForwardClustered::_request_ray_tracing_convergence): of the texels
@@ -1536,6 +1539,11 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// reset flag is raised on the frame its record is built, which is not
 	// always the frame it is first lit.
 	bool fresh = reset || old.a <= 0.0;
+	if (fresh) {
+		// The screen's memory of this texel (the gather's) is of whatever
+		// the atlas page held before.
+		imageStore(screen_atlas, texel, vec4(0.0));
+	}
 
 	// The radiance gradient: how much the deterministic part of this texel's
 	// lighting moved since the last relight, relative to itself, per channel

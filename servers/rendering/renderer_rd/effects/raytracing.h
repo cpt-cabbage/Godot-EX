@@ -387,7 +387,7 @@ private:
 		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
 		float card_youth_lod; // The mip a hit reads a card texel relit once through (0 disables); halves per doubling of the texel's relights.
 		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS).
-		uint32_t pad2;
+		float memory_rate; // The cards' screen memory (GODOT_GI_MEMORY): the blend rate a settled screen read is remembered at; 0 off.
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
 		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
@@ -399,6 +399,7 @@ private:
 	bool surface_cache_mirror_reflections = true;
 	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
 	RID rt_gi_dummy_rw_buffer; // The same for the buffers a shader writes.
+	RID rt_gi_dummy_image; // And for the cards' screen memory, a storage image.
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,

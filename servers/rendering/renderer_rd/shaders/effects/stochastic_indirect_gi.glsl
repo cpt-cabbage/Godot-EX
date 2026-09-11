@@ -58,7 +58,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
 	float card_youth_lod; // The mip a texel relit once is read through (0 disables); a level less per doubling of its relights (see surface_cache_lookup).
 	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
-	uint pad2;
+	float memory_rate; // The cards' screen memory (see screen_radiance_boost): the rate a settled screen read is blended into a texel's memory; 0 off.
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	// x: frames of history a hit's own pixel needs before its screen colour
 	// is trusted (the boost fades in from 0 to this; 0 trusts it at once);
@@ -200,8 +200,21 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	// answered and their summed luminance in 1/16 units.
 	uint tier_count[8];
 	uint tier_lum[8];
+	// Diagnostics (FLAG_TIER_STATS): the reflection rays alone, by what
+	// answered them (SPEC_SRC_*), and in [7] the memory's writes.
+	uint spec_count[8];
+	uint spec_lum[8];
 }
 calibration;
+
+#define SPEC_SRC_SCREEN 0u // The screen, whole.
+#define SPEC_SRC_PARTIAL 1u // The screen at the border fade or a young pixel's fade-in, the rest the card (and its memory).
+#define SPEC_SRC_MEMORY 2u // The card plus its memory (the screen not available).
+#define SPEC_SRC_CARD 3u // The card alone (no memory there).
+#define SPEC_SRC_HIT_SHADED 4u
+#define SPEC_SRC_SKY 5u
+#define SPEC_SRC_OTHER 6u // The cascades or probes, screen-boosted or not.
+uint boost_source = SPEC_SRC_OTHER; // What the last screen_radiance_boost answered with.
 
 // The surface cache (see surface_cache.cpp): per TLAS instance the record the
 // ray query's custom index names, per card set its six captures, and the lit
@@ -321,6 +334,17 @@ layout(set = 0, binding = 33) uniform sampler2D card_albedo_atlas;
 layout(set = 0, binding = 34) uniform sampler2D card_normal_atlas;
 layout(set = 0, binding = 36) uniform sampler2D card_static_atlas; // Alpha: the dynamic lights' visibility ratio.
 layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic lights' projector textures (see card_dynamic_direct).
+// The cards' screen memory (params.memory_rate > 0): per texel, what the
+// rendered screen showed over the card's radiance the last times a hit read
+// it settled (rgb, the difference over the card's luminance, see
+// MEMORY_FLOOR), and the frame it was last taught in (a,
+// frame_index % 1024 + 1; 0 empty). See screen_radiance_boost. Zeroed by
+// the card lighting on a fresh capture.
+layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atlas;
+// The frames both of a pixel's histories must hold before its screen colour
+// teaches the memory (its reads fade in from the memory over
+// screen_radiance_extra.x frames, fewer).
+#define MEMORY_WRITE_FRAMES 16.0
 layout(set = 0, binding = 35, std430) restrict readonly buffer DynamicLights {
 	uint count;
 	uint pad0;
@@ -706,6 +730,39 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	return sdfgi_probe_irradiance(rel_pos, sdfgi_hit_normal(rel_pos, ray_dir)) * params.probe_floor;
 }
 
+// The cards' screen memory (params.memory_rate > 0). The screen term below
+// is most of the light a lit room's rays bring back (the tier print: a
+// third of the rays, four fifths of the luminance), and it is view-fed: the
+// ceiling's glossy ray reads the mirror floor's colour, which is the
+// floor's image of the ceiling, which read the ceiling's colour. Where the
+// screen is not available -- a hit off frame, or on a pixel whose history a
+// camera flick just restarted -- the ray read the card alone, the cards'
+// diffuse-only level, and after a flick every pixel's history restarted
+// from that level and then converged on the screen-fed fixed point through
+// two running means: the reflection 44% dark at the stop and 7% still at
+// stop + 48, the diffuse 8% bright, over fifty frames (section 34). So a
+// card texel remembers, from the hits that read it settled, what the screen
+// showed over the card there; a hit that cannot read the screen reads the
+// card plus that memory, and the young state is the fixed point itself.
+// Stored as the difference, not the screen colour: the card's own term
+// (a dynamic light's direct term included) is then always current, and
+// only the screen's excess -- the specular, the textures, the emissives,
+// the further bounces -- is remembered. Defined after the card lookup.
+vec3 memory_base(vec3 cache_radiance);
+// The atlas position the last successful card lookup read (bilinear, in
+// texels), and the card it lies in (surface_cache_lookup sets them).
+vec2 card_atlas_texel = vec2(0.0);
+ivec2 card_atlas_origin = ivec2(0);
+ivec2 card_atlas_dims = ivec2(1);
+// The memory is kept relative to the card's luminance (the excess over
+// the card scales with the light on it: a light that dims or moves away
+// takes its specular and bounce along; measured absolute, the lab's
+// colour, orbit and sweep light cases read 15-25% worse from stop + 8,
+// the old light's excess serving until relearned), floored so a dark
+// card (the mirror floor's) keeps an absolute memory of the image it
+// shows.
+#define MEMORY_FLOOR 0.05
+
 // On-screen hits can read last frame's rendered radiance, which carries the
 // texture detail and emissive surfaces the cache lacks. Luminance-clamped
 // against the cache value so screen feedback cannot run away.
@@ -716,35 +773,36 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// the border hand-back agree.
 	uint tier = cache_tier;
 	vec3 cache_radiance = raw_cache_radiance * (tier == CACHE_TIER_SOLID ? params.cache_scale : (tier == CACHE_TIER_PROBE ? params.probe_scale : 1.0));
+	boost_source = tier == CACHE_TIER_CARD ? SPEC_SRC_CARD : SPEC_SRC_OTHER; // Diagnostics; memory_base and the reads below refine it.
 	if (!bool(params.flags & FLAG_SCREEN_RADIANCE)) {
 		return cache_radiance;
 	}
 	vec4 ndc = params.ndc_from_view * vec4(view_hit, 1.0);
 	if (ndc.w <= 0.0) {
-		return cache_radiance;
+		return memory_base(cache_radiance);
 	}
 	ndc.xyz /= ndc.w;
 	vec2 uv = ndc.xy * 0.5 + 0.5;
 	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
-		return cache_radiance;
+		return memory_base(cache_radiance);
 	}
 	float scene_depth = textureLod(depth_texture, uv, 0.0).r;
 	if (scene_depth == 0.0) {
-		return cache_radiance;
+		return memory_base(cache_radiance);
 	}
 	vec4 scene_view = params.view_from_ndc * vec4(ndc.xy, scene_depth, 1.0);
 	float scene_z = scene_view.z / scene_view.w;
 	if (abs(scene_z - view_hit.z) > max(abs(view_hit.z) * 0.1, 0.25)) {
-		return cache_radiance; // The visible surface is not the hit surface.
+		return memory_base(cache_radiance); // The visible surface is not the hit surface.
 	}
 	// The color buffer holds last frame's scene: look the hit up where it was.
 	vec4 prev_ndc = params.reproject * vec4(ndc.xy, scene_depth, 1.0);
 	if (prev_ndc.w <= 0.0) {
-		return cache_radiance;
+		return memory_base(cache_radiance);
 	}
 	vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 	if (any(lessThan(prev_uv, vec2(0.0))) || any(greaterThan(prev_uv, vec2(1.0)))) {
-		return cache_radiance;
+		return memory_base(cache_radiance);
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
 	// Weaker by a quarter per bounce: two pixels whose rays keep landing on
@@ -757,8 +815,14 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// term fades in with the hit pixel's own history, the card standing in
 	// until then.
 	float settled = 1.0;
+	float hit_frames = 64.0;
 	if (params.screen_radiance_extra.x > 0.0) {
-		float hit_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
+		vec4 hit_meta = textureLod(prev_gi_meta, prev_uv, 0.0);
+		// With the memory, the younger of the pixel's two histories: a
+		// glossy surface's colour is its reflection as much as its diffuse,
+		// and the reflection restarts on its own (the smear cap, the
+		// mismatch test).
+		hit_frames = (params.memory_rate > 0.0 ? min(hit_meta.r, hit_meta.g) : hit_meta.r) * 64.0;
 		settled = smoothstep(0.0, params.screen_radiance_extra.x, hit_frames);
 	}
 	float l = luminance(col);
@@ -797,6 +861,41 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
 	float screen_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)) * settled;
 	boost_from_screen = screen_share > 0.5;
+	if (params.memory_rate > 0.0 && tier == CACHE_TIER_CARD) {
+		// A settled, well-inside read teaches the texel; a young or edge
+		// read learns from it instead (see memory_base). One step per
+		// texel per frame (the frame stamp in the alpha; rays of one frame
+		// that land on the same texel all take the same step), from a pixel
+		// both of whose histories are past MEMORY_WRITE_FRAMES: at the
+		// blend rate per hit, and from any pixel whose diffuse had settled,
+		// the texels unlearned the converged screen within a frame or two
+		// of a flick, taught by the dim young reflections of pixels that
+		// counted as settled (measured: the stop's reflection 30% dark
+		// against 46% without the memory, instead of level).
+		if (screen_share >= 0.999 && hit_frames >= MEMORY_WRITE_FRAMES) {
+			float stamp = float(params.frame_index % 1024u + 1u);
+			vec4 mem = imageLoad(card_screen_atlas, ivec2(card_atlas_texel));
+			if (mem.a != stamp) {
+				vec3 diff = (col - cache_radiance) / max(luminance(cache_radiance), MEMORY_FLOOR);
+				mem.rgb = (mem.a <= 0.0 || any(isnan(mem.rgb))) ? diff : mix(mem.rgb, diff, params.memory_rate);
+				mem.a = stamp;
+				imageStore(card_screen_atlas, ivec2(card_atlas_texel), mem);
+				if (bool(params.flags & FLAG_TIER_STATS)) {
+					atomicAdd(calibration.spec_count[7], 1u);
+				}
+			}
+			boost_source = SPEC_SRC_SCREEN;
+			return col;
+		}
+		vec3 base = memory_base(cache_radiance);
+		if (screen_share > 0.0) {
+			boost_source = screen_share >= 0.999 ? SPEC_SRC_SCREEN : SPEC_SRC_PARTIAL;
+		}
+		return mix(base, col, screen_share);
+	}
+	if (screen_share > 0.0 && tier == CACHE_TIER_CARD) {
+		boost_source = screen_share >= 0.999 ? SPEC_SRC_SCREEN : SPEC_SRC_PARTIAL;
+	}
 	return mix(cache_radiance, col, screen_share);
 }
 
@@ -808,11 +907,6 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 // reading the card of the wall behind it. Among the valid cards the one
 // facing the ray most squarely wins.
 
-// The atlas position the last successful lookup read (bilinear, in texels),
-// and the card it lies in.
-vec2 card_atlas_texel = vec2(0.0);
-ivec2 card_atlas_origin = ivec2(0);
-ivec2 card_atlas_dims = ivec2(1);
 // The world radius of the ray's footprint at the hit, set by the caller: the
 // card is read through the mip level that footprint covers (never coarser
 // than a quarter of the card), so one sample of a rough lobe or of the
@@ -824,6 +918,21 @@ float specular_cone_tan = 0.0; // The reflection ray's, from the lobe (main).
 // How squarely the chosen card faced the lookup direction, and how far
 // inside its depth tolerance the surface sat: the fallback's confidence.
 float card_lookup_confidence = 0.0;
+
+// The cards' screen memory over the card's radiance (see the note at the
+// prototype above screen_radiance_boost; the globals it reads are declared
+// there).
+vec3 memory_base(vec3 cache_radiance) {
+	if (params.memory_rate <= 0.0 || cache_tier != CACHE_TIER_CARD) {
+		return cache_radiance;
+	}
+	vec4 mem = imageLoad(card_screen_atlas, ivec2(card_atlas_texel));
+	if (mem.a <= 0.0 || any(isnan(mem.rgb))) {
+		return cache_radiance;
+	}
+	boost_source = SPEC_SRC_MEMORY;
+	return max(cache_radiance + mem.rgb * max(luminance(cache_radiance), MEMORY_FLOOR), vec3(0.0));
+}
 
 bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
 	r_radiance = vec3(0.0);
@@ -1201,6 +1310,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
 	trace_source = TIER_SRC_UNSET;
 	boost_from_screen = false;
+	boost_source = SPEC_SRC_OTHER;
 	cache_tier = CACHE_TIER_PROBE;
 	vec3 radiance = trace_radiance_chain(rel_origin, world_geo_normal, world_dir, view_origin, view_dir, jitter, r_hit_distance);
 	if (bool(params.flags & FLAG_TIER_STATS)) {
@@ -1213,6 +1323,19 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 		}
 		atomicAdd(calibration.tier_count[src], 1u);
 		atomicAdd(calibration.tier_lum[src], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+		if (hit_specular) {
+			// The reflection ray alone, by what answered it (SPEC_SRC_*).
+			uint s = boost_source;
+			if (trace_source == TIER_SRC_HIT_SHADED) {
+				s = SPEC_SRC_HIT_SHADED;
+			} else if (trace_source == TIER_SRC_SKY) {
+				s = SPEC_SRC_SKY;
+			} else if (trace_source == TIER_SRC_NONE) {
+				s = SPEC_SRC_OTHER;
+			}
+			atomicAdd(calibration.spec_count[s], 1u);
+			atomicAdd(calibration.spec_lum[s], uint(min(luminance(max(radiance, vec3(0.0))), 64.0) * 16.0));
+		}
 	}
 	return radiance;
 }

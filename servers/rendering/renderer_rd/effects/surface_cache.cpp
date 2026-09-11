@@ -184,6 +184,8 @@ void SurfaceCache::_create_atlases() {
 	rd->texture_clear(indirect_filtered_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	static_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(static_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	screen_atlas = rd->texture_create(tf, RD::TextureView());
+	rd->texture_clear(screen_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	tf.format = RD::DATA_FORMAT_R32G32B32A32_UINT; // Six packed halves; see the shader.
 	change_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(change_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
@@ -242,7 +244,7 @@ void SurfaceCache::_free_atlases() {
 			rid = RID();
 		}
 	}
-	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -1184,12 +1186,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect_dyn_filtered(RD::UNIFORM_TYPE_IMAGE, 33, Vector<RID>({ indirect_dyn_filtered_atlas }));
 	RD::Uniform l_indirect_filtered(RD::UNIFORM_TYPE_IMAGE, 34, Vector<RID>({ indirect_filtered_atlas }));
 	RD::Uniform l_converge(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ converge_buffer }));
+	RD::Uniform l_screen(RD::UNIFORM_TYPE_IMAGE, 36, Vector<RID>({ screen_atlas }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

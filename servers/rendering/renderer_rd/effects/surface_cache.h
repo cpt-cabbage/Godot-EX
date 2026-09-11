@@ -154,6 +154,7 @@ private:
 	RID indirect_dyn_filtered_atlas; // RGBA16F, both dynamic bounces summed and filtered over the card (surface_cache_light.glsl filter_bounce); alpha the age the readers should take it for. What the readers read.
 	RID indirect_filtered_atlas; // RGBA16F, the static bounce accumulation filtered the same way; alpha its relights, 64ths. What the readers read in place of indirect_atlas.
 	RID static_atlas; // RGBA16F, the static lights' radiance alone, for the static cosine rays (surface_cache_light.glsl static_atlas).
+	RID screen_atlas; // RGBA16F, the screen's memory: what the rendered screen showed over the card's radiance at each texel, as the gather's hits last read it settled (stochastic_indirect_gi.glsl screen_radiance_boost); alpha the writes / 64. Zeroed by the lighting pass on a fresh capture.
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
 	// RGBA32UI, six packed halves: the unshadowed direct radiance (in
 	// colour) at the last relight, its relative change since the relight
@@ -436,6 +437,7 @@ public:
 	RID get_indirect_filtered_atlas() const { return indirect_filtered_atlas; }
 	RID get_dynamic_lights_buffer() const { return dynamic_lights_buffer; }
 	RID get_static_atlas() const { return static_atlas; }
+	RID get_screen_atlas() const { return screen_atlas; }
 	uint32_t get_dynamic_light_count() const { return dynamic_light_count; }
 	// The world light grid as the last update_lighting left it (the hit
 	// shading reads it the way the card lighting does).
