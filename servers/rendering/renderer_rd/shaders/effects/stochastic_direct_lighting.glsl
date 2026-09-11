@@ -606,6 +606,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	float best_alpha = 1.0;
+	bool any_filled = false;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -626,6 +627,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 		if (stored <= 0.0) {
 			continue;
 		}
+		any_filled = true;
 		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
 		float tolerance = max(2.0 * texel_world, 0.02 * longest);
 		if (abs(stored - depth) > tolerance) {
@@ -637,7 +639,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 		}
 	}
 	if (best_w <= 0.0) {
-		return true;
+		return any_filled; // A covered layer counts as covered; a hole (no filled texel under the hit) does not.
 	}
 	return best_alpha >= 0.5;
 }

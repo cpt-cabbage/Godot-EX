@@ -1579,6 +1579,19 @@ void fragment_shader(in SceneData scene_data) {
 #endif // USE_OPAQUE_PREPASS || ALPHA_ANTIALIASING_EDGE_USED
 #endif // MODE_RENDER_DEPTH
 
+#if defined(MODE_RENDER_MATERIAL) && (defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED) || defined(USE_OPAQUE_PREPASS))
+	// The surface cache's card capture (not the lightmapper's UV2 capture,
+	// which keeps the alpha in the texel): a fragment an alpha-tested material
+	// draws under half alpha is a hole, and its texel stays unfilled (depth 0),
+	// so the card lookups find the hole through the depth they test anyway,
+	// the ray goes on through it, and the mips and filters never average the
+	// texel in. A mesh whose material draws nothing (an invisible dome) then
+	// has no filled texel at all.
+	if (!bool(scene_data.flags & SCENE_DATA_FLAGS_USE_UV2_MATERIAL) && alpha < 0.5) {
+		discard;
+	}
+#endif
+
 #endif // !USE_SHADOW_TO_OPACITY
 
 #if defined(NORMAL_MAP_USED)

@@ -289,6 +289,12 @@ layout(set = 0, binding = 37, std430) restrict writeonly buffer MipDirty {
 	uint tiles[];
 }
 mip_dirty;
+// Per set: [0] once any texel was relit, [1] once a filled one was (see
+// SurfaceCache::set_captured_empty).
+layout(set = 0, binding = 38, std430) restrict writeonly buffer SetState {
+	uint state[];
+}
+set_state;
 
 // How settled the cards are, for the editor's idle repaints (see
 // RenderForwardClustered::_request_ray_tracing_convergence): of the texels
@@ -579,10 +585,6 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 // captured yet (or too small), 3 no card faces the ray with a filled texel
 // under the hit, 4 a card does but its stored depth disagrees with the hit.
 uint card_reject = 0u;
-// The captured coverage at the texel the last successful card_lookup read
-// (the albedo's alpha): under a half it is a hole in an alpha-tested caster,
-// or a mesh its material never draws, the way card_covers reads it.
-float card_alpha = 1.0;
 
 bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set, out float r_change, out float r_change_total, out vec3 r_n_world, out vec3 r_albedo, out ivec2 r_texel) {
 	r_radiance = vec3(0.0);
@@ -681,9 +683,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
 	r_change = change_load_gradient(best_texel);
 	r_change_total = change_load_total(best_texel);
-	vec4 albedo_alpha = texelFetch(albedo_atlas, best_texel, 0);
-	r_albedo = albedo_alpha.rgb;
-	card_alpha = albedo_alpha.a;
+	r_albedo = texelFetch(albedo_atlas, best_texel, 0).rgb;
 	r_texel = best_texel;
 	// The captured normal, as read_texel decodes it: the dynamic bounce needs
 	// the surface's orientation at the hit for its geometry terms.
@@ -707,8 +707,10 @@ vec3 basis_around(vec3 n, vec2 rnd) {
 // Coverage of a non-opaque candidate hit (an alpha-tested caster), from its
 // instance's cards: the card facing the ray most squarely whose stored depth
 // agrees with the hit, and its captured albedo alpha at that texel. A hit
-// with no card, or none agreeing, counts as covered, so a thick object never
-// leaks; only a texel the material left below half alpha lets the ray on.
+// with no card, or with filled texels that all disagree on depth, counts as
+// covered, so a thick object never leaks; a hit under which no facing card
+// has a filled texel is a hole (the capture leaves an alpha-tested
+// material's texels under half alpha unfilled) and lets the ray on.
 bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 	if (p_instance_id == SURFACE_CACHE_INVALID) {
 		return true;
@@ -726,6 +728,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
 	float best_alpha = 1.0;
+	bool any_filled = false;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		vec3 axis, u, v;
 		card_basis(k, axis, u, v);
@@ -746,6 +749,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 		if (stored <= 0.0) {
 			continue;
 		}
+		any_filled = true;
 		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
 		float tolerance = max(2.0 * texel_world, 0.02 * longest);
 		if (abs(stored - depth) > tolerance) {
@@ -757,7 +761,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 		}
 	}
 	if (best_w <= 0.0) {
-		return true;
+		return any_filled; // A covered layer, or a hole.
 	}
 	return best_alpha >= 0.5;
 }
@@ -1141,8 +1145,8 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 			}
 			rayQueryEXT rq;
 			dyn_stat(0u, ceiling);
-			// As the bounce ray: a hit whose card texel is under half alpha
-			// is a hole, and the ray goes on through it.
+			// As the bounce ray: a hit under which no facing card has a
+			// filled texel is a hole, and the ray goes on through it.
 			float d_lp = 0.0;
 			vec3 p = pos;
 			vec3 unused_radiance;
@@ -1167,7 +1171,7 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 				p = pos + dir * d_lp;
 				blocked = true;
 				landed_on_card = card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p);
-				if (!(landed_on_card && card_alpha < 0.5)) {
+				if (landed_on_card || card_reject != 3u) {
 					break;
 				}
 				blocked = false;
@@ -1249,12 +1253,13 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		// Opaque: alpha-tested casters occlude the bounce ray whole (the
 		// shadow rays above consult the cards' coverage at every candidate;
 		// the bounce is a diffuse term and those lookups cost a millisecond
-		// on the game project). But a hit whose card texel is under half
-		// alpha is no surface at all -- a hole in a leaf, or a mesh whose
-		// material draws nothing (a room's invisible dome carried a
-		// flashlight's light from inside to the walls outside) -- so the ray
-		// goes on from it, a few layers at most: a ray more per hole hit,
-		// and the lookup it needed anyway.
+		// on the game project). But a hit under which no facing card has a
+		// filled texel is a hole -- the capture leaves an alpha-tested
+		// material's texels under half alpha unfilled: a gap in a leaf, or a
+		// mesh whose material draws nothing (a room's invisible dome carried
+		// a flashlight's light from inside to the walls outside) -- so the
+		// ray goes on from it, a few layers at most: a ray more per hole
+		// hit, and the lookup it needed anyway.
 		float t_hit = 0.0;
 		uint hit_instance = SURFACE_CACHE_INVALID;
 		vec3 hit_pos = t.origin;
@@ -1281,7 +1286,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 			hit_pos = t.origin + ray_dir * t_hit;
 			blocked = true;
 			on_card = card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit);
-			if (!(on_card && card_alpha < 0.5)) {
+			if (on_card || card_reject != 3u) {
 				break;
 			}
 			blocked = false;
@@ -1943,6 +1948,7 @@ void main() {
 	if (card >= SURFACE_CACHE_CARDS) {
 		return;
 	}
+	set_state.state[set * 2u] = 1u;
 	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
 	ivec2 origin_texel = card_origin_packed(card_packed);
 	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
@@ -1958,8 +1964,9 @@ void main() {
 		ivec2 texel = origin_texel + texel_in_card;
 		Texel t;
 		if (!read_texel(s, card, dims, texel_in_card, texel, t)) {
-			return; // Nothing captured here.
+			return;
 		}
+		set_state.state[set * 2u + 1u] = 1u;
 		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		// The bounce ray's seed is its own, not the direct term's advanced
 		// one: the previous relight's ray must be reproducible from its
@@ -2001,6 +2008,9 @@ void main() {
 	for (uint k = 0u; k < 4u; k++) {
 		ivec2 texel_in_card = quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		valid[k] = read_texel(s, card, dims, texel_in_card, origin_texel + texel_in_card, t[k]);
+		if (valid[k]) {
+			set_state.state[set * 2u + 1u] = 1u;
+		}
 		valid_count += valid[k] ? 1u : 0u;
 	}
 	if (valid_count == 0u) {

@@ -28,7 +28,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform texture2D source; // The finer level.
 layout(set = 0, binding = 1) uniform texture2D depth_atlas; // Level 0's coverage.
 layout(set = 0, binding = 2, rgba16f) uniform restrict writeonly image2D destination;
-layout(set = 0, binding = 3, std430) restrict readonly buffer MipDirty {
+layout(set = 0, binding = 3, std430) restrict buffer MipDirty {
 	uint tiles[];
 }
 mip_dirty;
@@ -39,7 +39,8 @@ layout(push_constant, std430) uniform Params {
 	uint level; // The destination's mip level.
 	uint tiles_x; // Tiles across the atlas.
 	uint full; // 1: rebuild every tile.
-	uint pad[2];
+	uint last; // 1: the coarsest level, which clears the tiles' marks behind it (one texel per tile).
+	uint pad;
 }
 params;
 
@@ -48,11 +49,17 @@ void main() {
 	if (any(greaterThanEqual(p, params.size))) {
 		return;
 	}
-	if (params.full == 0u) {
-		uvec2 tile = (p << params.level) >> 5u;
-		if (mip_dirty.tiles[tile.y * params.tiles_x + tile.x] == 0u) {
-			return;
-		}
+	uvec2 tile = (p << params.level) >> 5u;
+	uint tile_index = tile.y * params.tiles_x + tile.x;
+	if (params.full == 0u && mip_dirty.tiles[tile_index] == 0u) {
+		return;
+	}
+	if (params.last != 0u) {
+		// The levels run in order with a barrier between: this one is the
+		// last reader of the mark, and clears it for the next frame (no
+		// buffer clear between the passes, whose encoder shifted the
+		// profile's timestamps by half a millisecond).
+		mip_dirty.tiles[tile_index] = 0u;
 	}
 	ivec2 base = ivec2(p) * 2;
 	vec3 sum = vec3(0.0);

@@ -272,6 +272,15 @@ private:
 	// every few frames, one readback in flight.
 	RID converge_buffer;
 	static bool converge_pending;
+	// Per set, two uints the lighting pass stores: [0] once any of its texels
+	// was relit, [1] once a filled one was. Read back with the convergence
+	// count. A set relit with nothing filled belongs to a mesh whose material
+	// draws nothing (an alpha-tested one under half alpha everywhere): the
+	// scene leaves such an instance out of the TLAS (see set_captured_empty).
+	RID set_state_buffer;
+	static bool set_state_pending;
+	static LocalVector<uint8_t> set_state; // [set * 2]: relit, [set * 2 + 1]: filled, as last read back.
+	static void _set_state_readback(const Vector<uint8_t> &p_data);
 	static uint32_t converge_young;
 	static uint32_t converge_relit;
 	static uint32_t converge_up; // The settled texels' bounce luminance that rose this relight, summed (fixed point, 1/1024).
@@ -453,6 +462,9 @@ public:
 	// hundred still young among those relit); true until the first count
 	// lands so an idle viewport is not pinned by a cache that never lit.
 	bool is_settled() const;
+	// Whether the set's cards, relit at least once, hold no filled texel: a
+	// mesh whose material draws nothing (false until the first readback).
+	bool set_captured_empty(uint32_t p_set) const;
 	Vector3 get_grid_origin() const { return last_grid_origin; }
 	float get_grid_cell() const { return last_grid_cell; }
 	uint32_t get_set_count() const { return sets.size(); }

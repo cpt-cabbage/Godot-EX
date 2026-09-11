@@ -70,9 +70,6 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// turn converges in a few frames instead of thirty. ray_count above is
 	// the larger of the two: the hit slots are sized by it.
 	uvec4 ray_params;
-	uint hiz_levels; // Levels of the depth pyramid the screen traces may walk (0: the linear march).
-	float screen_trace_distance; // How far a screen trace goes before the BVH ray takes over (metres).
-	vec2 hiz_pad;
 }
 params;
 
@@ -344,8 +341,6 @@ layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic
 // frame_index % 1024 + 1; 0 empty). See screen_radiance_boost. Zeroed by
 // the card lighting on a fresh capture.
 layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atlas;
-// The depth pyramid (level 0 = the depth halved), the nearest depth per cell; the walk reads the depth texture for its own level 0.
-layout(set = 0, binding = 39) uniform sampler2D hiz_texture;
 // The frames both of a pixel's histories must hold before its screen colour
 // teaches the memory (its reads fade in from the memory over
 // screen_radiance_extra.x frames, fewer).
@@ -934,10 +929,6 @@ float specular_cone_tan = 0.0; // The reflection ray's, from the lobe (main).
 // How squarely the chosen card faced the lookup direction, and how far
 // inside its depth tolerance the surface sat: the fallback's confidence.
 float card_lookup_confidence = 0.0;
-// The captured coverage (the albedo's alpha) at the texel the last successful
-// lookup read: under a half, the hit is a hole in an alpha-tested caster or a
-// mesh its material never draws, and the ray goes on through it.
-float card_alpha = 1.0;
 
 // The cards' screen memory over the card's radiance (see the note at the
 // prototype above screen_radiance_boost; the globals it reads are declared
@@ -1050,7 +1041,6 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float margin = 0.5 * exp2(lod);
 	vec2 atlas_texel = vec2(card_origin_packed(best_packed)) + clamp(best_uv * best_dims, vec2(margin), best_dims - margin);
 	r_radiance = textureLod(card_lighting_atlas, atlas_texel / float(params.surface_cache_atlas_size), lod).rgb;
-	card_alpha = texelFetch(card_albedo_atlas, card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1)), 0).a;
 	if (dyn_lights.count > 0u) {
 		// The dynamic lights' direct term at the hit (see the buffer above):
 		// the card's albedo and normal at the texel, its accumulated
@@ -1092,132 +1082,28 @@ bool screen_trace_hit(vec3 view_origin, vec3 view_normal, vec3 view_dir, float j
 	// r_hit_distance as a contact at a few centimetres and drives this pixel's
 	// visibility term to zero while its neighbour's stays at one.
 	view_origin += view_normal * params.ray_bias;
-	float trace_dist = params.screen_trace_distance;
-	// The reflection rays keep the contact march: their hits go to the
-	// materials or the cards by design, and a screen hit in their way would
-	// turn the mirror floor into a screen-space reflection, thickness
-	// artefacts included.
-	if (params.hiz_levels == 0u || hit_specular) {
-		if (hit_specular) {
-			trace_dist = 0.4;
-		}
-		// The six-step linear march: contact occlusion over the first stretch.
-		for (int i = 0; i < SCREEN_TRACE_STEPS; i++) {
-			float t = trace_dist * (float(i) + jitter + 0.5) / float(SCREEN_TRACE_STEPS);
-			vec3 p = view_origin + view_dir * t;
-			vec4 ndc = params.ndc_from_view * vec4(p, 1.0);
-			if (ndc.w <= 0.0) {
-				return false;
-			}
-			ndc.xyz /= ndc.w;
-			vec2 suv = ndc.xy * 0.5 + 0.5;
-			if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
-				return false;
-			}
-			float scene_depth = textureLod(depth_texture, suv, 0.0).r;
-			if (scene_depth == 0.0) {
-				continue; // Sky.
-			}
-			vec4 scene_view = params.view_from_ndc * vec4(ndc.xy, scene_depth, 1.0);
-			float scene_z = scene_view.z / scene_view.w;
-			if (scene_z > p.z + SCREEN_TRACE_BIAS && scene_z < p.z + SCREEN_TRACE_THICKNESS) {
-				hit_view_pos = vec3(p.xy, scene_z);
-				return true;
-			}
-		}
-		return false;
-	}
-	// The depth pyramid walk. A line in view space is a line in NDC (x, y and
-	// the reverse-Z depth alike), so the ray is marched in screen space by one
-	// parameter t. At each step the ray is compared with the nearest depth of
-	// the cell it is in at the current level: in front of it, the cell is
-	// skipped whole and the level coarsens; not, the level refines, and at the
-	// finest level the texel decides -- a ray within the surface's thickness
-	// behind it is a hit, one that dives deeper passed behind a thin object
-	// and goes on. Off the screen, or past the distance, the BVH ray takes over.
-	vec4 c0 = params.ndc_from_view * vec4(view_origin, 1.0);
-	if (c0.w <= 1e-4) {
-		return false;
-	}
-	vec4 c1 = params.ndc_from_view * vec4(view_origin + view_dir * trace_dist, 1.0);
-	if (c1.w <= 1e-4) {
-		// The end crosses the near plane: stop just before it (w is linear along the ray).
-		c1 = mix(c0, c1, (1e-4 - c0.w) / (c1.w - c0.w));
-	}
-	vec3 s0 = c0.xyz / c0.w;
-	vec3 s1 = c1.xyz / c1.w;
-	s0.xy = s0.xy * 0.5 + 0.5;
-	s1.xy = s1.xy * 0.5 + 0.5;
-	vec3 d = s1 - s0;
-	float t_end = 1.0;
-	if (d.x > 0.0) {
-		t_end = min(t_end, (1.0 - s0.x) / d.x);
-	} else if (d.x < 0.0) {
-		t_end = min(t_end, -s0.x / d.x);
-	}
-	if (d.y > 0.0) {
-		t_end = min(t_end, (1.0 - s0.y) / d.y);
-	} else if (d.y < 0.0) {
-		t_end = min(t_end, -s0.y / d.y);
-	}
-	if (t_end <= 0.0 || any(lessThan(s0.xy, vec2(0.0))) || any(greaterThan(s0.xy, vec2(1.0)))) {
-		return false;
-	}
-	vec2 full = vec2(params.full_screen_size);
-	vec2 far_edge = vec2(d.x >= 0.0 ? 1.0 : 0.0, d.y >= 0.0 ? 1.0 : 0.0);
-	// A twentieth of a texel along the ray, to step over a cell's edge.
-	float t_eps = 0.05 / max(length(d.xy * full), 1e-3);
-	float t = 0.0;
-	uint level = 0u;
-	bool skip_origin = true; // The origin's own texel is left without a test.
-	for (int i = 0; i < 64; i++) {
-		vec2 level_size = level == 0u ? full : vec2(textureSize(hiz_texture, int(level) - 1));
-		vec2 uv = s0.xy + d.xy * t;
-		vec2 cell = floor(uv * level_size);
-		vec2 t_edges = ((cell + far_edge) / level_size - s0.xy) / d.xy;
-		if (d.x == 0.0) {
-			t_edges.x = 1e30;
-		}
-		if (d.y == 0.0) {
-			t_edges.y = 1e30;
-		}
-		float t_exit = min(min(t_edges.x, t_edges.y) + t_eps, t_end);
-		float z_hiz = level == 0u ? texelFetch(depth_texture, ivec2(cell), 0).r : texelFetch(hiz_texture, ivec2(cell), int(level) - 1).r;
-		float z_ray_far = min(s0.z + d.z * t, s0.z + d.z * t_exit); // Reverse-Z: the farthest point of the segment.
-		if (skip_origin || z_hiz == 0.0 || z_ray_far > z_hiz) {
-			// Sky, or the ray in front of everything in the cell.
-			skip_origin = false;
-			t = t_exit;
-			if (t >= t_end) {
-				return false;
-			}
-			level = min(level + 1u, params.hiz_levels);
-			continue;
-		}
-		if (level > 0u) {
-			level--;
-			continue;
-		}
-		// The finest level: the ray reaches the texel's depth. The point where
-		// it crosses that depth is the candidate hit; how far behind the
-		// surface it is at the texel's far edge says whether it went through
-		// a thin object instead.
-		vec2 uv_c = (cell + 0.5) / full;
-		vec4 sv = params.view_from_ndc * vec4(uv_c * 2.0 - 1.0, z_hiz, 1.0);
-		float scene_z = sv.z / sv.w;
-		float t_cross = d.z != 0.0 ? clamp((z_hiz - s0.z) / d.z, t, t_exit) : t;
-		vec4 pv = params.view_from_ndc * vec4((s0.xy + d.xy * t_cross) * 2.0 - 1.0, s0.z + d.z * t_cross, 1.0);
-		vec3 p_cross = pv.xyz / pv.w;
-		vec4 ev = params.view_from_ndc * vec4((s0.xy + d.xy * t_exit) * 2.0 - 1.0, s0.z + d.z * t_exit, 1.0);
-		vec3 p_exit = ev.xyz / ev.w;
-		float behind = scene_z - p_exit.z; // Positive: the ray's far end is behind the surface.
-		if (behind < SCREEN_TRACE_THICKNESS) {
-			hit_view_pos = vec3(p_cross.xy, scene_z);
-			return true;
-		}
-		t = t_exit;
-		if (t >= t_end) {
+	float trace_dist = SCREEN_TRACE_DISTANCE;
+	for (int i = 0; i < SCREEN_TRACE_STEPS; i++) {
+		float t = trace_dist * (float(i) + jitter + 0.5) / float(SCREEN_TRACE_STEPS);
+		vec3 p = view_origin + view_dir * t;
+		vec4 ndc = params.ndc_from_view * vec4(p, 1.0);
+		if (ndc.w <= 0.0) {
 			return false;
+		}
+		ndc.xyz /= ndc.w;
+		vec2 suv = ndc.xy * 0.5 + 0.5;
+		if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
+			return false;
+		}
+		float scene_depth = textureLod(depth_texture, suv, 0.0).r;
+		if (scene_depth == 0.0) {
+			continue; // Sky.
+		}
+		vec4 scene_view = params.view_from_ndc * vec4(ndc.xy, scene_depth, 1.0);
+		float scene_z = scene_view.z / scene_view.w;
+		if (scene_z > p.z + SCREEN_TRACE_BIAS && scene_z < p.z + SCREEN_TRACE_THICKNESS) {
+			hit_view_pos = vec3(p.xy, scene_z);
+			return true;
 		}
 	}
 	return false;
@@ -1297,6 +1183,7 @@ vec3 fold_above(vec3 dir, vec3 geo_normal) {
 	return below < 0.0 ? dir - 2.0 * below * geo_normal : dir;
 }
 
+
 // One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
 // miss. Positions are camera-relative world space (the cascade convention).
 // r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
@@ -1345,63 +1232,43 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 	// The opaque flag: alpha-tested casters (non-opaque instances) occlude
 	// the bounce ray whole. Confirming their hits from the cards' coverage,
 	// as the direct pass does, cost 5.5 ms on the game project for a diffuse
-	// term that cannot show the holes. What the ray does instead is look the
-	// hit up (it would anyway) and, where the card's texel is under half
-	// alpha -- a hole in a leaf, a mesh whose material draws nothing (a
-	// room's invisible dome carried a flashlight's light from inside to the
-	// walls outside) -- go on from the hit, a few layers at most: a ray more
-	// per hole hit and nothing for the rest.
-	float t_hit = 0.0;
-	float t_base = 0.0;
-	vec3 ray_origin = origin;
-	vec3 rel_hit = origin;
-	vec3 world_hit = origin;
-	uint instance_id = SURFACE_CACHE_INVALID;
-	vec3 card_radiance = vec3(0.0);
-	uint card_set = SURFACE_CACHE_INVALID;
-	bool blocked = false;
-	bool on_card = false;
-	for (uint layer = 0u; layer < 4u; layer++) {
-		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ray_origin + params.world_from_view[3].xyz, layer == 0u ? params.ray_bias : 0.0, world_dir, t_max - t_base);
-		while (rayQueryProceedEXT(rq)) {
-		}
-		if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-			break;
-		}
-		t_hit = t_base + rayQueryGetIntersectionTEXT(rq, true);
-		rel_hit = origin + world_dir * t_hit;
-		blocked = true;
-		if (!bool(params.flags & FLAG_SURFACE_CACHE)) {
-			break;
-		}
-		instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-		world_hit = rel_hit + params.world_from_view[3].xyz;
-		// The ray's footprint at the hit: the diffuse cone, or the lobe's
-		// for the reflection ray (a mirror's is a point).
-		card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
-		on_card = surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set);
-		if (!(on_card && card_alpha < 0.5)) {
-			break;
-		}
-		blocked = false;
-		on_card = false;
-		t_base = t_hit + params.ray_bias;
-		ray_origin = origin + world_dir * t_base;
+	// term that cannot show the holes. A hit in a hole -- the capture leaves
+	// an alpha-tested material's texels under half alpha unfilled: a gap in
+	// a leaf, a mesh whose material draws nothing (a room's invisible dome
+	// carried a flashlight's lit cap from inside to the walls outside while
+	// its texels were captured and lit) -- finds no card and takes the
+	// cache tier like any other hit without one. Going on through the hole
+	// was measured: one ray in a hundred, and 0.5-0.8 ms on this
+	// register-bound pass for the code alone, as a loop or as a second
+	// trace.
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, t_max);
+	while (rayQueryProceedEXT(rq)) {
 	}
-	if (blocked) {
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+		float t_hit = rayQueryGetIntersectionTEXT(rq, true);
 		r_hit_distance = t_hit;
+		vec3 rel_hit = origin + world_dir * t_hit;
 		mat3 view_basis = transpose(mat3(params.world_from_view));
 		vec3 view_hit = view_basis * rel_hit;
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
+			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
+			// The ray's footprint at the hit: the diffuse cone, or the lobe's
+			// for the reflection ray (a mirror's is a point).
+			card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
 			// The hit goes to its material rather than the cards: for every
 			// hit, for the mirror ray's (a card's texel cannot carry the
 			// detail a mirror shows), or, the usual case, for a hit the
 			// cards cannot shade.
 			bool defer_first = bool(params.flags & FLAG_HIT_ALL) || (hit_mirror && bool(params.flags & FLAG_HIT_MIRROR));
-			if (!defer_first && on_card) {
-				card_requests.frame[card_set] = params.surface_cache_frame;
-				cache_tier = CACHE_TIER_CARD;
-				return screen_radiance_boost(view_hit, card_radiance);
+			if (!defer_first) {
+				vec3 card_radiance;
+				uint card_set;
+				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
+					card_requests.frame[card_set] = params.surface_cache_frame;
+					cache_tier = CACHE_TIER_CARD;
+					return screen_radiance_boost(view_hit, card_radiance);
+				}
 			}
 			if (bool(params.flags & FLAG_HIT_SHADING) && instance_id != SURFACE_CACHE_INVALID) {
 				uint geometry_base = card_instances.data[instance_id].geometry_base;
@@ -1438,10 +1305,14 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 					}
 				}
 			}
-			if (defer_first && on_card) {
-				card_requests.frame[card_set] = params.surface_cache_frame;
-				cache_tier = CACHE_TIER_CARD;
-				return screen_radiance_boost(view_hit, card_radiance);
+			if (defer_first) {
+				vec3 card_radiance;
+				uint card_set;
+				if (surface_cache_lookup(instance_id, world_hit, world_dir, card_radiance, card_set)) {
+					card_requests.frame[card_set] = params.surface_cache_frame;
+					cache_tier = CACHE_TIER_CARD;
+					return screen_radiance_boost(view_hit, card_radiance);
+				}
 			}
 		}
 		return screen_radiance_boost(view_hit, sdfgi_cache_radiance(rel_hit, world_dir));

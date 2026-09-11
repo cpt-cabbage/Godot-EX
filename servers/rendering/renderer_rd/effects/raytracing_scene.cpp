@@ -390,6 +390,12 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			{ double_sided & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
 			{ front_cull & alpha_tested, BitField<RD::AccelerationStructureInstanceFlagBits>(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) },
 		};
+		// An alpha-tested instance whose cards, relit, hold no filled texel is
+		// a mesh whose material draws nothing (the game room's invisible
+		// domes): the shadow maps never saw it, and neither does the TLAS.
+		if (alpha_tested != 0 && card_set != SurfaceCache::INVALID_ID && p_surface_cache->set_captured_empty(card_set)) {
+			continue;
+		}
 		if (alpha_tested != 0) {
 			alpha_tested_instances++;
 		}
