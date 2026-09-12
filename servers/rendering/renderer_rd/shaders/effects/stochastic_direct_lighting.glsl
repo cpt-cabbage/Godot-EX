@@ -17,6 +17,8 @@
 // albedo, full specular) goes into its own buffers and is multiplied back in
 // after denoising, so lighting detail never passes through the filter.
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../light_data_inc.glsl"
@@ -53,6 +55,15 @@ layout(set = 0, binding = 5, std430) restrict readonly buffer LightList {
 }
 prev_light_list;
 
+#define MAX_MIRROR_PLANES 4u
+struct MirrorPlane {
+	vec4 plane;
+	vec4 params;
+	vec4 center;
+	vec4 u_axis;
+	vec4 v_axis;
+};
+
 layout(set = 0, binding = 6, std140) uniform Params {
 	mat4 view_from_ndc; // Inverse of the (depth-corrected) projection.
 	mat4 ndc_from_view; // The (depth-corrected) projection, for screen traces.
@@ -84,10 +95,15 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	// off), and x its F0. Every local light then has an image entry beside
 	// it (IMAGE_BIT): the light evaluated at the mirrored point with the
 	// mirrored normal and view vector, times the Fresnel at the crossing.
-	vec4 mirror_plane;
-	vec4 mirror_params;
+	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), view space.
+	uint mirror_count;
+	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
+	uint mirror_pad1;
+	uint mirror_pad2;
 }
 params;
+
+#include "mirror_planes_inc.glsl"
 
 #define FLAG_LIGHT_GUIDING 1u
 #define FLAG_SCREEN_TRACES 2u
@@ -163,9 +179,20 @@ layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ana
 #define AREA_BIT 0x40000000u
 #define QUAD_MASK_SHIFT 26u
 #define QUAD_MASK_BITS (0xFu << QUAD_MASK_SHIFT)
-#define IMAGE_BIT 0x02000000u // The light's image through the planar mirror (see params.mirror_plane).
-#define ENTRY_ID_MASK 0x01FFFFFFu
-#define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | IMAGE_BIT | ENTRY_ID_MASK)
+#define IMAGE_BIT 0x02000000u // The light's image through a planar mirror (mirror_planes_inc.glsl); bits 23..24 name the mirror nearest the pixel.
+#define IMAGE_PLANE_SHIFT 23u
+#define IMAGE_PLANE_MASK (0x3u << IMAGE_PLANE_SHIFT)
+#define IMAGE2_BIT 0x00400000u // A second-order image: bits 20..21 name the next mirror toward the light (mirror_chain).
+#define IMAGE2_PLANE_SHIFT 20u
+#define IMAGE2_PLANE_MASK (0x3u << IMAGE2_PLANE_SHIFT)
+#define IMAGE3_BIT 0x00080000u // A third-order image: bits 17..18 name the mirror nearest the light.
+#define IMAGE3_PLANE_SHIFT 17u
+#define IMAGE3_PLANE_MASK (0x3u << IMAGE3_PLANE_SHIFT)
+#define ENTRY_ID_MASK 0x0001FFFFu
+#define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | IMAGE_BIT | IMAGE_PLANE_MASK | IMAGE2_BIT | IMAGE2_PLANE_MASK | IMAGE3_BIT | IMAGE3_PLANE_MASK | ENTRY_ID_MASK)
+#define ENTRY_MIRROR(e) (((e) & IMAGE_PLANE_MASK) >> IMAGE_PLANE_SHIFT)
+#define ENTRY_MIRROR2(e) ((((e) & IMAGE2_BIT) != 0u) ? (((e) & IMAGE2_PLANE_MASK) >> IMAGE2_PLANE_SHIFT) : MAX_MIRROR_PLANES)
+#define ENTRY_MIRROR3(e) ((((e) & IMAGE3_BIT) != 0u) ? (((e) & IMAGE3_PLANE_MASK) >> IMAGE3_PLANE_SHIFT) : MAX_MIRROR_PLANES)
 // Candidate set: the guided (visible list) candidates plus a strided subset of
 // the cluster cell. Keeping the per-pixel candidate count fixed is what makes
 // the cost independent of the total light count (MegaLights' central promise);
@@ -519,42 +546,32 @@ void light_eval(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float r
 	light_eval_at(is_spot, idx, view_pos, view_normal, normalize(-view_pos), roughness, diffuse, specular, spec_split, light_rel_vec);
 }
 
-// The planar mirror (params.mirror_plane): whether it is on, and its Fresnel.
-bool mirror_on() {
-	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5;
-}
-
-float mirror_fresnel(float c) {
-	float k = 1.0 - clamp(c, 0.0, 1.0);
-	float k2 = k * k;
-	return params.mirror_params.x + (1.0 - params.mirror_params.x) * k2 * k2 * k;
-}
-
-// A light's image through the planar mirror at a point: the light itself
-// at the mirrored point with the mirrored normal and view vector (the
+// A light's image through a planar mirror at a point: the light itself at
+// the mirrored point with the mirrored normal and view vector (the
 // attenuation, the cone, the cookie and the lobes come along), times the
 // Fresnel at the crossing. Nothing when the point or the light is behind
-// the plane.
-void light_eval_image(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+// the mirror, when the light's range cannot reach the point from its
+// image, or when the crossing misses the mirror's rectangle.
+void light_eval_image(uint mi, uint mj, uint mk, bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	diffuse = vec3(0.0);
 	specular = vec3(0.0);
 	spec_split = vec4(0.0);
-	vec3 n = params.mirror_plane.xyz;
-	float hp = dot(n, view_pos) - params.mirror_plane.w;
 	vec3 light_pos = is_spot ? spot_lights.data[idx].position : omni_lights.data[idx].position;
-	float hl = dot(n, light_pos) - params.mirror_plane.w;
-	if (hp <= 0.005 || hl <= 0.0) {
+	float inv_radius = is_spot ? spot_lights.data[idx].inv_radius : omni_lights.data[idx].inv_radius;
+	vec3 img, p_img, n_img, c1, c2, c3;
+	float f;
+	if (!mirror_chain(mi, mj, mk, view_pos, view_normal, light_pos, inv_radius, img, p_img, n_img, f, c1, c2, c3)) {
 		return;
 	}
-	vec3 p_img = view_pos - 2.0 * hp * n;
-	vec3 n_img = view_normal - 2.0 * dot(view_normal, n) * n;
-	vec3 v = normalize(-view_pos);
-	vec3 v_img = v - 2.0 * dot(v, n) * n;
+	vec3 v_img = mirror_dir(mi, normalize(-view_pos));
+	if (mj < MAX_MIRROR_PLANES) {
+		v_img = mirror_dir(mj, v_img);
+	}
+	if (mk < MAX_MIRROR_PLANES) {
+		v_img = mirror_dir(mk, v_img);
+	}
 	vec3 rel_unused;
 	light_eval_at(is_spot, idx, p_img, n_img, v_img, roughness, diffuse, specular, spec_split, rel_unused);
-	vec3 img = light_pos - 2.0 * hl * n;
-	float cos_p = abs(dot(n, normalize(img - view_pos)));
-	float f = mirror_fresnel(cos_p);
 	diffuse *= f;
 	specular *= f;
 	spec_split.rgb *= f;
@@ -628,25 +645,24 @@ void area_light_eval(uint idx, vec3 view_pos, vec3 view_normal, float roughness,
 	area_light_eval_at(idx, view_pos, view_normal, normalize(-view_pos), roughness, diffuse, specular, spec_split);
 }
 
-// An area light's image through the planar mirror (see light_eval_image).
-void area_light_eval_image(uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+// An area light's image through a planar mirror (see light_eval_image).
+void area_light_eval_image(uint mi, uint mj, uint mk, uint idx, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	diffuse = vec3(0.0);
 	specular = vec3(0.0);
 	spec_split = vec4(0.0);
-	vec3 n = params.mirror_plane.xyz;
-	float hp = dot(n, view_pos) - params.mirror_plane.w;
-	vec3 light_pos = area_lights.data[idx].position;
-	float hl = dot(n, light_pos) - params.mirror_plane.w;
-	if (hp <= 0.005 || hl <= 0.0) {
+	vec3 img, p_img, n_img, c1, c2, c3;
+	float f;
+	if (!mirror_chain(mi, mj, mk, view_pos, view_normal, area_lights.data[idx].position, area_lights.data[idx].inv_radius, img, p_img, n_img, f, c1, c2, c3)) {
 		return;
 	}
-	vec3 p_img = view_pos - 2.0 * hp * n;
-	vec3 n_img = view_normal - 2.0 * dot(view_normal, n) * n;
-	vec3 v = normalize(-view_pos);
-	vec3 v_img = v - 2.0 * dot(v, n) * n;
+	vec3 v_img = mirror_dir(mi, normalize(-view_pos));
+	if (mj < MAX_MIRROR_PLANES) {
+		v_img = mirror_dir(mj, v_img);
+	}
+	if (mk < MAX_MIRROR_PLANES) {
+		v_img = mirror_dir(mk, v_img);
+	}
 	area_light_eval_at(idx, p_img, n_img, v_img, roughness, diffuse, specular, spec_split);
-	vec3 img = light_pos - 2.0 * hl * n;
-	float f = mirror_fresnel(abs(dot(n, normalize(img - view_pos))));
 	diffuse *= f;
 	specular *= f;
 	spec_split.rgb *= f;
@@ -656,14 +672,14 @@ void area_light_eval_image(uint idx, vec3 view_pos, vec3 view_normal, float roug
 void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 		if ((entry & IMAGE_BIT) != 0u) {
-			area_light_eval_image(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+			area_light_eval_image(ENTRY_MIRROR(entry), ENTRY_MIRROR2(entry), ENTRY_MIRROR3(entry), entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
 		} else {
 			area_light_eval(entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
 		}
 	} else {
 		vec3 unused_rel;
 		if ((entry & IMAGE_BIT) != 0u) {
-			light_eval_image((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
+			light_eval_image(ENTRY_MIRROR(entry), ENTRY_MIRROR2(entry), ENTRY_MIRROR3(entry), (entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
 		} else {
 			light_eval((entry & SPOT_BIT) != 0u, entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split, unused_rel);
 		}
@@ -865,7 +881,7 @@ void main() {
 	vec3 view_pos = view_pos4.xyz / view_pos4.w;
 
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
-	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
+	vec3 view_normal = nr_normal(nr);
 	// Face the normal toward the viewer: the scene shader decides a
 	// double-sided material's side by winding, and a mesh whose triangles wind
 	// against their vertex normals writes a normal pointing into the surface
@@ -875,11 +891,7 @@ void main() {
 	if (dot(view_normal, view_pos) > 0.0) {
 		view_normal = -view_normal;
 	}
-	float roughness = nr.w;
-	if (roughness > 0.5) {
-		roughness = 1.0 - roughness;
-	}
-	roughness /= (127.0 / 255.0);
+	float roughness = nr_roughness(nr);
 
 	uint pixel_seed = pcg_hash(uint(pixel.x) + pcg_hash(uint(pixel.y) + pcg_hash(params.frame_index)));
 
@@ -1031,7 +1043,24 @@ void main() {
 		guided_count++;
 	}
 	float hidden_weight_sum = 0.0;
-	bool mirror_here = mirror_on() && dot(params.mirror_plane.xyz, view_pos) - params.mirror_plane.w > 0.005;
+	// The image chains this pixel faces (mirror_chains_at: each mirror on
+	// whose reflective side it lies, alone and in the pairs and triples
+	// worth it, a lamp seen in the floor seen in the ceiling): each local
+	// light gets an image entry beside it through each. The variants as
+	// entry bits, listed once here.
+	uint mirror_variant_bits[MIRROR_CHAINS_MAX];
+	uint mirror_variants = mirror_on() ? mirror_chains_at(view_pos, mirror_variant_bits) : 0u;
+	for (uint v = 0u; v < mirror_variants; v++) {
+		uint c = mirror_variant_bits[v];
+		uint bits = IMAGE_BIT | (MIRROR_CHAIN_A(c) << IMAGE_PLANE_SHIFT);
+		if (MIRROR_CHAIN_B(c) < MAX_MIRROR_PLANES) {
+			bits |= IMAGE2_BIT | (MIRROR_CHAIN_B(c) << IMAGE2_PLANE_SHIFT);
+		}
+		if (MIRROR_CHAIN_C(c) < MAX_MIRROR_PLANES) {
+			bits |= IMAGE3_BIT | (MIRROR_CHAIN_C(c) << IMAGE3_PLANE_SHIFT);
+		}
+		mirror_variant_bits[v] = bits;
+	}
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
 	// newly visible lights are still found, at a per-pixel cost that does not
@@ -1129,12 +1158,12 @@ void main() {
 						continue;
 					}
 
-					// The light, and beside it its image through the planar
-					// mirror (a candidate and an analytic term of its own,
-					// sharing the light's draw in the stride).
-					uint variants = mirror_here ? 2u : 1u;
+					// The light, and beside it its image through each planar
+					// mirror the pixel faces (a candidate and an analytic term
+					// of its own, sharing the light's draw in the stride).
+					uint variants = 1u + mirror_variants;
 					for (uint variant = 0u; variant < variants; variant++) {
-						uint e = variant == 0u ? entry : (entry | IMAGE_BIT);
+						uint e = variant == 0u ? entry : (entry | mirror_variant_bits[variant - 1u]);
 						vec3 f, s;
 						vec4 ss;
 						entry_eval(e, view_pos, view_normal, roughness, f, s, ss);
@@ -1315,15 +1344,25 @@ void main() {
 				quadrant = (rnd.x < 0.5 ? 0u : 1u) | (rnd.y < 0.5 ? 0u : 2u);
 				view_target = ld.position + ld.area_width * (rnd.x - 0.5) + ld.area_height * (rnd.y - 0.5);
 				if ((entry & IMAGE_BIT) != 0u) {
-					vec3 n = params.mirror_plane.xyz;
-					view_target -= 2.0 * (dot(n, view_target) - params.mirror_plane.w) * n;
+					if ((entry & IMAGE3_BIT) != 0u) {
+						view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
+					}
+					if ((entry & IMAGE2_BIT) != 0u) {
+						view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
+					}
+					view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
 				}
 			} else {
 				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
 				view_target = ld.position;
 				if ((entry & IMAGE_BIT) != 0u) {
-					vec3 n = params.mirror_plane.xyz;
-					view_target = ld.position - 2.0 * (dot(n, ld.position) - params.mirror_plane.w) * n;
+					if ((entry & IMAGE3_BIT) != 0u) {
+						view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
+					}
+					if ((entry & IMAGE2_BIT) != 0u) {
+						view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
+					}
+					view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
 				}
 				// Light size drives the penumbra: sample a disk of that
 				// radius perpendicular to the shadow ray, like the paper's
@@ -1359,20 +1398,34 @@ void main() {
 			if (shadow_opacity < 0.001 || caster_mask == 0u) {
 				visibility = 1.0;
 			} else if ((entry & IMAGE_BIT) != 0u) {
-				// The image's shadow in two legs: to a centimetre above the
-				// plane (along its normal), then from the plane to the real
-				// light (the jittered target mirrored back).
-				vec3 n = params.mirror_plane.xyz;
-				float hp = dot(n, view_pos) - params.mirror_plane.w;
-				vec3 dir = normalize(view_target - view_pos);
-				float cos_p = max(-dot(n, dir), 1e-3);
-				vec3 leg_end = view_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
-				vec3 m = view_pos + dir * (hp / cos_p) + n * 0.01;
-				vec3 real_target = view_target - 2.0 * (dot(n, view_target) - params.mirror_plane.w) * n;
-				vec3 w_leg_end = world_pos + world_basis * (leg_end - view_pos);
-				vec3 w_m = world_pos + world_basis * (m - view_pos);
-				vec3 w_real = world_pos + world_basis * (real_target - view_pos);
-				bool occluded = !trace_visible(world_pos, w_leg_end, caster_mask) || !trace_visible(w_m, w_real, caster_mask);
+				// The image's shadow in legs: to a centimetre above each
+				// mirror of the chain (along its normal), the target
+				// mirrored back a step each time, then from the last mirror
+				// to the real light (the jittered target).
+				uint chain[3];
+				chain[0] = ENTRY_MIRROR(entry);
+				chain[1] = ENTRY_MIRROR2(entry);
+				chain[2] = ENTRY_MIRROR3(entry);
+				vec3 from = view_pos;
+				vec3 w_from = world_pos;
+				vec3 target = view_target;
+				bool occluded = false;
+				for (uint s = 0u; s < 3u && !occluded; s++) {
+					uint m = chain[s];
+					if (m >= MAX_MIRROR_PLANES) {
+						break;
+					}
+					vec3 n = params.mirrors[m].plane.xyz;
+					float hp = mirror_height(m, from);
+					vec3 dir = normalize(target - from);
+					float cos_p = max(-dot(n, dir), 1e-3);
+					vec3 leg_end = from + dir * (max(hp - 0.01, 0.0) / cos_p);
+					occluded = hp <= 0.0 || !trace_visible(w_from, world_pos + world_basis * (leg_end - view_pos), caster_mask);
+					from = from + dir * (hp / cos_p) + n * 0.01;
+					w_from = world_pos + world_basis * (from - view_pos);
+					target = mirror_point(m, target);
+				}
+				occluded = occluded || !trace_visible(w_from, world_pos + world_basis * (target - view_pos), caster_mask);
 				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
 			} else {
 				bool occluded;

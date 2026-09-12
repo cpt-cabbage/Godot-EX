@@ -160,6 +160,7 @@ void SurfaceCache::_create_atlases() {
 	tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 	albedo_atlas = rd->texture_create(tf, RD::TextureView());
 	normal_atlas = rd->texture_create(tf, RD::TextureView());
+	specular_atlas = rd->texture_create(tf, RD::TextureView());
 	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 	emission_atlas = rd->texture_create(tf, RD::TextureView());
 	tf.format = RD::DATA_FORMAT_R32_SFLOAT;
@@ -252,7 +253,7 @@ void SurfaceCache::_free_atlases() {
 			rid = RID();
 		}
 	}
-	for (RID *rid : { &mip_dirty_buffer, &albedo_atlas, &normal_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &mip_dirty_buffer, &albedo_atlas, &normal_atlas, &specular_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -721,6 +722,7 @@ void SurfaceCache::commit_capture(const CaptureJob &p_job, uint32_t p_card) {
 	Vector3 size(p_job.dims[p_card].x, p_job.dims[p_card].y, 1);
 	rd->texture_copy(scratch_albedo, albedo_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_normal, normal_atlas, from, to, size, 0, 0, 0, 0);
+	rd->texture_copy(scratch_orm, specular_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_emission, emission_atlas, from, to, size, 0, 0, 0, 0);
 	rd->texture_copy(scratch_depth_out, depth_atlas, from, to, size, 0, 0, 0, 0);
 	// The coverage the mip chain weights by changed here: rebuild it whole.
@@ -906,16 +908,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		params.luma_weights[0] = luma.x;
 		params.luma_weights[1] = luma.y;
 		params.luma_weights[2] = luma.z;
-		// GODOT_GI_MIRROR (see Raytracing::process_rt_gi): the planar
-		// mirror's texels bounce nothing diffusely.
-		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
-		if (mirror.size() >= 7) {
-			for (int i = 0; i < 4; i++) {
-				params.mirror_plane[i] = mirror[i];
-			}
-			params.mirror_params[0] = mirror[4];
-			params.mirror_params[3] = mirror[5];
-			params.mirror_extra[0] = mirror[6];
+		// The scene's planar mirrors (see Raytracing::_fill_mirror_planes).
+		params.mirror_count = MIN(p_inputs.mirror_count, MAX_MIRROR_PLANES);
+		params.mirror_order = p_inputs.mirror_order;
+		static const uint32_t mirror_ablate = OS::get_singleton()->get_environment("GODOT_MIRROR_ABLATE").to_int();
+		params.mirror_debug = mirror_ablate;
+		for (uint32_t i = 0; i < params.mirror_count; i++) {
+			params.mirrors[i] = p_inputs.mirrors[i];
 		}
 	}
 	Projection world_from_view(p_inputs.world_from_view);
@@ -1236,12 +1235,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_screen(RD::UNIFORM_TYPE_IMAGE, 36, Vector<RID>({ screen_atlas }));
 	RD::Uniform l_mip_dirty(RD::UNIFORM_TYPE_STORAGE_BUFFER, 37, Vector<RID>({ mip_dirty_buffer }));
 	RD::Uniform l_set_state(RD::UNIFORM_TYPE_STORAGE_BUFFER, 38, Vector<RID>({ set_state_buffer }));
+	RD::Uniform l_specular(RD::UNIFORM_TYPE_TEXTURE, 39, Vector<RID>({ specular_atlas }));
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen, l_mip_dirty, l_set_state), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen, l_mip_dirty, l_set_state, l_specular), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1255,7 +1255,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
-		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d", sets.size(), budget, push.round_robin_period, push.idle_divisor));
+		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d; lights: %d omni, %d spot, %d area, %d mirrors", sets.size(), budget, push.round_robin_period, push.idle_divisor, params.omni_light_count, params.spot_light_count, params.area_light_count, params.mirror_count));
 		print_line(vformat("Dynamic lights: %d, motion this frame %.4f m, change %.3f", dyn.count, RendererRD::LightStorage::get_singleton()->get_card_dynamic_motion(), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 60 == 0) {

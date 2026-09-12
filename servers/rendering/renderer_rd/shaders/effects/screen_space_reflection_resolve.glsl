@@ -4,6 +4,8 @@
 
 #VERSION_DEFINES
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D source_depth;
@@ -23,12 +25,8 @@ params;
 void get_sample(float depth, vec3 normal, float roughness, ivec2 pixel_pos, out vec4 color, out float weight) {
 	float sample_depth = texelFetch(source_depth_half, pixel_pos, 0).x;
 	vec4 sample_normal_roughness = texelFetch(source_normal_roughness_half, pixel_pos, 0);
-	vec3 sample_normal = normalize(sample_normal_roughness.xyz * 2.0 - 1.0);
-	float sample_roughness = sample_normal_roughness.w;
-	if (sample_roughness > 0.5) {
-		sample_roughness = 1.0 - sample_roughness;
-	}
-	sample_roughness /= (127.0 / 255.0);
+	vec3 sample_normal = nr_normal(sample_normal_roughness);
+	float sample_roughness = nr_roughness(sample_normal_roughness);
 
 	vec2 uv = (pixel_pos + 0.5) / (params.screen_size * 0.5);
 
@@ -64,12 +62,8 @@ void main() {
 
 	float depth = texelFetch(source_depth, pixel_pos, 0).x;
 	vec4 normal_roughness = texelFetch(source_normal_roughness, pixel_pos, 0);
-	vec3 normal = normalize(normal_roughness.xyz * 2.0 - 1.0);
-	float roughness = normal_roughness.w;
-	if (roughness > 0.5) {
-		roughness = 1.0 - roughness;
-	}
-	roughness /= (127.0 / 255.0);
+	vec3 normal = nr_normal(normal_roughness);
+	float roughness = nr_roughness(normal_roughness);
 
 	vec2 half_tex_coord = (pixel_pos + 0.5) * 0.5;
 	vec2 bilinear_weights = fract(half_tex_coord);

@@ -370,6 +370,77 @@ void Raytracing::set_surface_cache_enabled(bool p_enabled, const SurfaceCache::S
 	}
 }
 
+bool Raytracing::_change_votes() {
+	// GODOT_GI_VOTES=1 (plan section 45): the lighting-change mark as a
+	// luminance-weighted vote over each 8x8 tile's rays (HiPR's splat),
+	// in place of the largest change one of a pixel's own rays landed on.
+	static const bool votes = OS::get_singleton()->get_environment("GODOT_GI_VOTES") == "1";
+	return votes;
+}
+
+uint32_t Raytracing::mirror_order() {
+	static const uint32_t order = OS::get_singleton()->get_environment("GODOT_MIRROR_ORDER").is_valid_int() ? CLAMP((uint32_t)OS::get_singleton()->get_environment("GODOT_MIRROR_ORDER").to_int(), 1u, 3u) : 2u;
+	return order;
+}
+
+uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world) const {
+	static const Vector<double> knob = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
+	static const bool knob_off = OS::get_singleton()->get_environment("GODOT_GI_MIRROR") == "0";
+	if (knob_off) {
+		return 0;
+	}
+	LocalVector<RaytracingScene::MirrorPlane> knob_planes;
+	if (knob.size() >= 7) {
+		RaytracingScene::MirrorPlane m;
+		m.normal = Vector3(knob[0], knob[1], knob[2]).normalized();
+		m.offset = knob[3];
+		m.center = m.normal * m.offset;
+		m.u_axis = Math::abs(m.normal.x) < 0.9f ? m.normal.cross(Vector3(1, 0, 0)).normalized() : m.normal.cross(Vector3(0, 1, 0)).normalized();
+		m.v_axis = m.normal.cross(m.u_axis);
+		m.half_u = m.half_v = 1e6f;
+		m.f0 = knob[4];
+		m.roughness = knob[5];
+		knob_planes.push_back(m);
+	}
+	const LocalVector<RaytracingScene::MirrorPlane> &planes = knob.size() >= 7 ? knob_planes : scene.get_mirror_planes();
+	uint32_t count = MIN((uint32_t)planes.size(), SurfaceCache::MAX_MIRROR_PLANES);
+	for (uint32_t i = 0; i < count; i++) {
+		const RaytracingScene::MirrorPlane &m = planes[i];
+		Vector3 n = m.normal;
+		Vector3 c = m.center;
+		Vector3 u = m.u_axis;
+		Vector3 v = m.v_axis;
+		if (p_view_from_world != nullptr) {
+			n = p_view_from_world->basis.xform(n).normalized();
+			c = p_view_from_world->xform(c);
+			u = p_view_from_world->basis.xform(u).normalized();
+			v = p_view_from_world->basis.xform(v).normalized();
+		}
+		SurfaceCache::MirrorPlaneGPU &g = r_planes[i];
+		g.plane[0] = n.x;
+		g.plane[1] = n.y;
+		g.plane[2] = n.z;
+		g.plane[3] = n.dot(c);
+		g.params[0] = m.f0;
+		g.params[1] = m.roughness;
+		g.params[2] = m.half_u;
+		g.params[3] = m.half_v;
+		g.center[0] = c.x;
+		g.center[1] = c.y;
+		g.center[2] = c.z;
+		g.center[3] = 0.0f;
+		g.u_axis[0] = u.x;
+		g.u_axis[1] = u.y;
+		g.u_axis[2] = u.z;
+		g.u_axis[3] = 0.0f;
+		g.v_axis[0] = v.x;
+		g.v_axis[1] = v.y;
+		g.v_axis[2] = v.z;
+		g.v_axis[3] = 0.0f;
+	}
+	return count;
+}
+
 void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
 	if (surface_cache == nullptr || scene.get_tlas().is_null()) {
 		return;
@@ -414,6 +485,8 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 	in.sky_energy = p_sky.energy;
 	in.sky_border = p_sky.border_size;
 	in.light_radius = light_storage->card_lights_are_valid() ? p_light_radius : 0.0f;
+	in.mirror_count = fill_mirror_planes(in.mirrors, nullptr);
+	in.mirror_order = mirror_order();
 	surface_cache->update_lighting(in);
 	hit_lighting = in;
 	hit_lighting_valid = true;
@@ -851,18 +924,11 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	StochasticParamsUBO params = {};
 	_set_luma_weights(params.luma_weights);
 	{
-		// GODOT_GI_MIRROR (see process_rt_gi): the plane in view space, so
-		// every local light gets an image entry beside it in this pass.
-		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
-		if (mirror.size() >= 7) {
-			Vector3 n_world(mirror[0], mirror[1], mirror[2]);
-			Vector3 n_view = p_world_from_view.basis.xform_inv(n_world);
-			params.mirror_plane[0] = n_view.x;
-			params.mirror_plane[1] = n_view.y;
-			params.mirror_plane[2] = n_view.z;
-			params.mirror_plane[3] = mirror[3] - n_world.dot(p_world_from_view.origin);
-			params.mirror_params[0] = mirror[4];
-		}
+		// The planar mirrors in view space: every local light gets an image
+		// entry beside it in this pass, through each mirror the pixel faces.
+		Transform3D view_from_world = p_world_from_view.affine_inverse();
+		params.mirror_count = fill_mirror_planes(params.mirrors, &view_from_world);
+		params.mirror_order = mirror_order();
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	for (int col = 0; col < 4; col++) {
@@ -1275,27 +1341,20 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RtGiParamsUBO params = {};
 	_set_luma_weights(params.luma_weights);
 	{
-		// GODOT_GI_MIRROR="nx,ny,nz,w,F0,roughness,diffuse_share[,lx,ly,lz,energy,range][,debug]"
-		// (plan sections 41-42, a prototype): a planar mirror (n . p = w)
-		// with that F0, roughness and diffuse share, an optional omni light
-		// of its own to image (the dynamic lights are imaged always), and
-		// diagnostics bits (1 the image terms alone, 2 no continuation).
+		// The planar mirrors (see fill_mirror_planes), and the knob's own
+		// omni light to image (GODOT_GI_MIRROR's optional lx,ly,lz,energy,
+		// range: a scene without the stochastic direct pass, the box) with
+		// its diagnostics bits (1 the image terms alone, 2 no continuation).
+		params.mirror_count = fill_mirror_planes(params.mirrors, nullptr);
+		params.mirror_order = mirror_order();
 		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
-		if (mirror.size() >= 7) {
+		if (mirror.size() >= 12) {
 			for (int i = 0; i < 4; i++) {
-				params.mirror_plane[i] = mirror[i];
+				params.mirror_light[i] = mirror[7 + i];
 			}
-			params.mirror_params[0] = mirror[4];
-			params.mirror_params[3] = mirror[5];
-			params.mirror_extra[0] = mirror[6];
-			if (mirror.size() >= 12) {
-				for (int i = 0; i < 4; i++) {
-					params.mirror_light[i] = mirror[7 + i];
-				}
-				params.mirror_params[1] = mirror[11];
-			}
-			params.mirror_params[2] = mirror.size() >= 13 ? mirror[12] : 0.0f;
+			params.mirror_params[1] = mirror[11];
 		}
+		params.mirror_params[2] = mirror.size() >= 13 ? mirror[12] : 0.0f;
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	Projection world_from_view_proj = Projection(p_world_from_view);
@@ -1456,6 +1515,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.fallback_parts = uint32_t(fallback_parts);
 	if (fallback_all && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
+	}
+	if (_change_votes()) {
+		params.flags |= 524288; // FLAG_VOTES
 	}
 	// The temporal pass's card correction needs the fallback at every pixel
 	// (GODOT_GI_MOD, see _update_reproject_ubo).
@@ -1630,11 +1692,29 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (calibrate || tier_stats) {
 		rd->buffer_clear(calibration.buffer, 0, 176);
 	}
+	// The lighting-change votes (GODOT_GI_VOTES=1, plan section 45): a
+	// buffer of two counters per 8x8 tile, cleared every frame.
+	const uint32_t vote_tiles = ((size.x + 7) / 8) * ((size.y + 7) / 8);
+	while (rb_state->rt_gi_votes_buffers.size() <= p_view) {
+		rb_state->rt_gi_votes_buffers.push_back(RID());
+		rb_state->rt_gi_votes_tiles.push_back(0);
+	}
+	if (rb_state->rt_gi_votes_buffers[p_view].is_null() || rb_state->rt_gi_votes_tiles[p_view] != vote_tiles) {
+		if (rb_state->rt_gi_votes_buffers[p_view].is_valid()) {
+			rd->free_rid(rb_state->rt_gi_votes_buffers[p_view]);
+		}
+		rb_state->rt_gi_votes_buffers[p_view] = rd->storage_buffer_create(MAX(vote_tiles, 1u) * 2 * sizeof(uint32_t));
+		rb_state->rt_gi_votes_tiles[p_view] = vote_tiles;
+	}
+	if (_change_votes()) {
+		rd->buffer_clear(rb_state->rt_gi_votes_buffers[p_view], 0, MAX(vote_tiles, 1u) * 2 * sizeof(uint32_t));
+	}
+	RD::Uniform u_votes(RD::UNIFORM_TYPE_STORAGE_BUFFER, 39, Vector<RID>({ rb_state->rt_gi_votes_buffers[p_view] }));
 	RENDER_TIMESTAMP("RT GI Gather");
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen, u_votes), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1755,6 +1835,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (_luma_compress()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
 		}
+		if (_change_votes()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_VOTES;
+		}
 		// GODOT_GI_LUMSTOP=0: the spatial luminance stop off (experiment).
 		static const bool no_lum_stop = OS::get_singleton()->get_environment("GODOT_GI_LUMSTOP") == "0";
 		if (no_lum_stop) {
@@ -1811,6 +1894,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_fb_now(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, raw_fallback }));
 		RD::Uniform u_fb_prev(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, prev_fallback }));
 		RD::Uniform u_hist_split(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, split_read }));
+		RD::Uniform u_votes_dn(RD::UNIFORM_TYPE_STORAGE_BUFFER, 16, Vector<RID>({ rb_state->rt_gi_votes_buffers[p_view] }));
 		RD::Uniform u_out_split(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ split_write }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ hist_write_a }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ hist_write_r }));
@@ -1823,7 +1907,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Temporal");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[DENOISE_VARIANT_TEMPORAL_VALIDATE]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal, u_fb_now, u_fb_prev, u_hist_split), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_raw_a, u_raw_r, u_dn_depth, u_hist_a, u_hist_r, u_hist_m, u_raw_meta_in, u_hist_meta, u_velocity, u_prev_depth, u_raw_d, u_hist_d, u_nr_temporal, u_fb_now, u_fb_prev, u_hist_split, u_votes_dn), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_m, u_out_meta, u_reproject, u_out_d, u_out_split), 1);
 		rd->compute_list_set_push_constant(list, &denoise_push_constant, sizeof(StochasticDenoisePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);

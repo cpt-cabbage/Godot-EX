@@ -3809,6 +3809,10 @@ void RenderingServer::init() {
 	// default.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/light_cascade_radiance"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
+	// Flat instances whose material reflects (a glossy floor) are found each
+	// frame and every lighting pass evaluates the lights' images through
+	// them: the caustic a mirror throws onto the room, which no ray finds.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/planar_mirrors"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
 	// The gather's own spatial filter settings. It used to borrow the direct
 	// lighting denoiser's; the two signals have nothing in common but the

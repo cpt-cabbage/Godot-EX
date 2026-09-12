@@ -4,6 +4,8 @@
 
 #VERSION_DEFINES
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D source_last_frame;
@@ -113,12 +115,8 @@ void main() {
 		vec3 pos = compute_view_pos(screen_pos);
 
 		vec4 normal_roughness = texelFetch(source_normal_roughness, pixel_pos, 0);
-		vec3 normal = normalize(normal_roughness.xyz * 2.0 - 1.0);
-		float roughness = normal_roughness.w;
-		if (roughness > 0.5) {
-			roughness = 1.0 - roughness;
-		}
-		roughness /= (127.0 / 255.0);
+		vec3 normal = nr_normal(normal_roughness);
+		float roughness = nr_roughness(normal_roughness);
 
 		// Do not compute SSR for rough materials to improve
 		// performance at the cost of subtle artifacting.
@@ -243,7 +241,7 @@ void main() {
 		}
 
 		if (all(lessThan(abs(screen_ray_dir.xy * t), 2.0 / params.screen_size))) {
-			vec3 hit_normal = texelFetch(source_normal_roughness, cur_pixel_pos, 0).xyz * 2.0 - 1.0;
+			vec3 hit_normal = nr_normal(texelFetch(source_normal_roughness, cur_pixel_pos, 0));
 			if (dot(ray_dir, hit_normal) >= 0.0) {
 				validity = 0.0;
 			}

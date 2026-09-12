@@ -16,7 +16,7 @@ layout(set = 0, binding = 0) uniform sampler2DMS source_depth;
 layout(set = 0, binding = 1) uniform sampler2DMS source_normal_roughness;
 
 layout(r32f, set = 1, binding = 0) uniform restrict writeonly image2D dest_depth;
-layout(rgba8, set = 1, binding = 1) uniform restrict writeonly image2D dest_normal_roughness;
+layout(rgb10_a2, set = 1, binding = 1) uniform restrict writeonly image2D dest_normal_roughness;
 
 #ifdef VOXEL_GI_RESOLVE
 layout(set = 2, binding = 0) uniform usampler2DMS source_voxel_gi;

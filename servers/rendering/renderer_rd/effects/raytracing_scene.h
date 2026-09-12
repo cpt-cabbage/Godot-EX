@@ -31,10 +31,12 @@
 #pragma once
 
 #include "core/templates/hash_map.h"
+#include "core/math/color.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_geometry_unpack.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_particles_expand.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 namespace RendererRD {
@@ -70,9 +72,38 @@ public:
 		virtual ~HitMaterialResolver() {}
 	};
 
+	// A planar mirror found in the scene (plan section 44): a flat instance
+	// (one extent of its local box under a tenth of the others, a face
+	// of a square metre or more) whose material reflects (roughness 0.3 or
+	// under, or an F0 of 0.3 or over, read from the material's parameters
+	// and the means of its textures). Both faces of a slab are candidates;
+	// the one the camera is behind is dropped, and the largest
+	// MAX_MIRROR_PLANES faces are kept. World space.
+	struct MirrorPlane {
+		Vector3 normal; // Unit, out of the reflective face.
+		float offset = 0.0f; // n . p = offset.
+		Vector3 center;
+		Vector3 u_axis; // Unit, in the plane.
+		Vector3 v_axis;
+		float half_u = 0.0f;
+		float half_v = 0.0f;
+		float f0 = 0.04f;
+		float roughness = 0.0f;
+		float area = 0.0f;
+	};
+	static constexpr uint32_t MAX_MIRROR_PLANES = SurfaceCache::MAX_MIRROR_PLANES;
+
 private:
 	RaytracedShadowsDecodeShaderRD decode_shader;
 	RID decode_shader_version;
+
+
+	bool mirror_planes_enabled = true;
+	LocalVector<MirrorPlane> mirror_planes;
+	HashMap<RID, Color> texture_means; // A texture's mean linear colour, read back once (see _texture_mean).
+	Color _texture_mean(RID p_texture, bool p_srgb);
+	bool _material_reflectance(RID p_material, float &r_f0, float &r_roughness);
+	void _find_mirror_planes(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position);
 	RID decode_pipeline;
 
 	struct DecodePushConstant {
@@ -92,6 +123,35 @@ private:
 
 	// One surface's unpack into the hit shading's geometry pool (see
 	// rt_geometry_unpack.glsl); re-run per frame for deforming geometry.
+	// GPU particles in the scene (plan section 47): the draw-pass mesh
+	// expanded into a soup of one copy per particle by the particles'
+	// instance buffer, a BLAS of its own rebuilt every frame (like a
+	// skinned mesh), one TLAS instance. No cards, no hit shading: hits on
+	// particles fall to the probes like any uncarded hit.
+	RtParticlesExpandShaderRD particles_shader;
+	RID particles_shader_version;
+	RID particles_pipeline;
+	struct ParticlesExpandPushConstant {
+		uint32_t triangle_count;
+		uint32_t particle_count;
+		uint32_t stride_vec4;
+		uint32_t flags;
+		uint32_t out_offset;
+		uint32_t pad[3];
+	};
+	struct ParticlesBlas {
+		RID blas;
+		RID soup; // The expanded positions (float3), the BLAS's input.
+		uint32_t soup_vertices = 0;
+		LocalVector<RID> decoded_buffers; // Decoded positions of compressed surfaces.
+		LocalVector<DecodeJob> decode_jobs;
+		uint32_t surface_mask = 0;
+		uint32_t particle_count = 0;
+	};
+	HashMap<RID, ParticlesBlas> particles_blas_cache; // Keyed by the particles RID.
+	ParticlesBlas *_resolve_particles_blas(RID p_particles, RID p_mesh, uint32_t p_surface_mask, uint32_t p_particle_count, uint32_t p_stride_vec4);
+	void _free_particles_blas(ParticlesBlas &p_entry);
+
 	struct HitUnpackJob {
 		RID vertex_buffer;
 		RID attribute_buffer; // Null when the surface has no colour or uvs.
@@ -237,6 +297,9 @@ public:
 	// cache to key it, resolving their materials.
 	// Returns false if there is no geometry to trace against.
 	bool update(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position, SurfaceCache *p_surface_cache);
+
+	void set_mirror_planes_enabled(bool p_enabled) { mirror_planes_enabled = p_enabled; }
+	const LocalVector<MirrorPlane> &get_mirror_planes() const { return mirror_planes; }
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return tlas; }

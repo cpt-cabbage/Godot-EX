@@ -157,6 +157,8 @@ public:
 
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
+	LocalVector<RID> rt_gi_votes_buffers; // Per view: the gather's lighting-change votes per 8x8 tile (GODOT_GI_VOTES).
+	LocalVector<uint32_t> rt_gi_votes_tiles; // Per view: the tiles the buffer holds.
 
 	// The translucency lighting volume (see process_translucency_volume):
 	// its ping-ponged textures and what last frame's mapping was, for the
@@ -292,6 +294,7 @@ private:
 		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
 		DENOISE_FLAG_MOD_PAINT = 4096, // Temporal (GI, diagnostics, GODOT_GI_MOD_PAINT): the card correction as a colour.
 		DENOISE_FLAG_NO_LUM_STOP = 8192, // Spatial (GI, experiment, GODOT_GI_LUMSTOP=0): the luminance stop off for settled pixels too.
+		DENOISE_FLAG_VOTES = 32768, // Temporal (GI, GODOT_GI_VOTES=1): the change mark is the gather's tile vote.
 		DENOISE_FLAG_FIREFLY_PAINT = 16384, // Temporal (GI, diagnostics, GODOT_GI_FIREFLY_PAINT=1): the samples the firefly test scaled, painted.
 	};
 
@@ -342,8 +345,10 @@ private:
 		uint32_t flags; // 1: light guiding, 2: screen traces.
 		float cluster_z0; // Nonzero: the cluster's depth slices are exponential from this depth (see ClusterBuilderRD).
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
-		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype) in view space: xyz normal, w offset; zero normal off.
-		float mirror_params[4]; // x F0.
+		SurfaceCache::MirrorPlaneGPU mirrors[SurfaceCache::MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), view space.
+		uint32_t mirror_count;
+		uint32_t mirror_order;
+		uint32_t mirror_pad[2];
 	};
 	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
 	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;
@@ -399,10 +404,12 @@ private:
 		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
 		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
 		float cv_params[4]; // The control variate (GODOT_GI_CV): x its weight (0 off), y the card relights at which the field is trusted fully (GODOT_GI_CV_RAMP).
-		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz normal, w offset (zero normal: off).
-		float mirror_light[4]; // The light it images: xyz world position, w energy.
-		float mirror_params[4]; // x F0, y the knob light's range, z debug bits, w the plane's roughness.
-		float mirror_extra[4]; // x the plane's diffuse share.
+		float mirror_light[4]; // The knob's own light (GODOT_GI_MIRROR): xyz world position, w energy.
+		float mirror_params[4]; // y the knob light's range, z debug bits.
+		SurfaceCache::MirrorPlaneGPU mirrors[SurfaceCache::MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
+		uint32_t mirror_count;
+		uint32_t mirror_order;
+		uint32_t mirror_pad[2];
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
@@ -638,6 +645,24 @@ public:
 	// from the frame's instances. Returns false if there is no geometry to
 	// trace against.
 	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) { return scene.update(p_instances, p_camera_position, surface_cache); }
+
+	// The planar mirrors (plan section 44): flat reflective instances found
+	// in the scene, whose image lights every lighting pass evaluates. See
+	// RaytracingScene::find_mirror_planes.
+	void set_planar_mirrors(bool p_enabled) { scene.set_mirror_planes_enabled(p_enabled); }
+	// The mirrors as a pass reads them, in world space, or in view space
+	// given the view's transform. GODOT_GI_MIRROR="nx,ny,nz,w,F0,roughness,
+	// diffuse_share[,lx,ly,lz,energy,range][,debug]" overrides the scene's
+	// with one unbounded plane (the box's knob; its diffuse share is read
+	// from the specular atlas now, the field is kept for the old command
+	// lines); GODOT_GI_MIRROR=0 turns every mirror off.
+	uint32_t fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world) const;
+	// The longest chain of mirrors an image is evaluated through (1 to 3;
+	// GODOT_MIRROR_ORDER, default 2): a lamp seen in the floor seen in the
+	// ceiling is a second-order image; the third order read nothing more in
+	// the box (its images lie past the lights' range) and costs.
+	static uint32_t mirror_order();
+	static bool _change_votes();
 	// See RaytracingScene::set_hit_shading.
 	void set_hit_shading(uint32_t p_mode, RaytracingScene::HitMaterialResolver *p_resolver) { scene.set_hit_shading(p_mode, p_resolver); }
 

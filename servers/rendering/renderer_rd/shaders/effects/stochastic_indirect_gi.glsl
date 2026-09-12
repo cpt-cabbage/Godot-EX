@@ -15,6 +15,8 @@
 // term. Outputs demodulated irradiance (no albedo) and specular radiance;
 // the stochastic denoiser filters both like the direct lighting pair.
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../light_data_inc.glsl"
@@ -27,6 +29,15 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
+
+#define MAX_MIRROR_PLANES 4u
+struct MirrorPlane {
+	vec4 plane;
+	vec4 params;
+	vec4 center;
+	vec4 u_axis;
+	vec4 v_axis;
+};
 
 layout(set = 0, binding = 3, std140) uniform Params {
 	mat4 view_from_ndc; // Inverse of the (depth-corrected) projection.
@@ -79,10 +90,13 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// plane (xyz its normal, w its offset: n . p = w; a zero normal is
 	// off), the one light it images (xyz world position, w energy) and
 	// x its F0, y the light's range.
-	vec4 mirror_plane;
-	vec4 mirror_light;
-	vec4 mirror_params; // x F0, y the knob light's range, z debug bits, w the plane's roughness.
-	vec4 mirror_extra; // x: the plane's diffuse share (what its texels keep of their albedo).
+	vec4 mirror_light; // The knob's own light (GODOT_GI_MIRROR, a scene without the stochastic direct pass): xyz world position, w energy.
+	vec4 mirror_params; // y the knob light's range, z debug bits (1 the image terms alone, 2 no continuation).
+	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
+	uint mirror_count;
+	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
+	uint mirror_pad1;
+	uint mirror_pad2;
 }
 params;
 
@@ -104,6 +118,7 @@ params;
 #define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 #define FLAG_FALLBACK_EVERY 131072u // The fallback for every pixel: the temporal pass modulates the history by its change (GODOT_GI_MOD).
+#define FLAG_VOTES 524288u // The lighting-change votes (change_votes): the temporal pass reads the tile's weighted change in place of the pixel's own mark.
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -301,6 +316,12 @@ uint pixel_rays = 1u; // The diffuse rays this pixel traces (ray_params), for th
 // Set per pixel in main(): the largest lighting change a ray of this pixel
 // landed on. The temporal pass restarts the history in proportion.
 float pixel_change = 0.0;
+// The largest change the current ray's card reads landed on (reset per
+// ray), and the pixel's votes: the rays' luminance-weighted change and
+// their luminance (FLAG_VOTES).
+float ray_change = 0.0;
+float vote_change = 0.0;
+float vote_weight = 0.0;
 
 // Set per pixel in main(): this pixel's hits contribute to the calibration.
 bool calibrate_pixel = false;
@@ -359,6 +380,16 @@ layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic
 // frame_index % 1024 + 1; 0 empty). See screen_radiance_boost. Zeroed by
 // the card lighting on a fresh capture.
 layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atlas;
+// The lighting-change votes (FLAG_VOTES, plan section 45): per 8x8 tile of
+// this pass's pixels, the rays' luminance-weighted change on the cards
+// they read and their luminance, fixed point (x1024), summed with atomics.
+// The temporal pass restarts a pixel by its tile's ratio (a lobe-weighted
+// vote over the tile's rays) rather than the largest change one of its
+// own rays landed on.
+layout(set = 0, binding = 39, std430) restrict buffer ChangeVotes {
+	uint data[];
+}
+change_votes;
 // The frames both of a pixel's histories must hold before its screen colour
 // teaches the memory (its reads fade in from the memory over
 // screen_radiance_extra.x frames, fewer).
@@ -663,35 +694,7 @@ vec3 sdfgi_hit_normal(vec3 rel_pos, vec3 ray_dir) {
 #define CACHE_TIER_CARD 2u // Surface cache: already outgoing radiance, never calibrated.
 uint cache_tier = CACHE_TIER_PROBE;
 
-// The planar mirror's Fresnel (Schlick over its F0).
-float mirror_fresnel(float c) {
-	float k = 1.0 - clamp(c, 0.0, 1.0);
-	float k2 = k * k;
-	return params.mirror_params.x + (1.0 - params.mirror_params.x) * k2 * k2 * k;
-}
-
-// Whether a world point lies on the mirror plane.
-bool on_mirror_plane(vec3 world_pos) {
-	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5 && abs(dot(params.mirror_plane.xyz, world_pos) - params.mirror_plane.w) < 0.02;
-}
-
-// The plane's reflection of a direction through a GGX lobe of its
-// roughness (a mirror at 0): the half vector sampled around the normal.
-vec3 mirror_reflect(vec3 dir_in, vec3 n, vec2 u) {
-	float a = params.mirror_params.w * params.mirror_params.w;
-	if (a < 1e-4) {
-		return reflect(dir_in, n);
-	}
-	float phi = u.x * 2.0 * M_PI;
-	float ct = sqrt((1.0 - u.y) / (1.0 + (a * a - 1.0) * u.y));
-	float st = sqrt(max(1.0 - ct * ct, 0.0));
-	vec3 h = normalize(basis_around(n) * vec3(st * cos(phi), st * sin(phi), ct));
-	vec3 r = reflect(dir_in, h);
-	if (dot(r, n) <= 1e-3) {
-		r = reflect(dir_in, n);
-	}
-	return r;
-}
+#include "mirror_planes_inc.glsl"
 
 // A shadow segment: anything opaque between the two points.
 bool mirror_occluded(vec3 from_world, vec3 to_world) {
@@ -1134,7 +1137,9 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		// Diagnostics (GODOT_GI_CONE < 0): the level picked, as the radiance.
 		r_radiance = vec3(lod / 5.0, card_lookup_footprint, best_texel_world * 10.0);
 	}
-	pixel_change = max(pixel_change, float((texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y >> 16u) & 0xFFu) / 255.0);
+	float texel_change = float((texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y >> 16u) & 0xFFu) / 255.0;
+	pixel_change = max(pixel_change, texel_change);
+	ray_change = max(ray_change, texel_change);
 	card_atlas_texel = atlas_texel;
 	card_atlas_origin = card_origin_packed(best_packed);
 	card_lookup_confidence = best_w * (1.0 - best_mismatch * best_mismatch);
@@ -1359,49 +1364,69 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
-			if (!hit_specular && on_mirror_plane(world_hit) && (uint(params.mirror_params.z) & 2u) == 0u) {
-				// The planar mirror: the diffuse ray reflects and goes on, and
-				// reads the card where it lands (the probes without one),
-				// weighted by the plane's Fresnel at the bounce. The mirror's
-				// own card is diffuse-only (the light pass zeroes it on the
-				// plane), so nothing is counted twice.
-				vec3 n = params.mirror_plane.xyz;
-				vec3 rdir = mirror_reflect(world_dir, n, stbn_sample(hit_pixel, 9u));
-				float f = mirror_fresnel(abs(dot(n, world_dir)));
-				// The plane's own card: its diffuse part (its texels keep that share).
+			uint hit_plane = (!hit_specular && mirror_on() && (uint(params.mirror_params.z) & 2u) == 0u) ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
+			if (hit_plane < MAX_MIRROR_PLANES) {
+				// A planar mirror: the diffuse ray reads the mirror's diffuse
+				// card, reflects and goes on, weighted by the Fresnel at the
+				// bounce, through up to MIRROR_BOUNCES_MAX mirrors (a ray off
+				// the ceiling that lands on a mirror floor would otherwise
+				// stop at the floor's dim diffuse card and lose what the
+				// floor reflects), and reads the card where it lands (the
+				// probes without one). A mirror's own card is diffuse-only
+				// (the light pass takes the F0 fold back out), so nothing is
+				// counted twice.
 				vec3 plane_diffuse = vec3(0.0);
-				if (params.mirror_extra.x > 0.0) {
-					card_lookup_footprint = t_hit * abs(params.card_cone_tan);
-					vec3 plane_radiance;
-					uint plane_set;
-					if (surface_cache_lookup(instance_id, world_hit, world_dir, plane_radiance, plane_set)) {
-						card_requests.frame[plane_set] = params.surface_cache_frame;
-						plane_diffuse = max(plane_radiance, vec3(0.0));
-					}
-				}
-				rayQueryEXT rq2;
-				rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, world_hit + n * params.ray_bias, params.ray_bias, rdir, t_max);
-				while (rayQueryProceedEXT(rq2)) {
-				}
 				vec3 bounced = vec3(0.0);
 				bool card_hit = false;
-				if (rayQueryGetIntersectionTypeEXT(rq2, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-					uint inst2 = rayQueryGetIntersectionInstanceCustomIndexEXT(rq2, true);
+				float f = 1.0;
+				float t_total = t_hit;
+				vec3 from = world_hit;
+				vec3 dir = world_dir;
+				uint inst = instance_id;
+				uint plane = hit_plane;
+				for (uint bounce = 0u; bounce < MIRROR_BOUNCES_MAX; bounce++) {
+					vec3 n = params.mirrors[plane].plane.xyz;
+					card_lookup_footprint = t_total * abs(params.card_cone_tan);
+					vec3 plane_radiance;
+					uint plane_set;
+					if (surface_cache_lookup(inst, from, dir, plane_radiance, plane_set)) {
+						card_requests.frame[plane_set] = params.surface_cache_frame;
+						plane_diffuse += f * max(plane_radiance, vec3(0.0));
+					}
+					f *= mirror_fresnel(plane, abs(dot(n, dir)));
+					if (bounce > 0u && !mirror_roulette(f, stbn_sample(hit_pixel, 12u + bounce).x)) {
+						break; // The chain ends here: what it held is in plane_diffuse.
+					}
+					dir = mirror_reflect(plane, dir, stbn_sample(hit_pixel, 9u + bounce));
+					rayQueryEXT rq2;
+					rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, from + n * params.ray_bias, params.ray_bias, dir, t_max);
+					while (rayQueryProceedEXT(rq2)) {
+					}
+					if (rayQueryGetIntersectionTypeEXT(rq2, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+						break; // The sky: nothing (the box has none; a real scene's sky is the cards' job).
+					}
+					inst = rayQueryGetIntersectionInstanceCustomIndexEXT(rq2, true);
 					float t2 = rayQueryGetIntersectionTEXT(rq2, true);
-					vec3 hit2 = world_hit + n * params.ray_bias + rdir * t2;
-					card_lookup_footprint = (t_hit + t2) * abs(params.card_cone_tan);
+					from = from + n * params.ray_bias + dir * t2;
+					t_total += t2;
+					plane = bounce + 1u < MIRROR_BOUNCES_MAX ? mirror_at(from) : MAX_MIRROR_PLANES;
+					if (plane < MAX_MIRROR_PLANES) {
+						continue;
+					}
+					card_lookup_footprint = t_total * abs(params.card_cone_tan);
 					vec3 card_radiance;
 					uint card_set;
-					if (surface_cache_lookup(inst2, hit2, rdir, card_radiance, card_set)) {
+					if (surface_cache_lookup(inst, from, dir, card_radiance, card_set)) {
 						card_requests.frame[card_set] = params.surface_cache_frame;
-						bounced = max(card_radiance, vec3(0.0));
+						bounced = f * max(card_radiance, vec3(0.0));
 						card_hit = true;
 					} else {
-						bounced = max(sdfgi_cache_radiance(hit2 - params.world_from_view[3].xyz, rdir), vec3(0.0));
+						bounced = f * max(sdfgi_cache_radiance(from - params.world_from_view[3].xyz, dir), vec3(0.0));
 					}
+					break;
 				}
 				cache_tier = CACHE_TIER_CARD;
-				vec3 answer = plane_diffuse + bounced * f;
+				vec3 answer = plane_diffuse + bounced;
 				ray_control = answer;
 				ray_card = true;
 				if (bool(params.flags & FLAG_TIER_STATS)) {
@@ -1560,7 +1585,7 @@ void main() {
 	calibrate_pixel = bool(params.flags & FLAG_CALIBRATE_CACHE) && ((pixel.x | pixel.y) & 3) == 0;
 
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
-	vec3 view_normal = normalize(nr.xyz * 2.0 - 1.0);
+	vec3 view_normal = nr_normal(nr);
 	// The surface the rays actually leave from. The buffer holds the shading
 	// normal, and two things about it can put a ray behind the surface:
 	//
@@ -1584,11 +1609,7 @@ void main() {
 	if (dot(view_normal, geo_view_normal) < 0.0) {
 		view_normal = -view_normal;
 	}
-	float roughness = nr.w;
-	if (roughness > 0.5) {
-		roughness = 1.0 - roughness;
-	}
-	roughness /= (127.0 / 255.0);
+	float roughness = nr_roughness(nr);
 
 	// Camera-relative world space: the cascade data is stored relative to the
 	// camera origin, and staying camera-relative preserves precision far from
@@ -1632,11 +1653,15 @@ void main() {
 		float t_hit;
 		hit_slot = r;
 		ray_card = false;
+		ray_change = 0.0;
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
 		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
 		irradiance += radiance;
+		float ray_lum = luminance(radiance);
+		vote_change += ray_lum * ray_change;
+		vote_weight += ray_lum;
 		control += ray_control;
 		moment += luminance(radiance) * dir;
 		// Only nearby geometry occludes: in an open scene nearly every ray
@@ -1648,75 +1673,60 @@ void main() {
 	irradiance *= inv_rays;
 	moment *= inv_rays;
 	visibility *= inv_rays;
-	if (dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5) {
-		// The lights' images through the planar mirror: direct light the
-		// mirror throws onto this surface, which no ray can find (a point
+	if (mirror_on() && params.mirror_light.w > 0.0) {
+		// The knob light's images through the planar mirrors: direct light
+		// a mirror throws onto this surface, which no ray can find (a point
 		// seen through a delta), so it is evaluated here, the way the box's
 		// image solve does. A light's image at a point is the light itself
-		// at the mirrored point with the mirrored normal (spots, cones and
-		// cookies come along), times the Fresnel at the crossing, seen
-		// through a shadow ray in two legs (to a centimetre above the
-		// plane measured along the normal, then from the plane to the
-		// light). The knob's own light (a scene without the stochastic
-		// direct pass, the box); the scene's lights are imaged by that pass.
-		vec3 n = params.mirror_plane.xyz;
+		// at the mirrored point with the mirrored normal, times the Fresnel
+		// at the crossing, seen through a shadow ray in two legs (to a
+		// centimetre above the mirror measured along its normal, then from
+		// the mirror to the light). The knob's own light only (a scene
+		// without the stochastic direct pass, the box): the scene's lights,
+		// the dynamic ones included, are imaged by that pass (their caustic
+		// is direct light), so they are not imaged twice here.
 		vec3 world_pos = rel_pos + params.world_from_view[3].xyz;
-		float hp = dot(n, world_pos) - params.mirror_plane.w;
 		if ((uint(params.mirror_params.z) & 1u) != 0u) {
 			irradiance = vec3(0.0); // Diagnostics: the image terms alone.
 			moment = vec3(0.0);
 		}
-		if (hp > 0.005) {
-			vec3 start = world_pos + world_geo_normal * params.ray_bias;
-			vec3 p_img = world_pos - 2.0 * hp * n;
-			vec3 n_img = world_normal - 2.0 * dot(world_normal, n) * n;
-			// The knob's own light only: the scene's lights, the dynamic ones
-			// included, are imaged by the stochastic direct pass (their
-			// caustic is direct light), so they are not imaged twice here.
-			uint count = params.mirror_light.w > 0.0 ? 1u : 0u;
-			for (uint i = 0u; i < count; i++) {
-				bool knob = true;
-				vec3 light = knob ? params.mirror_light.xyz : dyn_lights.data[i].position;
-				float hl = dot(n, light) - params.mirror_plane.w;
-				if (hl <= 0.0) {
-					continue;
-				}
-				vec3 img = light - 2.0 * hl * n;
-				vec3 rel = img - world_pos;
-				float d = length(rel);
-				vec3 dir = rel / max(d, 1e-4);
-				float cos_n = dot(world_normal, dir);
-				float cos_p = -dot(n, dir);
-				if (cos_n <= 0.0 || cos_p <= 1e-3) {
-					continue;
-				}
-				vec3 c;
-				if (knob) {
-					if (d >= params.mirror_params.y) {
-						continue;
-					}
-					float nd = d / params.mirror_params.y;
-					nd *= nd;
-					nd *= nd;
-					nd = max(1.0 - nd, 0.0);
-					nd *= nd;
-					c = vec3(params.mirror_light.w * nd / max(d, 1e-4) * cos_n);
-				} else {
-					c = dyn_light_direct(i, p_img, n_img);
-				}
-				c *= mirror_fresnel(cos_p);
-				if (luminance(c) <= 0.0) {
-					continue;
-				}
-				float tm = hp / cos_p;
-				vec3 m = world_pos + dir * tm;
-				vec3 leg_end = world_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
-				if (mirror_occluded(start, leg_end) || mirror_occluded(m + n * 0.01, light)) {
-					continue;
-				}
-				irradiance += c;
-				moment += luminance(c) * dir;
+		vec3 start = world_pos + world_geo_normal * params.ray_bias;
+		vec3 light = params.mirror_light.xyz;
+		for (uint mi = 0u; mi < mirror_count(); mi++) {
+			vec3 n = params.mirrors[mi].plane.xyz;
+			float hp = mirror_height(mi, world_pos);
+			if (hp <= 0.005 || mirror_height(mi, light) <= 0.0) {
+				continue;
 			}
+			vec3 img = mirror_point(mi, light);
+			vec3 m;
+			float cos_p;
+			float cover = mirror_crossing(mi, world_pos, img, m, cos_p);
+			if (cover <= 0.0) {
+				continue;
+			}
+			vec3 rel = img - world_pos;
+			float d = length(rel);
+			vec3 dir = rel / max(d, 1e-4);
+			float cos_n = dot(world_normal, dir);
+			if (cos_n <= 0.0 || d >= params.mirror_params.y) {
+				continue;
+			}
+			float nd = d / params.mirror_params.y;
+			nd *= nd;
+			nd *= nd;
+			nd = max(1.0 - nd, 0.0);
+			nd *= nd;
+			vec3 c = vec3(params.mirror_light.w * nd / max(d, 1e-4) * cos_n) * (cover * mirror_fresnel(mi, cos_p));
+			if (luminance(c) <= 0.0) {
+				continue;
+			}
+			vec3 leg_end = world_pos + dir * (max(hp - 0.01, 0.0) / cos_p);
+			if (mirror_occluded(start, leg_end) || mirror_occluded(m + n * 0.01, light)) {
+				continue;
+			}
+			irradiance += c;
+			moment += luminance(c) * dir;
 		}
 	}
 	vec3 reflection = vec3(0.0);
@@ -1911,6 +1921,13 @@ void main() {
 			}
 			irradiance = corrected;
 		}
+	}
+	if (bool(params.flags & FLAG_VOTES) && vote_weight > 0.0) {
+		// The pixel's votes into its 8x8 tile (fixed point).
+		uint tiles_x = uint(params.screen_size.x + 7) / 8u;
+		uint tile = uint(pixel.y) / 8u * tiles_x + uint(pixel.x) / 8u;
+		atomicAdd(change_votes.data[tile * 2u], uint(min(vote_change, 4096.0) * 1024.0));
+		atomicAdd(change_votes.data[tile * 2u + 1u], uint(min(vote_weight, 4096.0) * 1024.0));
 	}
 	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_directional, pixel, directional_out);

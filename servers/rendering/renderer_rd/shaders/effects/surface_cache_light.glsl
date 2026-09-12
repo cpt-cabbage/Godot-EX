@@ -61,6 +61,15 @@ layout(set = 0, binding = 6, std140) uniform DirectionalLights {
 }
 directional_lights;
 
+#define MAX_MIRROR_PLANES 4u
+struct MirrorPlane {
+	vec4 plane;
+	vec4 params;
+	vec4 center;
+	vec4 u_axis;
+	vec4 v_axis;
+};
+
 layout(set = 0, binding = 7, std140) uniform Params {
 	mat4 world_from_view;
 	vec4 camera_origin;
@@ -91,12 +100,15 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float pad_join1;
 	float pad_join2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
-	vec4 mirror_plane; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz its normal, w its offset; a texel on it bounces nothing diffusely (its transport is the image light and the continuation below).
-	vec4 mirror_light; // (The gather's knob light; unused here: the cards image the lights in their lists.)
-	vec4 mirror_params; // x F0, w the plane's roughness.
-	vec4 mirror_extra; // x: the plane's diffuse share (what its texels keep of their albedo).
+	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
+	uint mirror_count;
+	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
+	uint mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling): 1 no image lights, 2 no mirror continuation of the bounce rays, 4 the F0 fold kept on the mirrors' texels.
+	uint mirror_pad2;
 }
 params;
+
+#include "mirror_planes_inc.glsl"
 
 #define FLAG_SDFGI 1u
 #define FLAG_SKY_MODE_SKY 2u
@@ -110,6 +122,7 @@ layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
 layout(set = 0, binding = 10) uniform texture2D emission_atlas;
 layout(set = 0, binding = 11) uniform texture2D depth_atlas;
+layout(set = 0, binding = 39) uniform texture2D specular_atlas; // The capture's F0 (rgb) and roughness (a) per texel.
 layout(set = 0, binding = 12, rgba16f) uniform restrict image2D lighting_atlas;
 
 struct ProbeCascadeData {
@@ -785,37 +798,6 @@ bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 
 // Occlusion as the bounce rays see it: everything opaque, the first hit ends
 // the query (the dynamic bounce's connection, see trace_dynamic).
-// The planar mirror's Fresnel (Schlick over its F0) and plane test.
-float mirror_fresnel(float c) {
-	float k = 1.0 - clamp(c, 0.0, 1.0);
-	float k2 = k * k;
-	return params.mirror_params.x + (1.0 - params.mirror_params.x) * k2 * k2 * k;
-}
-
-bool mirror_on() {
-	return dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5;
-}
-
-// The plane's reflection of a direction through a GGX lobe of its
-// roughness (a mirror at 0).
-vec3 mirror_reflect(vec3 dir_in, vec3 n, vec2 u) {
-	float a = params.mirror_params.w * params.mirror_params.w;
-	if (a < 1e-4) {
-		return reflect(dir_in, n);
-	}
-	vec3 t0 = normalize(abs(n.x) < 0.9 ? cross(n, vec3(1.0, 0.0, 0.0)) : cross(n, vec3(0.0, 1.0, 0.0)));
-	vec3 t1 = cross(n, t0);
-	float phi = u.x * 2.0 * M_PI;
-	float ct = sqrt((1.0 - u.y) / (1.0 + (a * a - 1.0) * u.y));
-	float st = sqrt(max(1.0 - ct * ct, 0.0));
-	vec3 h = normalize(t0 * (st * cos(phi)) + t1 * (st * sin(phi)) + n * ct);
-	vec3 r = reflect(dir_in, h);
-	if (dot(r, n) <= 1e-3) {
-		r = reflect(dir_in, n);
-	}
-	return r;
-}
-
 bool occluded_opaque(vec3 origin, vec3 dir, float t_max) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, origin, 0.0, dir, t_max);
@@ -950,8 +932,13 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 	card_basis(card, axis, u, v);
 	vec3 n_local = u * n_cam.x + v * n_cam.y + axis * n_cam.z;
 	t.world_pos = (s.world_from_local * vec4(local_pos, 1.0)).xyz;
-	if (dot(params.mirror_plane.xyz, params.mirror_plane.xyz) > 0.5 && abs(dot(params.mirror_plane.xyz, t.world_pos) - params.mirror_plane.w) < 0.02) {
-		t.albedo *= params.mirror_extra.x; // The planar mirror's texel keeps its diffuse share; its reflection is the image lights and the continuations.
+	if (mirror_on() && (params.mirror_debug & 4u) == 0u && mirror_at(t.world_pos) < MAX_MIRROR_PLANES) {
+		// A planar mirror's texel keeps its diffuse albedo alone: the capture
+		// folded its F0 into the albedo as if Lambertian (the energy a card
+		// can hold), and here that fold comes back out of the specular
+		// atlas, since the mirror's reflection is carried by the image
+		// lights and the reflected rays instead.
+		t.albedo = max(t.albedo - texelFetch(specular_atlas, texel, 0).rgb, vec3(0.0));
 	}
 	t.n_world = normalize(mat3(s.world_from_local) * n_local);
 	t.origin = t.world_pos + t.n_world * params.ray_bias;
@@ -975,7 +962,120 @@ struct Direct {
 	bool sampled;
 };
 
-void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
+// The image lights' part of a texel's direct term (the planar mirrors,
+// mirror_planes_inc.glsl): every local and area light's image through
+// each chain the texel faces, summed, with one image drawn among them by
+// weight for the shadow legs. Computed at a quad's first texel and shared
+// by its other three (main's quad mode): the images are smooth over a
+// quad and cost as much as the real lights again per chain.
+struct ImageCache {
+	bool valid;
+	vec3 sum; // The images, unshadowed.
+	float geom; // Their geometric sum.
+	float weight_sum; // Their draw weights' sum.
+	bool has_sel; // An image was drawn among them.
+	uint sel_chain;
+	vec3 sel_pos; // The drawn image's position (the shadow legs' target).
+	float sel_opacity;
+	uint sel_mask;
+};
+
+void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
+	c.valid = true;
+	c.sum = vec3(0.0);
+	c.geom = 0.0;
+	c.weight_sum = 0.0;
+	c.has_sel = false;
+	c.sel_chain = 0u;
+	c.sel_pos = vec3(0.0);
+	c.sel_opacity = 0.0;
+	c.sel_mask = 0u;
+	// The image chains this texel faces (mirror_chains_at: each mirror on
+	// whose reflective side it lies, alone and in the pairs and triples
+	// worth it); see mirror_chain.
+	uint chain[MIRROR_CHAINS_MAX];
+	uint chains = mirror_on() ? mirror_chains_at(t.world_pos, chain) : 0u;
+	if (chains == 0u) {
+		return;
+	}
+	uint base;
+	uint light_count;
+	bool from_grid;
+	light_list(entry, t.world_pos, base, light_count, from_grid);
+	for (uint j = 0u; j < light_count; j++) {
+		bool is_spot;
+		LightData ld = light_at(base, j, from_grid, is_spot);
+		vec3 pos = (params.world_from_view * vec4(ld.position, 1.0)).xyz;
+		for (uint ch = 0u; ch < chains; ch++) {
+			// The light's image through each chain the texel faces
+			// (evaluated whether or not the light itself reaches the texel:
+			// a ceiling sees its own lights only in the floor).
+			vec3 img, p_img, n_img, c1, c2, c3;
+			float f;
+			if (!mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, pos, ld.inv_radius, img, p_img, n_img, f, c1, c2, c3)) {
+				continue;
+			}
+			vec3 pos_img;
+			float geom_img;
+			vec3 ci = light_contribution(ld, is_spot, p_img, n_img, pos_img, geom_img) * f;
+			float wi = luminance(abs(ci));
+			if (wi > 0.0) {
+				c.sum += ci;
+				c.geom += geom_img;
+				c.weight_sum += wi;
+				seed = pcg_hash(seed);
+				if (hash_to_float(seed) * c.weight_sum < wi) {
+					c.has_sel = true;
+					c.sel_chain = chain[ch];
+					c.sel_pos = img;
+					c.sel_opacity = ld.shadow_opacity;
+					c.sel_mask = ld.shadow_caster_mask & 0xFFu;
+				}
+			}
+		}
+	}
+	uint area_count = (params.debug & 4u) != 0u ? 0u : params.area_light_count;
+	for (uint j = 0u; j < area_count; j++) {
+		LightData ld = area_lights.data[j];
+		seed = pcg_hash(seed);
+		float xi0 = hash_to_float(seed);
+		seed = pcg_hash(seed);
+		float xi1 = hash_to_float(seed);
+		for (uint ch = 0u; ch < chains; ch++) {
+			// The area light's image through each chain the texel faces:
+			// the rect stays, the texel mirrors; the drawn point on the
+			// rect names the chain's crossings.
+			vec3 img, p_img, n_img, c1, c2, c3;
+			float f;
+			if (!mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, (params.world_from_view * vec4(ld.position, 1.0)).xyz, ld.inv_radius, img, p_img, n_img, f, c1, c2, c3)) {
+				continue;
+			}
+			float geom_img;
+			vec3 point_img;
+			vec3 ci = area_light_contribution(ld, params.world_from_view, p_img, n_img, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom_img, point_img);
+			if (!mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, point_img, 0.0, img, p_img, n_img, f, c1, c2, c3)) {
+				continue;
+			}
+			ci *= f;
+			float wi = luminance(abs(ci));
+			if (wi > 0.0) {
+				c.sum += ci;
+				c.geom += geom_img;
+				c.weight_sum += wi;
+				seed = pcg_hash(seed);
+				if (hash_to_float(seed) * c.weight_sum < wi) {
+					c.has_sel = true;
+					c.sel_chain = chain[ch];
+					c.sel_pos = img;
+					c.sel_opacity = ld.shadow_opacity;
+					c.sel_mask = ld.shadow_caster_mask & 0xFFu;
+				}
+			}
+		}
+	}
+}
+
+void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images, out Direct d) {
 	vec3 direct = vec3(0.0);
 	vec3 direct_unshadowed = vec3(0.0);
 	d.local_geom = 0.0;
@@ -1007,18 +1107,8 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 	float sel_opacity = 0.0;
 	uint sel_mask = 0u;
 	bool selected = false;
-	// The planar mirror: every local light's image joins the sum and the
-	// draw below (a light's image at a point is the light at the mirrored
-	// point with the mirrored normal, times the Fresnel at the crossing);
-	// a drawn image is shadowed in two legs (to the plane, then to the
-	// light).
 	bool sel_image = false;
-	vec3 sel_real = vec3(0.0);
-	vec3 mirror_n = params.mirror_plane.xyz;
-	float mirror_hp = dot(mirror_n, t.world_pos) - params.mirror_plane.w;
-	bool mirror_here = mirror_on() && mirror_hp > 0.005;
-	vec3 mirror_p = t.world_pos - 2.0 * mirror_hp * mirror_n;
-	vec3 mirror_nrm = t.n_world - 2.0 * dot(t.n_world, mirror_n) * mirror_n;
+	uint sel_chain = 0u;
 
 	uint base;
 	uint light_count;
@@ -1030,33 +1120,6 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		vec3 pos;
 		float geom;
 		vec3 c = light_contribution(ld, is_spot, t.world_pos, t.n_world, pos, geom);
-		if (mirror_here && dot(mirror_n, pos) - params.mirror_plane.w > 0.0) {
-			// The light's image (evaluated whether or not the light itself
-			// reaches the texel: a ceiling sees its own lights only in the
-			// floor).
-			vec3 pos_img;
-			float geom_img;
-			vec3 ci = light_contribution(ld, is_spot, mirror_p, mirror_nrm, pos_img, geom_img);
-			vec3 img = pos - 2.0 * (dot(mirror_n, pos) - params.mirror_plane.w) * mirror_n;
-			vec3 dir = normalize(img - t.world_pos);
-			float cos_p = -dot(mirror_n, dir);
-			ci *= cos_p > 1e-3 ? mirror_fresnel(cos_p) : 0.0;
-			float wi = luminance(abs(ci));
-			if (wi > 0.0) {
-				sum += ci;
-				d.local_geom += geom_img;
-				weight_sum += wi;
-				seed = pcg_hash(seed);
-				if (hash_to_float(seed) * weight_sum < wi) {
-					selected = true;
-					sel_image = true;
-					sel_pos = img;
-					sel_real = pos;
-					sel_opacity = ld.shadow_opacity;
-					sel_mask = ld.shadow_caster_mask & 0xFFu;
-				}
-			}
-		}
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
 			continue;
@@ -1067,7 +1130,6 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
-			sel_image = false;
 			sel_pos = pos;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
@@ -1087,32 +1149,6 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		float geom;
 		vec3 point;
 		vec3 c = area_light_contribution(ld, params.world_from_view, t.world_pos, t.n_world, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom, point);
-		if (mirror_here) {
-			// The area light's image: the rect stays, the texel mirrors.
-			float geom_img;
-			vec3 point_img;
-			vec3 ci = area_light_contribution(ld, params.world_from_view, mirror_p, mirror_nrm, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom_img, point_img);
-			float hl = dot(mirror_n, point_img) - params.mirror_plane.w;
-			vec3 img = point_img - 2.0 * hl * mirror_n;
-			vec3 dir = normalize(img - t.world_pos);
-			float cos_p = -dot(mirror_n, dir);
-			ci *= (hl > 0.0 && cos_p > 1e-3) ? mirror_fresnel(cos_p) : 0.0;
-			float wi = luminance(abs(ci));
-			if (wi > 0.0) {
-				sum += ci;
-				d.local_geom += geom_img;
-				weight_sum += wi;
-				seed = pcg_hash(seed);
-				if (hash_to_float(seed) * weight_sum < wi) {
-					selected = true;
-					sel_image = true;
-					sel_pos = img;
-					sel_real = point_img;
-					sel_opacity = ld.shadow_opacity;
-					sel_mask = ld.shadow_caster_mask & 0xFFu;
-				}
-			}
-		}
 		float w = luminance(abs(c));
 		// Written as the negation so a NaN term is rejected too (every
 		// comparison with a NaN is false): the accumulation below keeps
@@ -1132,10 +1168,31 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 		seed = pcg_hash(seed);
 		if (hash_to_float(seed) * weight_sum < w) {
 			selected = true;
-			sel_image = false;
 			sel_pos = point;
 			sel_opacity = ld.shadow_opacity;
 			sel_mask = ld.shadow_caster_mask & 0xFFu;
+		}
+	}
+	// The planar mirrors: the lights' images join the sum and the draw (the
+	// images' own reservoir merged with the real lights' by weight; a drawn
+	// image is shadowed in legs, to each mirror then to the light).
+	if (mirror_on() && (params.mirror_debug & 1u) == 0u) {
+		if (!images.valid) {
+			shade_images(entry, t, seed, images);
+		}
+		if (images.weight_sum > 0.0) {
+			sum += images.sum;
+			d.local_geom += images.geom;
+			weight_sum += images.weight_sum;
+			seed = pcg_hash(seed);
+			if (images.has_sel && hash_to_float(seed) * weight_sum < images.weight_sum) {
+				selected = true;
+				sel_image = true;
+				sel_chain = images.sel_chain;
+				sel_pos = images.sel_pos;
+				sel_opacity = images.sel_opacity;
+				sel_mask = images.sel_mask;
+			}
 		}
 	}
 	direct_unshadowed += sum;
@@ -1146,14 +1203,32 @@ void shade_direct(uint entry, Texel t, inout uint seed, out Direct d) {
 			float dist = length(to_light);
 			bool blocked;
 			if (sel_image) {
-				// Two legs: to a centimetre above the plane (along the normal), then from the plane to the real light.
-				vec3 dir = to_light / max(dist, 1e-5);
-				float cos_p = max(-dot(mirror_n, dir), 1e-3);
-				float leg = max(mirror_hp - 0.01, 0.0) / cos_p;
-				vec3 m = t.world_pos + dir * (mirror_hp / cos_p);
-				vec3 to_real = sel_real - m;
+				// Legs: to a centimetre above each mirror of the chain (along
+				// its normal), the target mirrored back a step each time,
+				// then from the last mirror to the real light.
+				uint mchain[3];
+				mchain[0] = MIRROR_CHAIN_A(sel_chain);
+				mchain[1] = MIRROR_CHAIN_B(sel_chain);
+				mchain[2] = MIRROR_CHAIN_C(sel_chain);
+				vec3 from = t.origin;
+				vec3 target = sel_pos;
+				blocked = false;
+				for (uint s = 0u; s < 3u && !blocked; s++) {
+					uint m = mchain[s];
+					if (m >= MAX_MIRROR_PLANES) {
+						break;
+					}
+					vec3 n = params.mirrors[m].plane.xyz;
+					float hp = mirror_height(m, from);
+					vec3 dir = normalize(target - from);
+					float cos_p = max(-dot(n, dir), 1e-3);
+					blocked = hp <= 0.0 || occluded(from, dir, max(hp - 0.01, 0.0) / cos_p, sel_mask);
+					from = from + dir * (hp / cos_p) + n * 0.01;
+					target = mirror_point(m, target);
+				}
+				vec3 to_real = target - from;
 				float dr = length(to_real);
-				blocked = occluded(t.origin, dir, leg, sel_mask) || occluded(m + mirror_n * 0.01, to_real / max(dr, 1e-5), max(dr - 0.01, 0.0), sel_mask);
+				blocked = blocked || occluded(from, to_real / max(dr, 1e-5), max(dr - 0.01, 0.0), sel_mask);
 			} else {
 				blocked = occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask);
 			}
@@ -1389,6 +1464,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		float t_base = 0.0;
 		float mirror_f = 1.0; // The planar mirror's Fresnel, per reflection the ray took.
 		vec3 plane_diffuse = vec3(0.0); // The plane's own diffuse card, read on the way.
+		uint mirror_bounces = 0u;
 		for (uint layer = 0u; layer < 4u; layer++) {
 			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
 			while (rayQueryProceedEXT(rq)) {
@@ -1399,21 +1475,30 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 			t_hit = t_base + rayQueryGetIntersectionTEXT(rq, true);
 			hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			hit_pos = ray_origin + ray_dir * (t_hit - t_base);
-			if (mirror_on() && abs(dot(params.mirror_plane.xyz, hit_pos) - params.mirror_plane.w) < 0.02) {
-				// The planar mirror: its texel's diffuse share is read, then
-				// the ray reflects through the plane's lobe and goes on,
-				// weighted by the Fresnel at the bounce.
-				vec3 n = params.mirror_plane.xyz;
-				if (params.mirror_extra.x > 0.0 && card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
+			uint hit_mirror = (mirror_on() && (params.mirror_debug & 2u) == 0u && mirror_bounces < MIRROR_BOUNCES_MAX) ? mirror_at(hit_pos) : MAX_MIRROR_PLANES;
+			if (hit_mirror < MAX_MIRROR_PLANES) {
+				// A planar mirror: its texel's diffuse card is read, then the
+				// ray reflects through the mirror's lobe and goes on,
+				// weighted by the Fresnel at the bounce (MIRROR_BOUNCES_MAX
+				// times; after that a mirror hit reads its diffuse card like
+				// any other).
+				mirror_bounces++;
+				vec3 n = params.mirrors[hit_mirror].plane.xyz;
+				if (card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
 					plane_diffuse += mirror_f * max(card_radiance, vec3(0.0));
 					card_requests.frame[hit_set] = params.frame;
 				}
-				mirror_f *= mirror_fresnel(abs(dot(n, ray_dir)));
+				mirror_f *= mirror_fresnel(hit_mirror, abs(dot(n, ray_dir)));
+				seed = pcg_hash(seed);
+				if (mirror_bounces > 1u && !mirror_roulette(mirror_f, hash_to_float(seed))) {
+					mirror_f = 0.0;
+					break; // The chain ends here: what it held is in plane_diffuse.
+				}
 				seed = pcg_hash(seed);
 				float u0 = hash_to_float(seed);
 				seed = pcg_hash(seed);
 				float u1 = hash_to_float(seed);
-				ray_dir = mirror_reflect(ray_dir, n, vec2(u0, u1));
+				ray_dir = mirror_reflect(hit_mirror, ray_dir, vec2(u0, u1));
 				t_base = t_hit + params.ray_bias;
 				ray_origin = hit_pos + n * params.ray_bias;
 				continue;
@@ -2111,7 +2196,9 @@ void main() {
 		uint bounce_seed = pcg_hash(seed ^ 0x9E3779B9u);
 		uint prev_seed = pcg_hash(pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(prev_frame))) ^ 0x9E3779B9u);
 		Direct d;
-		shade_direct(entry, t, seed, d);
+		ImageCache images;
+		images.valid = false;
+		shade_direct(entry, t, seed, images, d);
 		float gradient = bounce_gradient(texel, t, prev_seed, have_prev);
 		vec3 indirect_sample;
 		float bounce_change;
@@ -2199,6 +2286,9 @@ void main() {
 	trace_dynamic(tracer_texel, t[tracer], float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 	dyn_sample += dyn_light;
 	bounce_change_total = max(bounce_change_total, dyn_change_total);
+	// The image lights' sum, computed at the quad's first texel and shared.
+	ImageCache images;
+	images.valid = false;
 	for (uint k = 0u; k < 4u; k++) {
 		if (!valid[k]) {
 			continue;
@@ -2206,7 +2296,7 @@ void main() {
 		ivec2 texel = origin_texel + quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		Direct d;
-		shade_direct(entry, t[k], seed_k, d);
+		shade_direct(entry, t[k], seed_k, images, d);
 		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
 }

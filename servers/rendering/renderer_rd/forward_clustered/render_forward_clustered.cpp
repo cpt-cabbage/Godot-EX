@@ -272,7 +272,10 @@ uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_specular_
 }
 
 RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_format() {
-	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	// Octahedral normal, ten-bit roughness, the dynamic flag in the two
+	// alpha bits (normal_roughness_inc.glsl); every reader decodes through
+	// that include.
+	return RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
 }
 
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
@@ -2127,6 +2130,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi_screen_traces = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_traces");
 	use_rt_gi_light_cascade_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/light_cascade_radiance");
 	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
+	use_rt_gi_planar_mirrors = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/planar_mirrors");
 	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/temporal_frames"));
 	rt_gi_spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_stride"));
 	rt_gi_spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_iterations"));
@@ -2184,6 +2188,7 @@ void RenderForwardClustered::_update_ray_tracing_backend() {
 	if (raytracing != nullptr) {
 		raytracing->set_surface_cache_enabled(use_rt_gi && use_surface_cache, surface_cache_settings, use_surface_cache_mirror);
 		raytracing->set_hit_shading(use_rt_gi && use_surface_cache ? rt_gi_hit_shading : 0, &hit_material_resolver);
+		raytracing->set_planar_mirrors(use_rt_gi_planar_mirrors);
 	}
 }
 

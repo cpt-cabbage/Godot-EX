@@ -2225,18 +2225,18 @@ void fragment_shader(in SceneData scene_data) {
 			vec2 base_coord = screen_uv;
 			vec2 closest_coord = base_coord;
 #ifdef USE_MULTIVIEW
-			float closest_ang = dot(indirect_normal, normalize(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(base_coord, ViewIndex), 0.0).xyz * 2.0 - 1.0));
+			float closest_ang = dot(indirect_normal, nr_normal(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(base_coord, ViewIndex), 0.0)));
 #else // USE_MULTIVIEW
-			float closest_ang = dot(indirect_normal, normalize(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), base_coord, 0.0).xyz * 2.0 - 1.0));
+			float closest_ang = dot(indirect_normal, nr_normal(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), base_coord, 0.0)));
 #endif // USE_MULTIVIEW
 
 			for (int i = 0; i < 4; i++) {
 				const vec2 neighbors[4] = vec2[](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
 				vec2 neighbour_coord = base_coord + neighbors[i] * scene_data.screen_pixel_size;
 #ifdef USE_MULTIVIEW
-				float neighbour_ang = dot(indirect_normal, normalize(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(neighbour_coord, ViewIndex), 0.0).xyz * 2.0 - 1.0));
+				float neighbour_ang = dot(indirect_normal, nr_normal(textureLod(sampler2DArray(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), vec3(neighbour_coord, ViewIndex), 0.0)));
 #else // USE_MULTIVIEW
-				float neighbour_ang = dot(indirect_normal, normalize(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), neighbour_coord, 0.0).xyz * 2.0 - 1.0));
+				float neighbour_ang = dot(indirect_normal, nr_normal(textureLod(sampler2D(normal_roughness_buffer, SAMPLER_LINEAR_CLAMP), neighbour_coord, 0.0)));
 #endif // USE_MULTIVIEW
 				if (neighbour_ang > closest_ang) {
 					closest_ang = neighbour_ang;
@@ -2337,10 +2337,10 @@ void fragment_shader(in SceneData scene_data) {
 				ivec2 rtgi_fp = min(hp * 2, rtgi_full_size - ivec2(1));
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
-				vec3 sn = normalize(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0).xyz * 2.0 - 1.0);
+				vec3 sn = nr_normal(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0));
 #else
 				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
-				vec3 sn = normalize(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0).xyz * 2.0 - 1.0);
+				vec3 sn = nr_normal(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0));
 #endif
 				// Faced the way the gather faced it.
 				sn = dot(sn, view) < 0.0 ? -sn : sn;
@@ -3724,6 +3724,7 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef MODE_RENDER_MATERIAL
 
 	albedo_output_buffer.rgb = albedo;
+	vec3 card_f0 = vec3(0.0);
 	if (!bool(scene_data.flags & SCENE_DATA_FLAGS_USE_UV2_MATERIAL)) {
 		// The surface cache's card capture: the cards bounce diffusely and
 		// hold one radiance per texel, so a surface's specular reflectance
@@ -3736,6 +3737,7 @@ void fragment_shader(in SceneData scene_data) {
 		// on diffuse alone. The lightmapper's UV2 capture keeps the raw albedo.
 		vec3 f0 = mix(vec3(0.16 * specular * specular), albedo, metallic);
 		albedo_output_buffer.rgb = albedo * (1.0 - metallic) + f0;
+		card_f0 = f0;
 	}
 	albedo_output_buffer.a = alpha;
 
@@ -3747,21 +3749,20 @@ void fragment_shader(in SceneData scene_data) {
 	orm_output_buffer.g = roughness;
 	orm_output_buffer.b = metallic;
 	orm_output_buffer.a = sss_strength;
+	if (!bool(scene_data.flags & SCENE_DATA_FLAGS_USE_UV2_MATERIAL)) {
+		// The cards' specular atlas: the F0 the albedo above folded in, and
+		// the roughness, so a planar mirror's texels can take the fold back
+		// out (surface_cache_light.glsl read_texel).
+		orm_output_buffer = vec4(card_f0, roughness);
+	}
 
 	emission_output_buffer.rgb = emission;
 	emission_output_buffer.a = 0.0;
 #endif
 
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
-	normal_roughness_output_buffer = vec4(encode24(normal) * 0.5 + 0.5, roughness);
-
-	// We encode the dynamic static into roughness.
-	// Values over 0.5 are dynamic, under 0.5 are static.
-	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w * (127.0 / 255.0);
-	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC)) {
-		normal_roughness_output_buffer.w = 1.0 - normal_roughness_output_buffer.w;
-	}
-	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w;
+	// Octahedral normal, ten-bit roughness, the dynamic flag (normal_roughness_inc.glsl).
+	normal_roughness_output_buffer = nr_encode(normal, roughness, bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC));
 
 #ifdef MODE_RENDER_VOXEL_GI
 	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances

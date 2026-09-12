@@ -22,6 +22,8 @@
 // mirror keeps its own sample: its lobe admits no neighbour's ray, and the
 // resolve would only blur its image.
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // rgb the ray's radiance, a the virtual view depth (kept as the pixel's own).
@@ -64,12 +66,6 @@ vec3 view_position(ivec2 pixel, float depth) {
 	return p.xyz / p.w;
 }
 
-float decode_roughness(float r) {
-	if (r > 0.5) {
-		r = 1.0 - r;
-	}
-	return r / (127.0 / 255.0);
-}
 
 // The density the gather draws its rough ray with: GGX over the half
 // vector (stochastic_indirect_gi.glsl), turned to a density over
@@ -95,7 +91,7 @@ void main() {
 	vec4 center = texelFetch(raw_reflection, pixel, 0);
 	float depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
 	vec4 nr = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0);
-	float roughness = decode_roughness(nr.w);
+	float roughness = nr_roughness(nr);
 	vec4 own_ray = texelFetch(spec_ray, pixel, 0);
 	if (depth == 0.0 || roughness < params.rough_min || own_ray.z <= 0.0) {
 		imageStore(out_reflection, pixel, center);
@@ -131,7 +127,7 @@ void main() {
 			if (abs(-spos.z - view_depth) > 0.05 * max(view_depth, 1.0)) {
 				continue;
 			}
-			vec3 sn = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);
+			vec3 sn = nr_normal(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0));
 			float w_normal = pow(max(dot(n, sn), 0.0), 32.0);
 			if (w_normal <= 1e-3) {
 				continue;

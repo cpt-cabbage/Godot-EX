@@ -101,8 +101,25 @@ public:
 	};
 
 	// Everything the lighting pass needs from the frame.
+	// A planar mirror as the shaders read it (mirror_planes_inc.glsl): the
+	// plane, its F0, roughness and half extents, and its rectangle. The
+	// space is the reading pass's (world for the cards and the gather,
+	// view for the stochastic direct pass).
+	static constexpr uint32_t MAX_MIRROR_PLANES = 4;
+	struct MirrorPlaneGPU {
+		float plane[4]; // xyz the unit normal out of the reflective face, w its offset (n . p = w).
+		float params[4]; // x F0, y roughness, z half extent along u, w along v.
+		float center[4];
+		float u_axis[4];
+		float v_axis[4];
+	};
+
 	struct LightingInputs {
 		RID tlas;
+		// The scene's planar mirrors (RaytracingScene::get_mirror_planes), world space.
+		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES] = {};
+		uint32_t mirror_count = 0;
+		uint32_t mirror_order = 2;
 		RID omni_light_buffer;
 		RID spot_light_buffer;
 		RID directional_light_buffer;
@@ -140,6 +157,7 @@ private:
 	// Atlases (all atlas_size x atlas_size).
 	RID albedo_atlas; // RGBA8, alpha = coverage.
 	RID normal_atlas; // RGBA8, best-fit encoded card-view-space normal.
+	RID specular_atlas; // RGBA8, the capture's F0 (rgb, the fold the albedo atlas carries as Lambertian) and roughness (a): a planar mirror's texels take the fold back out.
 	RID emission_atlas; // RGBA16F.
 	RID depth_atlas; // R32F, distance from the card's near plane; 0 = empty.
 	RID lighting_atlas; // RGBA16F, outgoing radiance, assembled at every relight from the exact direct term and the two accumulated factors below; alpha = the visibility ratio's frames / 64.
@@ -368,10 +386,11 @@ private:
 		uint32_t area_light_count;
 		float pad_join[2];
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
-		float mirror_plane[4]; // A planar mirror (GODOT_GI_MIRROR, prototype): xyz normal, w offset; its texels bounce nothing diffusely.
-		float mirror_light[4]; // The one omni light it images: xyz world position, w energy.
-		float mirror_params[4]; // x F0, w the plane's roughness.
-		float mirror_extra[4]; // x the plane's diffuse share.
+		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
+		uint32_t mirror_count;
+		uint32_t mirror_order; // The longest image chain evaluated (Raytracing::mirror_order).
+		uint32_t mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling; see the shader).
+		uint32_t mirror_pad;
 	};
 
 	// The dynamic lights, as the card lighting and the GI gather read them

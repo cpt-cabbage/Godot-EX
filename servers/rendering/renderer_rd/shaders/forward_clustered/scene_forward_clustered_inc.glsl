@@ -558,13 +558,12 @@ layout(set = 1, binding = 51) uniform texture3D translucency_volume_bz; // USE_M
 
 #endif
 
+#include "../normal_roughness_inc.glsl"
+
+// The NORMAL_ROUGHNESS_TEXTURE a user shader reads: the normal in 0..1 and
+// the roughness, whatever the buffer's own encoding (normal_roughness_inc.glsl).
 vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {
-	float roughness = p_normal_roughness.w;
-	if (roughness > 0.5) {
-		roughness = 1.0 - roughness;
-	}
-	roughness /= (127.0 / 255.0);
-	return vec4(normalize(p_normal_roughness.xyz * 2.0 - 1.0) * 0.5 + 0.5, roughness);
+	return vec4(nr_normal(p_normal_roughness) * 0.5 + 0.5, nr_roughness(p_normal_roughness));
 }
 
 // https://google.github.io/filament/Filament.html#toc5.3.4.7

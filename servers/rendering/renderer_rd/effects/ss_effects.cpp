@@ -1487,7 +1487,7 @@ void SSEffects::ssr_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers,
 	uint32_t view_count = p_render_buffers->get_view_count();
 
 	if (ssr_half_size) {
-		p_render_buffers->create_texture(RB_SCOPE_SSR, RB_NORMAL_ROUGHNESS, RD::DATA_FORMAT_R8G8B8A8_UNORM, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_ssr_buffers.size, view_count);
+		p_render_buffers->create_texture(RB_SCOPE_SSR, RB_NORMAL_ROUGHNESS, RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_ssr_buffers.size, view_count);
 	}
 
 	p_render_buffers->create_texture(RB_SCOPE_SSR, RB_HIZ, RD::DATA_FORMAT_R32_SFLOAT, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_ssr_buffers.size, view_count, p_ssr_buffers.mipmaps);

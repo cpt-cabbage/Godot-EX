@@ -857,6 +857,7 @@ private:
 	bool use_rt_gi_screen_traces = true;
 	bool use_rt_gi_light_cascade_radiance = false;
 	bool use_rt_gi_specular = true;
+	bool use_rt_gi_planar_mirrors = true;
 	uint32_t rt_gi_temporal_frames = 32;
 	int rt_gi_spatial_stride = 2;
 	int rt_gi_spatial_iterations = 2;

@@ -12,6 +12,8 @@
 // bounded [0;1] visibility ratios (the analytic lighting is multiplied back
 // in at the end of the spatial pass), for GI they are radiance.
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // Params.flags bits.
@@ -29,6 +31,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
 #define FLAG_MOD_PAINT 4096u // Diagnostics (GODOT_GI_MOD_PAINT): the card correction as a colour (red its change, green the field's confidence, blue the mark).
 #define FLAG_NO_LUM_STOP 8192u // Experiment (GODOT_GI_LUMSTOP=0): the spatial pass's luminance stop off for settled pixels too.
+#define FLAG_VOTES 32768u // Temporal (GI): the change mark is the tile's luminance-weighted vote (change_votes), bilinear over the tiles, not the pixel's own largest hit.
 #define FLAG_FIREFLY_PAINT 16384u // Diagnostics (GODOT_GI_FIREFLY_PAINT=1): the temporal pass paints the samples the firefly test scaled.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block).
@@ -166,6 +169,12 @@ layout(set = 0, binding = 14) uniform sampler2D fallback_prev;
 // mean: their disagreement is the error of the accumulated value itself,
 // which the moments (the samples' variance) never reach.
 layout(set = 0, binding = 15) uniform sampler2D history_split;
+// The gather's lighting-change votes per 8x8 tile (FLAG_VOTES; see
+// stochastic_indirect_gi.glsl change_votes): weighted change, weight.
+layout(set = 0, binding = 16, std430) restrict readonly buffer ChangeVotes {
+	uint data[];
+}
+change_votes;
 layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_split;
 #endif
 #else // MODE_SPATIAL
@@ -388,6 +397,30 @@ void main() {
 	vec4 current_diffuse4 = texelFetch(in_diffuse, pixel, 0);
 	vec3 current_diffuse = current_diffuse4.rgb;
 	float change_age = current_diffuse4.a; // GI only; see the restart below.
+#if defined(MODE_TEMPORAL) && defined(HAS_DIRECTIONAL)
+	if ((params.flags & FLAG_VOTES) != 0u) {
+		// The tile vote (plan section 45): the change over the tile's rays
+		// weighted by what they brought, read bilinearly over the four
+		// tiles about the pixel so tile edges do not show.
+		int tiles_x = (params.screen_size.x + 7) / 8;
+		int tiles_y = (params.screen_size.y + 7) / 8;
+		vec2 tc = (vec2(pixel) + 0.5) / 8.0 - 0.5;
+		ivec2 t0 = ivec2(floor(tc));
+		vec2 fr = tc - vec2(t0);
+		float wc = 0.0;
+		float ww = 0.0;
+		for (int j = 0; j < 2; j++) {
+			for (int i = 0; i < 2; i++) {
+				ivec2 tt = clamp(t0 + ivec2(i, j), ivec2(0), ivec2(tiles_x - 1, tiles_y - 1));
+				float bw = (i == 0 ? 1.0 - fr.x : fr.x) * (j == 0 ? 1.0 - fr.y : fr.y);
+				uint idx = uint(tt.y * tiles_x + tt.x) * 2u;
+				wc += bw * float(change_votes.data[idx]);
+				ww += bw * float(change_votes.data[idx + 1u]);
+			}
+		}
+		change_age = ww > 0.0 ? clamp(wc / ww, 0.0, 1.0) : 0.0;
+	}
+#endif
 	vec4 current_specular4 = texelFetch(in_specular, pixel, 0);
 	vec3 current_specular = current_specular4.rgb;
 #ifdef HAS_DIRECTIONAL
@@ -397,12 +430,8 @@ void main() {
 	// of the way toward it the reflection's history is looked up: all of it
 	// for a mirror, none for a rough surface whose lobe has no single image.
 	float virtual_view_depth = current_specular4.a;
-	float nr_roughness = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).w;
-	if (nr_roughness > 0.5) {
-		nr_roughness = 1.0 - nr_roughness;
-	}
-	nr_roughness /= (127.0 / 255.0);
-	float virtual_weight = 1.0 - smoothstep(0.15, 0.6, nr_roughness);
+	float nr_rough = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+	float virtual_weight = 1.0 - smoothstep(0.15, 0.6, nr_rough);
 #endif
 
 	// 5x5 neighborhood statistics for history rectification.
@@ -462,7 +491,7 @@ void main() {
 			result_directional = current_directional;
 			firefly_hit = true;
 		}
-		if (nr_roughness >= reprojection.firefly_rough) {
+		if (nr_rough >= reprojection.firefly_rough) {
 			mean_n = nl_s.x / n;
 			std_n = sqrt(max(nl_s.y / n - mean_n * mean_n, 0.0));
 			bound = mean_n + reprojection.firefly_k * std_n;
@@ -872,7 +901,7 @@ void main() {
 					// stop 0.047 with flicker 0.023, without it 0.057 and
 					// 0.013, lagging for thirty frames). A mirror keeps its
 					// sample: the resolve would blur its image.
-					float lobe = smoothstep(0.15, 0.4, nr_roughness);
+					float lobe = smoothstep(0.15, 0.4, nr_rough);
 					if (reprojection.spec_fix > 0.0 && lobe > 0.0) {
 						hist_s = mix(hist_s, mean_s, change_age * lobe);
 						keep_s = max(keep_s, mix(1.0, reprojection.spec_fix, lobe));
@@ -894,7 +923,7 @@ void main() {
 			// hides. Pure rotation has no parallax and keeps everything.
 			{
 				float smear_px = parallax_px * (1.0 - virtual_weight);
-				float allowed_px = 4.0 + 12.0 * clamp(nr_roughness, 0.0, 1.0);
+				float allowed_px = 4.0 + 12.0 * clamp(nr_rough, 0.0, 1.0);
 				if (smear_px > 1e-3 && (params.flags & FLAG_SPEC_NO_SMEAR) == 0u) {
 					frames_s = min(frames_s, max(allowed_px / smear_px, 1.0));
 				}
@@ -1256,7 +1285,7 @@ void main() {
 	float depth_bound_b = depth_from_linear(center_view_depth * (1.0 + params.depth_tolerance));
 	float depth_min = min(depth_bound_a, depth_bound_b);
 	float depth_max = max(depth_bound_a, depth_bound_b);
-	vec3 center_normal = normalize(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).xyz * 2.0 - 1.0);
+	vec3 center_normal = nr_normal(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
 #ifdef FILTER_DIRECTIONAL
@@ -1292,11 +1321,7 @@ void main() {
 	// The reflection's kernel follows roughness: a rough lobe is as wide as
 	// the diffuse one, a mirror's image must not be filtered at all.
 	{
-		float r = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0).w;
-		if (r > 0.5) {
-			r = 1.0 - r;
-		}
-		r /= (127.0 / 255.0);
+		float r = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
 		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
 		if (spec_scale < 0.25) {
 			filter_s = false;
@@ -1358,7 +1383,7 @@ void main() {
 			// window, so it means the same thing at every range.
 			float w_spatial = 0.0;
 			if (sd != 0.0 && sd >= depth_min && sd <= depth_max) {
-				vec3 n = normalize(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0).xyz * 2.0 - 1.0);
+				vec3 n = nr_normal(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0));
 				float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
 				w_spatial = exp(-0.3 * float(x * x + y * y)) * w_normal;
 			}
@@ -1370,7 +1395,7 @@ void main() {
 				float sd_s = texelFetch(depth_texture, sp_s * params.depth_scale, 0).r;
 				w_spatial_s = 0.0;
 				if (sd_s != 0.0 && sd_s >= depth_min && sd_s <= depth_max) {
-					vec3 n_s = normalize(texelFetch(normal_roughness_texture, sp_s * params.depth_scale, 0).xyz * 2.0 - 1.0);
+					vec3 n_s = nr_normal(texelFetch(normal_roughness_texture, sp_s * params.depth_scale, 0));
 					w_spatial_s = exp(-0.3 * float(x * x + y * y)) * pow(max(dot(center_normal, n_s), 0.0), 32.0);
 				}
 			}

@@ -8,6 +8,8 @@
 #extension GL_EXT_samplerless_texture_functions : enable
 #endif
 
+#include "../normal_roughness_inc.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #define M_PI 3.141592
@@ -606,10 +608,11 @@ void voxel_gi_compute(uint index, vec3 position, vec3 normal, vec3 ref_vec, mat3
 	out_blend += blend;
 }
 
+// The normal, and the roughness decoded (normal_roughness_inc.glsl); a
+// zero normal where the buffer holds no surface.
 vec4 fetch_normal_and_roughness(ivec2 pos) {
-	vec4 normal_roughness = texelFetch(sampler2D(normal_roughness_buffer, linear_sampler), pos, 0);
-	normal_roughness.xyz = normalize(normal_roughness.xyz * 2.0 - 1.0);
-	return normal_roughness;
+	vec4 nr = texelFetch(sampler2D(normal_roughness_buffer, linear_sampler), pos, 0);
+	return vec4(nr_valid(nr) ? nr_normal(nr) : vec3(0.0), nr_roughness(nr));
 }
 
 void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 reflection_light) {
@@ -620,11 +623,6 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 	if (normal.length() > 0.5) {
 		//valid normal, can do GI
 		float roughness = normal_roughness.w;
-		bool dynamic_object = roughness > 0.5;
-		if (dynamic_object) {
-			roughness = 1.0 - roughness;
-		}
-		roughness /= (127.0 / 255.0);
 		vec3 view = -normalize(mat3(scene_data.cam_transform) * (vertex - scene_data.eye_offset[gl_GlobalInvocationID.z].xyz));
 		vertex = mat3(scene_data.cam_transform) * vertex;
 		normal = normalize(mat3(scene_data.cam_transform) * normal);
