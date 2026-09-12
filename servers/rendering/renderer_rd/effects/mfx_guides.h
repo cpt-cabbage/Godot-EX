@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  resolve.h                                                             */
+/*  mfx_guides.h                                                          */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,52 +30,46 @@
 
 #pragma once
 
-#include "servers/rendering/renderer_rd/pipeline_cache_rd.h"
-#include "servers/rendering/renderer_rd/shaders/effects/resolve.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/effects/resolve_raster.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/mfx_guides.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+
+// The guide textures the MetalFX temporal denoised scaler reads next to
+// the colour: normal, roughness, specular hit distance and the strength
+// mask, unpacked from the prepass buffers and the GI gather's spec ray
+// (mfx_guides.glsl). Diffuse and specular albedo come straight from the
+// prepass G-buffer.
+#define RB_SCOPE_MFX_GUIDES SNAME("rb_mfx_guides")
+#define RB_MFX_NORMAL SNAME("normal")
+#define RB_MFX_ROUGHNESS SNAME("roughness")
+#define RB_MFX_HIT_DISTANCE SNAME("hit_distance")
+#define RB_MFX_STRENGTH_MASK SNAME("strength_mask")
 
 namespace RendererRD {
 
-class Resolve {
-private:
-	bool prefer_raster_effects;
-
-	struct ResolvePushConstant {
+class MFXGuides {
+	struct PushConstant {
+		float world_from_view[16];
 		int32_t screen_size[2];
-		int32_t samples;
-		uint32_t pad;
+		uint32_t flags;
+		float miss_distance;
 	};
 
-	enum ResolveMode {
-		RESOLVE_MODE_GI,
-		RESOLVE_MODE_GI_VOXEL_GI,
-		RESOLVE_MODE_DEPTH,
-		RESOLVE_MODE_MAX
-	};
-
-	struct ResolveShader {
-		ResolvePushConstant push_constant;
-		ResolveShaderRD shader;
-		RID shader_version;
-		RID pipelines[RESOLVE_MODE_MAX]; //3 quality levels
-	} resolve;
-
-	struct ResolveRasterShader {
-		ResolvePushConstant push_constant;
-		ResolveRasterShaderRD shader;
-		RID shader_version;
-		PipelineCacheRD pipeline;
-	} resolve_raster;
+	MfxGuidesShaderRD shader;
+	RID shader_version;
+	RID pipeline;
 
 public:
-	Resolve(bool p_prefer_raster_effects);
-	~Resolve();
+	MFXGuides();
+	~MFXGuides();
 
-	// The G-buffer (albedo, f0) rides along with normal_roughness: the same
-	// sample is picked for every attachment.
-	void resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID p_source_albedo, RID p_source_f0, RID p_source_voxel_gi, RID p_dest_depth, RID p_dest_normal_roughness, RID p_dest_albedo, RID p_dest_f0, RID p_dest_voxel_gi, Vector2i p_screen_size, int p_samples);
-	void resolve_depth(RID p_source_depth, RID p_dest_depth, Vector2i p_screen_size, int p_samples);
-	void resolve_depth_raster(RID p_source_rd_texture, RID p_dest_framebuffer, int p_samples);
+	static RD::DataFormat get_normal_format() { return RD::DATA_FORMAT_R16G16B16A16_SFLOAT; }
+	static RD::DataFormat get_roughness_format() { return RD::DATA_FORMAT_R16_SFLOAT; }
+	static RD::DataFormat get_hit_distance_format() { return RD::DATA_FORMAT_R16_SFLOAT; }
+	static RD::DataFormat get_strength_mask_format() { return RD::DATA_FORMAT_R8_UNORM; }
+
+	void ensure_textures(Ref<RenderSceneBuffersRD> p_render_buffers);
+	// p_spec_ray may be null (no GI gather this frame): every hit distance is then a miss.
+	void process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, RID p_normal_roughness, RID p_gbuf_albedo, RID p_spec_ray, const Transform3D &p_world_from_view, bool p_view_space_normal);
 };
 
 } // namespace RendererRD

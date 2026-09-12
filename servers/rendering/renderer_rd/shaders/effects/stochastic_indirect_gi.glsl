@@ -16,6 +16,7 @@
 // the stochastic denoiser filters both like the direct lighting pair.
 
 #include "../normal_roughness_inc.glsl"
+#include "../albedo_f0_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -119,6 +120,7 @@ params;
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 #define FLAG_FALLBACK_EVERY 131072u // The fallback for every pixel: the temporal pass modulates the history by its change (GODOT_GI_MOD).
 #define FLAG_VOTES 524288u // The lighting-change votes (change_votes): the temporal pass reads the tile's weighted change in place of the pixel's own mark.
+#define FLAG_SPEC_BUDGET 1048576u // Rough dielectrics skip the GGX ray: the cosine rays' mean radiance stands in for their reflection (GODOT_GI_SPEC_BUDGET).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -386,6 +388,9 @@ layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atla
 // The temporal pass restarts a pixel by its tile's ratio (a lobe-weighted
 // vote over the tile's rays) rather than the largest change one of its
 // own rays landed on.
+// The prepass G-buffer's F0 (albedo_f0_inc.glsl), for the specular ray budget.
+layout(set = 0, binding = 40) uniform sampler2D gbuf_f0_texture;
+
 layout(set = 0, binding = 39, std430) restrict buffer ChangeVotes {
 	uint data[];
 }
@@ -1742,7 +1747,22 @@ void main() {
 	// alone, with sharp reflections left to SSR / probes, whose sharpness the
 	// blurry cache cannot match.
 	bool mirror = bool(params.flags & FLAG_MIRROR) && roughness <= 0.2;
-	if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror)) {
+	// The specular ray budget (FLAG_SPEC_BUDGET): a rough dielectric's
+	// reflection is a few percent of its shading (the split sum weighs it
+	// by F0), and its GGX lobe is close to the cosine lobe the diffuse rays
+	// already sample, so the ray is spent only where the reflection shows:
+	// smooth surfaces, or a strong F0. The stand-in is the diffuse rays'
+	// mean radiance, which is what a lobe as wide as the hemisphere would
+	// return; the filter's history and the resolve see no ray (spec_ray 0).
+	bool spec_stand_in = false;
+	// cv_params.z: the roughness above which, .w: the F0 luminance below which.
+	if (bool(params.flags & FLAG_SPEC_BUDGET) && !mirror && roughness > params.cv_params.z) {
+		float f0_lum = luminance(gb_f0(texelFetch(gbuf_f0_texture, full_pixel, 0)));
+		spec_stand_in = f0_lum < params.cv_params.w;
+	}
+	if (spec_stand_in) {
+		reflection = irradiance;
+	} else if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror)) {
 		// GGX half-vector sampling around the mirror direction.
 		vec2 rnd = stbn_sample(pixel, 6u);
 		vec3 v = normalize(-(world_basis * view_pos));

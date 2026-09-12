@@ -14,9 +14,14 @@ layout(r32f, set = 1, binding = 0) uniform restrict writeonly image2D dest_depth
 #ifdef MODE_RESOLVE_GI
 layout(set = 0, binding = 0) uniform sampler2DMS source_depth;
 layout(set = 0, binding = 1) uniform sampler2DMS source_normal_roughness;
+// The prepass G-buffer (albedo_f0_inc.glsl), written with normal_roughness.
+layout(set = 0, binding = 2) uniform sampler2DMS source_albedo;
+layout(set = 0, binding = 3) uniform sampler2DMS source_f0;
 
 layout(r32f, set = 1, binding = 0) uniform restrict writeonly image2D dest_depth;
 layout(rgb10_a2, set = 1, binding = 1) uniform restrict writeonly image2D dest_normal_roughness;
+layout(rgb10_a2, set = 1, binding = 2) uniform restrict writeonly image2D dest_albedo;
+layout(rgb10_a2, set = 1, binding = 3) uniform restrict writeonly image2D dest_f0;
 
 #ifdef VOXEL_GI_RESOLVE
 layout(set = 2, binding = 0) uniform usampler2DMS source_voxel_gi;
@@ -220,6 +225,8 @@ void main() {
 #endif
 	best_depth = texelFetch(source_depth, pos, best_index).r;
 	best_normal_roughness = texelFetch(source_normal_roughness, pos, best_index);
+	vec4 best_albedo = texelFetch(source_albedo, pos, best_index);
+	vec4 best_f0 = texelFetch(source_f0, pos, best_index);
 #ifdef VOXEL_GI_RESOLVE
 	best_voxel_gi = texelFetch(source_voxel_gi, pos, best_index).rg;
 #endif
@@ -228,6 +235,8 @@ void main() {
 
 	imageStore(dest_depth, pos, vec4(best_depth));
 	imageStore(dest_normal_roughness, pos, vec4(best_normal_roughness));
+	imageStore(dest_albedo, pos, best_albedo);
+	imageStore(dest_f0, pos, best_f0);
 #ifdef VOXEL_GI_RESOLVE
 	imageStore(dest_voxel_gi, pos, uvec4(best_voxel_gi, 0, 0));
 #endif

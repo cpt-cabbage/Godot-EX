@@ -44,6 +44,7 @@
 namespace MTLFX {
 class SpatialScalerBase;
 class TemporalScalerBase;
+class TemporalDenoisedScalerBase;
 } //namespace MTLFX
 
 namespace RendererRD {
@@ -169,6 +170,93 @@ public:
 	};
 
 	void process(MFXTemporalContext *p_ctx, Params p_params);
+};
+
+// The MetalFX temporal denoised scaler (macOS 26): the temporal upscaler
+// with a denoiser in front of it, guided by the G-buffer (diffuse albedo,
+// specular albedo, normal, roughness), the specular rays' hit distance and
+// a mask of the pixels to leave alone. The ray traced passes hand it their
+// unfiltered result (rendering/ray_tracing/denoiser/enabled off) under
+// GODOT_MFX_DENOISE=1.
+struct MFXTemporalDenoisedContext {
+	MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+	MFXTemporalDenoisedContext() = default;
+	~MFXTemporalDenoisedContext();
+};
+
+class MFXTemporalDenoisedEffect {
+	struct CallbackArgs {
+		MFXTemporalDenoisedEffect *owner = nullptr;
+		MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+		RDD::TextureID src;
+		RDD::TextureID depth;
+		RDD::TextureID motion;
+		RDD::TextureID exposure;
+		RDD::TextureID diffuse_albedo;
+		RDD::TextureID specular_albedo;
+		RDD::TextureID normal;
+		RDD::TextureID roughness;
+		RDD::TextureID hit_distance;
+		RDD::TextureID strength_mask;
+		RDD::TextureID dst;
+		Vector2 jitter_offset;
+		float world_to_view[16];
+		float view_to_clip[16];
+		bool reset = false;
+
+		static void free(CallbackArgs **p_args) {
+			(*p_args)->owner->args_allocator.free(*p_args);
+			*p_args = nullptr;
+		}
+	};
+
+	PagedAllocator<CallbackArgs, true, 16> args_allocator;
+
+	static void callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata);
+
+public:
+	MFXTemporalDenoisedEffect();
+	~MFXTemporalDenoisedEffect();
+
+	static bool is_supported();
+
+	struct CreateParams {
+		Vector2i input_size;
+		Vector2i output_size;
+		RDD::DataFormat input_format;
+		RDD::DataFormat depth_format;
+		RDD::DataFormat motion_format;
+		RDD::DataFormat albedo_format; // Diffuse and specular albedo.
+		RDD::DataFormat normal_format;
+		RDD::DataFormat roughness_format;
+		RDD::DataFormat hit_distance_format;
+		RDD::DataFormat strength_mask_format;
+		RDD::DataFormat output_format;
+		Vector2 motion_vector_scale;
+	};
+
+	// Null when the device or OS has no denoised scaler.
+	MFXTemporalDenoisedContext *create_context(CreateParams p_params) const;
+
+	struct Params {
+		RID src;
+		RID depth;
+		RID motion;
+		RID exposure;
+		RID diffuse_albedo;
+		RID specular_albedo;
+		RID normal;
+		RID roughness;
+		RID hit_distance;
+		RID strength_mask;
+		RID dst;
+		Vector2 jitter_offset;
+		Transform3D world_to_view;
+		Projection view_to_clip; // Depth-corrected, without the jitter.
+		bool reset = false;
+	};
+
+	void process(MFXTemporalDenoisedContext *p_ctx, Params p_params);
 };
 
 #endif

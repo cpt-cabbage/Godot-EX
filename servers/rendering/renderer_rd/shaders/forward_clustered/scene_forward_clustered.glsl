@@ -1044,9 +1044,12 @@ layout(location = 4) out float depth_output_buffer;
 
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 layout(location = 0) out vec4 normal_roughness_output_buffer;
+// The prepass G-buffer (albedo_f0_inc.glsl), always written with the normal.
+layout(location = 1) out vec4 gbuf_albedo_output_buffer;
+layout(location = 2) out vec4 gbuf_f0_output_buffer;
 
 #ifdef MODE_RENDER_VOXEL_GI
-layout(location = 1) out uvec2 voxel_gi_buffer;
+layout(location = 3) out uvec2 voxel_gi_buffer;
 #endif
 
 #endif //MODE_RENDER_NORMAL
@@ -3763,6 +3766,16 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 	// Octahedral normal, ten-bit roughness, the dynamic flag (normal_roughness_inc.glsl).
 	normal_roughness_output_buffer = nr_encode(normal, roughness, bool(instances.data[instance_index].flags & INSTANCE_FLAGS_DYNAMIC));
+
+	// The material the colour pass will shade with, for the ray traced
+	// passes that run in between (albedo_f0_inc.glsl).
+#ifdef MODE_UNSHADED
+	gbuf_albedo_output_buffer = gb_encode_albedo(albedo, 0.0, true);
+	gbuf_f0_output_buffer = vec4(0.0);
+#else
+	gbuf_albedo_output_buffer = gb_encode_albedo(albedo, metallic, false);
+	gbuf_f0_output_buffer = gb_encode_f0(albedo, metallic, specular);
+#endif
 
 #ifdef MODE_RENDER_VOXEL_GI
 	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_VOXEL_GI)) { // process voxel_gi_instances

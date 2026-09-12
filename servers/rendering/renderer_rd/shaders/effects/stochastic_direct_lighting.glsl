@@ -18,6 +18,7 @@
 // after denoising, so lighting detail never passes through the filter.
 
 #include "../normal_roughness_inc.glsl"
+#include "../albedo_f0_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -108,6 +109,7 @@ params;
 #define FLAG_LIGHT_GUIDING 1u
 #define FLAG_SCREEN_TRACES 2u
 #define FLAG_ALPHA_CASTERS 4u // Some TLAS instances are non-opaque: their hits are candidates, confirmed from the cards' coverage.
+#define FLAG_GBUF 8u // Weigh the candidates with the pixel's material (GODOT_RT_GBUF=0 reverts to a 4% dielectric with unit albedo).
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -150,6 +152,11 @@ layout(set = 0, binding = 16, std430) restrict readonly buffer CardSets {
 card_sets;
 layout(set = 0, binding = 17) uniform texture2D card_depth_atlas;
 layout(set = 0, binding = 18) uniform texture2D card_albedo_atlas;
+// The prepass G-buffer (albedo_f0_inc.glsl): the pixel's own material, for
+// the light selection to weigh the diffuse and specular terms the way the
+// scene shader will shade them (FLAG_GBUF).
+layout(set = 0, binding = 19) uniform sampler2D gbuf_albedo_texture;
+layout(set = 0, binding = 20) uniform sampler2D gbuf_f0_texture;
 
 layout(set = 1, binding = 0, r11f_g11f_b10f) uniform restrict writeonly image2D out_diffuse;
 layout(set = 1, binding = 1, r11f_g11f_b10f) uniform restrict writeonly image2D out_specular;
@@ -399,6 +406,25 @@ bool reservoir_merge(inout Reservoir g, Reservoir h, float p_scale, inout float 
 
 float luminance(vec3 c) {
 	return dot(c, params.luma_weights.rgb);
+}
+
+// The pixel's material for the light selection (FLAG_GBUF), set once in
+// main: the diffuse albedo's luminance and the Fresnel endpoints the scene
+// shader reassembles the specular with (F = f0 + (f90 - f0) * fc). Without
+// the G-buffer they stand at unit albedo and a 4% dielectric, the target
+// function the pass had before it existed.
+float mat_albedo_lum = 1.0;
+vec3 mat_f0 = vec3(0.04);
+float mat_f90 = 1.0;
+
+// The luminance a candidate's lighting would have on this pixel: the
+// diffuse radiance through the albedo, the specular lobe through the
+// material's Fresnel. This is the reservoirs' target function; the ratio
+// estimator divides the same weight out again, so any positive choice is
+// unbiased and this one matches what the scene shader composites.
+float candidate_luminance(vec3 f, vec4 ss) {
+	vec3 spec = ss.rgb * (mat_f0 + (mat_f90 - mat_f0) * ss.a);
+	return abs(luminance(f) * mat_albedo_lum + luminance(spec));
 }
 
 // Selection weight. MegaLights compresses this perceptually (log2(lum + 1)) to
@@ -893,6 +919,15 @@ void main() {
 	}
 	float roughness = nr_roughness(nr);
 
+	if ((params.flags & FLAG_GBUF) != 0u) {
+		vec4 gb_a = texelFetch(gbuf_albedo_texture, full_pixel, 0);
+		vec4 gb_f = texelFetch(gbuf_f0_texture, full_pixel, 0);
+		mat_albedo_lum = luminance(gb_albedo(gb_a));
+		mat_f0 = gb_f0(gb_f);
+		// scene_forward_clustered.glsl's stochastic_f90.
+		mat_f90 = clamp(50.0 * mat_f0.g, gb_metallic(gb_f), 1.0);
+	}
+
 	uint pixel_seed = pcg_hash(uint(pixel.x) + pcg_hash(uint(pixel.y) + pcg_hash(params.frame_index)));
 
 	// Look up the visible light list built last frame, reprojecting into the
@@ -1010,9 +1045,9 @@ void main() {
 	for (uint i = 0u; i < visible_count && guided_count < guided_budget; i++) {
 		uint entry = visible_list[i];
 		vec3 f, s;
-		vec4 ss_unused;
-		entry_eval(entry, view_pos, view_normal, roughness, f, s, ss_unused);
-		float lum = abs(luminance(f + s)); // abs: negative lights sample too.
+		vec4 ss;
+		entry_eval(entry, view_pos, view_normal, roughness, f, s, ss);
+		float lum = candidate_luminance(f, ss); // abs inside: negative lights sample too.
 		float w = light_weight(lum);
 		// Down-weight lights the tile found mostly shadowed last frame; the
 		// epsilon floor keeps every guided light discoverable, so one that
@@ -1193,7 +1228,7 @@ void main() {
 						if (listed) {
 							continue;
 						}
-						float lum = abs(luminance(f + s));
+						float lum = candidate_luminance(f, ss);
 						float w = light_weight(lum) * stride_mult;
 						if (w <= 0.0) {
 							continue;

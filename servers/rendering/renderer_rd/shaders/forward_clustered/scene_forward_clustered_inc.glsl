@@ -559,6 +559,7 @@ layout(set = 1, binding = 51) uniform texture3D translucency_volume_bz; // USE_M
 #endif
 
 #include "../normal_roughness_inc.glsl"
+#include "../albedo_f0_inc.glsl"
 
 // The NORMAL_ROUGHNESS_TEXTURE a user shader reads: the normal in 0..1 and
 // the roughness, whatever the buffer's own encoding (normal_roughness_inc.glsl).

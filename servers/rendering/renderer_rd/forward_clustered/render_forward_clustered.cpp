@@ -79,6 +79,22 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_normal_rou
 			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, get_normal_roughness_format(), get_normal_roughness_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
 		}
 	}
+	// The same prepass writes the G-buffer, so the two always exist together.
+	ensure_gbuffer_textures();
+}
+
+void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_gbuffer_textures() {
+	ERR_FAIL_NULL(render_buffers);
+
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO)) {
+		bool msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO, get_gbuf_format(), get_gbuf_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0, get_gbuf_format(), get_gbuf_usage_bits(msaa, false, render_buffers->get_can_be_storage()));
+		if (msaa) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO_MSAA, get_gbuf_format(), get_gbuf_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0_MSAA, get_gbuf_format(), get_gbuf_usage_bits(false, msaa, render_buffers->get_can_be_storage()), render_buffers->get_texture_samples());
+		}
+	}
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_voxelgi() {
@@ -116,6 +132,33 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_tempor
 	}
 	return false;
 }
+
+bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denoised(RendererRD::MFXTemporalDenoisedEffect *p_effect, RendererRD::MFXGuides *p_guides) {
+	if (mfx_denoised_context == nullptr && !mfx_denoised_unavailable) {
+		ensure_normal_roughness_texture();
+		p_guides->ensure_textures(render_buffers);
+		RendererRD::MFXTemporalDenoisedEffect::CreateParams params;
+		params.input_size = render_buffers->get_internal_size();
+		params.output_size = render_buffers->get_target_size();
+		params.input_format = render_buffers->get_base_data_format();
+		params.depth_format = render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage());
+		params.motion_format = render_buffers->get_velocity_format();
+		params.albedo_format = get_gbuf_format();
+		params.normal_format = RendererRD::MFXGuides::get_normal_format();
+		params.roughness_format = RendererRD::MFXGuides::get_roughness_format();
+		params.hit_distance_format = RendererRD::MFXGuides::get_hit_distance_format();
+		params.strength_mask_format = RendererRD::MFXGuides::get_strength_mask_format();
+		params.output_format = render_buffers->get_base_data_format();
+		params.motion_vector_scale = render_buffers->get_internal_size();
+		mfx_denoised_context = p_effect->create_context(params);
+		if (mfx_denoised_context == nullptr) {
+			mfx_denoised_unavailable = true;
+			WARN_PRINT_ONCE("MetalFX: no temporal denoised scaler (macOS 26 and a supporting GPU are needed); the temporal scaler is used instead.");
+		}
+		return mfx_denoised_context != nullptr;
+	}
+	return false;
+}
 #endif
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
@@ -143,6 +186,13 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	if (mfx_temporal_context) {
 		memdelete(mfx_temporal_context);
 		mfx_temporal_context = nullptr;
+	}
+	if (mfx_denoised_context) {
+		memdelete(mfx_denoised_context);
+		mfx_denoised_context = nullptr;
+	}
+	if (render_buffers) {
+		render_buffers->clear_context(RB_SCOPE_MFX_GUIDES);
 	}
 #endif
 
@@ -228,18 +278,23 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_depth_fb(Depth
 		case DEPTH_FB_ROUGHNESS: {
 			ensure_normal_roughness_texture();
 
+			// Attachment order: normal_roughness, albedo, f0 (locations 0-2 in the prepass shader).
 			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_GBUF_ALBEDO_MSAA : RB_TEX_GBUF_ALBEDO);
+			RID f0_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_GBUF_F0_MSAA : RB_TEX_GBUF_F0);
 
-			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer);
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, f0_buffer);
 		} break;
 		case DEPTH_FB_ROUGHNESS_VOXELGI: {
 			ensure_normal_roughness_texture();
 			ensure_voxelgi();
 
 			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_NORMAL_ROUGHNESS_MSAA : RB_TEX_NORMAL_ROUGHNESS);
+			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_GBUF_ALBEDO_MSAA : RB_TEX_GBUF_ALBEDO);
+			RID f0_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_GBUF_F0_MSAA : RB_TEX_GBUF_F0);
 			RID voxelgi_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_VOXEL_GI_MSAA : RB_TEX_VOXEL_GI);
 
-			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, voxelgi_buffer);
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, f0_buffer, voxelgi_buffer);
 		} break;
 		default: {
 			ERR_FAIL_V(RID());
@@ -287,6 +342,17 @@ RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_vox
 }
 
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+}
+
+RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuf_format() {
+	// Diffuse albedo + unshaded flag / F0 + metallic, ten bits per channel
+	// (albedo_f0_inc.glsl); the same format as normal_roughness so the MSAA
+	// resolve and the debug paint share its image qualifier.
+	return RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuf_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
 	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
 }
 
@@ -2565,12 +2631,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			} break;
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
 				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataForwardClustered::DEPTH_FB_ROUGHNESS);
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // normal_roughness
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf albedo
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf f0
 			} break;
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
 				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataForwardClustered::DEPTH_FB_ROUGHNESS_VOXELGI);
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
-				depth_pass_clear.push_back(Color(0, 0, 0, 0));
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // normal_roughness
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf albedo
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf f0
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // voxel_gi
 			} break;
 			default: {
 			};
@@ -2788,7 +2858,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_begin_label("Resolve Depth Pre-Pass (MSAA)");
 			if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
+					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), rb_data->get_gbuf_albedo_msaa(v), rb_data->get_gbuf_f0_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), rb_data->get_gbuf_f0(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
 				}
 			} else if (finish_depth) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
@@ -3045,7 +3115,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 				if (run_stochastic) {
 					raytracing->process_stochastic(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
-							rb_data->get_normal_roughness(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
+							rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), rb_data->get_gbuf_f0(v), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), light_storage->get_area_light_count(),
 							current_cluster_builder->get_cluster_buffer_log(), current_cluster_builder->get_cluster_log_z0(), current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_near, scene_data->z_far, stochastic_quality, velocity);
 				}
 				// The translucency lighting volume the transparent pass reads
@@ -3068,7 +3138,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 						screen_radiance = rb->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
 					}
 					raytracing->process_rt_gi(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
-							rb_data->get_normal_roughness(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_near, scene_data->z_far, gi_quality);
+							rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), rb_data->get_gbuf_f0(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_near, scene_data->z_far, gi_quality);
 				}
 			}
 			RD::get_singleton()->draw_command_end_label();
@@ -3472,20 +3542,63 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			// GODOT_MFX_DENOISE=1: the temporal denoised scaler in place of
+			// the temporal scaler, guided by the prepass G-buffer; meant to
+			// take the ray traced passes' unfiltered output
+			// (rendering/ray_tracing/denoiser/enabled off). GODOT_MFX_NORMAL=view
+			// hands it view-space normals instead of world-space ones.
+			static const bool mfx_denoise = OS::get_singleton()->get_environment("GODOT_MFX_DENOISE") == "1";
+			static const bool mfx_view_normal = OS::get_singleton()->get_environment("GODOT_MFX_NORMAL") == "view";
+			bool denoised_reset = false;
+			if (mfx_denoise) {
+				denoised_reset = rb_data->ensure_mfx_denoised(mfx_denoised_effect, mfx_guides);
+			}
+			const bool use_denoised = mfx_denoise && rb_data->get_mfx_denoised_context() != nullptr && rb_data->has_gbuffer();
+			bool reset = use_denoised ? denoised_reset : rb_data->ensure_mfx_temporal(mfx_temporal_effect);
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
 				exposure = luminance->get_current_luminance_buffer(rb);
 			}
 
-			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-			RENDER_TIMESTAMP("MetalFX Temporal");
+			if (use_denoised) {
+				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal Denoised");
+				RENDER_TIMESTAMP("MetalFX Temporal Denoised");
+			} else {
+				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
+				RENDER_TIMESTAMP("MetalFX Temporal");
+			}
 			// Scale to ±0.5.
 			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
 			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
 
-			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			for (uint32_t v = 0; v < rb->get_view_count() && use_denoised; v++) {
+				RID spec_ray = rb->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_RAW_SPEC_RAY) ? rb->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_SPEC_RAY, v, 0) : RID();
+				mfx_guides->process(rb, v, rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), spec_ray, p_render_data->scene_data->cam_transform, mfx_view_normal);
+
+				Projection correction;
+				correction.set_depth_correction(true);
+
+				RendererRD::MFXTemporalDenoisedEffect::Params params;
+				params.src = rb->get_internal_texture(v);
+				params.depth = rb->get_depth_texture(v);
+				params.motion = rb->get_velocity_buffer(false, v);
+				params.exposure = exposure;
+				params.diffuse_albedo = rb_data->get_gbuf_albedo(v);
+				params.specular_albedo = rb_data->get_gbuf_f0(v);
+				params.normal = rb->get_texture_slice(RB_SCOPE_MFX_GUIDES, RB_MFX_NORMAL, v, 0);
+				params.roughness = rb->get_texture_slice(RB_SCOPE_MFX_GUIDES, RB_MFX_ROUGHNESS, v, 0);
+				params.hit_distance = rb->get_texture_slice(RB_SCOPE_MFX_GUIDES, RB_MFX_HIT_DISTANCE, v, 0);
+				params.strength_mask = rb->get_texture_slice(RB_SCOPE_MFX_GUIDES, RB_MFX_STRENGTH_MASK, v, 0);
+				params.dst = rb->get_upscaled_texture(v);
+				params.jitter_offset = jitter;
+				params.world_to_view = p_render_data->scene_data->cam_transform.affine_inverse();
+				params.view_to_clip = correction * p_render_data->scene_data->view_projection[v];
+				params.reset = reset;
+				mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(), params);
+			}
+
+			for (uint32_t v = 0; v < rb->get_view_count() && !use_denoised; v++) {
 				RendererRD::MFXTemporalEffect::Params params;
 				params.src = rb->get_internal_texture(v);
 				params.depth = rb->get_depth_texture(v);
@@ -3596,8 +3709,10 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 		const bool debug_visibility = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_VISIBILITY;
 		const bool debug_analytic = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_STOCHASTIC_ANALYTIC;
 		StringName source = RB_RT_STOCHASTIC_DIFFUSE;
+		// GODOT_RT_DEBUG_SPEC=1: the specular signal in the visibility mode.
+		static const bool debug_spec = OS::get_singleton()->get_environment("GODOT_RT_DEBUG_SPEC") == "1";
 		if (debug_visibility) {
-			source = RB_RT_STOCHASTIC_RAW_DIFFUSE;
+			source = debug_spec ? RB_RT_STOCHASTIC_RAW_SPECULAR : RB_RT_STOCHASTIC_RAW_DIFFUSE;
 		} else if (debug_analytic) {
 			source = RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE;
 		}
@@ -5101,6 +5216,25 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 RID RenderForwardClustered::_render_buffers_get_normal_texture(Ref<RenderSceneBuffersRD> p_render_buffers) {
 	Ref<RenderBufferDataForwardClustered> rb_data = p_render_buffers->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
 
+	// GODOT_RT_GBUF_PAINT=albedo|f0|flags|metallic shows the prepass G-buffer
+	// under the normal-buffer debug draw: the texel's rgb as is, or its alpha
+	// (the unshaded flag, the metallic) spread over rgb.
+	static const String gbuf_paint = OS::get_singleton()->get_environment("GODOT_RT_GBUF_PAINT");
+	if (rb_data->has_gbuffer()) {
+		if (gbuf_paint == "albedo") {
+			return rb_data->get_gbuf_albedo();
+		} else if (gbuf_paint == "f0") {
+			return rb_data->get_gbuf_f0();
+		} else if (gbuf_paint == "flags" || gbuf_paint == "metallic") {
+			RD::TextureView alpha_only_view;
+			alpha_only_view.swizzle_r = RD::TEXTURE_SWIZZLE_A;
+			alpha_only_view.swizzle_g = RD::TEXTURE_SWIZZLE_A;
+			alpha_only_view.swizzle_b = RD::TEXTURE_SWIZZLE_A;
+			alpha_only_view.swizzle_a = RD::TEXTURE_SWIZZLE_ONE;
+			return p_render_buffers->get_texture_slice_view(RB_SCOPE_FORWARD_CLUSTERED, gbuf_paint == "flags" ? RB_TEX_GBUF_ALBEDO : RB_TEX_GBUF_F0, 0, 0, 1, 1, alpha_only_view);
+		}
+	}
+
 	return rb_data->get_normal_roughness();
 }
 
@@ -5738,6 +5872,12 @@ static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p
 	if (p_normal_roughness) {
 		attachment.format = RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_format();
 		attachment.usage_flags = RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_usage_bits(false, multisampling, p_can_be_storage);
+		attachments.push_back(attachment);
+
+		// The G-buffer (albedo, f0) is always written with normal_roughness.
+		attachment.format = RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuf_format();
+		attachment.usage_flags = RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuf_usage_bits(false, multisampling, p_can_be_storage);
+		attachments.push_back(attachment);
 		attachments.push_back(attachment);
 	}
 
@@ -6409,6 +6549,8 @@ RenderForwardClustered::RenderForwardClustered() {
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
+	mfx_denoised_effect = memnew(RendererRD::MFXTemporalDenoisedEffect);
+	mfx_guides = memnew(RendererRD::MFXGuides);
 #endif
 
 	_transparent_debug_init();
@@ -6496,6 +6638,14 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (mfx_temporal_effect) {
 		memdelete(mfx_temporal_effect);
 		mfx_temporal_effect = nullptr;
+	}
+	if (mfx_denoised_effect) {
+		memdelete(mfx_denoised_effect);
+		mfx_denoised_effect = nullptr;
+	}
+	if (mfx_guides) {
+		memdelete(mfx_guides);
+		mfx_guides = nullptr;
 	}
 
 	if (motion_vectors_store) {

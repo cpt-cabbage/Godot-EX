@@ -45,6 +45,7 @@
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
+#include "servers/rendering/renderer_rd/effects/mfx_guides.h"
 #endif
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
@@ -55,6 +56,12 @@
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
 #define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
+// The prepass G-buffer written next to normal_roughness (albedo_f0_inc.glsl):
+// diffuse albedo + unshaded flag, F0 + metallic.
+#define RB_TEX_GBUF_ALBEDO SNAME("gbuf_albedo")
+#define RB_TEX_GBUF_ALBEDO_MSAA SNAME("gbuf_albedo_msaa")
+#define RB_TEX_GBUF_F0 SNAME("gbuf_f0")
+#define RB_TEX_GBUF_F0_MSAA SNAME("gbuf_f0_msaa")
 
 namespace RendererSceneRenderImplementation {
 
@@ -104,6 +111,8 @@ public:
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+		RendererRD::MFXTemporalDenoisedContext *mfx_denoised_context = nullptr;
+		bool mfx_denoised_unavailable = false; // Creation failed once; do not retry every frame.
 #endif
 
 	public:
@@ -147,6 +156,16 @@ public:
 		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
 		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
 
+		// The G-buffer is created with the normal-roughness texture and rendered by the same prepass.
+		void ensure_gbuffer_textures();
+		bool has_gbuffer() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO); }
+		RID get_gbuf_albedo() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO); }
+		RID get_gbuf_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO, p_layer, 0); }
+		RID get_gbuf_albedo_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO_MSAA, p_layer, 0); }
+		RID get_gbuf_f0() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0); }
+		RID get_gbuf_f0(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0, p_layer, 0); }
+		RID get_gbuf_f0_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0_MSAA, p_layer, 0); }
+
 		void ensure_voxelgi();
 		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI); }
 		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI); }
@@ -159,6 +178,9 @@ public:
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
 		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
+		// True the frame the context was created (the history is reset); null context when unsupported.
+		bool ensure_mfx_denoised(RendererRD::MFXTemporalDenoisedEffect *p_effect, RendererRD::MFXGuides *p_guides);
+		RendererRD::MFXTemporalDenoisedContext *get_mfx_denoised_context() const { return mfx_denoised_context; }
 #endif
 
 		RID get_color_only_fb();
@@ -176,6 +198,8 @@ public:
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_gbuf_format();
+		static uint32_t get_gbuf_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 	};
 
 private:
@@ -949,6 +973,9 @@ private:
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
+	// The denoised scaler (GODOT_MFX_DENOISE=1) and the pass that unpacks its guides.
+	RendererRD::MFXTemporalDenoisedEffect *mfx_denoised_effect = nullptr;
+	RendererRD::MFXGuides *mfx_guides = nullptr;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 

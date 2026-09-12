@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/io/image.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/shaders/decal_data_inc.glsl.gen.h"
@@ -1156,7 +1157,9 @@ void RendererSceneRenderRD::_render_buffers_debug_draw(const RenderDataRD *p_ren
 
 	if (debug_draw == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER && _render_buffers_get_normal_texture(rb).is_valid()) {
 		Size2 rtsize = texture_storage->render_target_get_size(render_target);
-		copy_effects->copy_to_fb_rect(_render_buffers_get_normal_texture(rb), texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, false, false, false, RID(), false, false, false, true);
+		// GODOT_RT_GBUF_PAINT swaps the prepass G-buffer in for the normal (Forward+); it is shown as is.
+		static const bool gbuf_paint = !OS::get_singleton()->get_environment("GODOT_RT_GBUF_PAINT").is_empty();
+		copy_effects->copy_to_fb_rect(_render_buffers_get_normal_texture(rb), texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, false, false, false, RID(), false, false, false, !gbuf_paint);
 	}
 
 	if (debug_draw == RSE::VIEWPORT_DEBUG_DRAW_OCCLUDERS) {
