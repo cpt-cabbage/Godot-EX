@@ -120,6 +120,7 @@ params;
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 #define FLAG_FALLBACK_EVERY 131072u // The fallback for every pixel: the temporal pass modulates the history by its change (GODOT_GI_MOD).
 #define FLAG_VOTES 524288u // The lighting-change votes (change_votes): the temporal pass reads the tile's weighted change in place of the pixel's own mark.
+#define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_SPEC_BUDGET 1048576u // Rough dielectrics skip the GGX ray: the cosine rays' mean radiance stands in for their reflection (GODOT_GI_SPEC_BUDGET).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 
@@ -239,6 +240,17 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	// mean the rays used, summed as luminance in 1/1024 units over the
 	// pixels the variate applied to, and their count.
 	uint cv_sums[4];
+	// Diagnostics (FLAG_TIER_STATS): the screen reads' fold (FLAG_SRAD_FOLD)
+	// by the hit pixel's G-buffer metallic (four bins): the reads, and the
+	// fold's share of the card summed in 1/1024 units.
+	uint fold_count[4];
+	uint fold_sum[4];
+	uint fold_screen[4]; // The diffuse target's luminance before the fold, 1/1024 units.
+	uint fold_card[4]; // The card's, the same.
+	uint fold_near[4]; // Reads within a quarter metre of a mirror's rectangle (a hit the mirror path should have taken?).
+	uint fold_near_screen[4]; // Their diffuse target and card luminance sums, as above.
+	uint fold_near_card[4];
+	uint fold_near_spec[4]; // Of the near reads, the reflection rays'.
 }
 calibration;
 
@@ -250,6 +262,7 @@ calibration;
 #define SPEC_SRC_SKY 5u
 #define SPEC_SRC_OTHER 6u // The cascades or probes, screen-boosted or not.
 uint boost_source = SPEC_SRC_OTHER; // What the last screen_radiance_boost answered with.
+bool boost_fold = true; // screen_radiance_boost adds the fold (FLAG_SRAD_FOLD); the mirror path reads a plane's diffuse without it, its specular being the continuation.
 
 // The surface cache (see surface_cache.cpp): per TLAS instance the record the
 // ray query's custom index names, per card set its six captures, and the lit
@@ -388,8 +401,10 @@ layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atla
 // The temporal pass restarts a pixel by its tile's ratio (a lobe-weighted
 // vote over the tile's rays) rather than the largest change one of its
 // own rays landed on.
-// The prepass G-buffer's F0 (albedo_f0_inc.glsl), for the specular ray budget.
+// The prepass G-buffer's F0 and diffuse albedo (albedo_f0_inc.glsl), for the
+// specular ray budget and the screen read's fold (FLAG_SRAD_FOLD).
 layout(set = 0, binding = 40) uniform sampler2D gbuf_f0_texture;
+layout(set = 0, binding = 41) uniform sampler2D gbuf_albedo_texture;
 
 layout(set = 0, binding = 39, std430) restrict buffer ChangeVotes {
 	uint data[];
@@ -889,6 +904,53 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		return memory_base(cache_radiance);
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
+	if (bool(params.flags & FLAG_SRAD_FOLD) && boost_fold && tier == CACHE_TIER_CARD) {
+		// The diffuse target has no specular at all, and a rendered pixel's
+		// specular is the camera's anyway (Fresnel-boosted at the grazing
+		// angles the camera sees a ceiling at, and read here by rays from
+		// every other direction: the screen read 1.45-1.57x the card at the
+		// same points in the game, 1.05x in the radiosity box, and 0.98-1.03x
+		// as the diffuse target). What a ray from elsewhere wants of the
+		// surface's specular is, over the rays' directions, its energy: the
+		// hemispherical specular albedo (Schlick's average, F0 + (f90 - F0)
+		// / 21, f90 the scene shader's clamp(50 F0.g, metallic, 1): a
+		// material without a specular lobe folds nothing, the Lambert box
+		// read 1.02-1.05 of its truth with the plain 1 / 21) over the
+		// surface's total albedo, taken of the card's radiance
+		// (the card holds the F0 fold as Lambert, which is that energy) --
+		// from the card rather than the diffuse colour so a metal, whose
+		// diffuse is nothing, reads its card whole.
+		ivec2 gb_pixel = ivec2(uv * vec2(params.full_screen_size));
+		vec4 gb_a = texelFetch(gbuf_albedo_texture, gb_pixel, 0);
+		if (!gb_unshaded(gb_a)) {
+			vec4 gb_f = texelFetch(gbuf_f0_texture, gb_pixel, 0);
+			vec3 f0 = gb_f0(gb_f);
+			float f90 = clamp(50.0 * f0.g, gb_metallic(gb_f), 1.0);
+			float f_avg = luminance(f0 + (vec3(f90) - f0) / 21.0);
+			float a_lum = luminance(gb_albedo(gb_a));
+			float fold = f_avg / max(a_lum + f_avg, 1e-4);
+			if (bool(params.flags & FLAG_TIER_STATS)) {
+				uint bin = uint(gb_metallic(gb_f) * 3.0 + 0.5);
+				atomicAdd(calibration.fold_count[bin], 1u);
+				atomicAdd(calibration.fold_sum[bin], uint(fold * 1024.0));
+				atomicAdd(calibration.fold_screen[bin], uint(min(luminance(col), 64.0) * 1024.0));
+				atomicAdd(calibration.fold_card[bin], uint(min(luminance(cache_radiance), 64.0) * 1024.0));
+				vec3 world_hit = params.world_from_view[3].xyz + mat3(params.world_from_view) * view_hit;
+				for (uint mi = 0u; mi < mirror_count(); mi++) {
+					if (abs(mirror_height(mi, world_hit)) < 0.25 && mirror_in_rect(mi, world_hit)) {
+						atomicAdd(calibration.fold_near[bin], 1u);
+						atomicAdd(calibration.fold_near_screen[bin], uint(min(luminance(col), 64.0) * 1024.0));
+						atomicAdd(calibration.fold_near_card[bin], uint(min(luminance(cache_radiance), 64.0) * 1024.0));
+						if (hit_specular) {
+							atomicAdd(calibration.fold_near_spec[bin], 1u);
+						}
+						break;
+					}
+				}
+			}
+			col += cache_radiance * fold;
+		}
+	}
 	// Weaker by a quarter per bounce: two pixels whose rays keep landing on
 	// each other would otherwise hand the mark back and forth forever.
 	float hit_mark = textureLod(prev_gi_history, prev_uv, 0.0).a;
@@ -1369,10 +1431,29 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
-			uint hit_plane = (!hit_specular && mirror_on() && (uint(params.mirror_params.z) & 2u) == 0u) ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
+			// The glossy reflection rays take the mirror path too
+			// (GODOT_GI_MIRROR_SPEC=0 keeps them on the screen read): the
+			// ceiling's lobe lands on the mirror floor and wants the floor's
+			// image of the room in its own direction, which the continuation
+			// is. The screen read gave the floor's colour toward the camera
+			// (its image of another part of the ceiling, and the beam's
+			// highlight), and as the diffuse target it gives the floor's 20%
+			// diffuse alone: at pose E every reflection ray on the floor read
+			// the screen (RT_GI_FOLD's near-a-mirror count, 99.8% reflection
+			// rays), and the box's glossy ceiling pixel over its mirror floor
+			// reads 0.92 of its reference with the path against 0.725 on the
+			// screen. The delta mirror rays (a roughness-0 floor's) stay on
+			// the screen read: chained through the ceiling they read the
+			// cards' dynamic term at off-screen crossings, which lags a moving
+			// light's stop (the floor flash at stop + 32: err 0.026 and 18
+			// hot pixels per thousand with them on the path, 0.020 and 3.5
+			// without), while the ceiling's screen pixel is exact each frame.
+			bool spec_path = hit_specular && !hit_mirror && (uint(params.mirror_params.z) & 8u) == 0u;
+			bool mirror_path = mirror_on() && (uint(params.mirror_params.z) & 2u) == 0u && (!hit_specular || spec_path);
+			uint hit_plane = mirror_path ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
 			if (hit_plane < MAX_MIRROR_PLANES) {
-				// A planar mirror: the diffuse ray reads the mirror's diffuse
-				// card, reflects and goes on, weighted by the Fresnel at the
+				// A planar mirror: the ray reads the mirror's diffuse card,
+				// reflects and goes on, weighted by the Fresnel at the
 				// bounce, through up to MIRROR_BOUNCES_MAX mirrors (a ray off
 				// the ceiling that lands on a mirror floor would otherwise
 				// stop at the floor's dim diffuse card and lose what the
@@ -1389,20 +1470,48 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				vec3 dir = world_dir;
 				uint inst = instance_id;
 				uint plane = hit_plane;
+				// The chain's card reads through the ray's own footprint: the
+				// diffuse cone's, or the reflection lobe's.
+				float chain_cone_tan = hit_specular ? specular_cone_tan : abs(params.card_cone_tan);
 				for (uint bounce = 0u; bounce < MIRROR_BOUNCES_MAX; bounce++) {
 					vec3 n = params.mirrors[plane].plane.xyz;
-					card_lookup_footprint = t_total * abs(params.card_cone_tan);
+					card_lookup_footprint = t_total * chain_cone_tan;
 					vec3 plane_radiance;
 					uint plane_set;
 					if (surface_cache_lookup(inst, from, dir, plane_radiance, plane_set)) {
 						card_requests.frame[plane_set] = params.surface_cache_frame;
-						plane_diffuse += f * max(plane_radiance, vec3(0.0));
+						plane_radiance = max(plane_radiance, vec3(0.0));
+						// The plane's diffuse from the screen where the
+						// crossing is on it (the diffuse target: exact direct
+						// light, denoised; the card's dynamic term lags a
+						// moving light's stop by tens of frames, and the
+						// floor's mirror rays chained through the ceiling read
+						// that lag as a wash 1.6x the converged floor at stop
+						// + 32), the card otherwise. No fold: the plane's
+						// specular is the continuation below.
+						if ((uint(params.mirror_params.z) & 16u) == 0u) {
+							cache_tier = CACHE_TIER_CARD;
+							boost_fold = false;
+							plane_radiance = screen_radiance_boost(bounce == 0u ? view_hit : view_basis * (from - params.world_from_view[3].xyz), plane_radiance);
+							boost_fold = true;
+						}
+						plane_diffuse += f * plane_radiance;
 					}
 					f *= mirror_fresnel(plane, abs(dot(n, dir)));
 					if (bounce > 0u && !mirror_roulette(f, stbn_sample(hit_pixel, 12u + bounce).x)) {
 						break; // The chain ends here: what it held is in plane_diffuse.
 					}
 					dir = mirror_reflect(plane, dir, stbn_sample(hit_pixel, 9u + bounce));
+					// A glossy plane spreads the chain by its lobe: the card at
+					// the next hit is read through that width as well, so one
+					// sampled continuation reads the lobe's average rather than
+					// one bright texel of it (the floor's mirror rays off the
+					// glossy ceiling slab read the flashlight's spot on the
+					// ceiling card one texel at a time: 18 hot pixels per
+					// thousand at stop + 32 on the floor flash, 2.7 without
+					// the path).
+					float plane_alpha = params.mirrors[plane].params.y * params.mirrors[plane].params.y;
+					chain_cone_tan = max(chain_cone_tan, 2.0 * plane_alpha);
 					rayQueryEXT rq2;
 					rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, from + n * params.ray_bias, params.ray_bias, dir, t_max);
 					while (rayQueryProceedEXT(rq2)) {
@@ -1418,12 +1527,23 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 					if (plane < MAX_MIRROR_PLANES) {
 						continue;
 					}
-					card_lookup_footprint = t_total * abs(params.card_cone_tan);
+					card_lookup_footprint = t_total * chain_cone_tan;
 					vec3 card_radiance;
 					uint card_set;
 					if (surface_cache_lookup(inst, from, dir, card_radiance, card_set)) {
 						card_requests.frame[card_set] = params.surface_cache_frame;
-						bounced = f * max(card_radiance, vec3(0.0));
+						// The chain's end reads the screen where it is on it,
+						// as any card hit does (the fold included): the
+						// floor's mirror ray off the ceiling lands on the
+						// flashlit sofa, whose card's dynamic term settles
+						// thirty frames after the light stops while the
+						// screen's direct light is exact every frame.
+						card_radiance = max(card_radiance, vec3(0.0));
+						if ((uint(params.mirror_params.z) & 16u) == 0u) {
+							cache_tier = CACHE_TIER_CARD;
+							card_radiance = max(screen_radiance_boost(view_basis * (from - params.world_from_view[3].xyz), card_radiance), vec3(0.0));
+						}
+						bounced = f * card_radiance;
 						card_hit = true;
 					} else {
 						bounced = f * max(sdfgi_cache_radiance(from - params.world_from_view[3].xyz, dir), vec3(0.0));

@@ -684,6 +684,7 @@ public:
 		uint32_t rays_per_pixel = 1;
 		bool half_resolution = true;
 		bool screen_radiance = true;
+		bool screen_radiance_diffuse = false; // The screen texture is the colour pass's diffuse target (no camera specular): the gather adds the surface's own specular energy from the G-buffer (FLAG_SRAD_FOLD).
 		float screen_radiance_border_fade = 0.08f; // uv width of the hand-back to the cache; 0 is a hard switch.
 		float screen_radiance_clamp = 4.0f; // Absolute firefly ceiling on the screen term, in exposure-normalized units.
 		float probe_floor = 0.5f; // Neutral albedo turning probe irradiance into outgoing radiance.

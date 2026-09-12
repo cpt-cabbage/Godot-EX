@@ -2665,8 +2665,21 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// the converged room lost 16%: the camera's view of the mirror floor's
 	// beam is the only account the gather has of the light the floor throws
 	// on the ceiling (the cards hold no specular), wrong in direction but
-	// not in kind. Off by default, GODOT_GI_SRAD_DIFFUSE=1 to try.
-	static const bool srad_diffuse = OS::get_singleton()->get_environment("GODOT_GI_SRAD_DIFFUSE") == "1";
+	// not in kind. That was before the planar mirrors carried the floor's
+	// and the ceiling's images (section 44). Since then the calibration
+	// counters read the screen 1.45-1.57x the card at the same points in
+	// the game and 1.05x in the radiosity box, and the diffuse target alone
+	// 0.98-1.03x: the cards' diffuse level is right, and the whole excess
+	// was the specular toward the camera, Fresnel-boosted at the grazing
+	// angles the camera sees the ceiling at, handed to rays arriving from
+	// every other direction. Read as diffuse the light-change cases improve
+	// (floor flash err -25% moving, -13% at stop + 32, hot pixels halved;
+	// flash -16% at stop + 8), the flick is level either way, and the room
+	// at rest reads 6% darker, the level both boxes put within 3-4% of
+	// the truth (section 50). The surfaces' own specular energy comes back
+	// from the G-buffer's F0 in the gather (GODOT_GI_SRAD_FOLD).
+	// GODOT_GI_SRAD_DIFFUSE=0 reads the full colour as before.
+	static const bool srad_diffuse = OS::get_singleton()->get_environment("GODOT_GI_SRAD_DIFFUSE") != "0";
 	if (srad_diffuse && use_rt_gi && use_rt_gi_screen_radiance && rb_data.is_valid() && !is_reflection_probe && !p_render_data->transparent_bg) {
 		rt_diffuse_screen_radiance = true;
 	}
@@ -3036,6 +3049,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.rays_per_pixel = rt_gi_rays;
 				gi_quality.half_resolution = use_rt_gi_half_res;
 				gi_quality.screen_radiance = use_rt_gi_screen_radiance;
+				gi_quality.screen_radiance_diffuse = rt_diffuse_screen_radiance;
 				gi_quality.screen_radiance_border_fade = rt_gi_screen_radiance_border_fade;
 				gi_quality.screen_radiance_clamp = rt_gi_screen_radiance_clamp;
 				gi_quality.probe_floor = rt_gi_probe_floor;

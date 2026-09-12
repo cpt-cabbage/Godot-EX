@@ -1343,7 +1343,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(176); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own.
+		c.buffer = rd->storage_buffer_create(304); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own, the control variate's and the fold's.
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -1366,6 +1366,18 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			params.mirror_params[1] = mirror[11];
 		}
 		params.mirror_params[2] = mirror.size() >= 13 ? mirror[12] : 0.0f;
+		// GODOT_GI_MIRROR_SPEC=0 (bit 8): the reflection rays' hits on a mirror
+		// read the screen as before instead of taking the mirror path.
+		static const bool mirror_spec_off = OS::get_singleton()->get_environment("GODOT_GI_MIRROR_SPEC") == "0";
+		if (mirror_spec_off) {
+			params.mirror_params[2] = float(uint32_t(params.mirror_params[2]) | 8u);
+		}
+		// GODOT_GI_MIRROR_SCREEN=0 (bit 16): the chain's crossings and its end
+		// read their cards alone, never the screen.
+		static const bool mirror_screen_off = OS::get_singleton()->get_environment("GODOT_GI_MIRROR_SCREEN") == "0";
+		if (mirror_screen_off) {
+			params.mirror_params[2] = float(uint32_t(params.mirror_params[2]) | 16u);
+		}
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	Projection world_from_view_proj = Projection(p_world_from_view);
@@ -1461,6 +1473,15 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.probe_scale = calibrate ? calibration.state->scale[1] : 1.0f;
 	if (p_quality.screen_radiance && p_screen_radiance.is_valid()) {
 		params.flags |= 1; // FLAG_SCREEN_RADIANCE
+	}
+	// The screen texture is the diffuse target (render_forward_clustered.cpp,
+	// GODOT_GI_SRAD_DIFFUSE): a card hit's screen read adds the surface's
+	// own specular energy back, the card's radiance times the G-buffer's
+	// hemispherical specular albedo over its total (FLAG_SRAD_FOLD).
+	// GODOT_GI_SRAD_FOLD=0 leaves the diffuse target as read.
+	static const bool srad_fold = OS::get_singleton()->get_environment("GODOT_GI_SRAD_FOLD") != "0";
+	if (srad_fold && p_quality.screen_radiance_diffuse && p_screen_radiance.is_valid() && p_gbuf_albedo.is_valid() && p_gbuf_f0.is_valid()) {
+		params.flags |= 2097152; // FLAG_SRAD_FOLD
 	}
 	if (calibrate) {
 		params.flags |= 256; // FLAG_CALIBRATE_CACHE
@@ -1622,6 +1643,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
 	// The prepass G-buffer's F0 (the normal texture stands in for the binding when absent; never read then).
 	RD::Uniform u_gbuf_f0(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 40, Vector<RID>({ sampler, p_gbuf_f0.is_valid() ? p_gbuf_f0 : p_normal_roughness }));
+	RD::Uniform u_gbuf_albedo(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 41, Vector<RID>({ sampler, p_gbuf_albedo.is_valid() ? p_gbuf_albedo : p_normal_roughness }));
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ rb_state->rt_gi_params_ubos[p_view] }));
 	RD::Uniform u_stbn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, stbn_texture }));
 	RD::Uniform u_sdf(RD::UNIFORM_TYPE_TEXTURE, 5, sdf_ids);
@@ -1720,7 +1742,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
 	if (calibrate || tier_stats) {
-		rd->buffer_clear(calibration.buffer, 0, 176);
+		rd->buffer_clear(calibration.buffer, 0, 304);
 	}
 	// The lighting-change votes (GODOT_GI_VOTES=1, plan section 45): a
 	// buffer of two counters per 8x8 tile, cleared every frame.
@@ -1744,7 +1766,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen, u_votes, u_gbuf_f0), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen, u_votes, u_gbuf_f0, u_gbuf_albedo), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1761,7 +1783,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_TIER_PRINT=<frames> sets the interval (60 when unset or 0).
 	static const int64_t tier_interval = MAX(OS::get_singleton()->get_environment("GODOT_GI_TIER_PRINT").to_int(), int64_t(0));
 	if (tier_stats && (rb_state->frame_index % (tier_interval > 0 ? uint32_t(tier_interval) : 60u)) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 152);
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 280);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -2494,6 +2516,22 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 		if (v[3] > 0) {
 			double k = 1.0 / 1024.0 / double(v[3]);
 			print_line(vformat("RT_GI_CV pixels %d  field %.4f  control %.4f  used %.4f  (control / field %.3f, used / field %.3f)", v[3], v[0] * k, v[1] * k, v[2] * k, v[0] > 0 ? double(v[1]) / double(v[0]) : 0.0, v[0] > 0 ? double(v[2]) / double(v[0]) : 0.0));
+		}
+	}
+	if (p_data.size() >= 280) {
+		// The screen reads' fold (FLAG_SRAD_FOLD) by the hit pixel's metallic,
+		// with the diffuse target's luminance over the card's at those reads.
+		const uint32_t *f = t + 36;
+		uint32_t total = f[0] + f[1] + f[2] + f[3];
+		if (total > 0) {
+			String fold_line = vformat("RT_GI_FOLD screen reads %d:", total);
+			const char *bins[4] = { "metallic 0", "1/3", "2/3", "1" };
+			for (int i = 0; i < 4; i++) {
+				uint32_t far_screen = f[8 + i] - f[20 + i];
+				uint32_t far_card = f[12 + i] - f[24 + i];
+				fold_line += vformat("  %s %.1f%% (fold %.3f, diffuse / card %.3f; near a mirror %.1f%% at %.3f (%.1f%% of them reflection rays), the rest %.3f)", bins[i], 100.0 * f[i] / total, f[i] > 0 ? double(f[4 + i]) / 1024.0 / double(f[i]) : 0.0, f[12 + i] > 0 ? double(f[8 + i]) / double(f[12 + i]) : 0.0, f[i] > 0 ? 100.0 * f[16 + i] / f[i] : 0.0, f[24 + i] > 0 ? double(f[20 + i]) / double(f[24 + i]) : 0.0, f[16 + i] > 0 ? 100.0 * f[28 + i] / f[16 + i] : 0.0, far_card > 0 ? double(far_screen) / double(far_card) : 0.0);
+			}
+			print_line(fold_line);
 		}
 	}
 }
