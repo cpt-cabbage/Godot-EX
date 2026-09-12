@@ -556,7 +556,7 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		ubo.borrow_band = borrow_band;
 		// The gather's rays for a young pixel (see process_rt_gi): the
 		// temporal pass weighs such a frame's sample by as many.
-		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
+		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
 		ubo.young_rays = float(CLAMP(young_rays, 1, 4));
 		// The split history (RAYTRACING_PLAN.md section 36): GODOT_GI_SPLIT=
 		// 1 reads the pixel's own halves, 2 the 3x3 neighbourhood's (0
@@ -1390,8 +1390,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// Measured (section 33): four rays cut a flick's stop error 0.0136 ->
 	// 0.0126 on the ceiling and nothing off its blur (the other temporal
 	// passes' restarts), for 0.4 ms at rest and a fourfold gather while a
-	// screen is young; off by default.
-	static const int64_t young_rays_setting = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
+	// screen is young. A light change restarts the same pixels, and there
+	// the sample count is the whole story: the flashlight's stop on the
+	// mirror floor (game_floor_flash) read 0.062 at stop + 8 with one ray,
+	// 0.043 with two (0.048 with four), the same as two rays everywhere at
+	// a fraction of the cost (the gather 3.3 -> 4.3 ms averaged over a fast
+	// yaw, double only while the screen is young). Two by default.
+	static const int64_t young_rays_setting = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
 	const uint32_t base_rays = CLAMP(p_quality.rays_per_pixel, 1u, 4u);
 	const uint32_t young_rays = uint32_t(CLAMP(young_rays_setting, 1, 4));
 	params.ray_count = MAX(base_rays, young_rays);
