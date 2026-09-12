@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  center_container.cpp                                                  */
+/*  Utils.kt                                                              */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,77 +28,10 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "center_container.h"
+package org.godotengine.editor.utils
 
-#include "core/object/class_db.h"
+import android.content.Context
 
-Size2 CenterContainer::get_minimum_size() const {
-	if (use_top_left) {
-		return Size2();
-	}
-	return Container::_get_minimum_size();
-}
-
-Size2 CenterContainer::get_desired_size() const {
-	if (use_top_left) {
-		return Size2();
-	}
-	Size2 ds;
-	for (int i = 0; i < get_child_count(); i++) {
-		Control *c = as_sortable_control(get_child(i), SortableVisibilityMode::VISIBLE);
-		if (!c) {
-			continue;
-		}
-		Size2 minsize = c->get_bound_desired_size();
-		ds = ds.max(minsize);
-	}
-
-	return ds;
-}
-
-void CenterContainer::set_use_top_left(bool p_enable) {
-	if (use_top_left == p_enable) {
-		return;
-	}
-
-	use_top_left = p_enable;
-
-	update_minimum_size();
-	queue_sort();
-}
-
-bool CenterContainer::is_using_top_left() const {
-	return use_top_left;
-}
-
-Vector<int> CenterContainer::get_allowed_size_flags_horizontal() const {
-	return Vector<int>{ SIZE_MAXIMIZE };
-}
-
-Vector<int> CenterContainer::get_allowed_size_flags_vertical() const {
-	return Vector<int>{ SIZE_MAXIMIZE };
-}
-
-void CenterContainer::_notification(int p_what) {
-	switch (p_what) {
-		case NOTIFICATION_SORT_CHILDREN: {
-			Size2 size = get_size();
-			for (int i = 0; i < get_child_count(); i++) {
-				Control *c = as_sortable_control(get_child(i));
-				if (!c) {
-					continue;
-				}
-				Size2 minsize = c->get_bound_minimum_size();
-				Point2 ofs = use_top_left ? (-minsize * 0.5).floor() : ((size - minsize) / 2.0).floor();
-				fit_child_in_rect(c, Rect2(ofs, minsize));
-			}
-		} break;
-	}
-}
-
-void CenterContainer::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("set_use_top_left", "enable"), &CenterContainer::set_use_top_left);
-	ClassDB::bind_method(D_METHOD("is_using_top_left"), &CenterContainer::is_using_top_left);
-
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "use_top_left"), "set_use_top_left", "is_using_top_left");
+object Utils {
+	fun getDefaultSharedPreferences(context: Context?) =  context?.getSharedPreferences("${context.packageName}_preferences", Context.MODE_PRIVATE)
 }
