@@ -3272,6 +3272,10 @@
 		<member name="rendering/lights_and_shadows/use_physical_light_units" type="bool" setter="" getter="" default="false">
 			Enables the use of physically based units for light sources. Physically based units tend to be much larger than the arbitrary units used by Godot, but they can be used to match lighting within Godot to real-world lighting. Due to the large dynamic range of lighting conditions present in nature, Godot bakes exposure into the various lighting quantities before rendering. Most light sources bake exposure automatically at run time based on the active [CameraAttributes] resource, but [LightmapGI] and [VoxelGI] require a [CameraAttributes] resource to be set at bake time to reduce the dynamic range. At run time, Godot will automatically reconcile the baked exposure with the active exposure to ensure lighting remains consistent.
 		</member>
+		<member name="rendering/limits/cluster_builder/compute_cull" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the light/decal/probe cluster is built by a compute pass that tests each element's bounds against the froxels' six planes, instead of by rasterising the elements' proxy geometry into the cluster. The image is identical; the compute cull scales to hundreds of lights where the rasterised bake did not (measured 2.5/12/29 ms down to 0.14/0.61/1.5 ms at 40/200/500 lights on an Apple M4). Off restores the rasterised bake.
+			[b]Note:[/b] This setting is only effective when using the Forward+ rendering method.
+		</member>
 		<member name="rendering/limits/cluster_builder/max_clustered_elements" type="float" setter="" getter="" default="512">
 			The maximum number of clustered elements ([OmniLight3D] + [SpotLight3D] + [Decal] + [ReflectionProbe]) that can be rendered at once in the camera view. If there are more clustered elements present in the camera view, some of them will not be rendered (leading to pop-in during camera movement). Enabling distance fade on lights and decals ([member Light3D.distance_fade_enabled], [member Decal.distance_fade_enabled]) can help avoid reaching this limit.
 			Decreasing this value may improve GPU performance on certain setups, even if the maximum number of clustered elements is never reached in the project.
@@ -3330,109 +3334,206 @@
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
 		<member name="rendering/ray_tracing/denoiser/enabled" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the noisy output of [member rendering/ray_tracing/stochastic_direct_lighting/enabled] and [member rendering/ray_tracing/raytraced_gi/enabled] is denoised: accumulated over time along motion vectors, then filtered spatially where it is still noisy.
-			Turning this off shows the raw traced samples. That is a debugging view rather than a quality setting — at any affordable ray count the result is far too noisy to ship — but it is the only way to see what the tracing itself is producing, and it makes the effect of a ray count change obvious in a way the denoised image hides.
-			[b]Note:[/b] Only used by the Forward+ renderer, on a device whose driver supports ray queries.
+			Denoises the traced direct lighting and GI over time and space. Off shows the raw noisy samples: a debugging view, not a quality setting.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/spatial_iterations" type="int" setter="" getter="" default="2">
-			How many à-trous iterations the spatial filter runs, each at twice the previous iteration's stride. With [member rendering/ray_tracing/denoiser/spatial_stride] at its default, 1 iteration reaches ±2 pixels, 2 reaches ±6 and 3 reaches ±14.
-			Reach is what removes low-frequency blotching, which is the artefact left over once temporal accumulation has handled the high-frequency noise. More iterations cost roughly a full-screen pass each and blur across detail the edge-stopping functions fail to catch.
+			Spatial filter passes. Each costs about a full-screen pass and removes lower-frequency blotching.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/spatial_stride" type="int" setter="" getter="" default="2">
-			The base pixel stride of the spatial filter's first à-trous iteration; every further iteration doubles it. Raising this widens the filter's reach without costing more taps, at the price of the sparser sampling showing up as structure in flat regions.
+			Base pixel stride of the spatial filter. Wider reach at no cost, at the risk of visible filter structure.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/temporal_frames" type="int" setter="" getter="" default="16">
-			The number of frames the temporal accumulator averages over, as a cap: a per-pixel convergence counter carries the first frames at full weight, so a high value does not mean a slow start, only a longer memory once converged.
-			Longer memory means less noise and more lag behind moving lights and moving objects. History that fails reprojection — newly revealed pixels, or a depth mismatch — is discarded regardless.
+			How many frames the direct lighting is averaged over. Higher is smoother and lags more behind moving lights and objects. Free.
 		</member>
 		<member name="rendering/ray_tracing/denoiser/variance_threshold" type="float" setter="" getter="" default="0.02">
-			Relative variance below which a pixel skips the spatial filter entirely. A converged pixel with a stable estimate has nothing left to gain from being blurred with its neighbours, and skipping it is what keeps sharp contact shadows and small bright highlights from being softened by a filter aimed at noise elsewhere in the frame.
-			Raising this skips more pixels, which is faster and sharper but leaves residual noise where the estimate was not as settled as the variance suggested. [code]0.0[/code] always filters.
+			Pixels this settled skip the spatial filter, which keeps contact shadows and highlights sharp. Raising it is faster and sharper but leaves more noise.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/directional" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the gather records which direction its light arrived from, not only how much. That direction is what lets flat irradiance be re-based onto normal-mapped detail (see [member rendering/ray_tracing/raytraced_gi/directionality]), lets indirect specular be occluded (see [member rendering/ray_tracing/raytraced_gi/specular_occlusion]), and lets a reflection probe captured under different lighting be re-fitted (see [member rendering/ray_tracing/raytraced_gi/reflection_probe_refit]).
-			Turning it off saves the extra buffer and the bandwidth to write it, and disables all three of those.
+		<member name="rendering/ray_tracing/raytraced_gi/cache_calibration" type="bool" setter="" getter="" default="true">
+			Corrects the brightness of the SDFGI probe fallback against what is visible on screen. Only affects hits that fall through to the probes. Free.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/directionality" type="float" setter="" getter="" default="1.0">
-			How far the directional term re-bases indirect light onto the fragment's own normal. Indirect lighting is gathered per pixel at geometric resolution, so without this a normal-mapped surface receives the same bounce light everywhere and its detail only shows in direct light. [code]0.0[/code] leaves the irradiance flat; values above [code]1.0[/code] exaggerate the effect past what the recorded direction supports.
-			Requires [member rendering/ray_tracing/raytraced_gi/directional].
+		<member name="rendering/ray_tracing/raytraced_gi/directional/directionality" type="float" setter="" getter="" default="1.0">
+			How strongly bounce light reacts to normal maps. [code]0.0[/code] is flat; above [code]1.0[/code] exaggerates.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/directional/enabled" type="bool" setter="" getter="" default="true">
+			Records the direction bounce light arrives from. Enables the three settings below at the cost of one extra buffer.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/directional/reflection_probe_refit" type="bool" setter="" getter="" default="true">
+			Rescales reflection probes to the lighting measured now, so a probe captured under old lighting stops disagreeing with its surroundings. Free.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/directional/specular_occlusion" type="bool" setter="" getter="" default="true">
+			Darkens reflections where the rays found no light, so corners and shelves stop glowing. Free.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/enabled" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], indirect lighting is gathered by tracing hardware rays from each pixel and shading what they hit, in place of the screen-space resolve that [SDFGI] and [VoxelGI] otherwise perform. It also replaces SSIL: the same rays that gather bounce light measure how far they got, which is a truer occlusion term than a depth-buffer estimate.
-			The hits are shaded from whichever radiance cache is available — SDFGI cascades first, [VoxelGI] volumes next — and from sky visibility alone when neither is active, which is a usable ambient-occlusion-and-sky pass in a scene with no GI set up at all.
-			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
+			Ray traced global illumination: bounce light and ambient occlusion gathered per pixel with hardware rays. Replaces the SDFGI/VoxelGI screen pass, SSIL, SSAO and SSR. Hits are shaded from the screen, then the surface cache ([member rendering/ray_tracing/surface_cache/enabled]), then SDFGI probes or the sky. Cost dials are under [code]quality[/code].
+			[b]Note:[/b] Forward+ only, on a device with ray query support.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/half_resolution" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the gather runs at half resolution and is reconstructed to full resolution afterwards, which is roughly four times cheaper. Indirect lighting is low-frequency almost everywhere, so this is on by default and the cost of turning it off is rarely repaid.
+		<member name="rendering/ray_tracing/raytraced_gi/hit_shading/debug" type="int" setter="" getter="" default="0">
+			Debug views for hit shading; bits 1/2/4 show albedo/normal/UV, 8/16/32 drop shadow rays/indirect/direct. Leave at [code]0[/code].
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/hit_shading/lod_bias" type="float" setter="" getter="" default="0.0">
+			Texture mip bias for materials run at ray hits. Positive is blurrier and cheaper.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/hit_shading/mirror" type="bool" setter="" getter="" default="true">
+			Mirror reflections always run the material at the hit, since a cache texel cannot carry mirror detail.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/hit_shading/mode" type="int" setter="" getter="" default="1">
+			What happens to hits the surface cache cannot shade (multimesh interiors, uncaptured instances, grazing edges). [b]Off[/b] returns the coarse cache. [b]Card Misses[/b] runs those hits' materials. [b]All Hits[/b] runs every hit's material: the reference-quality path, and the expensive one.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/light_cascade_radiance" type="bool" setter="" getter="" default="false">
+			Shades probe-fallback hits from the SDFGI light cascades instead of the probes. Measured a third too bright; kept off.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/occlusion_range" type="float" setter="" getter="" default="3.0">
-			The world-space distance, in metres, at which the near-field visibility term saturates: a ray that travels this far without hitting anything counts as fully unoccluded. This is the ambient occlusion radius, and it should match the scale of the geometry whose contact you want to see — small for interior clutter, larger for architecture.
+			Ambient occlusion radius in metres. Match it to the scale of the geometry: small for clutter, larger for architecture.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/rays_per_pixel" type="int" setter="" getter="" default="1">
-			How many indirect rays each pixel traces per frame. One ray per pixel plus temporal accumulation is the intended operating point; more rays converge faster after a cut or a lighting change but cost close to linearly, and do nothing the denoiser's history was not already going to do.
+		<member name="rendering/ray_tracing/raytraced_gi/planar_mirrors" type="bool" setter="" getter="" default="true">
+			Flat reflective surfaces (a glossy floor, a mirror) cast the lights' reflections back into the room. Cost scales with mirrors times lights; free with none in the scene.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/reflection_probe_refit" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], a [ReflectionProbe]'s captured radiance is re-fitted to the irradiance the gather measures this frame. A probe is captured once under the lighting of that moment; when the lighting since moved — a day cycle, a light switched off — its reflections keep the old lighting and disagree with everything around them. Re-fitting rescales what the probe returns so it agrees with the light actually arriving.
-			Requires [member rendering/ray_tracing/raytraced_gi/directional].
+		<member name="rendering/ray_tracing/raytraced_gi/probe_floor" type="float" setter="" getter="" default="0.5">
+			Albedo assumed when a hit is shaded from the SDFGI probes. Only affects hits that fall through to the probes. [code]0.0[/code] disables the floor.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], a ray that hits something visible on screen is shaded from the previous frame's rendered colour rather than from the radiance cache. On-screen geometry is shaded at full quality, so this is both sharper and more accurate than the cache wherever it applies, and it is the difference between coloured bounce light off a nearby wall and the cache's blurry approximation of it.
-			Rays that hit off-screen geometry fall back to the cache regardless.
+		<member name="rendering/ray_tracing/raytraced_gi/quality/half_resolution" type="bool" setter="" getter="" default="true">
+			Gathers at half resolution, roughly four times cheaper; full resolution doubled the frame time at 1440p. Leave on.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel" type="int" setter="" getter="" default="1">
+			Indirect rays per pixel per frame. One plus temporal accumulation is the intended setting; more converge faster after a cut at a near-linear cost.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/spatial_iterations" type="int" setter="" getter="" default="2">
+			Spatial filter passes on the GI. Each costs about a full-screen pass and removes lower-frequency blotching.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/spatial_stride" type="int" setter="" getter="" default="2">
+			Base pixel stride of the GI's spatial filter. Wider reach at no cost, at the risk of visible filter structure.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/temporal_frames" type="int" setter="" getter="" default="32">
+			How many frames the GI is averaged over. Higher is smoother and lags more behind lighting changes. Free.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/variance_threshold" type="float" setter="" getter="" default="0.02">
+			Pixels this settled skip the spatial filter. Raising it is faster and sharper but leaves more noise.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/replace_ssao" type="bool" setter="" getter="" default="true">
+			Skips SSAO while the traced GI runs, as its rays already occlude corners. Saves the SSAO pass and avoids darkening corners twice.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance/border_fade" type="float" setter="" getter="" default="0.08">
+			Width of the blend from screen colour to the cache at the screen edge, as a fraction of the screen. [code]0.0[/code] is a hard cut.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance/clamp" type="float" setter="" getter="" default="4.0">
+			Brightest value a screen-shaded hit may return, in exposure units ([code]1.0[/code] is a well-exposed white). Prevents fireflies; too low greys out bright reflections in bounce light.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/screen_radiance/enabled" type="bool" setter="" getter="" default="true">
+			Rays that hit something visible on screen take its rendered colour, which is sharper and truer than the cache. Free.
+		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/screen_traces" type="bool" setter="" getter="" default="true">
+			Adds small contact occlusion from the depth buffer that rays miss. About 1.5 ms.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/specular" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the gather also produces an indirect specular term, so rough reflections come from traced rays instead of only from probes and screen-space reflections. Turning it off leaves indirect diffuse traced and indirect specular to the existing sources.
-		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/specular_occlusion" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], indirect specular is occluded using how far the gather's rays actually got. Reflections in a corner or under a shelf otherwise stay at full strength where no light can reach them, which reads as a glow in exactly the places that should be darkest.
-			Requires [member rendering/ray_tracing/raytraced_gi/directional].
-		</member>
-		<member name="rendering/ray_tracing/raytraced_gi/temporal_frames" type="int" setter="" getter="" default="32">
-			The accumulation cap for indirect lighting, in frames. Higher than the direct lighting equivalent by default because indirect light changes more slowly than a shadow edge does, so it can afford a longer memory. See [member rendering/ray_tracing/denoiser/temporal_frames].
+			Also traces rough reflections. With [member rendering/ray_tracing/surface_cache/mirror_reflections] all roughness is traced and screen-space reflections are skipped. Costs the reflection resolve.
 		</member>
 		<member name="rendering/ray_tracing/raytraced_shadows/enabled" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], the [DirectionalLight3D] sun's shadow is ray traced against the scene instead of sampled from a shadow map. There is no cascade split to tune, no shadow bias to fight, and no resolution to run out of at a distance; the penumbra follows [member Light3D.light_angular_distance] exactly rather than approximating it with a filter width.
-			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
+			Ray traces the sun's shadow instead of using shadow maps. No cascades, bias or resolution to tune; the penumbra follows [member Light3D.light_angular_distance] exactly.
+			[b]Note:[/b] Forward+ only, on a device with ray query support.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_shadows/rays_per_pixel" type="int" setter="" getter="" default="4">
-			How many shadow rays each pixel traces per frame towards the sun's angular extent. This is what a soft shadow's penumbra is sampled with, so a wide sun angle wants more of them; a hard sun is well served by the minimum plus temporal accumulation.
+		<member name="rendering/ray_tracing/raytraced_shadows/quality/rays_per_pixel" type="int" setter="" getter="" default="4">
+			Shadow rays per pixel. More rays give a cleaner soft penumbra at a linear cost; a hard sun is fine at 1.
 		</member>
-		<member name="rendering/ray_tracing/raytraced_shadows/temporal_frames" type="int" setter="" getter="" default="16">
-			The accumulation cap for the sun and area-light shadow mask, in frames. See [member rendering/ray_tracing/denoiser/temporal_frames]; the same per-pixel convergence counter applies, so this can be long without a visibly slow start.
+		<member name="rendering/ray_tracing/raytraced_shadows/quality/temporal_frames" type="int" setter="" getter="" default="16">
+			How many frames the shadow is averaged over. Higher is smoother but lags more behind moving objects and lights. Free.
 		</member>
 		<member name="rendering/ray_tracing/sdfgi/ray_query" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], [SDFGI] traces its probe rays against the scene's ray tracing acceleration structure instead of marching its own signed distance field. The distance field is a voxelisation, so it cannot represent anything thinner than a voxel; tracing the real geometry stops light leaking through thin walls and floors, which is the artefact SDFGI is otherwise most often blamed for.
-			Only takes effect when an acceleration structure exists, which means when SDFGI is active and some ray tracing feature has caused one to be built.
-			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries.
+			SDFGI traces its probe rays against the real geometry instead of its distance field, which stops light leaking through thin walls. Only applies when SDFGI is active and ray tracing is on.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/enabled" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], direct lighting from local lights ([OmniLight3D], [SpotLight3D] and area lights) is estimated by sampling a few lights per pixel and tracing their shadows, instead of shading every light analytically against its own shadow map.
-			The cost of this path is set by the ray budget rather than by the number of lights, which is what makes hundreds of shadow-casting lights affordable: a shadow map costs a render pass per light per frame, while a traced sample costs the same whether the scene has ten lights or a thousand. The estimate is noisy by construction and depends on the denoiser to be usable.
-			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
-		</member>
-		<member name="rendering/ray_tracing/stochastic_direct_lighting/half_resolution" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the direct lighting's visibility is traced and denoised at half resolution and reconstructed to full resolution afterwards; the unshadowed lighting itself is still evaluated per pixel, so material detail such as normal maps is kept. Roughly a third of the pass's cost at 0.67 scale, at some softening of shadow edges.
+			Ray traces the shadows of all local lights (omni, spot, area) instead of rendering a shadow map per light. Cost depends on the ray budget, not on the light count, so hundreds of shadow-casting lights become affordable. Cost dials are under [code]quality[/code].
+			[b]Note:[/b] Forward+ only, on a device with ray query support.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/light_guiding" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the choice of which lights to sample is guided by which lights were actually visible from the same place last frame. Sampling lights uniformly wastes most of the budget on lights that turn out to be occluded or too distant to matter; guiding spends it on the ones that contributed, which is worth several times the ray count in noise.
-			The guiding deliberately keeps some budget for lights it has not seen recently, so a light that becomes visible is still found.
+			Spends the ray budget on the lights that actually reached each pixel last frame. Free and worth several rays' worth of noise; leave on.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution" type="bool" setter="" getter="" default="true">
+			Traces and denoises at half resolution. The biggest performance lever of this pass (about a third of the cost) at some softening of shadow edges. Material detail is kept.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel" type="int" setter="" getter="" default="4">
+			Lights sampled and shadow-traced per pixel per frame. The main quality-versus-cost dial of this pass.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/skip_local_shadow_maps" type="bool" setter="" getter="" default="true">
+			Stops rendering shadow maps for the lights this pass traces. The largest saving of the whole path; leave on unless you need shadow maps for something else.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/ray_bias" type="float" setter="" getter="" default="0.08">
-			How far along the ray, in metres, a shadow ray starts, so that a surface does not shadow itself through floating-point error in its own position. This is the ray traced equivalent of shadow map bias, and it has the same failure mode: too small and surfaces acquire a dark grain, too large and contact shadows detach from whatever casts them.
-		</member>
-		<member name="rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel" type="int" setter="" getter="" default="4">
-			How many lights each pixel samples and shadow-traces per frame. This is the whole budget of the path, and the setting to reach for first when trading quality against cost.
+			Distance the shadow rays start from the surface, in metres. Raise if surfaces show dark grain, lower if contact shadows detach from their casters.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the first part of each shadow ray is marched through the depth buffer before it is handed to the acceleration structure. Near-field occlusion resolved this way is both cheaper than a trace and finer than the acceleration structure can represent, so it recovers small contact shadows the traced result misses.
+			Adds small contact shadows from the depth buffer that rays miss. About 0.7 ms.
 		</member>
-		<member name="rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], local lights whose shadows this path traces do not render shadow maps at all. Not rendering them is the single largest cost this path avoids — it is where the win over shadow mapping actually comes from — so there is rarely a reason to turn it off.
-			Turn it off to keep those shadow maps for the transparent pass, which still shades local lights analytically and so has no traced shadow to use. Transparent surfaces otherwise take local light unshadowed.
-			Requires [member rendering/ray_tracing/stochastic_direct_lighting/enabled].
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/core" type="bool" setter="" getter="" default="false">
+			Alpha-scissor and alpha-hash surfaces (most foliage) also use the volume instead of per-pixel lighting. Cheaper, but the softening shows most on exactly those surfaces. Off by default.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/depth" type="int" setter="" getter="" default="64">
+			Volume resolution along the view direction, in slices. Higher is sharper and costlier.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/enabled" type="bool" setter="" getter="" default="true">
+			Lights transparent surfaces from a shadowed lighting volume computed once per frame instead of per pixel. Cheaper on stacked glass and foliage, at a softer shadow resolution.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect" type="bool" setter="" getter="" default="true">
+			The volume also carries bounce light from the surface cache, so transparent surfaces receive GI without SDFGI. Requires [member rendering/ray_tracing/raytraced_gi/enabled] and [member rendering/ray_tracing/surface_cache/enabled].
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect_rays" type="int" setter="" getter="" default="2">
+			Bounce rays per volume cell per frame. More settle faster after lighting changes; cost scales with the cell count.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/length" type="float" setter="" getter="" default="64.0">
+			How far from the camera the volume reaches, in metres. Transparent surfaces past it fall back to per-pixel lighting.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/size" type="int" setter="" getter="" default="64">
+			Volume resolution across the screen, in cells. Higher gives sharper shadows on transparent surfaces at a higher cost.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/spread" type="float" setter="" getter="" default="2.0">
+			How directional the volume's lighting is. Lower is flatter, higher sharpens the lit and shadowed sides of a leaf.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/temporal_frames" type="int" setter="" getter="" default="8">
+			How many frames the volume is averaged over. Higher is smoother, lower follows moving lights faster. Free.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/enabled" type="bool" setter="" getter="" default="true">
+			Transparent surfaces trace one hard shadow ray per light. Otherwise they take local light unshadowed once shadow maps are skipped. Costs per transparent pixel, noticeable on dense foliage.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/max_rays" type="int" setter="" getter="" default="4">
+			Most lights a transparent pixel traces a shadow ray to; lights past that are unshadowed. Caps the cost where many lights overlap.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], volumetric fog takes its local light shadows from traced rays as well, so that light shafts through fog agree with the shadows on the surfaces around them. Without it, fog is lit by whatever local shadow information the fog pass can reach on its own, which with [member rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps] on is none.
-			Requires [member rendering/ray_tracing/stochastic_direct_lighting/enabled] and [member Environment.volumetric_fog_enabled].
+			Volumetric fog takes its local-light shadows from the traced rays, so light shafts match the shadows around them. Costs traces in the fog pass.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/enabled" type="bool" setter="" getter="" default="true">
+			Keeps a lit, cached copy of every instance's surfaces ("cards") that rays read at their hits instead of running materials. Makes traced GI usable in interiors; without it hits fall back to SDFGI probes or the sky. Cost dials are under [code]quality[/code].
+			[b]Note:[/b] Forward+ only, on a device with ray query support.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/light_grid" type="bool" setter="" getter="" default="true">
+			Lets the cache handle more than 32 lights per instance. Small cost; leave on for scenes with many lights.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/light_radius" type="float" setter="" getter="" default="64.0">
+			Lights within this distance of the camera light the cache even when off screen, so a lamp behind you still bounces off the wall ahead. [code]0.0[/code] uses only visible lights.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/mirror_reflections" type="bool" setter="" getter="" default="true">
+			Sharp reflections are traced and shaded from the cache, so a polished floor reflects the room as it is lit now. With [member rendering/ray_tracing/raytraced_gi/specular], screen-space reflections are skipped.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/atlas_size" type="int" setter="" getter="" default="2048">
+			Size of the cache's texture atlas. When it fills, instances lose detail and then their cards, and a warning is printed. Larger costs memory and lighting time.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/captures_per_frame" type="int" setter="" getter="" default="8">
+			Instances captured into the cache per frame. Higher warms up and updates moved objects faster at a higher per-frame cost.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/density_distance" type="float" setter="" getter="" default="12.0">
+			Beyond this distance in metres, cached resolution falls off with distance. Keeps large scenes within budget. [code]0.0[/code] keeps full resolution everywhere.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame" type="int" setter="" getter="" default="64">
+			Instances re-lit per frame. Higher follows moving and switching lights faster; the cache lighting is one of the larger passes and scales with this.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/max_card_size" type="int" setter="" getter="" default="128">
+			Largest cached surface in texels. Larger keeps big walls sharp at the cost of atlas space.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/shared_bounce_ray" type="bool" setter="" getter="" default="true">
+			One bounce ray per 2x2 texels instead of one per texel. Roughly halves the cache lighting cost with no visible loss; leave on.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/temporal_frames" type="int" setter="" getter="" default="16">
+			How many updates the cache's bounce light is averaged over. Higher is smoother and slower to follow lighting changes. Free.
+		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/texels_per_meter" type="float" setter="" getter="" default="16.0">
+			Resolution of the cached surfaces near the camera. Sets how sharp bounce light and reflections of the cache are; doubling it costs four times the texels.
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

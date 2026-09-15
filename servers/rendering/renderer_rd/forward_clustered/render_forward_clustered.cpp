@@ -2223,26 +2223,26 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_settings_version = settings_version;
 
 	use_raytraced_shadows = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
-	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/rays_per_pixel"));
+	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/quality/rays_per_pixel"));
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
-	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/half_resolution");
+	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution");
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
-	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps");
-	use_stochastic_transparent_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows");
-	stochastic_transparent_max_rays = CLAMP(int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays")), 1, 16);
-	translucency_quality.enabled = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume");
-	translucency_quality.core = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_core");
-	translucency_quality.size = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_size"));
-	translucency_quality.depth = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_depth"));
-	translucency_quality.length = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_length");
-	translucency_quality.spread = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread");
-	translucency_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames"));
+	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/skip_local_shadow_maps");
+	use_stochastic_transparent_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/enabled");
+	stochastic_transparent_max_rays = CLAMP(int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/max_rays")), 1, 16);
+	translucency_quality.enabled = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/enabled");
+	translucency_quality.core = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/core");
+	translucency_quality.size = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/size"));
+	translucency_quality.depth = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/depth"));
+	translucency_quality.length = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/length");
+	translucency_quality.spread = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/spread");
+	translucency_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/temporal_frames"));
 	translucency_quality.ray_bias = stochastic_quality.ray_bias;
 	// The froxels' bounce rays against the surface cache: with them the volume
 	// carries the blended fragments' indirect light too, so they need no
 	// per-fragment SDFGI. Off without the cache, which is what the rays read.
-	translucency_quality.indirect = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect") && use_surface_cache && use_rt_gi;
-	translucency_quality.indirect_rays = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect_rays"));
+	translucency_quality.indirect = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect") && use_surface_cache && use_rt_gi;
+	translucency_quality.indirect_rays = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect_rays"));
 	if (scene_shader_ray_query) {
 		// Outside any draw list, which is where an acceleration structure
 		// may be built; the scene shader's TLAS binding reads it later.
@@ -2250,55 +2250,55 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	}
 	use_rt_sdfgi_probes = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/sdfgi/ray_query"));
 	if (raytracing != nullptr) {
-		raytracing->shadow_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/temporal_frames"));
+		raytracing->shadow_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/quality/temporal_frames"));
 	}
 	use_rt_gi = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
-	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/half_resolution");
-	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/rays_per_pixel"));
-	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance");
-	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_border_fade");
-	rt_gi_screen_radiance_clamp = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance_clamp");
+	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/half_resolution");
+	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel"));
+	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/enabled");
+	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/border_fade");
+	rt_gi_screen_radiance_clamp = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/clamp");
 	rt_gi_probe_floor = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/probe_floor");
 	use_rt_gi_cache_calibration = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/cache_calibration");
 	use_rt_gi_screen_traces = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_traces");
 	use_rt_gi_light_cascade_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/light_cascade_radiance");
 	use_rt_gi_specular = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular");
 	use_rt_gi_planar_mirrors = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/planar_mirrors");
-	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/temporal_frames"));
-	rt_gi_spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_stride"));
-	rt_gi_spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/spatial_iterations"));
-	rt_gi_variance_threshold = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/variance_threshold");
-	use_rt_gi_directional = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional");
-	use_rt_gi_specular_occlusion = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/specular_occlusion");
-	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/reflection_probe_refit");
+	rt_gi_temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/temporal_frames"));
+	rt_gi_spatial_stride = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/spatial_stride"));
+	rt_gi_spatial_iterations = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/spatial_iterations"));
+	rt_gi_variance_threshold = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/variance_threshold");
+	use_rt_gi_directional = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional/enabled");
+	use_rt_gi_specular_occlusion = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional/specular_occlusion");
+	use_rt_gi_probe_refit = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional/reflection_probe_refit");
 	rt_gi_ao_range = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/occlusion_range");
 	rt_gi_replaces_ssao = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/replace_ssao");
-	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directionality");
+	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional/directionality");
 	use_surface_cache = GLOBAL_GET("rendering/ray_tracing/surface_cache/enabled");
 	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
-	rt_gi_hit_shading = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading"));
-	rt_gi_hit_mirror = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_mirror");
-	rt_gi_hit_lod_bias = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_lod_bias");
-	rt_gi_hit_debug = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading_debug"));
-	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/atlas_size"));
+	rt_gi_hit_shading = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/mode"));
+	rt_gi_hit_mirror = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/mirror");
+	rt_gi_hit_lod_bias = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/lod_bias");
+	rt_gi_hit_debug = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/debug"));
+	surface_cache_settings.atlas_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/atlas_size"));
 	if (surface_cache_settings.atlas_size < 64) {
 		// A project file written while the enum hint had no values holds the option index (0..2).
 		surface_cache_settings.atlas_size = 1024u << MIN(surface_cache_settings.atlas_size, 2u);
 	}
-	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/texels_per_meter");
-	surface_cache_settings.density_distance = GLOBAL_GET("rendering/ray_tracing/surface_cache/density_distance");
-	surface_cache_settings.max_card_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/max_card_size"));
+	surface_cache_settings.texels_per_meter = GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/texels_per_meter");
+	surface_cache_settings.density_distance = GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/density_distance");
+	surface_cache_settings.max_card_size = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/max_card_size"));
 	if (surface_cache_settings.max_card_size < 16) {
 		surface_cache_settings.max_card_size = 64u << MIN(surface_cache_settings.max_card_size, 2u);
 	}
-	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/captures_per_frame"));
-	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/lighting_updates_per_frame"));
-	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/temporal_frames"));
-	surface_cache_settings.shared_bounce_ray = GLOBAL_GET("rendering/ray_tracing/surface_cache/shared_bounce_ray");
+	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/captures_per_frame"));
+	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame"));
+	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/temporal_frames"));
+	surface_cache_settings.shared_bounce_ray = GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/shared_bounce_ray");
 	surface_cache_light_radius = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_radius");
 	surface_cache_settings.light_grid = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_grid");
 
-	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel"));
+	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
 	stochastic_quality.light_guiding = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/light_guiding");
 	stochastic_quality.screen_traces = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces");

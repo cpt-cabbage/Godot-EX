@@ -586,7 +586,7 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 			}
 			if (!ok) {
 				if (!atlas_full_warned) {
-					WARN_PRINT("Surface cache atlas is full; some instances will shade ray hits from the coarse cache. Raise rendering/ray_tracing/surface_cache/atlas_size or lower texels_per_meter.");
+					WARN_PRINT("Surface cache atlas is full; some instances will shade ray hits from the coarse cache. Raise rendering/ray_tracing/surface_cache/quality/atlas_size or lower texels_per_meter.");
 					atlas_full_warned = true;
 				}
 			} else if (s->size < size && !atlas_degraded_warned) {

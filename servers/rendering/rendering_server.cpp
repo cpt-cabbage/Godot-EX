@@ -3708,19 +3708,30 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/lights_and_shadows/multi_bounce_occlusion/enabled"), false);
 
-	// Ray tracing (raytraced shadows + stochastic direct lighting). All of
-	// these are live: they are read every frame, so changing them in the
-	// project settings updates the running viewport without a restart.
-	// The three master toggles are basic settings: they are the way into the
+	// Ray tracing (raytraced shadows, stochastic direct lighting, ray-traced GI
+	// and its surface cache). All of these are live: they are read every frame,
+	// so changing them in the project settings updates the running viewport
+	// without a restart.
+	// The four master toggles are basic settings: they are the way into the
 	// whole category, and a feature nobody can find without ticking "Advanced"
-	// is a feature nobody turns on. Everything under them is a quality dial and
-	// stays advanced.
+	// is a feature nobody turns on. Everything under them stays advanced.
+	// Each group is laid out the same way: switches that add or remove a
+	// capability, and look dials that cost nothing, sit at the group's root;
+	// everything that trades GPU time against noise, detail or lag lives in
+	// the group's "quality" subsection. The split is what the settings tree
+	// shows the reader, so a dial goes under quality only if it moves the
+	// frame time, and a switch stays at the root even when it is also a win.
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_shadows/enabled"), false);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/rays_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), 4);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), 4);
 	// Accumulation cap for the sun/area shadow mask. A per-pixel convergence
 	// counter carries the first frames, so this can be long without a slow start.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_shadows/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
+
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/enabled"), false);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/light_guiding"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/ray_bias", PROPERTY_HINT_RANGE, "0.001,1.0,0.001,or_greater"), 0.08);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows"), true);
 	// Half resolution is the paper's design and the frame's largest lever
 	// (the sampling pass 8.3 -> 2.4 ms at 0.67 scale, plan section 33). Its
 	// first composite multiplied the analytic term in at half resolution and
@@ -3729,81 +3740,72 @@ void RenderingServer::init() {
 	// are upsampled alone now and the scene shader applies its own per-pixel
 	// analytic term (scene_forward_clustered.glsl, stochastic_direct_lights
 	// == 2), which holds still like the full-resolution pass.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/half_resolution"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/light_guiding"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/ray_bias", PROPERTY_HINT_RANGE, "0.001,1.0,0.001,or_greater"), 0.08);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
 	// The stochastic pass ray traces every local light's shadow, so the opaque
 	// pass never samples their shadow maps. Rendering them anyway is the single
 	// largest cost this path can avoid. Turn this off to keep them for the
 	// transparent pass, which still shades local lights analytically.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/skip_local_shadow_maps"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/skip_local_shadow_maps"), true);
 	// On those frames the transparent pass has no shadow map to sample either,
 	// so it traces one hard ray per light per fragment instead, toward the
-	// light's centre, up to this many local lights per fragment (the rest stay
+	// light's centre, up to max_rays local lights per fragment (the rest stay
 	// unshadowed). The ray-traced sun is traced the same way there.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadow_rays", PROPERTY_HINT_RANGE, "1,16,1"), 4);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/enabled"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/max_rays", PROPERTY_HINT_RANGE, "1,16,1"), 4);
 	// The translucency lighting volume: blended surfaces read their direct
 	// light (shadowed, as a first-order spherical-harmonic sum) from a froxel
 	// grid traced once per frame instead of running the light loops and the
 	// shadow rays above per fragment. The fragments an alpha depth pre-pass
-	// wrote keep the per-fragment shading unless translucency_volume_core.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_core"), false);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_size", PROPERTY_HINT_RANGE, "16,256,1"), 64);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_depth", PROPERTY_HINT_RANGE, "16,256,1"), 64);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_length", PROPERTY_HINT_RANGE, "4.0,1000.0,1.0"), 64.0);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_spread", PROPERTY_HINT_RANGE, "0.5,6.0,0.1"), 2.0);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+	// wrote keep the per-fragment shading unless translucency_volume/core.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/enabled"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/core"), false);
 	// The froxels' bounce rays against the surface cache: the volume then
 	// carries the blended fragments' indirect light as well as their direct,
 	// which is what lets the transparent pass do without per-fragment SDFGI.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume_indirect_rays", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect_rays", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/size", PROPERTY_HINT_RANGE, "16,256,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/depth", PROPERTY_HINT_RANGE, "16,256,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/length", PROPERTY_HINT_RANGE, "4.0,1000.0,1.0"), 64.0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/spread", PROPERTY_HINT_RANGE, "0.5,6.0,0.1"), 2.0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+
 	// SDFGI probe rays traced against the scene BVH (used whenever a TLAS is
 	// available, i.e. any other ray tracing feature is on or SDFGI is active).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/sdfgi/ray_query"), true);
+
 	// Ray-traced indirect lighting: a per-pixel final gather that traces
-	// hardware rays and shades hits from the SDFGI cascades (sky-only when no
-	// SDFGI is active). Replaces the SDFGI/VoxelGI screen resolve and SSIL.
+	// hardware rays and shades hits from the surface cache's cards, else the
+	// SDFGI cascades (sky-only when neither is active). Replaces the
+	// SDFGI/VoxelGI screen resolve, SSIL, SSAO and SSR.
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
-	// Half resolution is the dominant residual noise source (one ray per 2x2
-	// block: four times the variance at twice the correlation length, which
-	// the upsample turns into low-frequency blotches on flat walls), and full
-	// resolution at one ray measured cleaner than half at four. It stays the
-	// default because full resolution doubled the frame time on the M4 at
-	// 1440p (78 -> 158 ms on the interior test scene).
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/half_resolution"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance"), true);
-	// Width, in uv, of the border band over which the screen-radiance boost
-	// hands back to the cache. 0 restores the hard switch at the frustum edge.
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance_border_fade", PROPERTY_HINT_RANGE, "0.0,0.25,0.005"), 0.08);
-	// Firefly ceiling on the screen-radiance term, in exposure-normalized units
-	// (1.0 is a well-exposed white surface). The gather writes the buffer this
-	// term reads, so a ceiling keyed only to the radiance cache lets a dim cache
-	// drag the loop down; this is the floor under that ceiling.
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance_clamp", PROPERTY_HINT_RANGE, "0.0,16.0,0.1,or_greater"), 4.0);
-	// The light cascades the gather shades hits from only hold values at solid
-	// cells; the lightprobes cover all space and are already converged, so they
-	// floor the lookup where a cell was never voxelized. Probes carry irradiance,
-	// so this is the neutral albedo that turns it into outgoing radiance. 0
-	// disables the floor and restores the cascade-only lookup.
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/probe_floor", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.5);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
+	// Flat instances whose material reflects (a glossy floor) are found each
+	// frame and every lighting pass evaluates the lights' images through
+	// them: the caustic a mirror throws onto the room, which no ray finds.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/planar_mirrors"), true);
+	// The gather's rays occlude for real, so screen-space AO would darken
+	// the same corners twice; skipped under the traced GI like SSIL and SSR.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/replace_ssao"), true);
+	// The gather's own short screen-space contact trace. Separate from the
+	// direct lighting pass' setting of the same name: they are different passes
+	// with different needs, and one shared toggle means neither can be turned
+	// off without moving the other.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_traces"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/occlusion_range", PROPERTY_HINT_RANGE, "0.1,20.0,0.1,or_greater"), 3.0);
 	// Scale the cache tier (probes x probe_floor) by the measured ratio of the
 	// screen tier to the cache tier over the frame's on-screen hits. The probes
 	// carry about half the light of a radiosity solve in a closed room and the
 	// floor is a guessed albedo; the on-screen hits see both tiers for the same
 	// points, which is exactly the correction the off-screen hits lack.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/cache_calibration"), true);
-	// The gather's own short screen-space contact trace. Separate from the
-	// direct lighting pass' setting of the same name: they are different passes
-	// with different needs, and one shared toggle means neither can be turned
-	// off without moving the other.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_traces"), true);
+	// The light cascades the gather shades hits from only hold values at solid
+	// cells; the lightprobes cover all space and are already converged, so they
+	// floor the lookup where a cell was never voxelized. Probes carry irradiance,
+	// so this is the neutral albedo that turns it into outgoing radiance. 0
+	// disables the floor and restores the cascade-only lookup.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/probe_floor", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.5);
 	// Shade the gather's hits from the SDFGI light cascades where they have an
 	// entry (solid cells: albedo x direct light and some bounce), the
 	// lightprobes elsewhere (bounce light only). Either tier is far dimmer
@@ -3812,65 +3814,82 @@ void RenderingServer::init() {
 	// room while the cascades overshoot it by a third, so the probes stay the
 	// default.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/light_cascade_radiance"), false);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
-	// Flat instances whose material reflects (a glossy floor) are found each
-	// frame and every lighting pass evaluates the lights' images through
-	// them: the caustic a mirror throws onto the room, which no ray finds.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/planar_mirrors"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
+	// Half resolution is the dominant residual noise source (one ray per 2x2
+	// block: four times the variance at twice the correlation length, which
+	// the upsample turns into low-frequency blotches on flat walls), and full
+	// resolution at one ray measured cleaner than half at four. It stays the
+	// default because full resolution doubled the frame time on the M4 at
+	// 1440p (78 -> 158 ms on the interior test scene).
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/half_resolution"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
 	// The gather's own spatial filter settings. It used to borrow the direct
 	// lighting denoiser's; the two signals have nothing in common but the
 	// filter code. Full-resolution GI wants one more a-trous iteration than
 	// half-resolution to cover the same footprint.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/spatial_iterations", PROPERTY_HINT_RANGE, "1,3,1"), 2);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/variance_threshold", PROPERTY_HINT_RANGE, "0.0,0.5,0.001"), 0.02);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/spatial_iterations", PROPERTY_HINT_RANGE, "1,3,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/quality/variance_threshold", PROPERTY_HINT_RANGE, "0.0,0.5,0.001"), 0.02);
+	// Hits on geometry the camera sees are shaded from the previous frame's
+	// diffuse target rather than from the cards: sharper and truer wherever
+	// it applies. The hand-back to the cache is faded over a border band so
+	// the frustum edge does not draw a line through the bounce light.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/screen_radiance/enabled"), true);
+	// Width, in uv, of the border band over which the screen-radiance boost
+	// hands back to the cache. 0 restores the hard switch at the frustum edge.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance/border_fade", PROPERTY_HINT_RANGE, "0.0,0.25,0.005"), 0.08);
+	// Firefly ceiling on the screen-radiance term, in exposure-normalized units
+	// (1.0 is a well-exposed white surface). The gather writes the buffer this
+	// term reads, so a ceiling keyed only to the radiance cache lets a dim cache
+	// drag the loop down; this is the floor under that ceiling.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/screen_radiance/clamp", PROPERTY_HINT_RANGE, "0.0,16.0,0.1,or_greater"), 4.0);
 	// The gather also records which direction its light came from and how far
 	// its rays got, which re-bases the irradiance onto normal-mapped detail,
 	// occludes indirect specular, and re-fits reflection probes captured under
 	// different lighting.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular_occlusion"), true);
-	// The gather's rays occlude for real, so screen-space AO would darken
-	// the same corners twice; skipped under the traced GI like SSIL and SSR.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/replace_ssao"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/reflection_probe_refit"), true);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/occlusion_range", PROPERTY_HINT_RANGE, "0.1,20.0,0.1,or_greater"), 3.0);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/directionality", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
-	// Surface cache: material cards per instance, lit on the GPU, that the
-	// ray-traced GI shades its hits from (in place of the coarse SDFGI cache).
-	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/enabled"), true);
-	// Explicit enum values: without them the editor stores the option index, which the renderer then read as a 2-pixel atlas.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/atlas_size", PROPERTY_HINT_ENUM, "1024:1024,2048:2048,4096:4096"), 2048);
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/texels_per_meter", PROPERTY_HINT_RANGE, "1.0,64.0,1.0"), 16.0);
-	// Past this distance from the camera a card's texel density falls off with the distance (0 disables).
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/density_distance", PROPERTY_HINT_RANGE, "0.0,200.0,1.0"), 12.0);
-	// The longest edge of a card in texels; a card spans several 64-texel atlas pages past 64, and its two edges follow the instance's extents.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/max_card_size", PROPERTY_HINT_ENUM, "64:64,128:128,256:256"), 128);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/mirror_reflections"), true);
-	// Card lighting ray budget: one bounce ray per 2x2 texels, shared by the
-	// quad (a thread per quad, so the fewer rays cost fewer SIMD groups).
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/shared_bounce_ray"), true);
-	// The cards are lit by every positional light within this distance of the
-	// camera, in the view or not; 0 falls back to the view's lights.
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/light_radius", PROPERTY_HINT_RANGE, "0.0,1000.0,1.0"), 64.0);
-	// The card lighting reads each texel's cell of a world light grid (32 cells across twice the radius) rather than the first 32 lights overlapping its set's box.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/light_grid"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional/enabled"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/directional/directionality", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional/specular_occlusion"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/directional/reflection_probe_refit"), true);
 	// Deferred hit shading: the gather's hits the cards cannot shade (a
 	// multimesh's interior, an uncaptured or overflowed set, a grazing miss)
 	// are handed to their materials, run in compute at the hit and lit like a
 	// card texel. "All Hits" shades every hit that way, the cards then only
 	// feeding the card lighting's own bounce.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading", PROPERTY_HINT_ENUM, "Off,Card Misses,All Hits"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading/mode", PROPERTY_HINT_ENUM, "Off,Card Misses,All Hits"), 1);
 	// The mirror ray's hits always go to the material: a card's texel cannot carry the detail a mirror shows.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/hit_shading_mirror"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/hit_shading/mirror"), true);
 	// Added to the texture level the ray cone picks at a hit (positive is blurrier).
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/hit_shading_lod_bias", PROPERTY_HINT_RANGE, "-4.0,4.0,0.1"), 0.0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/hit_shading/lod_bias", PROPERTY_HINT_RANGE, "-4.0,4.0,0.1"), 0.0);
 	// Bits: 1 albedo, 2 normal, 4 uv (the shaded hits show the value instead of radiance); 8 no shadow rays, 16 no indirect, 32 no direct.
-	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading_debug", PROPERTY_HINT_RANGE, "0,63,1"), 0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading/debug", PROPERTY_HINT_RANGE, "0,63,1"), 0);
+
+	// Surface cache: material cards per instance, lit on the GPU, that the
+	// ray-traced GI shades its hits from (in place of the coarse SDFGI cache).
+	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/enabled"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/mirror_reflections"), true);
+	// The cards are lit by every positional light within this distance of the
+	// camera, in the view or not; 0 falls back to the view's lights.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/light_radius", PROPERTY_HINT_RANGE, "0.0,1000.0,1.0"), 64.0);
+	// The card lighting reads each texel's cell of a world light grid (32 cells across twice the radius) rather than the first 32 lights overlapping its set's box.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/light_grid"), true);
+	// Explicit enum values: without them the editor stores the option index, which the renderer then read as a 2-pixel atlas.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/atlas_size", PROPERTY_HINT_ENUM, "1024:1024,2048:2048,4096:4096"), 2048);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/quality/texels_per_meter", PROPERTY_HINT_RANGE, "1.0,64.0,1.0"), 16.0);
+	// Past this distance from the camera a card's texel density falls off with the distance (0 disables).
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/surface_cache/quality/density_distance", PROPERTY_HINT_RANGE, "0.0,200.0,1.0"), 12.0);
+	// The longest edge of a card in texels; a card spans several 64-texel atlas pages past 64, and its two edges follow the instance's extents.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/max_card_size", PROPERTY_HINT_ENUM, "64:64,128:128,256:256"), 128);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
+	// Card lighting ray budget: one bounce ray per 2x2 texels, shared by the
+	// quad (a thread per quad, so the fewer rays cost fewer SIMD groups).
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/surface_cache/quality/shared_bounce_ray"), true);
+
+	// The direct lighting denoiser. Its "enabled" also gates the GI's
+	// denoise; the GI's own temporal and spatial dials are under
+	// raytraced_gi/quality, the two signals sharing only the filter code.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/denoiser/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/denoiser/spatial_stride", PROPERTY_HINT_RANGE, "1,4,1"), 2);
