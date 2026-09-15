@@ -1,3 +1,53 @@
+# Godot Engine — experimental ray-tracing fork
+
+> **This is a personal fork of [Godot Engine](https://github.com/godotengine/godot)**, tracking
+> upstream `master` and adding my own experimental rendering features on top. It targets the
+> Forward+ renderer on macOS/Metal (Apple Silicon); everything else is stock Godot. Expect rough
+> edges — this is a research playground, not a release.
+
+## What this fork adds
+
+- **Metal ray tracing**: hardware acceleration structures and ray queries in the Metal driver
+  (`GL_EXT_ray_query` compute shaders → SPIR-V → MSL), per-mesh BLAS and a per-frame TLAS over
+  the whole scene, including skinned/blend-shaped meshes, multimeshes and GPU particles; GPU
+  timestamp queries for per-pass profiling on Metal
+- **Ray-traced shadows**: directional and area-light shadows that replace the shadow maps —
+  soft shadows from the sun's angular size, temporal accumulation, depth-aware denoise, alpha-tested
+  casters, per-light and per-instance control, ray-traced volumetric fog shadows
+- **Stochastic direct lighting** ("mini-MegaLights"): many-light sampling with blue-noise
+  candidates, visibility-guided light lists, screen-space contact traces, area lights, a ratio
+  estimator with an SVGF-style variance-driven denoiser, half-resolution mode
+- **Ray-traced GI**: hardware final gather with directional irradiance and traced specular
+  occlusion, glossy reflections (stock SSR skipped where they cover it), depth-validated temporal
+  history, a-trous denoiser with propagated variance, restart on lighting changes, extra rays on
+  young pixels, screen-radiance memory
+- **Surface cache**: per-instance orthographic material "cards" (albedo/normal/emission/depth
+  atlases) lit on the GPU every frame with a budget — direct light with shadow rays, a world light
+  grid, area lights, spot cookies/projectors, bounce histories for moving lights, a mip chain —
+  and read at every ray hit instead of running the material
+- **Deferred hit shading**: the scene shader's material runs in compute on binned ray hits the
+  cards cannot answer
+- **Translucency volume**: a froxel lighting volume for the transparent pass, with traced bounce
+  rays, replacing the per-fragment light loops
+- **Planar mirrors**: detected from the scene, with image lights, image chains and glossy lobes
+  flowing through the stochastic direct and GI passes
+- **Prepass G-buffer**: albedo, F0 and flags from the depth prepass feeding the direct and GI
+  passes; material-weighted light selection
+- **Denoiser infrastructure**: per-viewport temporal state, moving-object reprojection,
+  frame-edge history borrowing, working-space luminance, NaN-safe histories, MetalFX / FSR2
+  aware velocity
+- **SDFGI / VoxelGI**: SDFGI probe rays traced with hardware ray queries; VoxelGI as a fallback
+  radiance cache; reflection probes re-fit to the frame's irradiance
+- **AreaLight3D**: a visible emitting rect, gizmo selection and range display for lights
+- **Colour management (OpenColorIO)**: vendored OCIO 2.4.2, a config-driven working space
+  (e.g. ACEScg), OCIO views spliced into the tonemapper, texture import converted into the working
+  space, display and view chosen separately
+- **Cluster builder**: the bake as a compute cull, an exponential-depth cluster for the sampling pass
+- **Editor**: gizmos kept out of SSR/screen-space traces; the editor keeps repainting until the
+  temporal histories have settled
+
+---
+
 # Godot Engine
 
 <p align="center">
