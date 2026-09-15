@@ -820,7 +820,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// and only on frames the pass actually dispatched (no lights or a not yet
 	// ready TLAS otherwise leave last frame's lighting frozen in the buffers).
 	// 1: full resolution buffers, 2: half resolution (depth-aware upsample).
-	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? 2 : 1) : 0;
+	// 0 off, 1 full resolution, 2 half resolution composited as the denoised
+	// ratios times this shader's own per-pixel analytic term, 3 half
+	// resolution modulated at half resolution and upsampled (the first form,
+	// GODOT_RT_HALF_ANALYTIC=0; see the shader's composite).
+	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? (RendererRD::Raytracing::half_res_pixel_analytic() ? 2 : 3) : 1) : 0;
 	// Same validity rule for the ray-traced GI buffers. Bits 0-1: resolution
 	// mode (1 full, 2 half with the depth-aware upsample); bit 2: the traced
 	// reflection buffer is populated (otherwise the composite must not blend
@@ -4960,6 +4964,18 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_SPECULAR : stochastic_depth_name);
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		// Additive terms: black when inactive.
+		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	for (uint32_t i = 0; i < 4; i++) {
+		// The half-res direct pass's analytic terms (scene_forward_clustered_inc.glsl).
+		RD::Uniform u;
+		u.binding = 53 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_ANALYTIC_SPECULAR : (i == 2 ? RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE : RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR));
+		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);

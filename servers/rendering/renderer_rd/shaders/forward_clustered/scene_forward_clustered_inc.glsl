@@ -537,6 +537,13 @@ layout(set = 1, binding = 43) uniform texture2DArray rt_gi_ambient_buffer;
 layout(set = 1, binding = 44) uniform texture2DArray rt_gi_reflection_buffer;
 layout(set = 1, binding = 45) uniform texture2DArray rt_gi_depth_buffer;
 layout(set = 1, binding = 46) uniform texture2DArray rt_gi_directional_buffer;
+// The half-resolution direct pass's analytic terms (unshadowed; the whole
+// cell and the planar mirrors' image lights' share of it), for the
+// per-pixel composite (stochastic_direct_lights == 2).
+layout(set = 1, binding = 53) uniform texture2DArray stochastic_analytic_diffuse_buffer;
+layout(set = 1, binding = 54) uniform texture2DArray stochastic_analytic_specular_buffer;
+layout(set = 1, binding = 55) uniform texture2DArray stochastic_image_diffuse_buffer;
+layout(set = 1, binding = 56) uniform texture2DArray stochastic_image_specular_buffer;
 #else
 layout(set = 1, binding = 38) uniform texture2D rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2D rt_area_shadow_mask;
@@ -547,6 +554,10 @@ layout(set = 1, binding = 43) uniform texture2D rt_gi_ambient_buffer;
 layout(set = 1, binding = 44) uniform texture2D rt_gi_reflection_buffer;
 layout(set = 1, binding = 45) uniform texture2D rt_gi_depth_buffer;
 layout(set = 1, binding = 46) uniform texture2D rt_gi_directional_buffer;
+layout(set = 1, binding = 53) uniform texture2D stochastic_analytic_diffuse_buffer;
+layout(set = 1, binding = 54) uniform texture2D stochastic_analytic_specular_buffer;
+layout(set = 1, binding = 55) uniform texture2D stochastic_image_diffuse_buffer;
+layout(set = 1, binding = 56) uniform texture2D stochastic_image_specular_buffer;
 #endif
 
 // The translucency lighting volume: A, and B per axis (see translucency_volume.glsl).

@@ -3409,8 +3409,8 @@
 			The cost of this path is set by the ray budget rather than by the number of lights, which is what makes hundreds of shadow-casting lights affordable: a shadow map costs a render pass per light per frame, while a traced sample costs the same whether the scene has ten lights or a thousand. The estimate is noisy by construction and depends on the denoiser to be usable.
 			[b]Note:[/b] Only supported by the Forward+ renderer, on a device whose driver supports ray queries. Enabling it on a device without them renders exactly as if it were off, with one warning in the log.
 		</member>
-		<member name="rendering/ray_tracing/stochastic_direct_lighting/half_resolution" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], the direct lighting estimate is traced at half resolution and reconstructed to full resolution afterwards. Off by default: unlike indirect light, direct light carries shadow edges, and reconstructing an edge from half-resolution samples softens exactly the detail this path exists to get right.
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/half_resolution" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the direct lighting's visibility is traced and denoised at half resolution and reconstructed to full resolution afterwards; the unshadowed lighting itself is still evaluated per pixel, so material detail such as normal maps is kept. Roughly a third of the pass's cost at 0.67 scale, at some softening of shadow edges.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/light_guiding" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], the choice of which lights to sample is guided by which lights were actually visible from the same place last frame. Sampling lights uniformly wastes most of the budget on lights that turn out to be occluded or too distant to matter; guiding spends it on the ones that contributed, which is worth several times the ray count in noise.

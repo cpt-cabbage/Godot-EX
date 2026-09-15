@@ -378,6 +378,15 @@ bool Raytracing::_change_votes() {
 	return votes;
 }
 
+bool Raytracing::half_res_pixel_analytic() {
+	// GODOT_RT_HALF_ANALYTIC=0: the first half-resolution composite, the
+	// analytic term multiplied into the ratios at half resolution and the
+	// product upsampled. See the scene shader's half-res composite for why
+	// the per-pixel form replaced it (plan section 52).
+	static const bool per_pixel = OS::get_singleton()->get_environment("GODOT_RT_HALF_ANALYTIC") != "0";
+	return per_pixel;
+}
+
 uint32_t Raytracing::mirror_order() {
 	static const uint32_t order = OS::get_singleton()->get_environment("GODOT_MIRROR_ORDER").is_valid_int() ? CLAMP((uint32_t)OS::get_singleton()->get_environment("GODOT_MIRROR_ORDER").to_int(), 1u, 3u) : 2u;
 	return order;
@@ -856,7 +865,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RB_RT_STOCHASTIC_RAW_DIFFUSE, RB_RT_STOCHASTIC_RAW_SPECULAR,
 			RB_RT_STOCHASTIC_HIST_DIFFUSE_0, RB_RT_STOCHASTIC_HIST_DIFFUSE_1,
 			RB_RT_STOCHASTIC_HIST_SPECULAR_0, RB_RT_STOCHASTIC_HIST_SPECULAR_1,
-			RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE
+			RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE
 		};
 		for (const StringName &name : lighting_names) {
 			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32,
@@ -865,7 +874,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		// The specular buffers the scene shader consumes carry the Fresnel weight
 		// in alpha (the analytic lobe is stored without its Fresnel term so the
 		// material's own f0 / f90 can be applied at composite time).
-		const StringName specular_names[] = { RB_RT_STOCHASTIC_SPECULAR, RB_RT_STOCHASTIC_ANALYTIC_SPECULAR };
+		const StringName specular_names[] = { RB_RT_STOCHASTIC_SPECULAR, RB_RT_STOCHASTIC_ANALYTIC_SPECULAR, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR };
 		for (const StringName &name : specular_names) {
 			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_SHADOWS, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
 					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, size);
@@ -1044,6 +1053,8 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RD::Uniform u_view_depth_out(RD::UNIFORM_TYPE_IMAGE, 4, Vector<RID>({ view_depth }));
 	RD::Uniform u_analytic_d_out(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ analytic_diffuse }));
 	RD::Uniform u_analytic_s_out(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ analytic_specular }));
+	RD::Uniform u_analytic_image_d_out(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE, p_view, 0) }));
+	RD::Uniform u_analytic_image_s_out(RD::UNIFORM_TYPE_IMAGE, 8, Vector<RID>({ p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR, p_view, 0) }));
 
 	// RT_LAB_FORCE_AREA_PIPELINE=1 keeps the full pipeline on frames without
 	// area lights, so the two can be timed against each other from one build.
@@ -1055,7 +1066,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out), 1);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1208,7 +1219,11 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		RID out_specular = last ? final_specular : scratch_s[iteration & 1];
 		RID out_moments = last ? RID() : (iteration == 0 ? moments_read : moments_scratch);
 
-		denoise_push_constant.flags = last ? DENOISE_FLAG_MODULATE_ANALYTIC : 0;
+		// At half resolution the analytic term is applied by the scene shader
+		// per full-res pixel (half_res_pixel_analytic), so the last iteration
+		// hands it the ratios; at full resolution it is multiplied back here.
+		const bool modulate = last && !(p_quality.half_resolution && half_res_pixel_analytic());
+		denoise_push_constant.flags = modulate ? DENOISE_FLAG_MODULATE_ANALYTIC : 0;
 		denoise_push_constant.stride = p_quality.spatial_stride << iteration;
 		// The final iteration writes the RGBA16F specular buffer (Fresnel weight
 		// in alpha); the intermediate ones stay in the packed scratch format.

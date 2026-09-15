@@ -1084,7 +1084,11 @@ layout(location = 2) out vec2 motion_vector;
 // Local shadow maps are skipped on the frames the stochastic pass ray traces
 // their shadows instead. The mobile renderer shares the light include but has
 // no implementation data block, so the condition is a macro with a default.
-#define LOCAL_SHADOW_MAPS_RENDERED (implementation_data.local_shadow_maps != 0u)
+// The half-resolution direct lighting's per-pixel analytic term (see the
+// composite in main) runs the light loops unshadowed whatever the frame
+// rendered: the shadows are the ratios' business.
+bool stochastic_analytic_unshadowed = false;
+#define LOCAL_SHADOW_MAPS_RENDERED (implementation_data.local_shadow_maps != 0u && !stochastic_analytic_unshadowed)
 
 #ifdef RT_TRANSPARENT_SHADOWS
 // Transparent surfaces are shaded analytically, per fragment, with no
@@ -3328,8 +3332,24 @@ void fragment_shader(in SceneData scene_data) {
 	rt_transparent_ray_budget = (!LOCAL_SHADOW_MAPS_RENDERED && bool(implementation_data.rt_transparent_shadows & 1u)) ? implementation_data.rt_transparent_max_rays : 0u;
 #endif
 
+	// Half resolution, composited per pixel (stochastic_direct_lights == 2):
+	// the three loops below run unshadowed into sums of their own, this
+	// pixel's analytic term with its own normal, which the composite after
+	// them multiplies by the upsampled visibility ratios. (Declared outside
+	// the vertex-lighting guard: the composite reads them either way.)
+	bool stochastic_pixel_analytic = implementation_data.stochastic_direct_lights == 2u;
+	vec3 analytic_px_diffuse = vec3(0.0);
+	vec3 analytic_px_specular = vec3(0.0);
 #ifndef USE_VERTEX_LIGHTING
-	if (implementation_data.stochastic_direct_lights == 0u && !tv_active) { //omni lights
+	vec3 saved_diffuse_light = diffuse_light;
+	vec3 saved_direct_specular_light = direct_specular_light;
+	if (stochastic_pixel_analytic) {
+		diffuse_light = vec3(0.0);
+		direct_specular_light = vec3(0.0);
+		stochastic_analytic_unshadowed = true;
+	}
+	bool analytic_lights_here = (implementation_data.stochastic_direct_lights == 0u || stochastic_pixel_analytic) && !tv_active;
+	if (analytic_lights_here) { //omni lights
 
 		uint cluster_omni_offset = cluster_offset;
 
@@ -3390,7 +3410,7 @@ void fragment_shader(in SceneData scene_data) {
 		}
 	}
 
-	if (implementation_data.stochastic_direct_lights == 0u && !tv_active) { //spot lights
+	if (analytic_lights_here) { //spot lights
 
 		uint cluster_spot_offset = cluster_offset + implementation_data.cluster_type_size;
 
@@ -3452,7 +3472,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 
 	// Area lights are owned by the stochastic pass when it is active.
-	if (sc_cluster_has_area_light() && implementation_data.stochastic_direct_lights == 0u && !tv_active) { // area lights
+	if (sc_cluster_has_area_light() && analytic_lights_here) { // area lights
 
 		uint cluster_area_offset = cluster_offset + implementation_data.cluster_type_size * 2;
 
@@ -3512,6 +3532,13 @@ void fragment_shader(in SceneData scene_data) {
 			}
 		}
 	}
+	if (stochastic_pixel_analytic) {
+		analytic_px_diffuse = diffuse_light;
+		analytic_px_specular = direct_specular_light;
+		diffuse_light = saved_diffuse_light;
+		direct_specular_light = saved_direct_specular_light;
+		stochastic_analytic_unshadowed = false;
+	}
 #endif // !USE_VERTEX_LIGHTING
 
 	// Stochastic direct lighting: omni/spot/area
@@ -3531,11 +3558,25 @@ void fragment_shader(in SceneData scene_data) {
 		vec4 stochastic_spec = textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
 		direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
-	} else if (implementation_data.stochastic_direct_lights == 2u) {
+	} else if (implementation_data.stochastic_direct_lights >= 2u) {
 		// Half resolution buffers: depth-aware upsample. Each half-res texel
 		// stores the view depth it was lit at; weight the four nearest by
 		// bilinear distance and how well that depth matches ours, so lighting
 		// does not bleed across silhouettes.
+		//
+		// Two forms. 3 (the first, GODOT_RT_HALF_ANALYTIC=0): the buffers hold
+		// the denoised ratios already multiplied by the half-res analytic
+		// term, and the product is upsampled. 2: the buffers hold the ratios
+		// alone, and they are multiplied here by this pixel's own analytic
+		// term (the loops above, unshadowed) plus the upsampled image lights'
+		// share, which this shader cannot evaluate. The analytic term carries
+		// the normal map: at half resolution it is one pixel's normal for the
+		// block, blended back at the fragment's jittered position, and on a
+		// bumpy wall under grazing light that is a mottle that never settles
+		// (2.4x the full-res frame-to-frame change with no upscaler, 8.5x
+		// under MetalFX's jitter, plan section 52). The ratios are smooth;
+		// the bumps belong to the pixel.
+		bool pixel_analytic = implementation_data.stochastic_direct_lights == 2u;
 		//
 		// Round rather than truncate: screen_pixel_size is 1/size, and its
 		// reciprocal lands just under the integer for sizes whose inverse is
@@ -3557,28 +3598,60 @@ void fragment_shader(in SceneData scene_data) {
 		float own_depth = -vertex.z;
 		vec3 up_diffuse = vec3(0.0);
 		vec4 up_specular = vec4(0.0);
+		vec3 up_image_diffuse = vec3(0.0);
+		vec4 up_image_specular = vec4(0.0);
+		vec3 up_analytic_diffuse = vec3(0.0);
+		vec4 up_analytic_specular = vec4(0.0);
 		float up_weight = 0.0;
 		// Best depth match, kept for when no tap agrees well enough to trust
 		// the blend.
 		vec3 near_diffuse = vec3(0.0);
 		vec4 near_specular = vec4(0.0);
+		vec3 near_image_diffuse = vec3(0.0);
+		vec4 near_image_specular = vec4(0.0);
+		vec3 near_analytic_diffuse = vec3(0.0);
+		vec4 near_analytic_specular = vec4(0.0);
 		float near_depth_weight = -1.0;
 		for (int i = 0; i < 4; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
+			vec3 tap_image_diffuse = vec3(0.0);
+			vec4 tap_image_specular = vec4(0.0);
+			vec3 tap_analytic_diffuse = vec3(0.0);
+			vec4 tap_analytic_specular = vec4(0.0);
 #ifdef USE_MULTIVIEW
 			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
 			vec3 tap_diffuse = texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
+			if (pixel_analytic) {
+				tap_image_diffuse = texelFetch(sampler2DArray(stochastic_image_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+				tap_image_specular = texelFetch(sampler2DArray(stochastic_image_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
+				if (tv_active) {
+					tap_analytic_diffuse = texelFetch(sampler2DArray(stochastic_analytic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
+					tap_analytic_specular = texelFetch(sampler2DArray(stochastic_analytic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
+				}
+			}
 #else
 			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
 			vec3 tap_diffuse = texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
+			if (pixel_analytic) {
+				tap_image_diffuse = texelFetch(sampler2D(stochastic_image_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+				tap_image_specular = texelFetch(sampler2D(stochastic_image_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
+				if (tv_active) {
+					tap_analytic_diffuse = texelFetch(sampler2D(stochastic_analytic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
+					tap_analytic_specular = texelFetch(sampler2D(stochastic_analytic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
+				}
+			}
 #endif
 			float depth_weight = exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
 			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y)) * depth_weight;
 			up_diffuse += tap_diffuse * w;
 			up_specular += tap_specular * w;
+			up_image_diffuse += tap_image_diffuse * w;
+			up_image_specular += tap_image_specular * w;
+			up_analytic_diffuse += tap_analytic_diffuse * w;
+			up_analytic_specular += tap_analytic_specular * w;
 			up_weight += w;
 			// Ranked on depth alone: where the taps disagree it is the one at
 			// our own depth that is right, however far it sits on screen.
@@ -3586,23 +3659,58 @@ void fragment_shader(in SceneData scene_data) {
 				near_depth_weight = depth_weight;
 				near_diffuse = tap_diffuse;
 				near_specular = tap_specular;
+				near_image_diffuse = tap_image_diffuse;
+				near_image_specular = tap_image_specular;
+				near_analytic_diffuse = tap_analytic_diffuse;
+				near_analytic_specular = tap_analytic_specular;
 			}
 		}
 		// Any positive sum normalizes correctly, however small -- this only has
 		// to catch the case where every tap was rejected to nothing.
 		vec4 stochastic_spec;
+		vec3 image_diffuse;
+		vec4 image_specular;
+		vec3 half_analytic_diffuse;
+		vec4 half_analytic_specular;
 		if (up_weight > 1e-6) {
-			diffuse_light += up_diffuse / up_weight;
+			up_diffuse /= up_weight;
 			stochastic_spec = up_specular / up_weight;
+			image_diffuse = up_image_diffuse / up_weight;
+			image_specular = up_image_specular / up_weight;
+			half_analytic_diffuse = up_analytic_diffuse / up_weight;
+			half_analytic_specular = up_analytic_specular / up_weight;
 		} else {
 			// Every tap disagreed on depth. Adding nothing, as this did, leaves
 			// the pixel with no direct lighting whatsoever -- a black speckle
 			// that crawls along silhouettes as the camera moves. A single
 			// mismatched sample is far closer to the truth than darkness.
-			diffuse_light += near_diffuse;
+			up_diffuse = near_diffuse;
 			stochastic_spec = near_specular;
+			image_diffuse = near_image_diffuse;
+			image_specular = near_image_specular;
+			half_analytic_diffuse = near_analytic_diffuse;
+			half_analytic_specular = near_analytic_specular;
 		}
-		direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
+		if (pixel_analytic) {
+			// The ratios (a luminance visibility fraction, replicated over
+			// rgb) times the analytic term: this pixel's own for the real
+			// lights, the half-res buffer's for the images, and -- where the
+			// translucency volume shades the fragment and the loops above did
+			// not run -- the half-res whole, as the first form had it.
+			vec3 ratio_d = up_diffuse;
+			vec3 ratio_s = stochastic_spec.rgb;
+			vec3 image_spec = image_specular.rgb * (f0 + (stochastic_f90 - f0) * image_specular.a) * energy_compensation;
+			if (tv_active) {
+				diffuse_light += ratio_d * half_analytic_diffuse;
+				direct_specular_light += ratio_s * half_analytic_specular.rgb * (f0 + (stochastic_f90 - f0) * half_analytic_specular.a) * energy_compensation;
+			} else {
+				diffuse_light += ratio_d * (analytic_px_diffuse + image_diffuse);
+				direct_specular_light += ratio_s * (analytic_px_specular + image_spec);
+			}
+		} else {
+			diffuse_light += up_diffuse;
+			direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
+		}
 	}
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 

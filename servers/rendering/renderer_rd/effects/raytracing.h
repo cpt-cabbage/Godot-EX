@@ -76,6 +76,8 @@
 #define RB_RT_STOCHASTIC_VIEW_DEPTH_1 SNAME("stochastic_view_depth_1")
 #define RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE SNAME("stochastic_analytic_diffuse")
 #define RB_RT_STOCHASTIC_ANALYTIC_SPECULAR SNAME("stochastic_analytic_specular")
+#define RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE SNAME("stochastic_analytic_image_diffuse")
+#define RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR SNAME("stochastic_analytic_image_specular")
 #define RB_RT_STOCHASTIC_META_0 SNAME("stochastic_meta_0")
 #define RB_RT_STOCHASTIC_META_1 SNAME("stochastic_meta_1")
 
@@ -664,6 +666,10 @@ public:
 	// ceiling is a second-order image; the third order read nothing more in
 	// the box (its images lie past the lights' range) and costs.
 	static uint32_t mirror_order();
+	// Whether the half-resolution direct lighting is composited as ratios
+	// times the scene shader's own per-pixel analytic term (default) rather
+	// than modulated at half resolution and upsampled (GODOT_RT_HALF_ANALYTIC=0).
+	static bool half_res_pixel_analytic();
 	static bool _change_votes();
 	// See RaytracingScene::set_hit_shading.
 	void set_hit_shading(uint32_t p_mode, RaytracingScene::HitMaterialResolver *p_resolver) { scene.set_hit_shading(p_mode, p_resolver); }

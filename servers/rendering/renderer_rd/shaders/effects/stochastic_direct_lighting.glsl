@@ -171,6 +171,12 @@ layout(set = 1, binding = 4, r16f) uniform restrict writeonly image2D out_view_d
 layout(set = 1, binding = 5, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_diffuse;
 // rgb: the specular lobe without Fresnel, a: the Schlick weight (see light_eval).
 layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_analytic_specular;
+// The planar mirrors' image lights' share of the two above, for the
+// half-resolution composite: the scene shader recomputes the real lights'
+// analytic term per full-res pixel (its own normal) and takes only the
+// images from here, since it cannot evaluate them itself.
+layout(set = 1, binding = 7, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_image_diffuse;
+layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_analytic_image_specular;
 
 #define MAX_RESERVOIRS 4u
 #define TILE_SIZE 8
@@ -899,6 +905,8 @@ void main() {
 		imageStore(out_view_depth, pixel, vec4(0.0));
 		imageStore(out_analytic_diffuse, pixel, vec4(0.0));
 		imageStore(out_analytic_specular, pixel, vec4(0.0));
+		imageStore(out_analytic_image_diffuse, pixel, vec4(0.0));
+		imageStore(out_analytic_image_specular, pixel, vec4(0.0));
 		return;
 	}
 
@@ -1004,6 +1012,11 @@ void main() {
 	vec3 analytic_spec_base = vec3(0.0);
 	float analytic_fc_num = 0.0;
 	float analytic_fc_den = 0.0;
+	// The image lights' part of the three (see out_analytic_image_diffuse).
+	vec3 analytic_image_diffuse = vec3(0.0);
+	vec3 analytic_image_spec_base = vec3(0.0);
+	float analytic_image_fc_num = 0.0;
+	float analytic_image_fc_den = 0.0;
 	// The same two sums as scalar luminance, in the |luminance| convention the
 	// ray terms use. These are the ratio's denominators: taking them from the
 	// vec3 sums instead would normalize by |sum L| where the numerator estimates
@@ -1214,6 +1227,12 @@ void main() {
 						float ss_lum = abs(luminance(ss.rgb)) * analytic_scale;
 						analytic_fc_num += ss_lum * ss.a;
 						analytic_fc_den += ss_lum;
+						if (variant != 0u) {
+							analytic_image_diffuse += f * analytic_scale;
+							analytic_image_spec_base += ss.rgb * analytic_scale;
+							analytic_image_fc_num += ss_lum * ss.a;
+							analytic_image_fc_den += ss_lum;
+						}
 						analytic_lum_d += abs(luminance(f)) * analytic_scale;
 						analytic_lum_s += abs(luminance(s)) * analytic_scale;
 						if (!sampled) {
@@ -1597,6 +1616,8 @@ void main() {
 	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
 	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
 	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_spec_base), analytic_fc_den > 0.0 ? analytic_fc_num / analytic_fc_den : 0.0));
+	imageStore(out_analytic_image_diffuse, pixel, vec4(bound_analytic(analytic_image_diffuse), 0.0));
+	imageStore(out_analytic_image_specular, pixel, vec4(bound_analytic(analytic_image_spec_base), analytic_image_fc_den > 0.0 ? analytic_image_fc_num / analytic_image_fc_den : 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 	imageStore(out_meta, pixel, vec4(dominance));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z));
