@@ -3586,9 +3586,31 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
 				RENDER_TIMESTAMP("MetalFX Temporal");
 			}
-			// Scale to ±0.5.
+			// The scaler wants the jitter in input pixels (MTLFXTemporalScaler
+			// jitterOffsetX: "the horizontal pixel offset this scaler samples
+			// to return to the frame's reference frame"); taa_jitter is the
+			// projection's offset in clip units, so the pixel offset is the
+			// FSR2 formula above, +-0.5 px, and in the same frame as the
+			// projection's. Upstream scaled it by 0.5 alone -- a thousandth
+			// of a pixel, so the scaler reconstructed nothing from the
+			// jitter and blurred it instead -- and flipped y. Measured on
+			// the game at rest, the raster alone (plan section 52): pixels
+			// unflipped reads 0.905 of the native image's sharpness and
+			// 0.0022 error against it, upstream's 0.847 / 0.0036, the y flip
+			// 0.825 / 0.0040, x negated twice the wobble on vertical edges.
+			// GODOT_MFX_JITTER: 0 upstream's, 1 pixels with the y flip, 2
+			// pixels as they are (default), 3 pixels negated in x.
+			static const int mfx_jitter_mode = OS::get_singleton()->get_environment("GODOT_MFX_JITTER").is_valid_int() ? OS::get_singleton()->get_environment("GODOT_MFX_JITTER").to_int() : 2;
 			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
+			if (mfx_jitter_mode != 0) {
+				jitter *= Vector2(rb->get_internal_size());
+			}
+			if (mfx_jitter_mode == 3) {
+				jitter = -jitter;
+			}
+			if (mfx_jitter_mode != 2) {
+				jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
+			}
 
 			for (uint32_t v = 0; v < rb->get_view_count() && use_denoised; v++) {
 				RID spec_ray = rb->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_RAW_SPEC_RAY) ? rb->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_SPEC_RAY, v, 0) : RID();
