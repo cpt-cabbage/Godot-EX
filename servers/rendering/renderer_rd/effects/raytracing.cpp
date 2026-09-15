@@ -392,18 +392,19 @@ uint32_t Raytracing::mirror_order() {
 	return order;
 }
 
-uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world, uint32_t p_pass) const {
+const LocalVector<RaytracingScene::MirrorPlane> &Raytracing::mirror_planes_for_pass(uint32_t p_pass, uint32_t &r_count) const {
 	static const Vector<double> knob = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 	static const bool knob_off = OS::get_singleton()->get_environment("GODOT_GI_MIRROR") == "0";
 	// GODOT_MIRROR_PASSES=<bits>: which passes see the mirrors at all (1 the
 	// cards, 2 the direct pass's image lights, 4 the GI gather; default
 	// all), to ablate one consumer at a time.
 	static const uint32_t passes = OS::get_singleton()->get_environment("GODOT_MIRROR_PASSES").is_valid_int() ? (uint32_t)OS::get_singleton()->get_environment("GODOT_MIRROR_PASSES").to_int() : 7u;
+	static LocalVector<RaytracingScene::MirrorPlane> knob_planes;
 	if (knob_off || !(passes & p_pass)) {
-		return 0;
+		r_count = 0;
+		return knob_planes;
 	}
-	LocalVector<RaytracingScene::MirrorPlane> knob_planes;
-	if (knob.size() >= 7) {
+	if (knob.size() >= 7 && knob_planes.is_empty()) {
 		RaytracingScene::MirrorPlane m;
 		m.normal = Vector3(knob[0], knob[1], knob[2]).normalized();
 		m.offset = knob[3];
@@ -416,7 +417,13 @@ uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, 
 		knob_planes.push_back(m);
 	}
 	const LocalVector<RaytracingScene::MirrorPlane> &planes = knob.size() >= 7 ? knob_planes : scene.get_mirror_planes();
-	uint32_t count = MIN((uint32_t)planes.size(), SurfaceCache::MAX_MIRROR_PLANES);
+	r_count = MIN((uint32_t)planes.size(), SurfaceCache::MAX_MIRROR_PLANES);
+	return planes;
+}
+
+uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world, uint32_t p_pass) const {
+	uint32_t count = 0;
+	const LocalVector<RaytracingScene::MirrorPlane> &planes = mirror_planes_for_pass(p_pass, count);
 	for (uint32_t i = 0; i < count; i++) {
 		const RaytracingScene::MirrorPlane &m = planes[i];
 		Vector3 n = m.normal;
@@ -452,6 +459,89 @@ uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, 
 		g.v_axis[3] = 0.0f;
 	}
 	return count;
+}
+
+// The chains mirror_chains_at (mirror_planes_inc.glsl) would offer, over
+// every mirror rather than the ones a point faces: singles for each, then
+// the pairs and triples mirror_chain_counts admits (major mirrors, no
+// mirror twice in a row, the F0 product a twentieth or more), within
+// mirror_order. Same three-bit packing as the shader's (A | B << 3 | C << 6,
+// MAX_MIRROR_PLANES ending the chain).
+uint32_t Raytracing::update_image_chains() {
+	image_chain_count = 0;
+	uint32_t count = 0;
+	const LocalVector<RaytracingScene::MirrorPlane> &planes = mirror_planes_for_pass(2u, count);
+	image_chain_planes.clear();
+	for (uint32_t i = 0; i < count; i++) {
+		image_chain_planes.push_back(planes[i]);
+	}
+	const uint32_t order = mirror_order();
+	const uint32_t none = SurfaceCache::MAX_MIRROR_PLANES;
+	auto major = [&](uint32_t i) { return planes[i].half_u * planes[i].half_v >= 1.0f; };
+	auto counts = [&](uint32_t mi, uint32_t mj, uint32_t mk) {
+		const uint32_t len = mj < none ? (mk < none ? 3u : 2u) : 1u;
+		if (len > order || (len >= 2 && mi == mj) || (len >= 3 && mj == mk)) {
+			return false;
+		}
+		if (len == 1) {
+			return true;
+		}
+		if (!major(mi) || !major(mj) || (len >= 3 && !major(mk))) {
+			return false;
+		}
+		float f = planes[mi].f0 * planes[mj].f0;
+		if (len >= 3) {
+			f *= planes[mk].f0;
+		}
+		return f >= 0.05f;
+	};
+	for (uint32_t mi = 0; mi < count && image_chain_count < IMAGE_CHAINS_MAX; mi++) {
+		image_chain_codes[image_chain_count++] = mi | (none << 3) | (none << 6);
+	}
+	for (uint32_t len = 2; len <= 3 && len <= order; len++) {
+		for (uint32_t mi = 0; mi < count; mi++) {
+			for (uint32_t mj = 0; mj < count; mj++) {
+				for (uint32_t mk = 0; mk < (len == 3 ? count : 1u); mk++) {
+					const uint32_t k = len == 3 ? mk : none;
+					if (image_chain_count < IMAGE_CHAINS_MAX && counts(mi, mj, k)) {
+						image_chain_codes[image_chain_count++] = mi | (mj << 3) | (k << 6);
+					}
+				}
+			}
+		}
+	}
+	return image_chain_count;
+}
+
+// A light's transform mirrored through a chain from the light's end
+// (mirror_chain's imgs[]: through C, then B, then A), its basis reflected
+// with it so a spot's cone and an area light's box point where the image
+// shines. False where a stage of the light lies behind a mirror of the
+// chain, as mirror_chain rejects it.
+bool Raytracing::mirror_chain_transform(uint32_t p_chain, const Transform3D &p_light, Transform3D &r_image) const {
+	const uint32_t none = SurfaceCache::MAX_MIRROR_PLANES;
+	const uint32_t stages[3] = { (p_chain >> 6) & 7u, (p_chain >> 3) & 7u, p_chain & 7u };
+	r_image = p_light;
+	for (uint32_t s = 0; s < 3; s++) {
+		const uint32_t mi = stages[s];
+		if (mi >= none) {
+			continue;
+		}
+		if (mi >= image_chain_planes.size()) {
+			return false;
+		}
+		const RaytracingScene::MirrorPlane &m = image_chain_planes[mi];
+		const float h = m.normal.dot(r_image.origin) - m.offset;
+		if (h <= 0.0f) {
+			return false;
+		}
+		r_image.origin -= 2.0f * h * m.normal;
+		for (int c = 0; c < 3; c++) {
+			const Vector3 a = r_image.basis.get_column(c);
+			r_image.basis.set_column(c, a - 2.0f * a.dot(m.normal) * m.normal);
+		}
+	}
+	return true;
 }
 
 void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky) {
@@ -942,6 +1032,10 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		Transform3D view_from_world = p_world_from_view.affine_inverse();
 		params.mirror_count = fill_mirror_planes(params.mirrors, &view_from_world, 2u);
 		params.mirror_order = mirror_order();
+		params.image_chain_count = params.mirror_count > 0 ? image_chain_count : 0;
+		for (uint32_t i = 0; i < IMAGE_CHAINS_MAX; i++) {
+			params.image_chains[i] = image_chain_codes[i];
+		}
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
 	for (int col = 0; col < 4; col++) {

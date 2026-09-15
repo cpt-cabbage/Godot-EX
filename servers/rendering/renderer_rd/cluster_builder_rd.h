@@ -177,7 +177,7 @@ private:
 		uint32_t original_index;
 		float transform_inv[12]; // Transposed transform for less space.
 		float scale[3];
-		uint32_t has_wide_spot_angle;
+		uint32_t has_wide_spot_angle; // Bit 0: a spot light drawn as a sphere. Bit 1: an image light (see add_light_image).
 	}; // Keep aligned to 32 bytes.
 
 	uint32_t cluster_count_by_type[ELEMENT_TYPE_MAX] = {};
@@ -229,6 +229,9 @@ private:
 	RID cluster_store_log_uniform_set;
 	float log_z0 = 0.0f;
 	bool log_valid = false;
+	// Whether this frame's bake is the compute cull (read at begin, so the
+	// image lights, which only that path culls, are added on the same rule).
+	bool compute_cull = false;
 
 	// Persistent data.
 
@@ -268,17 +271,45 @@ public:
 	void begin(const Transform3D &p_view_transform, const Projection &p_cam_projection, bool p_flip_y);
 
 	_FORCE_INLINE_ void add_light(LightType p_type, const Transform3D &p_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size) {
-		if (p_type == LIGHT_TYPE_OMNI && cluster_count_by_type[ELEMENT_TYPE_OMNI_LIGHT] == max_elements_by_type) {
-			return; // Max number elements reached.
+		_add_light(p_type, p_transform, p_radius, p_spot_aperture, p_area_size, UINT32_MAX);
+	}
+
+	// A local light's image through a planar mirror chain (the light's
+	// transform mirrored through the chain), as an element of the
+	// exponential-depth cluster only, under an index of the caller's past
+	// the real lights of its type: the stochastic pass decodes it back into
+	// the light and the chain. The image's proxy is placed where the image
+	// shines, which is what the pass's cell walk needs; walking the real
+	// light's cell for its images tied their presence to whether the real
+	// light's proxy happened to cover the pixel's froxel (plan section 53).
+	// Nothing on the raster paths sees these: the compute cull keeps them
+	// out of the linear cluster, and none are added when it is not running.
+	_FORCE_INLINE_ void add_light_image(LightType p_type, const Transform3D &p_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size, uint32_t p_original_index) {
+		if (!compute_cull || p_original_index >= max_elements_by_type) {
+			return;
 		}
-		if (p_type == LIGHT_TYPE_SPOT && cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT] == max_elements_by_type) {
-			return; // Max number elements reached.
+		_add_light(p_type, p_transform, p_radius, p_spot_aperture, p_area_size, p_original_index);
+	}
+
+	_FORCE_INLINE_ void _add_light(LightType p_type, const Transform3D &p_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size, uint32_t p_image_index) {
+		const bool image = p_image_index != UINT32_MAX;
+		if (!image) {
+			if (p_type == LIGHT_TYPE_OMNI && cluster_count_by_type[ELEMENT_TYPE_OMNI_LIGHT] == max_elements_by_type) {
+				return; // Max number elements reached.
+			}
+			if (p_type == LIGHT_TYPE_SPOT && cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT] == max_elements_by_type) {
+				return; // Max number elements reached.
+			}
+			if (p_type == LIGHT_TYPE_AREA && cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT] == max_elements_by_type) {
+				return; // Max number elements reached.
+			}
 		}
-		if (p_type == LIGHT_TYPE_AREA && cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT] == max_elements_by_type) {
-			return; // Max number elements reached.
+		if (render_element_count >= render_element_max) {
+			return; // The element list is full (the images share it with every type).
 		}
 
 		RenderElementData &e = render_elements[render_element_count];
+		e.has_wide_spot_angle = 0;
 
 		Transform3D xform = view_xform * p_transform;
 
@@ -311,13 +342,11 @@ public:
 			e.scale[2] = radius;
 			if (p_type == LIGHT_TYPE_OMNI) {
 				e.type = ELEMENT_TYPE_OMNI_LIGHT;
-				e.original_index = cluster_count_by_type[ELEMENT_TYPE_OMNI_LIGHT];
-				cluster_count_by_type[ELEMENT_TYPE_OMNI_LIGHT]++;
+				e.original_index = image ? p_image_index : cluster_count_by_type[ELEMENT_TYPE_OMNI_LIGHT]++;
 			} else { // LIGHT_TYPE_SPOT with wide angle.
 				e.type = ELEMENT_TYPE_SPOT_LIGHT;
-				e.has_wide_spot_angle = true;
-				e.original_index = cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT];
-				cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
+				e.has_wide_spot_angle = 1;
+				e.original_index = image ? p_image_index : cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
 			}
 
 			RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
@@ -359,13 +388,10 @@ public:
 			e.scale[0] = len * shared->cone_overfit;
 			e.scale[1] = len * shared->cone_overfit;
 			e.scale[2] = radius;
-			e.has_wide_spot_angle = false;
 			e.type = ELEMENT_TYPE_SPOT_LIGHT;
-			e.original_index = cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT];
+			e.original_index = image ? p_image_index : cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
 
 			RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
-
-			cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
 		} else { /* LIGHT_TYPE_AREA */
 			Vector3 scale = Vector3(p_area_size.x / 2.0 + radius, p_area_size.y / 2.0 + radius, radius / 2.0);
 
@@ -394,15 +420,22 @@ public:
 			e.scale[2] = scale.z;
 
 			e.type = ELEMENT_TYPE_AREA_LIGHT;
-			e.original_index = cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT];
+			e.original_index = image ? p_image_index : cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT]++;
 
 			RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
-
-			cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT]++;
+		}
+		if (image) {
+			e.has_wide_spot_angle |= 2;
 		}
 
 		render_element_count++;
 	}
+
+	// The real lights of a type added so far (the index the next one gets).
+	_FORCE_INLINE_ uint32_t get_light_count(LightType p_type) const {
+		return cluster_count_by_type[p_type == LIGHT_TYPE_OMNI ? ELEMENT_TYPE_OMNI_LIGHT : (p_type == LIGHT_TYPE_SPOT ? ELEMENT_TYPE_SPOT_LIGHT : ELEMENT_TYPE_AREA_LIGHT)];
+	}
+	_FORCE_INLINE_ uint32_t get_max_elements_by_type() const { return max_elements_by_type; }
 
 	_FORCE_INLINE_ void add_box(BoxType p_box_type, const Transform3D &p_transform, const Vector3 &p_half_size) {
 		if (p_box_type == BOX_TYPE_DECAL && cluster_count_by_type[ELEMENT_TYPE_DECAL] == max_elements_by_type) {

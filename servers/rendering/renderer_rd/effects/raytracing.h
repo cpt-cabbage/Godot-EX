@@ -350,8 +350,11 @@ private:
 		SurfaceCache::MirrorPlaneGPU mirrors[SurfaceCache::MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), view space.
 		uint32_t mirror_count;
 		uint32_t mirror_order;
-		uint32_t mirror_pad[2];
+		uint32_t image_chain_count; // The image chains in the cluster (image_chain_codes), 0 without mirrors.
+		uint32_t mirror_pad;
+		uint32_t image_chains[16]; // The chains' codes, uvec4[4] in the shader (std140 packs a uint array by 16 bytes).
 	};
+	static_assert(sizeof(StochasticParamsUBO) == 752, "StochasticParamsUBO layout must match stochastic_direct_lighting.glsl.");
 	static constexpr uint32_t LIGHT_LIST_TILE_SIZE = RenderBuffersRT::LIGHT_LIST_TILE_SIZE;
 	static constexpr uint32_t LIGHT_LIST_SIZE = RenderBuffersRT::LIGHT_LIST_SIZE;
 
@@ -647,6 +650,14 @@ public:
 	// from the frame's instances. Returns false if there is no geometry to
 	// trace against.
 	bool update_scene(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) { return scene.update(p_instances, p_camera_position, surface_cache); }
+	// The planar mirror image chains the direct pass evaluates this frame
+	// (their count; see image_chain_codes), and a light's transform mirrored
+	// through one of them. The renderer adds every local light's image through
+	// every chain to the light cluster after the real lights.
+	uint32_t update_image_chains();
+	uint32_t get_image_chain_count() const { return image_chain_count; }
+	uint32_t get_image_chain_code(uint32_t p_index) const { return image_chain_codes[p_index]; }
+	bool mirror_chain_transform(uint32_t p_chain, const Transform3D &p_light, Transform3D &r_image) const;
 
 	// The planar mirrors (plan section 44): flat reflective instances found
 	// in the scene, whose image lights every lighting pass evaluates. See
@@ -661,6 +672,17 @@ public:
 	// the caller (1 the cards, 2 the direct pass, 4 the GI gather) for
 	// GODOT_MIRROR_PASSES to keep the mirrors from one consumer at a time.
 	uint32_t fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world, uint32_t p_pass) const;
+	const LocalVector<RaytracingScene::MirrorPlane> &mirror_planes_for_pass(uint32_t p_pass, uint32_t &r_count) const;
+	// The direct pass's image lights this frame (plan section 53): each
+	// local light's image through each of these mirror chains is an
+	// element of the exponential-depth cluster (ClusterBuilderRD::
+	// add_light_image, fed by the clustered renderer after the real lights),
+	// indexed past its type's real lights as count + light * chains + chain;
+	// the pass decodes that back into the light and the chain's entry bits.
+	static constexpr uint32_t IMAGE_CHAINS_MAX = 16;
+	uint32_t image_chain_codes[IMAGE_CHAINS_MAX] = {};
+	uint32_t image_chain_count = 0;
+	LocalVector<RaytracingScene::MirrorPlane> image_chain_planes; // World space, the direct pass's list.
 	// The longest chain of mirrors an image is evaluated through (1 to 3;
 	// GODOT_MIRROR_ORDER, default 2): a lamp seen in the floor seen in the
 	// ceiling is a second-order image; the third order read nothing more in

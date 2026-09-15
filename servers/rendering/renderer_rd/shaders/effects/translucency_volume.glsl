@@ -284,6 +284,9 @@ void main() {
 				uint bit = findMSB(mask);
 				mask &= ~(1u << bit);
 				uint light_index = 32u * i + bit;
+				if (light_index >= (type == 0u ? params.omni_light_count : params.spot_light_count)) {
+					continue; // A light's mirror image (ClusterBuilderRD::add_light_image); the froxels light by the lights alone.
+				}
 				LightData ld = type == 0u ? omni_lights.data[light_index] : spot_lights.data[light_index];
 				vec3 rel = ld.position - view_pos;
 				float len = length(rel);

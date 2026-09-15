@@ -1047,6 +1047,20 @@ public:
 	virtual void setup_added_light(const RSE::LightType p_type, const Transform3D &p_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size) override;
 	virtual void setup_added_decal(const Transform3D &p_transform, const Vector3 &p_half_size) override;
 
+	// The frame's local lights as the cluster took them, for their planar
+	// mirror images to follow once every real light is in (the images are
+	// indexed past the real lights of their type; _add_image_lights).
+	struct AddedLight {
+		ClusterBuilderRD::LightType type;
+		uint32_t index; // The cluster's, and the light buffer's.
+		Transform3D transform;
+		float radius;
+		float spot_aperture;
+		Vector2 area_size;
+	};
+	LocalVector<AddedLight> added_lights;
+	void _add_image_lights();
+
 	virtual void base_uniforms_changed() override;
 
 	/* SDFGI UPDATE */

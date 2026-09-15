@@ -493,6 +493,7 @@ void ClusterBuilderRD::begin(const Transform3D &p_view_transform, const Projecti
 	z_near = projection.get_z_near();
 	z_far = projection.get_z_far();
 	camera_orthogonal = p_cam_projection.is_orthogonal();
+	compute_cull = GLOBAL_GET("rendering/limits/cluster_builder/compute_cull");
 	adjusted_projection = projection;
 	if (!camera_orthogonal) {
 		adjusted_projection.adjust_perspective_znear(0.0001);
@@ -563,7 +564,6 @@ void ClusterBuilderRD::bake_cluster() {
 		RENDER_TIMESTAMP("Render 3D Cluster Elements");
 
 		// The compute cull (cluster_cull.glsl), or the proxy rasterisation.
-		const bool compute_cull = GLOBAL_GET("rendering/limits/cluster_builder/compute_cull");
 		if (compute_cull) {
 			RD::get_singleton()->buffer_clear(cluster_render_buffer_log, 0, cluster_render_buffer_size);
 			RD::get_singleton()->buffer_clear(cluster_buffer_log, 0, cluster_buffer_size);
@@ -591,7 +591,7 @@ void ClusterBuilderRD::bake_cluster() {
 						// If the spot angle is above a certain threshold, use a sphere instead of a cone for building the clusters
 						// since the cone gets too flat/large (spot angle close to 90 degrees) or
 						// can't even cover the affected area of the light (spot angle above 90 degrees).
-						if (render_elements[i].has_wide_spot_angle) {
+						if (render_elements[i].has_wide_spot_angle & 1) {
 							RD::get_singleton()->draw_list_bind_vertex_array(draw_list, shared->sphere_vertex_array);
 							RD::get_singleton()->draw_list_bind_index_array(draw_list, shared->sphere_index_array);
 						} else {

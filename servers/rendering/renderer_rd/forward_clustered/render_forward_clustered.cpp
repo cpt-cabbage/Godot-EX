@@ -1648,7 +1648,66 @@ void RenderForwardClustered::setup_added_light(const RSE::LightType p_type, cons
 			type = ClusterBuilderRD::LIGHT_TYPE_AREA;
 		}
 
+		const uint32_t index = current_cluster_builder->get_light_count(type);
 		current_cluster_builder->add_light(type, p_transform, p_radius, p_spot_aperture, p_area_size);
+		if (current_cluster_builder->get_light_count(type) != index) {
+			added_lights.push_back({ type, index, p_transform, p_radius, p_spot_aperture, p_area_size });
+		}
+	}
+}
+
+// Every local light's image through every planar mirror chain the direct
+// pass evaluates, as elements of the exponential-depth cluster placed where
+// the image shines (ClusterBuilderRD::add_light_image), indexed past the
+// real lights of the type as count + light * chains + chain. The pass's
+// cell walk decodes them (stochastic_direct_lighting.glsl); before this
+// the images were evaluated for the real lights of the pixel's own cell,
+// and whether a lamp's reflection reached a ceiling depended on whether
+// the lamp's own proxy covered the ceiling's froxel (plan section 53).
+void RenderForwardClustered::_add_image_lights() {
+	if (current_cluster_builder == nullptr || raytracing == nullptr || !use_stochastic_lighting || added_lights.is_empty()) {
+		return;
+	}
+	const uint32_t chains = raytracing->update_image_chains();
+	if (chains == 0) {
+		return;
+	}
+	uint32_t counts[3] = { current_cluster_builder->get_light_count(ClusterBuilderRD::LIGHT_TYPE_OMNI), current_cluster_builder->get_light_count(ClusterBuilderRD::LIGHT_TYPE_SPOT), current_cluster_builder->get_light_count(ClusterBuilderRD::LIGHT_TYPE_AREA) };
+	const uint32_t cap = current_cluster_builder->get_max_elements_by_type();
+	// Diagnostics (GODOT_IMAGE_PRINT=1): the chains and the images added, once.
+	static const bool print = OS::get_singleton()->get_environment("GODOT_IMAGE_PRINT") == "1";
+	static bool printed = false;
+	uint32_t added = 0;
+	uint32_t rejected = 0;
+	for (const AddedLight &l : added_lights) {
+		const uint32_t count = counts[l.type == ClusterBuilderRD::LIGHT_TYPE_OMNI ? 0 : (l.type == ClusterBuilderRD::LIGHT_TYPE_SPOT ? 1 : 2)];
+		for (uint32_t c = 0; c < chains; c++) {
+			const uint32_t index = count + l.index * chains + c;
+			if (index >= cap) {
+				break; // Past the cluster's element budget: the pass finds no image (as it found none at all before).
+			}
+			Transform3D image;
+			if (!raytracing->mirror_chain_transform(raytracing->get_image_chain_code(c), l.transform, image)) {
+				rejected++;
+				continue; // The light behind a mirror of the chain: no image.
+			}
+			// GODOT_IMAGE_BRUTE=1: every image in every cell (a proxy a
+			// hundred times the range), the reference the culled set is
+			// checked against.
+			static const bool brute = OS::get_singleton()->get_environment("GODOT_IMAGE_BRUTE") == "1";
+			current_cluster_builder->add_light_image(l.type, image, brute ? l.radius * 100.0f : l.radius, l.spot_aperture, l.area_size, index);
+			added++;
+			if (print && !printed && l.type == ClusterBuilderRD::LIGHT_TYPE_OMNI && l.index == 0) {
+				print_line(vformat("IMAGE omni 0 at %s chain %x -> %s index %d", l.transform.origin, raytracing->get_image_chain_code(c), image.origin, index));
+			}
+		}
+	}
+	if (print && !printed) {
+		printed = true;
+		for (const AddedLight &l : added_lights) {
+			print_line(vformat("IMAGE real light type %d index %d at %s radius %.2f", (int)l.type, l.index, l.transform.origin, l.radius));
+		}
+		print_line(vformat("IMAGE lights: %d chains, counts %d/%d/%d (cap %d), %d real lights, %d images added, %d rejected", chains, counts[0], counts[1], counts[2], cap, added_lights.size(), added, rejected));
 	}
 }
 
@@ -1979,7 +2038,11 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	uint32_t directional_light_count = 0;
 	uint32_t positional_light_count = 0;
+	added_lights.clear();
 	light_storage->update_light_buffers(p_render_data, *p_render_data->lights, p_render_data->scene_data->cam_transform, p_render_data->shadow_atlas, using_shadows, directional_light_count, positional_light_count, p_render_data->directional_light_soft_shadows, _get_rt_sun_base(p_render_data));
+	if (p_render_data->reflection_probe.is_null()) {
+		_add_image_lights();
+	}
 	texture_storage->update_decal_buffer(*p_render_data->decals, p_render_data->scene_data->cam_transform);
 
 	p_render_data->directional_light_count = directional_light_count;

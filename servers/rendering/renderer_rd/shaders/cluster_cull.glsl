@@ -51,7 +51,7 @@ struct RenderElement {
 	uint original_index;
 	mat3x4 transform_inv; // The proxy's view-space placement (rotation and origin); vec4(p, 1) * m.
 	vec3 scale; // The proxy's half extents (a sphere: its radius; a cone: base radius, base radius, height).
-	uint has_wide_spot_angle; // A spot light drawn as a sphere.
+	uint has_wide_spot_angle; // Bit 0: a spot light drawn as a sphere. Bit 1: an image light, in the exponential cluster only.
 };
 
 layout(set = 0, binding = 2, std430) buffer restrict readonly RenderElements {
@@ -134,7 +134,7 @@ bool obb_frustum(vec3 c, vec3 ax, vec3 ay, vec3 az, vec3 h, vec4 planes[6]) {
 
 bool intersects(RenderElement e, vec4 planes[6]) {
 	vec3 origin = place(e.transform_inv, vec3(0.0));
-	if (e.type == 0u || (e.type == 1u && e.has_wide_spot_angle != 0u)) {
+	if (e.type == 0u || (e.type == 1u && (e.has_wide_spot_angle & 1u) != 0u)) {
 		return sphere_frustum(origin, e.scale.x, planes);
 	}
 	if (e.type == 1u) {
@@ -218,7 +218,11 @@ void main() {
 		uint chunk_count = min(CHUNK, count - chunk);
 		for (uint j = 0u; j < chunk_count; j++) {
 			RenderElement e = render_elements.data[chunk + j];
-			if (intersects(e, planes)) {
+			// An image light (ClusterBuilderRD::add_light_image) is indexed
+			// past its type's real lights, which only the stochastic pass
+			// decodes: the linear cluster the scene shader reads never
+			// holds one.
+			if ((e.has_wide_spot_angle & 2u) == 0u && intersects(e, planes)) {
 				atomicOr(masks[j], 1u << slice);
 			}
 			if (intersects(e, planes_log)) {

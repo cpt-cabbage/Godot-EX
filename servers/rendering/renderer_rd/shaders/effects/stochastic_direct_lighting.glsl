@@ -99,8 +99,13 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), view space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
-	uint mirror_pad1;
-	uint mirror_pad2;
+	// The image chains in the cluster (see the cell walk in main): a
+	// cell entry past a type's real lights is light * chains + chain, the
+	// chain's code packed as mirror_chains_at packs them (A | B << 3 |
+	// C << 6, MAX_MIRROR_PLANES ending it), four to a uvec4.
+	uint image_chain_count;
+	uint mirror_pad;
+	uvec4 image_chains[4];
 }
 params;
 
@@ -202,6 +207,7 @@ layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_ana
 #define IMAGE3_PLANE_SHIFT 17u
 #define IMAGE3_PLANE_MASK (0x3u << IMAGE3_PLANE_SHIFT)
 #define ENTRY_ID_MASK 0x0001FFFFu
+#define IMAGE_CHAINS_MAX 16u // Raytracing::IMAGE_CHAINS_MAX, the chain table in params.
 #define ENTRY_KEY_MASK (SPOT_BIT | AREA_BIT | IMAGE_BIT | IMAGE_PLANE_MASK | IMAGE2_BIT | IMAGE2_PLANE_MASK | IMAGE3_BIT | IMAGE3_PLANE_MASK | ENTRY_ID_MASK)
 #define ENTRY_MIRROR(e) (((e) & IMAGE_PLANE_MASK) >> IMAGE_PLANE_SHIFT)
 #define ENTRY_MIRROR2(e) ((((e) & IMAGE2_BIT) != 0u) ? (((e) & IMAGE2_PLANE_MASK) >> IMAGE2_PLANE_SHIFT) : MAX_MIRROR_PLANES)
@@ -889,6 +895,19 @@ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
 	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, mask_width);
 }
 
+// A mirror chain's code (mirror_chains_at's packing) as the entry bits of
+// a light's image through it.
+uint image_entry_bits(uint c) {
+	uint bits = IMAGE_BIT | (MIRROR_CHAIN_A(c) << IMAGE_PLANE_SHIFT);
+	if (MIRROR_CHAIN_B(c) < MAX_MIRROR_PLANES) {
+		bits |= IMAGE2_BIT | (MIRROR_CHAIN_B(c) << IMAGE2_PLANE_SHIFT);
+	}
+	if (MIRROR_CHAIN_C(c) < MAX_MIRROR_PLANES) {
+		bits |= IMAGE3_BIT | (MIRROR_CHAIN_C(c) << IMAGE3_PLANE_SHIFT);
+	}
+	return bits;
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
@@ -1091,23 +1110,20 @@ void main() {
 		guided_count++;
 	}
 	float hidden_weight_sum = 0.0;
-	// The image chains this pixel faces (mirror_chains_at: each mirror on
-	// whose reflective side it lies, alone and in the pairs and triples
-	// worth it, a lamp seen in the floor seen in the ceiling): each local
-	// light gets an image entry beside it through each. The variants as
-	// entry bits, listed once here.
-	uint mirror_variant_bits[MIRROR_CHAINS_MAX];
-	uint mirror_variants = mirror_on() ? mirror_chains_at(view_pos, mirror_variant_bits) : 0u;
-	for (uint v = 0u; v < mirror_variants; v++) {
-		uint c = mirror_variant_bits[v];
-		uint bits = IMAGE_BIT | (MIRROR_CHAIN_A(c) << IMAGE_PLANE_SHIFT);
-		if (MIRROR_CHAIN_B(c) < MAX_MIRROR_PLANES) {
-			bits |= IMAGE2_BIT | (MIRROR_CHAIN_B(c) << IMAGE2_PLANE_SHIFT);
-		}
-		if (MIRROR_CHAIN_C(c) < MAX_MIRROR_PLANES) {
-			bits |= IMAGE3_BIT | (MIRROR_CHAIN_C(c) << IMAGE3_PLANE_SHIFT);
-		}
-		mirror_variant_bits[v] = bits;
+	// The image chains in the cluster (the light's image through a chain
+	// of mirrors, a lamp seen in the floor seen in the ceiling), for the
+	// cell walk to decode an image entry with. Every local light has an
+	// image through every chain, placed where the image shines; one whose
+	// chain this pixel does not face, or whose crossings miss the
+	// rectangles, evaluates to nothing (mirror_chain).
+	uint image_chains = mirror_on() ? min(params.image_chain_count, IMAGE_CHAINS_MAX) : 0u;
+	// The mirrors this pixel faces (mirror_chains_at's test): an image
+	// through a chain whose last mirror it does not face is nothing, and
+	// is dropped before its evaluation. The wide lights' images (a spot of
+	// a hundred metres' range, an area light) sit in every cell.
+	uint faced_mirrors = 0u;
+	for (uint i = 0u; i < mirror_count(); i++) {
+		faced_mirrors |= mirror_height(i, view_pos) > 0.005 ? (1u << i) : 0u;
 	}
 
 	// Discovery candidates: a strided subset of this pixel's cluster cell, so
@@ -1190,7 +1206,31 @@ void main() {
 					uint bit = findLSB(mask);
 					mask &= ~(1u << bit);
 					uint take = cell_index++;
-					uint entry = (32u * i + bit) | (type == 1u ? SPOT_BIT : (type == 2u ? AREA_BIT : 0u));
+					uint raw = 32u * i + bit;
+					uint type_bits = type == 1u ? SPOT_BIT : (type == 2u ? AREA_BIT : 0u);
+					uint entry = raw | type_bits;
+					// Past the type's real lights the cell holds their images
+					// (ClusterBuilderRD::add_light_image): light * chains +
+					// chain, decoded into the light's entry with the chain's
+					// bits. The count is the renderer's, which the cluster
+					// indexed the same lights by.
+					uint type_light_count = type == 1u ? params.spot_light_count : (type == 2u ? params.area_light_count : params.omni_light_count);
+					if (raw >= type_light_count) {
+						if (image_chains == 0u) {
+							continue;
+						}
+						uint k = raw - type_light_count;
+						uint light = k / image_chains;
+						uint chain = k - light * image_chains;
+						if (light >= type_light_count) {
+							continue;
+						}
+						uint code = params.image_chains[chain >> 2u][chain & 3u];
+						if ((faced_mirrors & (1u << MIRROR_CHAIN_A(code))) == 0u) {
+							continue;
+						}
+						entry = light | type_bits | image_entry_bits(code);
+					}
 
 					// Which lights this pixel samples. Past the exact cap each
 					// light draws its own phase instead of sharing one across
@@ -1206,12 +1246,12 @@ void main() {
 						continue;
 					}
 
-					// The light, and beside it its image through each planar
-					// mirror the pixel faces (a candidate and an analytic term
-					// of its own, sharing the light's draw in the stride).
-					uint variants = 1u + mirror_variants;
-					for (uint variant = 0u; variant < variants; variant++) {
-						uint e = variant == 0u ? entry : (entry | mirror_variant_bits[variant - 1u]);
+					// A light and its images are cell entries alike (a candidate
+					// and an analytic term of their own, each drawn in the
+					// stride on its own).
+					{
+						uint e = entry;
+						bool is_image = (e & IMAGE_BIT) != 0u;
 						vec3 f, s;
 						vec4 ss;
 						entry_eval(e, view_pos, view_normal, roughness, f, s, ss);
@@ -1227,7 +1267,7 @@ void main() {
 						float ss_lum = abs(luminance(ss.rgb)) * analytic_scale;
 						analytic_fc_num += ss_lum * ss.a;
 						analytic_fc_den += ss_lum;
-						if (variant != 0u) {
+						if (is_image) {
 							analytic_image_diffuse += f * analytic_scale;
 							analytic_image_spec_base += ss.rgb * analytic_scale;
 							analytic_image_fc_num += ss_lum * ss.a;
