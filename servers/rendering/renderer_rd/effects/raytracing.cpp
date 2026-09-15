@@ -325,6 +325,13 @@ void RenderBuffersRT::free_data() {
 		rd->free_rid(ubo);
 	}
 	rt_gi_params_ubos.clear();
+	for (const RID &buffer : rt_gi_votes_buffers) {
+		if (buffer.is_valid()) {
+			rd->free_rid(buffer);
+		}
+	}
+	rt_gi_votes_buffers.clear();
+	rt_gi_votes_tiles.clear();
 	for (const RtGiCalibration &c : rt_gi_calibration) {
 		rd->free_rid(c.buffer);
 	}
