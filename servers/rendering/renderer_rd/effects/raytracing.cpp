@@ -78,8 +78,8 @@ static void _set_luma_weights(float *p_out) {
 // GODOT_GI_MOD=<strength>: how much of the cards' frame-to-frame change the
 // GI temporal pass writes into its history while a light moves (1 the whole
 // change; 0, the default, off: the change mark restarts the history alone).
-// Measured neutral on the game flick and inert on rt_lab's sweep
-// (MEGALIGHTS_PLAN.md section 27); kept as the knob to retest with. On, the
+// Measured neutral on the game flick and inert on rt_lab's sweep; kept
+// as the knob to retest with. On, the
 // gather reads the cards' fallback for every pixel (a primary ray each).
 static float _card_modulation() {
 	static const float strength = OS::get_singleton()->get_environment("GODOT_GI_MOD") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_MOD").to_float());
@@ -93,9 +93,9 @@ static bool _luma_compress() {
 	return compress;
 }
 
-// The split history (RAYTRACING_PLAN.md section 36, measured and left
-// off): its textures exist only while GODOT_GI_SPLIT (the kernel verdicts)
-// or GODOT_GI_SPLIT_SIGMA=2 (the luminance stop) reads it.
+// The split history (measured and left off): its textures exist only
+// while GODOT_GI_SPLIT (the kernel verdicts) or GODOT_GI_SPLIT_SIGMA=2
+// (the luminance stop) reads it.
 static bool _split_history() {
 	static const bool split = (OS::get_singleton()->get_environment("GODOT_GI_SPLIT") != "" && OS::get_singleton()->get_environment("GODOT_GI_SPLIT") != "0") || OS::get_singleton()->get_environment("GODOT_GI_SPLIT_SIGMA") == "2";
 	return split;
@@ -526,8 +526,8 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 				ubo.prev_reproject[col * 4 + row] = h.previous.columns[col][row];
 			}
 		}
-		// The GI temporal pass's card correction (MEGALIGHTS_PLAN.md section
-		// 27): GODOT_GI_MOD=<strength> (0 restores the change mark's restart
+		// The GI temporal pass's card correction: GODOT_GI_MOD=<strength>
+		// (0 restores the change mark's restart
 		// of the history alone), GODOT_GI_MOD_FLOOR=<frames> the frames a
 		// corrected history is shortened to, GODOT_GI_MOD_DEAD=<fraction> the
 		// relative change of the field under which it is the cards' own
@@ -558,7 +558,7 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// temporal pass weighs such a frame's sample by as many.
 		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
 		ubo.young_rays = float(CLAMP(young_rays, 1, 4));
-		// The split history (RAYTRACING_PLAN.md section 36): GODOT_GI_SPLIT=
+		// The split history: GODOT_GI_SPLIT=
 		// 1 reads the pixel's own halves, 2 the 3x3 neighbourhood's (0
 		// off); GODOT_GI_SPLIT_THRESH the relative variance of the mean
 		// under which a settled pixel's kernel is halved, GODOT_GI_SPLIT_SKIP
@@ -1821,8 +1821,8 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	_set_luma_weights(denoise_push_constant.luma_weights);
 	denoise_push_constant.blend_alpha = p_quality.denoise ? 1.0f / float(MAX(p_quality.temporal_frames, 1u)) : 1.0f;
 
-	// The rough reflection's spatial resolve (MEGALIGHTS_PLAN.md section
-	// 28): the temporal pass accumulates the neighbourhood's hits weighted
+	// The rough reflection's spatial resolve: the temporal pass
+	// accumulates the neighbourhood's hits weighted
 	// into each pixel's lobe rather than the pixel's one sample. Measured
 	// neutral against the restart-time resolve of the history fix (section
 	// 27) on the game flick and the mirror-floor strafe, so off by default:

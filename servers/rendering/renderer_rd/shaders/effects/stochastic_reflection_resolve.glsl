@@ -4,7 +4,7 @@
 
 #VERSION_DEFINES
 
-// The rough reflection's spatial resolve (MEGALIGHTS_PLAN.md section 28):
+// The rough reflection's spatial resolve:
 // before the temporal pass, a pixel's one GGX sample is replaced by the
 // lobe-weighted average of its neighbourhood's rays. Each neighbour's ray
 // was drawn from that neighbour's lobe with a known density and hit a

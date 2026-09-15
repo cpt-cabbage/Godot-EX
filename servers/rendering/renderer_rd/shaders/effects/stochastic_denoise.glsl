@@ -814,15 +814,15 @@ void main() {
 			// alpha over eight frames, where the gather's on-screen hits read
 			// it, so a change propagates through the screen bounces.
 			//
-			// Measured and not kept (MEGALIGHTS_PLAN.md section 19): an
+			// Measured and not kept: an
 			// accumulated drift in place of the decaying max, restarting to
 			// 1 / sqrt(c) under a steady change. It followed the slow ones
 			// closer (the game project's flashlight, a cycling hue) and made
 			// a fast flicker worse, an oscillation's swings counting as
 			// distance travelled.
 			//
-			// With the card correction (reprojection.mod_strength > 0;
-			// MEGALIGHTS_PLAN.md section 27): the restart above took a pixel
+			// With the card correction (reprojection.mod_strength > 0): the
+			// restart above took a pixel
 			// to one raw sample wherever a ray of its had landed on a changed
 			// card, at different pixels every frame under a moving
 			// flashlight, and the spatial pass widened its kernel on each --
