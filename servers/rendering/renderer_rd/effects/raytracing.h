@@ -655,8 +655,10 @@ public:
 	// diffuse_share[,lx,ly,lz,energy,range][,debug]" overrides the scene's
 	// with one unbounded plane (the box's knob; its diffuse share is read
 	// from the specular atlas now, the field is kept for the old command
-	// lines); GODOT_GI_MIRROR=0 turns every mirror off.
-	uint32_t fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world) const;
+	// lines); GODOT_GI_MIRROR=0 turns every mirror off, and p_pass names
+	// the caller (1 the cards, 2 the direct pass, 4 the GI gather) for
+	// GODOT_MIRROR_PASSES to keep the mirrors from one consumer at a time.
+	uint32_t fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world, uint32_t p_pass) const;
 	// The longest chain of mirrors an image is evaluated through (1 to 3;
 	// GODOT_MIRROR_ORDER, default 2): a lamp seen in the floor seen in the
 	// ceiling is a second-order image; the third order read nothing more in

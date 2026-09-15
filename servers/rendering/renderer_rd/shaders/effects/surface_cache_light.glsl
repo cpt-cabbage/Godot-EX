@@ -103,7 +103,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
-	uint mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling): 1 no image lights, 2 no mirror continuation of the bounce rays, 4 the F0 fold kept on the mirrors' texels.
+	uint mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling): 1 no image lights, 2 no mirror continuation of the bounce rays, 4 the F0 fold kept on the mirrors' texels, 8 no area-light images, 16 the area-light images weighted through the drawn rect point (see shade_images).
 	uint mirror_pad2;
 }
 params;
@@ -1034,7 +1034,7 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 			}
 		}
 	}
-	uint area_count = (params.debug & 4u) != 0u ? 0u : params.area_light_count;
+	uint area_count = (params.debug & 4u) != 0u || (params.mirror_debug & 8u) != 0u ? 0u : params.area_light_count;
 	for (uint j = 0u; j < area_count; j++) {
 		LightData ld = area_lights.data[j];
 		seed = pcg_hash(seed);
@@ -1043,8 +1043,24 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 		float xi1 = hash_to_float(seed);
 		for (uint ch = 0u; ch < chains; ch++) {
 			// The area light's image through each chain the texel faces:
-			// the rect stays, the texel mirrors; the drawn point on the
-			// rect names the chain's crossings.
+			// the rect stays, the texel mirrors. The chain's weight (the
+			// Fresnel and the rectangle's coverage) is taken through the
+			// rect's centre, and the drawn point on the rect names only the
+			// shadow legs' target. Taking the weight through the drawn
+			// point too (mirror_debug bit 16, the first form) made the
+			// unshadowed sum a random variable on every texel an area
+			// light's image reached -- its coverage came and went with the
+			// point, and a broken chain dropped the whole term -- which the
+			// radiance gradient below, built on that sum being exact,
+			// read as the light changing at every relight: the bounce
+			// accumulation and the screen's GI history restarted at random
+			// over the whole room (pose E0 at rest, frame-to-frame
+			// difference 0.00071 against 0.00046 without the images; the
+			// centre's weight 0.00047). The cost is the coverage at a
+			// mirror's edge, all-or-nothing where the rect's reflection
+			// straddles it (the lobe's footprint softens it, not the
+			// rect's extent), the same approximation as evaluating the LTC
+			// term at the mirrored texel alone.
 			vec3 img, p_img, n_img, c1, c2, c3;
 			float f;
 			if (!mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, (params.world_from_view * vec4(ld.position, 1.0)).xyz, ld.inv_radius, img, p_img, n_img, f, c1, c2, c3)) {
@@ -1053,7 +1069,14 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 			float geom_img;
 			vec3 point_img;
 			vec3 ci = area_light_contribution(ld, params.world_from_view, p_img, n_img, vec2(xi0, xi1), area_light_atlas, linear_sampler_mipmaps, geom_img, point_img);
-			if (!mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, point_img, 0.0, img, p_img, n_img, f, c1, c2, c3)) {
+			vec3 img_pt, p_pt, n_pt, c1_pt, c2_pt, c3_pt;
+			float f_pt;
+			if (mirror_chain(MIRROR_CHAIN_A(chain[ch]), MIRROR_CHAIN_B(chain[ch]), MIRROR_CHAIN_C(chain[ch]), t.world_pos, t.n_world, point_img, 0.0, img_pt, p_pt, n_pt, f_pt, c1_pt, c2_pt, c3_pt)) {
+				img = img_pt;
+				if ((params.mirror_debug & 16u) != 0u) {
+					f = f_pt;
+				}
+			} else if ((params.mirror_debug & 16u) != 0u) {
 				continue;
 			}
 			ci *= f;

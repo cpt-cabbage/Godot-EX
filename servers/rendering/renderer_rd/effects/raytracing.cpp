@@ -383,10 +383,14 @@ uint32_t Raytracing::mirror_order() {
 	return order;
 }
 
-uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world) const {
+uint32_t Raytracing::fill_mirror_planes(SurfaceCache::MirrorPlaneGPU *r_planes, const Transform3D *p_view_from_world, uint32_t p_pass) const {
 	static const Vector<double> knob = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 	static const bool knob_off = OS::get_singleton()->get_environment("GODOT_GI_MIRROR") == "0";
-	if (knob_off) {
+	// GODOT_MIRROR_PASSES=<bits>: which passes see the mirrors at all (1 the
+	// cards, 2 the direct pass's image lights, 4 the GI gather; default
+	// all), to ablate one consumer at a time.
+	static const uint32_t passes = OS::get_singleton()->get_environment("GODOT_MIRROR_PASSES").is_valid_int() ? (uint32_t)OS::get_singleton()->get_environment("GODOT_MIRROR_PASSES").to_int() : 7u;
+	if (knob_off || !(passes & p_pass)) {
 		return 0;
 	}
 	LocalVector<RaytracingScene::MirrorPlane> knob_planes;
@@ -485,7 +489,7 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 	in.sky_energy = p_sky.energy;
 	in.sky_border = p_sky.border_size;
 	in.light_radius = light_storage->card_lights_are_valid() ? p_light_radius : 0.0f;
-	in.mirror_count = fill_mirror_planes(in.mirrors, nullptr);
+	in.mirror_count = fill_mirror_planes(in.mirrors, nullptr, 1u);
 	in.mirror_order = mirror_order();
 	surface_cache->update_lighting(in);
 	hit_lighting = in;
@@ -927,7 +931,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		// The planar mirrors in view space: every local light gets an image
 		// entry beside it in this pass, through each mirror the pixel faces.
 		Transform3D view_from_world = p_world_from_view.affine_inverse();
-		params.mirror_count = fill_mirror_planes(params.mirrors, &view_from_world);
+		params.mirror_count = fill_mirror_planes(params.mirrors, &view_from_world, 2u);
 		params.mirror_order = mirror_order();
 	}
 	Projection ndc_from_view = p_view_from_ndc.inverse();
@@ -1356,7 +1360,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		// omni light to image (GODOT_GI_MIRROR's optional lx,ly,lz,energy,
 		// range: a scene without the stochastic direct pass, the box) with
 		// its diagnostics bits (1 the image terms alone, 2 no continuation).
-		params.mirror_count = fill_mirror_planes(params.mirrors, nullptr);
+		params.mirror_count = fill_mirror_planes(params.mirrors, nullptr, 4u);
 		params.mirror_order = mirror_order();
 		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 		if (mirror.size() >= 12) {

@@ -1063,6 +1063,9 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 		if (force == "all" || (force == "spot" && light->type == RSE::LIGHT_SPOT)) {
 			weight = 1.0f;
 		}
+		// GODOT_CARD_DYN_PRINT=1: every change a light makes to the dynamic
+		// set, with the frame (which light restarted the cards, and when).
+		static const bool dyn_print = OS::get_singleton()->get_environment("GODOT_CARD_DYN_PRINT") == "1";
 		if ((weight > 0.0f) != track.dynamic) {
 			// Joining or leaving the dynamic set: every card's static radiance
 			// changes (the light's direct term leaves it or returns), and the
@@ -1071,6 +1074,11 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 			// hundreds of frames after a flashlight's first move).
 			track.dynamic = weight > 0.0f;
 			card_dynamic_generation++;
+			if (dyn_print) {
+				print_line(vformat("Card lights: frame %d, %s light %s the dynamic set (changed %s, motion %.3f, weight %.2f).", card_light_frame, light->type == RSE::LIGHT_SPOT ? "spot" : "omni", track.dynamic ? "joins" : "leaves", changed ? "yes" : "no", motion, weight));
+			}
+		} else if (dyn_print && changed) {
+			print_line(vformat("Card lights: frame %d, %s light changed (motion %.3f, weight %.2f before %.2f).", card_light_frame, light->type == RSE::LIGHT_SPOT ? "spot" : "omni", motion, weight, weight_before));
 		}
 		if (changed && weight > weight_before) {
 			// A light that was static (or fading back to it) changed: the
