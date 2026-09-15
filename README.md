@@ -14,7 +14,7 @@
 - **Ray-traced shadows**: directional and area-light shadows that replace the shadow maps —
   soft shadows from the sun's angular size, temporal accumulation, depth-aware denoise, alpha-tested
   casters, per-light and per-instance control, ray-traced volumetric fog shadows
-- **Stochastic direct lighting** ("mini-MegaLights"): many-light sampling with blue-noise
+- **Stochastic direct lighting**: many-light sampling with blue-noise
   candidates, visibility-guided light lists, screen-space contact traces, area lights, a ratio
   estimator with an SVGF-style variance-driven denoiser, half-resolution mode
 - **Ray-traced GI**: hardware final gather with directional irradiance and traced specular

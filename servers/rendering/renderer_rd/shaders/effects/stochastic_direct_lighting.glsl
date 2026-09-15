@@ -7,7 +7,7 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_samplerless_texture_functions : enable
 
-// Stochastic direct lighting (mini-MegaLights).
+// Stochastic direct lighting.
 // Per pixel: weighted reservoir sampling over a candidate set built from the
 // previous frame's visible light list (guided) and a strided subset of the
 // clustered light grid cell (discovery), one ray-query visibility ray per

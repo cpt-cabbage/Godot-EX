@@ -748,7 +748,7 @@ public:
 	// shader merges at the GI buffer merge point.
 	void process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_gbuf_albedo, RID p_gbuf_f0, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality);
 
-	// Stochastic direct lighting (mini-MegaLights): samples omni/spot lights
+	// Stochastic direct lighting: samples omni/spot lights
 	// per pixel (guided by last frame's visible lights, discovering new ones
 	// through a strided subset of the clustered light grid cell) and shades
 	// ray-traced-visible samples into demodulated diffuse/specular buffers

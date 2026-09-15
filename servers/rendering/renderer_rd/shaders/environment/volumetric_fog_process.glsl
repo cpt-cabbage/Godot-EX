@@ -229,7 +229,7 @@ layout(set = 0, binding = 20) uniform texture2D sky_texture;
 layout(set = 0, binding = 21) uniform texture2D area_light_atlas;
 
 #ifdef USE_RAY_QUERY
-// Stochastic ray-traced fog shadows (mini-MegaLights): instead of sampling
+// Stochastic ray-traced fog shadows: instead of sampling
 // shadow maps, each froxel accumulates its local light in-scatter analytically
 // while reservoir-sampling one light proportionally to its contribution, then
 // traces a single ray to that light and applies its visibility to the whole

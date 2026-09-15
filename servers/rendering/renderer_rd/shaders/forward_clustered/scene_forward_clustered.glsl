@@ -3514,7 +3514,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #endif // !USE_VERTEX_LIGHTING
 
-	// Stochastic direct lighting (mini-MegaLights): omni/spot/area
+	// Stochastic direct lighting: omni/spot/area
 	// contribution computed by the ray-traced compute pass. Demodulated:
 	// albedo, AO and metallic are applied by the common composite below.
 	// The specular buffer holds the lobe without its Fresnel term (rgb) and the
