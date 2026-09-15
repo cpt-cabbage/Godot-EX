@@ -2325,9 +2325,15 @@ void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_re
 	// A frame the scene itself asked for restarts the count, and so does moving
 	// the view: reprojection carries the history across small camera motion, but
 	// disocclusions and changed shading angles still have to converge again.
+	// GODOT_REPAINT_PRINT=1: why this frame restarted the count or asked for
+	// another (an editor that keeps drawing at rest, and which branch).
+	static const bool repaint_print = OS::get_singleton()->get_environment("GODOT_REPAINT_PRINT") == "1";
 	if (RenderingServerDefault::had_changes_at_draw() ||
 			scene_data->cam_transform != scene_data->prev_cam_transform ||
 			scene_data->cam_projection != scene_data->prev_cam_projection) {
+		if (repaint_print) {
+			print_line(vformat("Repaint: count restarted by %s%s%s (rb %d).", RenderingServerDefault::had_changes_at_draw() ? "a change " : "", scene_data->cam_transform != scene_data->prev_cam_transform ? "the camera transform " : "", scene_data->cam_projection != scene_data->prev_cam_projection ? "the projection " : "", (uint64_t)(uintptr_t)p_rb_data));
+		}
 		p_rb_data->rt_converged_frames = 0;
 	}
 
@@ -2347,6 +2353,9 @@ void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_re
 
 	if (p_rb_data->rt_converged_frames < frames_needed) {
 		p_rb_data->rt_converged_frames++;
+		if (repaint_print && p_rb_data->rt_converged_frames % 8 == 1) {
+			print_line(vformat("Repaint: history filling, %d of %d (rb %d).", p_rb_data->rt_converged_frames, frames_needed, (uint64_t)(uintptr_t)p_rb_data));
+		}
 		RenderingServerDefault::repaint_request();
 		return;
 	}
@@ -2361,6 +2370,9 @@ void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_re
 	RendererRD::SurfaceCache *cache = raytracing != nullptr ? raytracing->get_surface_cache() : nullptr;
 	if (cache != nullptr && !cache->is_settled() && p_rb_data->rt_converged_frames < frames_needed + 600) {
 		p_rb_data->rt_converged_frames++;
+		if (repaint_print && p_rb_data->rt_converged_frames % 30 == 0) {
+			print_line(vformat("Repaint: cards settling, %d (rb %d).", p_rb_data->rt_converged_frames, (uint64_t)(uintptr_t)p_rb_data));
+		}
 		RenderingServerDefault::repaint_request_after(33000);
 	}
 }

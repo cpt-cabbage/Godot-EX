@@ -304,6 +304,8 @@ private:
 	static uint32_t converge_up; // The settled texels' bounce luminance that rose this relight, summed (fixed point, 1/1024).
 	static uint32_t converge_down; // And that fell.
 	static double converge_drift; // |up - down| / (up + down), smoothed over the readbacks (1 while any count is young).
+	static bool converge_settled; // The verdict, with hysteresis on the drift (see _converge_readback).
+	static double converge_total_max; // The largest up + down count since the last restart: a readback far under it is too few texels to judge the drift by.
 	static uint64_t converge_readback_frame; // Engine frame the last readback landed on.
 	static void _converge_readback(const Vector<uint8_t> &p_data);
 	static bool _settled();

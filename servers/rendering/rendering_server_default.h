@@ -63,6 +63,14 @@ class RenderingServerDefault : public RenderingServer {
 	// Of those, the ones the renderer asked for itself, so they do not read back
 	// as a scene change on the next frame.
 	static int self_repaints;
+	// And the ones from the canvas (2D) API: a control redrawing is a
+	// reason to draw a frame, not to start a 3D temporal accumulation over.
+	// The editor's update spinner steps whenever a frame was drawn, its
+	// icon change is a canvas write, and a renderer that restarted its
+	// convergence on every change then asked for more frames, which
+	// stepped the spinner again: an editor at rest that never stopped
+	// drawing (and showed its upscaler's jitter on every thin line).
+	static int canvas_changes;
 	static bool changes_at_draw;
 	static uint64_t repaint_deadline_usec; // repaint_request_after: when the next delayed repaint is due (0: none).
 	RID test_cube;
@@ -117,6 +125,10 @@ public:
 		changes++;
 	}
 #endif
+	_FORCE_INLINE_ static void canvas_redraw_request() {
+		redraw_request();
+		canvas_changes++;
+	}
 
 	// Ask for one more frame without marking the scene as changed. Temporal
 	// effects use this to keep accumulating while everything else sits idle:
@@ -133,9 +145,10 @@ public:
 	// frame it produces counts as a repaint, not a change.
 	static void repaint_request_after(uint64_t p_delay_usec);
 
-	// Whether the frame currently being drawn was asked for by an actual change,
-	// as opposed to one of those repaints. Temporal effects use it to know when
-	// their accumulation has to start over.
+	// Whether the frame currently being drawn was asked for by an actual change
+	// outside the canvas, as opposed to one of those repaints or a control
+	// redrawing. Temporal effects use it to know when their accumulation has
+	// to start over.
 	_FORCE_INLINE_ static bool had_changes_at_draw() {
 		return changes_at_draw;
 	}
@@ -1024,6 +1037,8 @@ public:
 //from now on, calls forwarded to this singleton
 #define ServerName RendererCanvasCull
 #define server_name RSG::canvas
+#undef WRITE_ACTION
+#define WRITE_ACTION canvas_redraw_request();
 
 	/* CANVAS (2D) */
 
@@ -1169,6 +1184,8 @@ public:
 
 #undef server_name
 #undef ServerName
+#undef WRITE_ACTION
+#define WRITE_ACTION redraw_request();
 //from now on, calls forwarded to this singleton
 #define ServerName RendererMaterialStorage
 #define server_name RSG::material_storage

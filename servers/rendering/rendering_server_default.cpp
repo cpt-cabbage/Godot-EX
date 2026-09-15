@@ -46,6 +46,7 @@
 // careful, these may run in different threads than the rendering server
 
 int RenderingServerDefault::changes = 0;
+int RenderingServerDefault::canvas_changes = 0;
 int RenderingServerDefault::self_repaints = 0;
 bool RenderingServerDefault::changes_at_draw = false;
 uint64_t RenderingServerDefault::repaint_deadline_usec = 0;
@@ -472,9 +473,10 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	// Recorded before the counter is cleared: a frame whose only pending
 	// requests came from the renderer itself is an idle repaint, and temporal
 	// accumulation may carry on across it.
-	changes_at_draw = changes > self_repaints;
+	changes_at_draw = changes > self_repaints + canvas_changes;
 	changes = 0;
 	self_repaints = 0;
+	canvas_changes = 0;
 	if (create_thread) {
 		command_queue.push(this, &RenderingServerDefault::_draw, p_present, frame_step);
 	} else {

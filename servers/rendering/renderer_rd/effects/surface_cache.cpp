@@ -770,6 +770,8 @@ uint32_t SurfaceCache::converge_relit = 0;
 uint32_t SurfaceCache::converge_up = 0;
 uint32_t SurfaceCache::converge_down = 0;
 double SurfaceCache::converge_drift = 1.0;
+double SurfaceCache::converge_total_max = 0.0;
+bool SurfaceCache::converge_settled = false;
 uint64_t SurfaceCache::converge_readback_frame = 0;
 
 void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
@@ -788,7 +790,33 @@ void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
 	// verdict that flickers would restart the editor's repaints.
 	double total = double(converge_up) + double(converge_down);
 	double drift = total > 0.0 ? Math::abs(double(converge_up) - double(converge_down)) / total : 0.0;
-	converge_drift = converge_young * 100 >= converge_relit ? 1.0 : Math::lerp(converge_drift, drift, 0.25);
+	// A readback over few texels is a noisy sample of the drift: once the
+	// cards are settled the idle budget relights a fifth as many, the
+	// share read 15-25% on those, the verdict unsettled, the full rate
+	// resumed and settled again -- a cycle the editor drew at 8 Hz for
+	// ever. The smoothing takes a readback whose count is within a quarter
+	// of the largest seen since the last restart, and skips the rest.
+	if (converge_young * 100 >= converge_relit) {
+		converge_drift = 1.0;
+		converge_total_max = 0.0;
+	} else {
+		converge_total_max = MAX(converge_total_max, total);
+		if (total * 4.0 >= converge_total_max) {
+			converge_drift = Math::lerp(converge_drift, drift, 0.25);
+		}
+	}
+	// The verdict, with hysteresis: settled at a tenth, unsettled again only
+	// past a seventh (or a young texel in a hundred). The game room's
+	// converged drift sits at 8-10% (section 33), on the threshold, and a
+	// verdict read fresh each time flipped every few seconds there, each
+	// flip another twenty seconds of the editor repainting -- and showing
+	// the upscaler's jitter on every thin line -- for a field that had
+	// stopped moving.
+	if (converge_young * 100 >= converge_relit || converge_drift > 0.15) {
+		converge_settled = false;
+	} else if (converge_drift <= 0.10) {
+		converge_settled = true;
+	}
 	if (OS::get_singleton()->has_environment("GODOT_CARD_CONVERGE_PRINT")) {
 		print_line(vformat("Surface cache convergence: %d of %d relit texels young, drift %+.1f%% of the movement (smoothed %.1f%%, %s)", converge_young, converge_relit, total > 0.0 ? 100.0 * (double(converge_up) - double(converge_down)) / total : 0.0, 100.0 * converge_drift, _settled() ? "settled" : "converging"));
 	}
@@ -808,13 +836,11 @@ bool SurfaceCache::_settled() {
 	if (converge_relit == 0) {
 		return true;
 	}
-	if (converge_young * 100 >= converge_relit) {
-		return false;
-	}
 	// The game room's bounce reads 5% under its converged level at a drift
 	// of 11-12% and 1-2% under it at 8-10%, where the smoothed drift then
-	// stays (section 33).
-	return converge_drift <= 0.10;
+	// stays (section 33); the verdict is kept with hysteresis in
+	// _converge_readback.
+	return converge_settled;
 }
 
 void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
