@@ -114,13 +114,17 @@ void main() {
 	}
 	// A set the gather reached last frame, or one just captured, is due now;
 	// everything else comes round on the period so stale lighting never lasts.
-	bool urgent = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || (push.frame - requests.frame[set]) <= 1u;
+	// A fresh capture stays urgent until its first relight has been recorded
+	// (relit.frame is cleared with the capture): the reset flag alone lasts
+	// one upload, and a set the budget dropped that frame would otherwise
+	// wait for a ray to ask for it, which for a mesh no ray reaches is never.
+	bool fresh = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || relit.frame[set * 2u + 1u] == 0u;
+	bool urgent = fresh || (push.frame - requests.frame[set]) <= 1u;
 	// Once the cards have settled under static lights (SurfaceCache's
 	// convergence count), a relight only re-derives what the texel already
 	// holds: the sets the hits reach take turns, one in idle_divisor a
 	// frame, and the round comes idle_divisor times slower. A fresh capture
 	// is due at once regardless.
-	bool fresh = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
 	bool turn = fresh || ((set + push.frame) % push.idle_divisor) == 0u;
 	bool pick;
 	if (push.mode == 0u) {

@@ -747,6 +747,14 @@ void SurfaceCache::finish_capture(const CaptureJob &p_job) {
 	// A fresh capture: the relit/filled state starts over (the old one could
 	// say "empty" of cards that now hold something, or the reverse).
 	RD::get_singleton()->buffer_clear(set_state_buffer, p_job.set * 2 * sizeof(uint32_t), 2 * sizeof(uint32_t));
+	// And the relight frames: a set is "fresh" to the select pass until its
+	// first relight after the capture has been recorded there, however many
+	// frames the lighting budget makes it wait (section 63). The reset flag
+	// alone lasted one upload: a fresh set the budget dropped that frame was
+	// never relit unless a ray asked for it, so an invisible dome nobody's
+	// rays reach was never judged empty and stayed in the TLAS -- or not,
+	// by the order the atomics fell in, from one run to the next.
+	RD::get_singleton()->buffer_clear(relit_buffer, p_job.set * 2 * sizeof(uint32_t), 2 * sizeof(uint32_t));
 	if (p_job.set * 2 + 1 < set_state.size()) {
 		set_state[p_job.set * 2] = 0;
 		set_state[p_job.set * 2 + 1] = 0;
@@ -763,8 +771,33 @@ void SurfaceCache::_set_state_readback(const Vector<uint8_t> &p_data) {
 	const uint32_t *d = reinterpret_cast<const uint32_t *>(p_data.ptr());
 	uint32_t n = p_data.size() / sizeof(uint32_t);
 	set_state.resize(n);
+	uint32_t empties = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		set_state[i] = d[i] != 0 ? 1 : 0;
+		if ((i & 1u) == 1u && set_state[i - 1] != 0 && set_state[i] == 0) {
+			empties++;
+		}
+	}
+	// GODOT_CARD_STATE_PRINT[=<set>,<set>,...] (diagnostics): every readback,
+	// the sets judged captured-empty (dropped from the TLAS), and the raw
+	// relit / filled words of the sets named. The run-to-run "two states" of
+	// section 63 were found with it: a dome's set reading 0 0 for a whole run.
+	static const bool state_print = OS::get_singleton()->has_environment("GODOT_CARD_STATE_PRINT");
+	if (state_print) {
+		String ids;
+		for (uint32_t i = 0; i + 1 < n; i += 2) {
+			if (set_state[i] != 0 && set_state[i + 1] == 0) {
+				ids += vformat(" %d", i / 2);
+			}
+		}
+		String watch;
+		for (const String &w : OS::get_singleton()->get_environment("GODOT_CARD_STATE_PRINT").split(",", false)) {
+			uint32_t k = w.to_int();
+			if (k * 2 + 1 < n) {
+				watch += vformat(" [%d: %d %d]", k, d[k * 2], d[k * 2 + 1]);
+			}
+		}
+		print_line(vformat("Surface cache set state: %d sets, %d captured empty:%s%s", n / 2, empties, ids, watch));
 	}
 }
 

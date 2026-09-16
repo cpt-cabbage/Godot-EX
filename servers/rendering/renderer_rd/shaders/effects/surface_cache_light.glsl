@@ -2227,11 +2227,14 @@ void main() {
 	set_state.state[set * 2u] = 1u;
 	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
 	ivec2 origin_texel = card_origin_packed(card_packed);
-	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u;
+	// The relight before this one, whose bounce ray the gradient re-traces.
+	// Zero since the capture cleared it: this is the first relight after the
+	// capture, a reset whether or not the flag's one upload reached this
+	// frame (the select pass keeps a fresh set urgent until it is relit).
+	uint prev_frame = relit.frame[set * 2u];
+	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || prev_frame == 0u;
 	ivec2 card_min = origin_texel;
 	ivec2 card_max = origin_texel + dims - ivec2(1);
-	// The relight before this one, whose bounce ray the gradient re-traces.
-	uint prev_frame = relit.frame[set * 2u];
 	bool have_prev = !reset && prev_frame != 0u && prev_frame < params.frame;
 	relit.frame[set * 2u + 1u] = params.frame;
 
