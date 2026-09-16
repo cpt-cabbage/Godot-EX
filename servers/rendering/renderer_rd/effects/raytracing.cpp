@@ -1491,6 +1491,24 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		// its diagnostics bits (1 the image terms alone, 2 no continuation).
 		params.mirror_count = fill_mirror_planes(params.mirrors, nullptr, 4u);
 		params.mirror_order = mirror_order();
+		// The stand-in mark (section 60): a pixel whose card reads landed on
+		// screen pixels revealed under GODOT_GI_STANDIN_YOUNG frames ago
+		// (16) raises a change mark of GODOT_GI_STANDIN_MARK (0.25; 0 off)
+		// times that share, so its history stays near four frames while the
+		// screen it reads is a running mean still climbing from its own
+		// restart, and grows once that has settled. After a camera flick
+		// the right-hand furniture of pose E (a quarter of its light the
+		// screen term) climbed back from -18% over fifty frames; with the
+		// mark -9% at +8 and -4% at +32 against -13% and -7%, the frame's
+		// error 8% lower through +16, the ceiling +1% at +32 (its error
+		// unchanged); the flashlight flick and the motion cases within
+		// their spread. Keyed on the age since the reveal, not the frame
+		// count: the count is what the mark shortens, and on it the pixels
+		// kept each other young for ever.
+		static const float standin_mark = OS::get_singleton()->get_environment("GODOT_GI_STANDIN_MARK") == "" ? 0.25f : float(OS::get_singleton()->get_environment("GODOT_GI_STANDIN_MARK").to_float());
+		params.mirror_params[0] = CLAMP(standin_mark, 0.0f, 1.0f);
+		static const float standin_young = OS::get_singleton()->get_environment("GODOT_GI_STANDIN_YOUNG") == "" ? 16.0f : float(OS::get_singleton()->get_environment("GODOT_GI_STANDIN_YOUNG").to_float());
+		params.mirror_params[3] = MAX(standin_young, 1.0f);
 		static const Vector<double> mirror = OS::get_singleton()->get_environment("GODOT_GI_MIRROR").split_floats(",");
 		if (mirror.size() >= 12) {
 			for (int i = 0; i < 4; i++) {
@@ -2060,6 +2078,18 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (spec_ablate.contains("why")) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_PAINT_WHY;
 		}
+		// GODOT_GI_OBJECTS=0 (experiment): the histories always at the camera
+		// reprojection, never at the velocity buffer's moving-object guess.
+		static const bool no_objects = OS::get_singleton()->get_environment("GODOT_GI_OBJECTS") == "0";
+		if (no_objects) {
+			denoise_push_constant.flags |= DENOISE_FLAG_NO_OBJECTS;
+		}
+		// GODOT_GI_BORROW_SPEC=1 (experiment): the frame-edge borrow serves a
+		// mirror's reflection too (section 59 stopped it there).
+		static const bool borrow_spec = OS::get_singleton()->get_environment("GODOT_GI_BORROW_SPEC") == "1";
+		if (borrow_spec) {
+			denoise_push_constant.flags |= DENOISE_FLAG_BORROW_SPEC;
+		}
 		// GODOT_GI_SPEC_RESTART_MIN=<frames>: a floor under the change mark's
 		// restart of the reflection (measured, off by default: 8 took the
 		// flashlight floor's moving flicker 0.037 -> 0.033 for 0.003 of lag).
@@ -2140,6 +2170,14 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		denoise_push_constant.flags = (fallback_all && use_cards) ? DENOISE_FLAG_FALLBACK_ALL : 0;
 		if (_luma_compress()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
+		}
+		static const bool spec_no_young = OS::get_singleton()->get_environment("GODOT_GI_SPEC_ABLATE").contains("young");
+		if (spec_no_young) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_YOUNG;
+		}
+		static const bool spatial_off = OS::get_singleton()->get_environment("GODOT_GI_SPATIAL") == "0";
+		if (spatial_off) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_OFF;
 		}
 		// GODOT_GI_FALLBACK_RAMP=<relights>: the card accumulation at which
 		// the young pixel's stand-in reaches full weight.

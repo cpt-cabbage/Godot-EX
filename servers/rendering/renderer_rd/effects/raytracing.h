@@ -298,6 +298,10 @@ private:
 		DENOISE_FLAG_NO_LUM_STOP = 8192, // Spatial (GI, experiment, GODOT_GI_LUMSTOP=0): the luminance stop off for settled pixels too.
 		DENOISE_FLAG_VOTES = 32768, // Temporal (GI, GODOT_GI_VOTES=1): the change mark is the gather's tile vote.
 		DENOISE_FLAG_FIREFLY_PAINT = 16384, // Temporal (GI, diagnostics, GODOT_GI_FIREFLY_PAINT=1): the samples the firefly test scaled, painted.
+		DENOISE_FLAG_SPEC_NO_YOUNG = 131072, // Spatial (GI, experiment, GODOT_GI_SPEC_ABLATE=young): a young reflection is not filtered for its youth.
+		DENOISE_FLAG_SPATIAL_OFF = 262144, // Spatial (GI, experiment, GODOT_GI_SPATIAL=0): the pass stores its input unfiltered.
+		DENOISE_FLAG_BORROW_SPEC = 524288, // Temporal (GI, experiment, GODOT_GI_BORROW_SPEC=1): the frame-edge borrow serves a mirror's reflection too.
+		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every

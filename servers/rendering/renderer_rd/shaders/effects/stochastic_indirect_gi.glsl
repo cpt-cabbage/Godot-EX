@@ -95,7 +95,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// a scene without the stochastic direct pass, the box): xyz world
 	// position, w energy.
 	vec4 mirror_light;
-	vec4 mirror_params; // y the knob light's range, z debug bits (1 the image terms alone, 2 no continuation, 8 GODOT_GI_MIRROR_SPEC=0, 16 GODOT_GI_MIRROR_SCREEN=0); x unused.
+	vec4 mirror_params; // y the knob light's range, z debug bits (1 the image terms alone, 2 no continuation, 8 GODOT_GI_MIRROR_SPEC=0, 16 GODOT_GI_MIRROR_SCREEN=0); x the stand-in mark (GODOT_GI_STANDIN_MARK, see standin_youth; 0 off), w the frames since a hit pixel's reveal over which it counts as young to it (GODOT_GI_STANDIN_YOUNG).
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
@@ -856,6 +856,22 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 // only the screen's excess -- the specular, the textures, the emissives,
 // the further bounces -- is remembered. Defined after the card lookup.
 vec3 memory_base(vec3 cache_radiance);
+// The share of this pixel's card reads that landed on a screen pixel
+// revealed under mirror_params.w frames ago (the edge's stand-in is
+// permanent and not counted), summed over the reads, and their count. After
+// a camera flick every history restarts from dark samples -- the screen
+// the rays read is itself a running mean of such -- and the right-hand
+// furniture of pose E, a quarter of whose light is the screen term, read
+// 18% dark at the stop and climbed back over fifty frames, the early
+// samples staying in the mean (section 56 B). With mirror_params.x > 0
+// the pixel raises a change mark of that times the share (out_ambient's
+// alpha, the mark a lighting change raises), so its history stays short
+// while the screen it reads is young and grows once that has settled
+// (section 60). The mark keyed on the hit pixel's frame count instead
+// fed itself: the count is what marks shorten.
+float standin_youth = 0.0;
+float standin_reads = 0.0;
+
 // The atlas position the last successful card lookup read (bilinear, in
 // texels), and the card it lies in (surface_cache_lookup sets them).
 vec2 card_atlas_texel = vec2(0.0);
@@ -971,7 +987,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// until then.
 	float settled = 1.0;
 	float hit_frames = 64.0;
-	if (params.screen_radiance_extra.x > 0.0) {
+	if (params.screen_radiance_extra.x > 0.0 || params.mirror_params.x > 0.0) {
 		vec4 hit_meta = textureLod(prev_gi_meta, prev_uv, 0.0);
 		// With the memory, the younger of the pixel's two histories: a
 		// glossy surface's colour is its reflection as much as its diffuse,
@@ -1024,8 +1040,21 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// an edge decides how much of the boost survives.
 	vec2 border = min(min(uv, vec2(1.0) - uv), min(prev_uv, vec2(1.0) - prev_uv));
 	// A fade of 0 collapses the smoothstep back to the hard switch at the edge.
-	float screen_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y)) * settled;
+	float border_share = smoothstep(0.0, max(params.screen_radiance_border_fade, 1e-5), min(border.x, border.y));
+	float screen_share = border_share * settled;
 	boost_from_screen = screen_share > 0.5;
+	if (tier == CACHE_TIER_CARD && params.mirror_params.x > 0.0) {
+		// The hit pixel revealed under mirror_params.w frames ago (the meta's
+		// alpha, stochastic_denoise.glsl REVEAL_STEP): the colour read is
+		// a running mean still climbing from its restart. The age, not the
+		// frame count: the count is what the mark shortens, and keyed on
+		// it the pixels kept each other young for ever (measured: the
+		// furniture 12% dark at rest).
+		vec4 hit_meta_age = textureLod(prev_gi_meta, prev_uv, 0.0);
+		float age = (1.0 - hit_meta_age.a) * (255.0 / 4.0);
+		standin_youth += border_share * (1.0 - min(age / params.mirror_params.w, 1.0));
+		standin_reads += 1.0;
+	}
 	if (params.memory_rate > 0.0 && tier == CACHE_TIER_CARD) {
 		// A settled, well-inside read teaches the texel; a young or edge
 		// read learns from it instead (see memory_base). One step per
@@ -2085,6 +2114,9 @@ void main() {
 		uint tile = uint(pixel.y) / 8u * tiles_x + uint(pixel.x) / 8u;
 		atomicAdd(change_votes.data[tile * 2u], uint(min(vote_change, 4096.0) * 1024.0));
 		atomicAdd(change_votes.data[tile * 2u + 1u], uint(min(vote_weight, 4096.0) * 1024.0));
+	}
+	if (params.mirror_params.x > 0.0 && standin_reads > 0.0) {
+		pixel_change = max(pixel_change, params.mirror_params.x * standin_youth / standin_reads);
 	}
 	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	imageStore(out_directional, pixel, directional_out);

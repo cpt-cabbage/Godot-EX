@@ -35,6 +35,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_NO_LUM_STOP 8192u // Experiment (GODOT_GI_LUMSTOP=0): the spatial pass's luminance stop off for settled pixels too.
 #define FLAG_VOTES 32768u // Temporal (GI): the change mark is the tile's luminance-weighted vote (change_votes), bilinear over the tiles, not the pixel's own largest hit.
 #define FLAG_FIREFLY_PAINT 16384u // Diagnostics (GODOT_GI_FIREFLY_PAINT=1): the temporal pass paints the samples the firefly test scaled.
+#define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
+#define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
+#define FLAG_BORROW_SPEC 524288u // Experiment (GODOT_GI_BORROW_SPEC=1): a borrowed history serves the reflection on a mirror too (the form before section 59).
+#define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
 // how far outside the previous frame a history may lie and still borrow the
@@ -47,6 +51,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // neighboring column, so it starts the accumulation and is then replaced by
 // the pixel's own samples over the next few frames.
 #define BORROW_FRAMES 4.0
+// The meta's alpha: 1 at a reveal, less REVEAL_STEP every frame a usable
+// history followed (exact in the 8-bit texture), so 1 - a is the frames
+// since the reveal over REVEAL_STEP, up to 63.
+#define REVEAL_STEP (4.0 / 255.0)
 // Spatial pass (GI): frames of accumulation under which the pixel's
 // hit-distance term (a ray or two's worth) is not trusted to shape the
 // kernel, and the luminance stop stays off.
@@ -564,7 +572,7 @@ void main() {
 		// reflection's reprojection below (the reflector took its image
 		// along).
 		vec2 object_delta = vec2(0.0);
-		if ((params.flags & FLAG_HAS_VELOCITY) != 0u) {
+		if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u) {
 			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			// Under FSR2 the pixels no geometry wrote carry a (-1, -1)
@@ -806,7 +814,20 @@ void main() {
 			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
 			if (borrowed) {
 				frames_d = min(frames_d, BORROW_FRAMES);
+#ifdef HAS_DIRECTIONAL
+				// The lighting is continuous across the frame edge; a
+				// mirror's image is not. A borrowed reflection on the game's
+				// mirror floor was the bottom row's image copied up every
+				// floor pixel whose history lay below the frame after a
+				// flick (a yaw's motion field has a vertical component in
+				// the corners): streaks along the columns, gone by +16
+				// (section 59). A mirror takes its own sample instead; a
+				// rough lobe's blur is as continuous as the lighting and
+				// keeps the borrow.
+				frames_s = min(frames_s, (params.flags & FLAG_BORROW_SPEC) != 0u ? BORROW_FRAMES : mix(BORROW_FRAMES, 1.0, virtual_weight));
+#else
 				frames_s = min(frames_s, BORROW_FRAMES);
+#endif
 			}
 #ifdef HAS_DIRECTIONAL
 			// The gather hands each pixel the largest lighting change its
@@ -1017,7 +1038,12 @@ void main() {
 			// A usable history clears the disocclusion mark over a few frames.
 			// A borrowed one is still young enough to want the widened kernel
 			// for a couple of frames, but not the full reset.
-			reveal = borrowed ? 0.5 : max(hist_meta.a - 0.25, 0.0);
+			// The mark counts the frames since the reveal (REVEAL_STEP a
+			// frame, exact in the 8-bit meta): the spatial pass reads it as
+			// "revealed within two frames" as it did the old quarter steps,
+			// and the gather reads the age itself, one the change marks
+			// cannot shorten (its stand-in mark, section 60).
+			reveal = borrowed ? 1.0 - 2.0 * REVEAL_STEP : max(hist_meta.a - REVEAL_STEP, 0.0);
 		}
 	}
 	if (reveal == 1.0) {
@@ -1209,7 +1235,7 @@ void main() {
 	// meaningless there. A signal whose accumulation is still young (reset by
 	// history clipping) also has no usable variance yet, so it filters
 	// unconditionally at normal stride until a few frames have accumulated.
-	bool newly_revealed = meta.a > 0.25;
+	bool newly_revealed = meta.a > 1.0 - 2.5 * REVEAL_STEP;
 	bool no_lum_stop = (params.flags & FLAG_NO_LUM_STOP) != 0u;
 	bool young_d = frames_d < 4.0;
 	bool young_s = frames_s < 4.0;
@@ -1224,7 +1250,11 @@ void main() {
 	float youth = 0.0;
 #endif
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
-	bool filter_s = newly_revealed || young_s || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
+	bool filter_s = newly_revealed || (young_s && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u) || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
+	if ((params.flags & FLAG_SPATIAL_OFF) != 0u) {
+		filter_d = false;
+		filter_s = false;
+	}
 	// The split history (GODOT_GI_SPLIT): the moments' variance is that of
 	// the samples, which a one-ray GI signal never brings under the
 	// threshold above, so a settled pixel is filtered at the full stride for
