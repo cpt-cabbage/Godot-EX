@@ -57,7 +57,8 @@ Error load_config_from_file(const String &p_path, ConfigID *r_config, String *r_
 
 // Loads one of the configs built into OpenColorIO itself. These are compiled in
 // as data, so they need no files on disk and cannot go missing. Pass an empty
-// name for the default (the latest ACES studio config).
+// name for the default (ocio://default, the latest ACES CG config; the studio
+// variant is ocio://studio-config-latest).
 Error load_config_builtin(const String &p_name, ConfigID *r_config, String *r_error = nullptr);
 
 // Loads the config named by the $OCIO environment variable.

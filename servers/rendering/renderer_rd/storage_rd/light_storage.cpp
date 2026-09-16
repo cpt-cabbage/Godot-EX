@@ -33,10 +33,10 @@
 #include "core/config/project_settings.h"
 #include "core/math/geometry_3d.h"
 #include "core/os/os.h"
+#include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_globals.h"
-#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -740,8 +740,8 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size);
 }
 
-// The fields of update_light_buffers' positional fill that the card lighting
-// reads (surface_cache_light.glsl): kept in step with it by hand.
+// A spot projector's sampling table for the cards' light rays (see
+// ProjectorTable in the header), built once per texture from a readback.
 const LightStorage::ProjectorTable &LightStorage::_projector_table(RID p_texture) {
 	ProjectorTable *found = projector_tables.getptr(p_texture);
 	if (found != nullptr) {
@@ -769,6 +769,9 @@ const LightStorage::ProjectorTable &LightStorage::_projector_table(RID p_texture
 		for (int x = 0; x < w; x++) {
 			const uint32_t cx = MIN(uint32_t(x) * n / uint32_t(w), n - 1);
 			// As the shaders read it: the sRGB atlas decoded, times alpha.
+			// Rec.709 weights whatever the working space: the table is a
+			// sampling density, so the choice of weights only reshapes
+			// where the rays go, never the estimate (open item, section 55).
 			const Color c = img->get_pixel(x, y).srgb_to_linear();
 			lum[cy * n + cx] += (0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b) * c.a;
 			cnt[cy * n + cx] += 1.0f;
@@ -814,6 +817,8 @@ const LightStorage::ProjectorTable &LightStorage::_projector_table(RID p_texture
 	return t;
 }
 
+// The fields of update_light_buffers' positional fill that the card lighting
+// reads (surface_cache_light.glsl): kept in step with it by hand.
 void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_type, const Light *p_light, const LightInstance *p_light_instance, const Transform3D &p_inverse_transform, float p_distance, RID p_camera_attributes) const {
 	r_data = LightData();
 	const Transform3D light_transform = p_light_instance->transform;
@@ -835,7 +840,8 @@ void LightStorage::_fill_card_light_data(LightData &r_data, RSE::LightType p_typ
 	float energy = sign * p_light->param[RSE::LIGHT_PARAM_ENERGY] * fade;
 	if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
 		energy *= p_light->param[RSE::LIGHT_PARAM_INTENSITY];
-		energy *= (p_type == RSE::LIGHT_OMNI) ? 1.0 / (Math::PI * 4.0) : (p_type == RSE::LIGHT_AREA) ? 1.0 / (Math::PI * 2.0) : 1.0 / Math::PI;
+		energy *= (p_type == RSE::LIGHT_OMNI) ? 1.0 / (Math::PI * 4.0) : (p_type == RSE::LIGHT_AREA) ? 1.0 / (Math::PI * 2.0)
+																									 : 1.0 / Math::PI;
 	} else {
 		energy *= Math::PI;
 	}
@@ -1093,12 +1099,12 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 				card_dynamic_generation++;
 			}
 		}
-		// The card copy's pad marks a dynamic light (the cards' visibility
-		// ratio keeps the dynamic lights' apart, surface_cache_light.glsl
-		// shade_direct).
+		// Nothing reads the card copy's pad: the dynamic lights' membership
+		// travels in dyn_lights (whose pad is is-spot), and the separate
+		// visibility ratio for them that once keyed off this mark was
+		// measured and changed nothing (surface_cache_light.glsl accumulate).
 		data.pad = 0.0f;
 		if (weight > 0.0f && card_dynamic_lights.size() < 8) {
-			data.pad = 1.0f;
 			card_dynamic_motion = MAX(card_dynamic_motion, motion);
 			card_dynamic_lights.push_back(light->type == RSE::LIGHT_OMNI ? card_omni_lights.size() : (card_spot_lights.size() | 0x80000000u));
 			card_dynamic_weights.push_back(weight);

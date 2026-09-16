@@ -2113,7 +2113,7 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #else
 
-	// Bit 3 of translucency_volume: the volume's froxels traced bounce rays,
+	// Bit 2 (value 4) of translucency_volume: the volume's froxels traced bounce rays,
 	// so a blended fragment reads the room's indirect light from it and the
 	// per-fragment SDFGI below would be that same bounce a second time. Only
 	// the transparent pass sets the volume at all.
@@ -2271,10 +2271,13 @@ void fragment_shader(in SceneData scene_data) {
 
 	// Ray-traced indirect lighting: the gather's rays already carry sky
 	// visibility and SDFGI bounce, so its demodulated irradiance replaces the
-	// ambient estimate outright; the traced reflection feeds only the rough
-	// specular band (sharp reflections stay with probes / SSR, whose
-	// sharpness the blurry radiance cache cannot match). Reflection probes
-	// later still override inside their volumes, as with SDFGI.
+	// ambient estimate outright. With the surface cache's mirror path
+	// (rt_gi bit 64, the default with the cache on) the traced reflection
+	// covers every roughness and SSR is skipped; without it the reflection
+	// feeds only the rough specular band and sharp reflections stay with
+	// probes / SSR, whose sharpness the blurry radiance cache cannot match.
+	// Reflection probes later still override inside their volumes, as with
+	// SDFGI.
 	if (implementation_data.rt_gi != 0u) {
 		vec3 rt_gi_ambient = vec3(0.0);
 		vec3 rt_gi_reflection = vec3(0.0);
@@ -2699,7 +2702,7 @@ void fragment_shader(in SceneData scene_data) {
 		}
 		indirect_specular_light *= specular_occlusion;
 #endif // SPECULAR_OCCLUSION_DISABLED
-		// The traced reflection, occluded by its own ray and by nothing else.
+	   // The traced reflection, occluded by its own ray and by nothing else.
 		indirect_specular_light += rt_gi_spec_traced_color * rt_gi_spec_traced;
 		ambient_light *= albedo.rgb;
 

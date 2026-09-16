@@ -30,14 +30,14 @@
 
 #pragma once
 
-#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_grid.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/effects/surface_cache_mip.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_light.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/surface_cache_mip.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/surface_cache_prepare.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/rendering_device.h"
 
 namespace RendererRD {
@@ -55,8 +55,10 @@ namespace RendererRD {
 // of six axis directions through the scene shader's material pass (the same
 // pass the lightmapper bakes with), writing albedo, normal, emission and depth
 // into atlases. A lighting pass then shades a budgeted set of cards each
-// frame -- direct light with one shadow ray per texel per frame against the
-// TLAS, indirect from the SDFGI lightprobes, emission on top -- into a
+// frame -- direct light with one shadow ray per directional light and one
+// for the drawn local light per relight against the TLAS, indirect from
+// the cards' own cosine bounce (the SDFGI lightprobes or the sky only where
+// the ray finds no card), emission on top -- into a
 // radiance atlas the gather samples at hits. Captures are in the instance's
 // local space, so a moving object keeps its cards and only its lighting has
 // to follow it.
@@ -169,20 +171,22 @@ private:
 	RID lighting_atlas_mips[LIGHTING_MIPS];
 	RID indirect_dyn_atlas; // RGBA16F, the dynamic lights' bounce (surface_cache_light.glsl trace_dynamic), alpha their direct term's luminance.
 	RID indirect_dyn2_atlas; // RGBA16F, their second bounce.
-	RID indirect_dyn_filtered_atlas; // RGBA16F, both dynamic bounces summed and filtered over the card (surface_cache_light.glsl filter_bounce); alpha the age the readers should take it for. What the readers read.
+	RID indirect_dyn_filtered_atlas; // RGBA16F, both dynamic bounces summed and filtered over the card (surface_cache_light.glsl filter_bounces); alpha the age the readers should take it for. What the readers read.
 	RID indirect_filtered_atlas; // RGBA16F, the static bounce accumulation filtered the same way; alpha its relights, 64ths. What the readers read in place of indirect_atlas.
 	RID static_atlas; // RGBA16F, the static lights' radiance alone, for the static cosine rays (surface_cache_light.glsl static_atlas).
 	RID screen_atlas; // RGBA16F, the screen's memory: what the rendered screen showed over the card's radiance at each texel, as the gather's hits last read it settled (stochastic_indirect_gi.glsl screen_radiance_boost); alpha the writes / 64. Zeroed by the lighting pass on a fresh capture.
-	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per texel per frame, accumulated).
-	// RGBA32UI, six packed halves: the unshadowed direct radiance (in
-	// colour) at the last relight, its relative change since the relight
-	// before (the radiance gradient: the term is deterministic, so that
-	// change is the lighting's temporal gradient (A-SVGF), free; the GI
-	// gather reads it at hits to restart the pixel's history), the local
+	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per 2x2 quad per relight, young texels four, accumulated).
+	// RGBA32UI (change_store): three halves of the unshadowed direct
+	// radiance at the last relight, two bytes of its relative change since
+	// the relight before -- the static lights' and the whole lighting's (the
+	// radiance gradient: the term is deterministic, so that change is the
+	// lighting's temporal gradient (A-SVGF), free; the GI gather reads it at
+	// hits to restart the pixel's history) -- two halves for the local
 	// lights' geometric sum, whose change restarts the visibility ratio, and
 	// the accumulated visibility ratio of the local lights (the ratio
 	// estimator: the unshadowed sum is exact every relight, only the shadow
-	// ray's answer is accumulated).
+	// ray's answer is accumulated), then a half of the bounce ray's hit
+	// distance and sixteen bits of the set it hit.
 	RID change_atlas;
 
 	// Scratch framebuffer the material pass renders one card into.
@@ -381,7 +385,7 @@ private:
 		float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (GODOT_CARD_BOUNCE_FLOOR).
 		uint32_t young_rays; // Extra bounce rays for a texel whose accumulation is under eight relights (GODOT_CARD_YOUNG_RAYS).
 		uint32_t dynamic_rays; // Light rays per dynamic light per texel per relight (GODOT_CARD_DYN_RAYS).
-		float dynamic_motion; // The dynamic lights' motion this frame over GODOT_CARD_DYN_MOTION (0 at rest, 1 a full refresh).
+		float dynamic_motion; // The dynamic lights' motion this frame over GODOT_CARD_DYN_MOTION, or their relative intensity/colour change if larger (0 at rest, 1 a full refresh).
 		float dynamic_window; // The most relights the dynamic histories accumulate (GODOT_CARD_DYN_WINDOW).
 		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
 		float dynamic_join; // The share of a joining light's bounce the static accumulation holds, on the frame it joins (LightStorage; 0 otherwise).

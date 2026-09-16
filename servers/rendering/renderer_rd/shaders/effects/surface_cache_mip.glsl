@@ -13,8 +13,9 @@
 // them, and the gather's cone-filtered reads (a footprint of a quarter of
 // the hit distance, mip levels 2-5 across a room) lost 6-12% of the
 // bounce in the game room -- only when a flashlight lit it, the beam being
-// the one bright thing the cards held. Level 0's alpha is the relight
-// count, so its coverage comes from the depth atlas (a captured texel has
+// the one bright thing the cards held. Level 0's alpha is the visibility
+// ratio's frame count (restarted by geometric change, not coverage), so
+// its coverage comes from the depth atlas (a captured texel has
 // a depth; an unfilled one is zero).
 //
 // Only the tiles the lighting pass wrote this frame are rebuilt: a tile is

@@ -6,16 +6,17 @@
 
 // The cluster bake as a compute cull: a workgroup per screen tile, a thread
 // per depth slice, every froxel tested against every element. It writes the
-// same buffer the proxy rasterisation (cluster_render.glsl) does -- a used
+// same buffer the proxy rasterization (cluster_render.glsl) does -- a used
 // bit per element per tile, and the 32 depth bits per element per tile --
 // so cluster_store.glsl packs it unchanged. The rasterisation's cost grew
 // with the proxies' screen area (5 -> 53 ms from 40 to 500 lights at 1080p
 // on an Apple M4); this is a fixed tiles x slices x elements loop.
 //
-// The tests are exact for a sphere and conservative for the cone (the
-// cone against the froxel's bounding sphere, and the cone's bounding sphere
-// against the froxel) and the box (the six face axes of the separating axis
-// test), so a froxel never loses an element that touches it.
+// Every test is against the froxel's six planes only: a sphere by its
+// centre's distance (conservative near a corner, where the planes' wedge
+// is wider than the froxel), a cone by its apex and its farthest base
+// point toward each plane, a box by its center and its projected radius on
+// each plane, so a froxel never loses an element that touches it.
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -89,7 +90,7 @@ vec3 place(mat3x4 m, vec3 p) {
 // inside where dot(n, p) + d >= 0 on all six. A box around a froxel is no
 // use: a slice is z_far / 32 deep and its pyramid's box is nearly the whole
 // tile frustum, so the tests are against the planes, as the proxies'
-// rasterisation was against the tile's silhouette.
+// rasterization was against the tile's silhouette.
 bool sphere_frustum(vec3 c, float r, vec4 planes[6]) {
 	for (uint i = 0u; i < 6u; i++) {
 		if (dot(planes[i].xyz, c) + planes[i].w < -r) {

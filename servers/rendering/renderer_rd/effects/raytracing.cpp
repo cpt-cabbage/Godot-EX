@@ -57,8 +57,8 @@ static RID _create_cleared_texture(const Ref<RenderSceneBuffersRD> &p_render_buf
 	return texture;
 }
 #include "servers/rendering/rendering_server_globals.h"
-#include "servers/rendering/storage/utilities.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
+#include "servers/rendering/storage/utilities.h"
 
 using namespace RendererRD;
 
@@ -1287,8 +1287,10 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	// footprint of roughly stride * 2^N pixels for N times the cost of one.
 	// History is the temporal result, so the spatial filter is not fed back (no
 	// recurrent blurring). It filters the visibility ratios and multiplies the
-	// analytic lighting back in at the end -- only the last iteration
-	// modulates, the earlier ones stay in ratio space.
+	// analytic lighting back in at the end -- at most the last iteration
+	// modulates, the earlier ones stay in ratio space, and at half resolution
+	// (the default) none does: the scene shader multiplies the upsampled
+	// ratios by its own per-pixel analytic term (half_res_pixel_analytic).
 	//
 	// The moments are filtered alongside the color now (SPATIAL_MOMENTS_OUT in
 	// the shader): each intermediate iteration hands the next one the moments

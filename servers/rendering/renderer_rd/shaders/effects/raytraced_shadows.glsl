@@ -70,7 +70,9 @@ void main() {
 	float visibility;
 
 #ifdef MODE_AREA
-	// Sample the light's rectangle with stratified jittered points.
+	// Sample the light's rectangle with jittered points, stratified over a
+	// 2x2 grid: samples past the fourth wrap onto the same four cells (fract),
+	// so rays_per_pixel above 4 adds samples but no finer stratification.
 	uint hits = 0u;
 	for (uint s = 0u; s < SOFT_SHADOW_SAMPLES; s++) {
 		vec2 strat = vec2(float(s % 2u), float(s / 2u)) * 0.5;

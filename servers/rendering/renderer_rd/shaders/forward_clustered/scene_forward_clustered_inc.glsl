@@ -353,10 +353,10 @@ struct ImplementationData {
 	bool volumetric_fog_enabled;
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
-	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass.
+	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass (1 full resolution, 2 half resolution composited here against the per-pixel analytic term, 3 half resolution modulated at half resolution and upsampled).
 
 	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
-	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers (1: full res, 2: half res).
+	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers. Bits 0-1 the resolution (1 full, 2 half), 4 the reflection buffer is populated, 8 directional, 16 specular occlusion from the bent normal, 32 reflection probe refit, 64 the mirror path (every roughness traced, SSR skipped), 128 no AO (GODOT_GI_NO_AO); see RenderForwardClustered::_setup_environment.
 	float rt_gi_directionality; // Scales how far the directional term re-bases irradiance onto the fragment normal.
 	uint local_shadow_maps; // Zero: no omni/spot/area shadow map was rendered this frame (the stochastic pass owns those shadows), so the analytic paths must not sample the atlas.
 
@@ -373,7 +373,9 @@ struct ImplementationData {
 	// The translucency lighting volume (Raytracing::process_translucency_volume):
 	// bit 0, blended fragments read it for their direct light in place of the
 	// light loops and the shadow rays; bit 1, the fragments an alpha depth
-	// pre-pass wrote read it too. tv_size froxels, tv_length the view depth
+	// pre-pass wrote read it too; bit 2, the froxels carry the bounce rays'
+	// indirect light, so blended fragments skip their per-fragment SDFGI.
+	// tv_size froxels, tv_length the view depth
 	// it reaches with slices exponential in tv_spread, tv_inv_proj_xy the
 	// frustum's half extents per unit of depth.
 	uint translucency_volume;
@@ -525,8 +527,12 @@ layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 layout(set = 1, binding = 37) uniform texture2DArray sscs_buffer;
 #endif // USE_MULTIVIEW
 
-// Screen-space visibility masks from ray-traced shadows (1.0 = lit).
-// Bound to default white textures when the effect is inactive.
+// The ray tracing passes' outputs, read in place of the shadow maps, SDFGI,
+// SSR and the light loops: the sun's and the area lights' visibility masks
+// (1.0 = lit, white when inactive), the stochastic direct pass's denoised
+// diffuse/specular ratios and their depth, the GI's ambient, reflection,
+// depth and directional buffers, and the half-resolution direct pass's
+// analytic terms. Bound to defaults when a pass is inactive.
 #ifdef USE_MULTIVIEW
 layout(set = 1, binding = 38) uniform texture2DArray rt_shadow_mask;
 layout(set = 1, binding = 39) uniform texture2DArray rt_area_shadow_mask;
@@ -564,13 +570,13 @@ layout(set = 1, binding = 56) uniform texture2D stochastic_image_specular_buffer
 layout(set = 1, binding = 48) uniform texture3D translucency_volume_a;
 layout(set = 1, binding = 49) uniform texture3D translucency_volume_bx;
 layout(set = 1, binding = 50) uniform texture3D translucency_volume_by;
-layout(set = 1, binding = 51) uniform texture3D translucency_volume_bz; // USE_MULTIVIEW
+layout(set = 1, binding = 51) uniform texture3D translucency_volume_bz;
 #define RT_AREA_SHADOW_MASK_AVAILABLE
 
 #endif
 
-#include "../normal_roughness_inc.glsl"
 #include "../albedo_f0_inc.glsl"
+#include "../normal_roughness_inc.glsl"
 
 // The NORMAL_ROUGHNESS_TEXTURE a user shader reads: the normal in 0..1 and
 // the roughness, whatever the buffer's own encoding (normal_roughness_inc.glsl).

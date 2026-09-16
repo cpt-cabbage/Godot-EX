@@ -27,8 +27,9 @@ layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
 layout(set = 1, binding = 1, rg8) uniform restrict writeonly image2D dest_history;
 
 #define FLAG_HAS_VELOCITY 1u
-// Frame-edge history borrowing (see the reprojection block); same values as
-// the stochastic denoiser's.
+// Frame-edge history borrowing (see the reprojection block); the band is
+// fixed here where the stochastic denoiser's comes from GODOT_GI_BORROW,
+// equal at that knob's default.
 #define BORROW_BAND 0.15
 #define BORROW_FRAMES 4.0
 

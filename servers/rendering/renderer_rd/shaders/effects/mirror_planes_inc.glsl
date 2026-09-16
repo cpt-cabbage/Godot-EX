@@ -4,12 +4,14 @@
 // light no ray can find (a light seen through a delta lobe), so every pass
 // that lights a point evaluates each local light's image through each
 // mirror the point faces: the light itself at the mirrored point with the
-// mirrored normal, times the Fresnel at the crossing, shadowed in two legs.
+// mirrored normal, times the Fresnel at each crossing, shadowed leg by
+// leg (two for a single mirror, up to four along a three-mirror chain).
 // Diffuse rays that land on a mirror read its diffuse card and reflect on.
 //
 // The including shader declares, before its params UBO:
 //   struct MirrorPlane { vec4 plane; vec4 params; vec4 center; vec4 u_axis; vec4 v_axis; };
-// and in the UBO `MirrorPlane mirrors[MAX_MIRROR_PLANES]; uint mirror_count;`
+// and in the UBO `MirrorPlane mirrors[MAX_MIRROR_PLANES]; uint mirror_count; uint mirror_order;`
+// (mirror_order: the longest image chain evaluated, 1..3)
 // (plane: xyz the unit normal out of the reflective face, w its offset,
 // n . p = w; params: x F0, y roughness, z half extent along u, w along v;
 // center, u_axis, v_axis: the rectangle, u and v unit and in the plane).

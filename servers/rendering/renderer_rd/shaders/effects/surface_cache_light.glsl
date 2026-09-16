@@ -10,9 +10,12 @@
 // Surface cache lighting: shades the card texels of this frame's active card
 // sets. Per texel, the position and normal come back out of the capture
 // (card depth plus the card's orthographic frame), direct light is the sun
-// and the lights culled to the set's box with one shadow ray per texel per
-// frame (a ratio estimator over the box's light list, like the direct
-// pass), indirect light is the SDFGI lightprobes or the sky, and emission
+// and the local lights (the world light grid's cell, else the set's box
+// list) with one shadow ray per directional light and one for the drawn
+// local, area or image light per relight (a ratio estimator over the
+// list, like the direct pass; up to four legs through mirrors), indirect
+// light is the cards' own cosine bounce (trace_bounce), the SDFGI
+// lightprobes or the sky only where the ray finds no card, and emission
 // rides on top. The result accumulates in the radiance atlas the GI gather
 // reads at ray hits.
 
@@ -84,7 +87,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint flags;
 	uint temporal_frames;
 	uint atlas_size;
-	uint debug; // Profiling ablations: 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights.
+	uint debug; // Ablations (GODOT_CARD_ABLATE): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no gradient, 32 no bounce restart, 64 no visibility restart, 16384 strict card lookups; diagnostics 128/256/512/2048/131072/262144 paint views (paint, paint2, paint3, paint5, paint8, paintn), 4096 dynamic-ray stats, 8192 tier stats (GODOT_GI_TIER_PRINT).
 	vec3 grid_origin; // The world light grid, when FLAG_GRID: its corner, cell size, cells per edge, entries per cell.
 	float grid_cell;
 	uint grid_n;
@@ -113,10 +116,10 @@ params;
 #define FLAG_SDFGI 1u
 #define FLAG_SKY_MODE_SKY 2u
 #define FLAG_SKY_MODE_COLOR 4u
-#define FLAG_SHARED_BOUNCE_RAY 16u
-#define FLAG_DYN_FILTER 128u // The dynamic bounce filtered over the card while its histories are young (filter_dynamic; GODOT_CARD_DYN_FILTER=0 clears it).
+#define FLAG_SHARED_BOUNCE_RAY 16u // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
+#define FLAG_DYN_FILTER 128u // The static and the dynamic bounce histories filtered over the card at every age (filter_bounces; GODOT_CARD_DYN_FILTER=0 clears it).
 #define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
-#define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights. // One bounce ray per 2x2 quad: a thread per quad, a workgroup per 16x16 texels.
+#define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights.
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -171,8 +174,9 @@ layout(set = 0, binding = 17) uniform texture2DArray sky_radiance;
 layout(set = 0, binding = 17) uniform texture2D sky_radiance;
 #endif
 
-// The cache reads itself for its indirect term: each texel traces one
-// cosine ray per frame and, where it lands on another card, takes that
+// The cache reads itself for its indirect term: each 2x2 quad of texels
+// traces one cosine ray per relight (FLAG_SHARED_BOUNCE_RAY; one per texel
+// without it, young texels four) and, where it lands on another card, takes that
 // card's outgoing radiance from the previous update. Emission and direct
 // light so propagate bounce by bounce through the cards, with nothing
 // depending on the probes for geometry that moves.
@@ -289,7 +293,7 @@ layout(set = 0, binding = 32, std430) restrict readonly buffer ProjectorTables {
 proj_tables;
 // The dynamic bounces as the readers take them (the gather's fallback and
 // hits, the hit shader, this pass's own recursion): both histories summed,
-// and while they are young filtered over the card (filter_dynamic); the
+// and filtered over the card (filter_bounces); the
 // alpha is the age the readers should read it at (the filter's samples
 // counted in), 64ths.
 layout(set = 0, binding = 33, rgba16f) uniform restrict image2D indirect_dyn_filtered_atlas;
@@ -416,8 +420,9 @@ layout(set = 0, binding = 25, std430) restrict buffer DynStats {
 dyn_stats;
 
 // Diagnostics (GODOT_GI_TIER_PRINT, debug bit 8192): where a texel's static
-// bounce ray got its radiance. i: 0 a card, 1 the SDFGI probes at a hit
-// without a card, 2 the sky at such a hit without probes, 3 a miss (sky).
+// bounce ray got its radiance. i: 0 a card, 1 the SDFGI probes at the
+// texel (the hit had no card), 2 the sky at the texel (no card, no probes),
+// 3 a miss (sky).
 // Luminance sums are in 1/16 units.
 float luminance(vec3 c);
 void tier_stat(uint i, vec3 radiance) {
@@ -720,7 +725,6 @@ vec3 basis_around(vec3 n, vec2 rnd) {
 	return normalize(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(max(1.0 - rnd.y, 0.0)));
 }
 
-
 // Coverage of a non-opaque candidate hit (an alpha-tested caster), from its
 // instance's cards: the card facing the ray most squarely whose stored depth
 // agrees with the hit, and its captured albedo alpha at that texel. A hit
@@ -945,7 +949,8 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 	return true;
 }
 
-// Direct light at the texel: the sun, and the lights culled to the set's box.
+// Direct light at the texel: the sun, and the local lights (the world
+// light grid's cell with FLAG_GRID, else the list culled to the set's box).
 // The direct term in its parts: the directional lights with their one hard
 // shadow ray each (deterministic: the same ray every relight, so exact, no
 // accumulation), the local lights' unshadowed analytic sum (exact) with its
@@ -1271,8 +1276,9 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 // cannot estimate: one texel in a few lands a ray on the spot per relight,
 // and the field over the ceiling is a mottle of texels that saw it and
 // texels that did not -- coherent across every mip the hits read it
-// through, so no screen-space filter averages it -- that sixty-four
-// relights average out, which a light that keeps moving never gives them,
+// through, so no screen-space filter averages it -- that the window
+// (twice temporal_frames, 32 relights by default) averages out, which a
+// light that keeps moving never gives them,
 // and that every move restarts (the change of a lit texel is carried by
 // the rays that hit it and restarts the readers to one sample, at random
 // relights over the eight the mark lasts; the static lamps' converged
@@ -1297,7 +1303,8 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 //
 // Directions come from the R2 sequence per texel, advanced per relight: the
 // samples of one texel's window tile the cone rather than clump. The
-// squared distance of the connection is softened by a centimetre.
+// squared distance of the connection is softened by ten centimeters
+// (d*d + 0.01).
 void dyn_stat(uint i, bool ceiling) {
 	if ((params.debug & 4096u) != 0u) {
 		atomicAdd(dyn_stats.count[i], 1u);
@@ -1434,8 +1441,6 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 		}
 	}
 }
-
-// Diagnostics (paint3): the dynamic term's share of the sample, see accumulate.
 
 // The indirect term of the static lights: one cosine ray into the scene
 // (see main), the card's radiance at its hit less the dynamic lights' part.
@@ -1736,9 +1741,9 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 // card -- an a-trous 5x5 at a stride from the histories' age (3 texels at
 // one or two relights, 2 up to six, 1 from there on), the taps weighted by
 // the binomial kernel, by how alike the captured normals are and by how
-// near the stored depths (a tilted plane's depth climbs a few centimetres
-// a texel; another object in the same card sits tens of centimetres off).
-// The bounce is a smooth field and one cosine ray per texel per relight
+// near the stored depths (a tilted plane's depth climbs a few centimeters
+// a texel; another object in the same card sits tens of centimeters off).
+// The bounce is a smooth field and one cosine ray per quad per relight
 // estimates it: in a room lit by bounce alone the accumulation still
 // wandered by 6% of itself at three hundred relights, and where a moving
 // light kept the dynamic histories at a relight or two the readers used
@@ -1953,7 +1958,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	now.bounce_t = bounce_t;
 	change_store(texel, now);
 
-	// The bounce, one ray per frame: restarted by the radiance gradient (a
+	// The bounce, one ray per quad per relight: restarted by the radiance gradient (a
 	// light that changed here changed at the texels this one bounces off,
 	// near enough) and by the change the ray's own hit carried.
 	// The restart is A-SVGF's, to 1 / change relights, for the gradient as
@@ -2160,6 +2165,9 @@ void main() {
 	}
 	uint set = active_sets.list[entry];
 	CardSet s = sets.data[set];
+	// Sets under eight texels an edge are captured but never lit (the
+	// lookups accept four): harmless at the default min_card_size of 8,
+	// a set at edge 4 would read as black (open item, section 55).
 	if (s.card_size < 8.0) {
 		return;
 	}

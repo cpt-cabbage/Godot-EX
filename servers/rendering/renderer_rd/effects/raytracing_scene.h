@@ -30,8 +30,8 @@
 
 #pragma once
 
-#include "core/templates/hash_map.h"
 #include "core/math/color.h"
+#include "core/templates/hash_map.h"
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
@@ -97,7 +97,6 @@ private:
 	RaytracedShadowsDecodeShaderRD decode_shader;
 	RID decode_shader_version;
 
-
 	bool mirror_planes_enabled = true;
 	LocalVector<MirrorPlane> mirror_planes;
 	HashMap<RID, Color> texture_means; // A texture's mean linear colour, read back once (see _texture_mean).
@@ -121,8 +120,6 @@ private:
 		AABB aabb;
 	};
 
-	// One surface's unpack into the hit shading's geometry pool (see
-	// rt_geometry_unpack.glsl); re-run per frame for deforming geometry.
 	// GPU particles in the scene (plan section 47): the draw-pass mesh
 	// expanded into a soup of one copy per particle by the particles'
 	// instance buffer, a BLAS of its own rebuilt every frame (like a
@@ -152,6 +149,8 @@ private:
 	ParticlesBlas *_resolve_particles_blas(RID p_particles, RID p_mesh, uint32_t p_surface_mask, uint32_t p_particle_count, uint32_t p_stride_vec4);
 	void _free_particles_blas(ParticlesBlas &p_entry);
 
+	// One surface's unpack into the hit shading's geometry pool (see
+	// rt_geometry_unpack.glsl); re-run per frame for deforming geometry.
 	struct HitUnpackJob {
 		RID vertex_buffer;
 		RID attribute_buffer; // Null when the surface has no colour or uvs.

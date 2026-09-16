@@ -3778,7 +3778,9 @@ void RenderingServer::init() {
 	// Ray-traced indirect lighting: a per-pixel final gather that traces
 	// hardware rays and shades hits from the surface cache's cards, else the
 	// SDFGI cascades (sky-only when neither is active). Replaces the
-	// SDFGI/VoxelGI screen resolve, SSIL, SSAO and SSR.
+	// SDFGI/VoxelGI screen resolve and SSIL; SSAO only with replace_ssao, SSR
+	// only once specular + surface_cache/mirror_reflections trace every
+	// roughness (GODOT_GI_SSR=1 keeps it).
 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/specular"), true);
 	// Flat instances whose material reflects (a glossy floor) are found each
@@ -3862,6 +3864,7 @@ void RenderingServer::init() {
 	// Added to the texture level the ray cone picks at a hit (positive is blurrier).
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/ray_tracing/raytraced_gi/hit_shading/lod_bias", PROPERTY_HINT_RANGE, "-4.0,4.0,0.1"), 0.0);
 	// Bits: 1 albedo, 2 normal, 4 uv (the shaded hits show the value instead of radiance); 8 no shadow rays, 16 no indirect, 32 no direct.
+	// The shader also honors 64 (bounce traced at every hit), 128/256 (geometric/vertex normal) and 512 (unshadowed direct), above the range the editor offers.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/hit_shading/debug", PROPERTY_HINT_RANGE, "0,63,1"), 0);
 
 	// Surface cache: material cards per instance, lit on the GPU, that the

@@ -220,7 +220,8 @@ private:
 	// their bounce apart (surface_cache_light.glsl trace_dynamic). Per light
 	// instance, what it looked like when last seen and when it last changed;
 	// the list is this frame's card light indices (bit 31 for a spot) of
-	// those that changed within GODOT_CARD_DYN_HOLD frames (600).
+	// those that changed within GODOT_CARD_DYN_HOLD frames (600) plus the
+	// GODOT_CARD_DYN_FADE tail (600 more) over which they hand back.
 	struct CardLightTrack {
 		Transform3D transform;
 		Color color;

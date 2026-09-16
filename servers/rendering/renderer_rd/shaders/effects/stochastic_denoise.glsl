@@ -6,8 +6,10 @@
 
 // Denoiser for the stochastic direct lighting buffers, following the
 // MegaLights / SVGF structure: temporal accumulation of lighting and its
-// luminance moments (giving a per-pixel variance estimate), then a single
-// variance-driven spatial pass using depth, normal and variance edge-stopping.
+// luminance moments (giving a per-pixel variance estimate), then a
+// variance-driven spatial pass iterated a-trous style (up to three
+// strides, Raytracing::process_stochastic) using depth, normal and
+// variance edge-stopping.
 // The two filtered signals are demodulated: for direct lighting they are
 // bounded [0;1] visibility ratios (the analytic lighting is multiplied back
 // in at the end of the spatial pass), for GI they are radiance.
@@ -34,10 +36,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_VOTES 32768u // Temporal (GI): the change mark is the tile's luminance-weighted vote (change_votes), bilinear over the tiles, not the pixel's own largest hit.
 #define FLAG_FIREFLY_PAINT 16384u // Diagnostics (GODOT_GI_FIREFLY_PAINT=1): the temporal pass paints the samples the firefly test scaled.
 
-// Frame-edge history borrowing (temporal pass, see the reprojection block).
-// How far outside the previous frame (in UV) a pixel's history may lie and
-// still borrow the nearest in-frame history instead of restarting.
-#define BORROW_BAND 0.15
+// Frame-edge history borrowing (temporal pass, see the reprojection block):
+// how far outside the previous frame a history may lie and still borrow the
+// nearest in-frame one comes in as reprojection.borrow_band (GODOT_GI_BORROW).
 // Temporal (GI): how far a reflection history tap's stored image depth may
 // differ from the predicted one, relative, before the tap is left out (see
 // the reflection fetch); the whole-pixel mismatch restart begins at 0.1.
@@ -259,13 +260,14 @@ layout(push_constant, std430) uniform Params {
 	mat4 reproject; // Current NDC -> previous frame NDC (temporal only).
 	ivec2 screen_size;
 	float blend_alpha; // Minimum weight of the current frame.
-	float depth_tolerance;
+	float depth_tolerance; // Spatial only: the temporal pass hardcodes its 0.1 (and BORROW_DEPTH_TOLERANCE for a borrowed history).
 	float variance_threshold; // Relative variance below which filtering is skipped.
 	int stride; // Spatial kernel stride.
 	int depth_scale; // 2 when the lighting buffers are half resolution.
 	// Neighborhood clamp width in standard deviations; <= 0 disables history
-	// clipping entirely. Dense signals (the direct lighting ratio) use ~1.5;
-	// sparse Monte Carlo signals (the GI gather) must not clamp: a 5x5
+	// clipping entirely. Every signal takes 4.0 now (Raytracing::process_stochastic
+	// measured 1.5 on the direct ratio as a darkening); sparse Monte Carlo
+	// signals (the GI gather) must not clamp: a 5x5
 	// neighborhood that catches no bright sample this frame would clip a
 	// perfectly converged history to black every frame (the same failure the
 	// STB lighting talk hits with TAA color clamping on noisy input).
@@ -441,7 +443,7 @@ void main() {
 	vec3 m2_s = vec3(0.0);
 	float count = 0.0;
 #ifdef HAS_DIRECTIONAL
-	// The neighbours' luminance without the centre (the firefly test below).
+	// The neighbours' luminance without the center (the firefly test below).
 	vec2 nl_d = vec2(0.0); // sum, sum of squares
 	vec2 nl_s = vec2(0.0);
 #endif
@@ -758,7 +760,6 @@ void main() {
 		}
 #endif
 		if (history_usable) {
-
 			vec3 hist_d = hist_d4.rgb;
 			vec3 hist_s = hist_s4.rgb;
 			float confidence_d = 1.0;

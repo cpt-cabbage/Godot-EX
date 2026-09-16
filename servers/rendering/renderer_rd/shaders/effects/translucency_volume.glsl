@@ -117,6 +117,8 @@ float hash_to_float(uint h) {
 	return float(h & 0x00FFFFFFu) / float(0x01000000u);
 }
 
+// Rec.709 by omission: this pass has no luma_weights bound, unlike the
+// other RT passes, which follow the working space (open item, section 55).
 float luminance(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -371,8 +373,8 @@ void main() {
 	// cannot know: a froxel's escaped-ray fraction was tried as that occlusion
 	// and read as froxel-sized blotches wherever a blended surface lay along
 	// the view (a froxel straddling the floor sees a different sky than its
-	// neighbour, and no accumulation window smooths a step that is real).
-	// Noisy at one ray a froxel, and left that way: the volume accumulates
+	// neighbor, and no accumulation window smooths a step that is real).
+	// Noisy at a ray or two a froxel (indirect_rays, 2), and left that way: the volume accumulates
 	// over its temporal window and the fragments read it trilinearly, which
 	// is the whole reason the transparent pass can afford this at all.
 	if (bool(params.flags & FLAG_SURFACE_CACHE)) {

@@ -348,8 +348,8 @@ bool SurfaceCache::_alloc_block(uint32_t p_run_x, uint32_t p_run_y, Slot &r_slot
 	return false;
 }
 
-// A slot for a card of p_dims texels: a square slot of the longer edge's
-// class within a page, or a block of pages past it.
+// A slot for a card of p_dims texels: a square slot of the set's longest
+// edge's class within a page, or a block of pages past it.
 bool SurfaceCache::_alloc_card(const Vector2i &p_dims, uint32_t p_set_edge, Slot &r_slot) {
 	if (p_set_edge <= PAGE_SIZE) {
 		// A square slot of the set's longest edge for every card, whatever
@@ -791,9 +791,10 @@ void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
 	double total = double(converge_up) + double(converge_down);
 	double drift = total > 0.0 ? Math::abs(double(converge_up) - double(converge_down)) / total : 0.0;
 	// A readback over few texels is a noisy sample of the drift: once the
-	// cards are settled the idle budget relights a fifth as many, the
-	// share read 15-25% on those, the verdict unsettled, the full rate
-	// resumed and settled again -- a cycle the editor drew at 8 Hz for
+	// cards are settled the idle budget relights an eighth as many
+	// (GODOT_CARD_IDLE), the share read 15-25% on those, the verdict
+	// unsettled, the full rate resumed and settled again -- a cycle the
+	// editor's ~30 Hz repaint, reading back every fourth frame, drew for
 	// ever. The smoothing takes a readback whose count is within a quarter
 	// of the largest seen since the last restart, and skips the rest.
 	if (converge_young * 100 >= converge_relit) {
@@ -934,7 +935,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		params.luma_weights[0] = luma.x;
 		params.luma_weights[1] = luma.y;
 		params.luma_weights[2] = luma.z;
-		// The scene's planar mirrors (see Raytracing::_fill_mirror_planes).
+		// The scene's planar mirrors (see Raytracing::fill_mirror_planes).
 		params.mirror_count = MIN(p_inputs.mirror_count, MAX_MIRROR_PLANES);
 		params.mirror_order = p_inputs.mirror_order;
 		static const uint32_t mirror_ablate = OS::get_singleton()->get_environment("GODOT_MIRROR_ABLATE").to_int();
@@ -980,8 +981,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (settings.shared_bounce_ray) {
 		params.flags |= 16;
 	}
-	// GODOT_CARD_DYN_FILTER=0: the dynamic bounce reaches the readers raw
-	// (the filter over the card while the histories are young off).
+	// GODOT_CARD_DYN_FILTER=0: the static and the dynamic bounce reach the
+	// readers raw (filter_bounces, the 5x5 binomial over the card, off).
 	static const bool dyn_filter = OS::get_singleton()->get_environment("GODOT_CARD_DYN_FILTER") != "0";
 	if (dyn_filter) {
 		params.flags |= 128;
@@ -1008,7 +1009,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	last_grid_built = use_grid;
 	last_grid_origin = grid_origin;
 	last_grid_cell = grid_cell;
-	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart,strict
+	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart,visrestart,strict;
+	// diagnostics paint,paint2,paint3,paint5,paint8,paintn,stats (see the shader's debug bits).
 	// switches parts of the texel shading off (gradient: the bounce ray
 	// re-traced for the temporal gradient; restart: the bounce accumulation's
 	// restart on a change), read once.
@@ -1016,7 +1018,21 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		uint32_t bits = 0;
 		for (const String &part : OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").split(",", false)) {
 			const String name = part.strip_edges().to_lower();
-			bits |= name == "bounce" ? 1 : name == "shadow" ? 2 : name == "lights" ? 4 : name == "sun" ? 8 : name == "gradient" ? 16 : name == "restart" ? 32 : name == "visrestart" ? 64 : name == "paint" ? 128 : name == "paint2" ? 256 : name == "paint3" ? 512 : name == "paint5" ? 2048 : name == "stats" ? 4096 : name == "strict" ? 16384 : name == "paint8" ? 131072 : name == "paintn" ? 262144 : 0;
+			bits |= name == "bounce" ? 1 : name == "shadow" ? 2
+					: name == "lights"						? 4
+					: name == "sun"							? 8
+					: name == "gradient"					? 16
+					: name == "restart"						? 32
+					: name == "visrestart"					? 64
+					: name == "paint"						? 128
+					: name == "paint2"						? 256
+					: name == "paint3"						? 512
+					: name == "paint5"						? 2048
+					: name == "stats"						? 4096
+					: name == "strict"						? 16384
+					: name == "paint8"						? 131072
+					: name == "paintn"						? 262144
+															: 0;
 		}
 		if (bits != 0) {
 			print_line(vformat("Surface cache lighting ablation 0x%x.", bits));
@@ -1123,7 +1139,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// lighting (a dynamic light, a light joining or leaving, a capture this
 	// frame) restores the full rate at once, and a change the rays find
 	// unsettles the count within a few relights. Measured (section 33): the
-	// lighting pass at rest 10.9 -> ... ms.
+	// lighting pass over a 600-frame rest tail 7.9 -> 5.9 ms averaged.
 	static const int64_t idle_setting = OS::get_singleton()->get_environment("GODOT_CARD_IDLE") == "" ? 8 : OS::get_singleton()->get_environment("GODOT_CARD_IDLE").to_int();
 	const uint32_t idle_divisor = uint32_t(CLAMP(idle_setting, 1, 64));
 	const bool idle = idle_divisor > 1 && !full_relight && dyn.count == 0 && RendererRD::LightStorage::get_singleton()->get_card_dynamic_change() <= 0.0f && pending_captures.is_empty() && _settled();
@@ -1305,7 +1321,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			n += c[16 + i];
 			l += c[20 + i];
 		}
-		const char *names[4] = { "card", "probe", "sky-at-hit", "miss" };
+		const char *names[4] = { "card", "probe-at-texel", "sky-at-texel", "miss" };
 		String line = vformat("RT_GI_TIERS cards: %d rays", int(n));
 		for (int i = 0; i < 4; i++) {
 			line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * c[16 + i] / n : 0.0, l > 0.0 ? 100.0 * c[20 + i] / l : 0.0);

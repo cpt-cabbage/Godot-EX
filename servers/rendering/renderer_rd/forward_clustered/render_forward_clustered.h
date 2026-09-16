@@ -840,7 +840,8 @@ private:
 	// (see _transparent_debug_init): GODOT_TRANSPARENT_SPLIT=N draws the
 	// transparent list as N chunks with a timestamp each, so --gpu-profile
 	// attributes the pass to its surfaces; GODOT_TRANSPARENT_ABLATE=sun,cluster,
-	// gi,soft,rays switches those parts of the transparent shading off.
+	// gi,soft,rays,core,fringe,volume (or all) switches those parts of the
+	// transparent shading off.
 	enum TransparentAblate {
 		TRANSPARENT_ABLATE_SUN = 1, // No directional lights (and no sun ray).
 		TRANSPARENT_ABLATE_CLUSTER = 2, // An empty cluster: no omni/spot/area lights, reflection probes or decals.
@@ -970,7 +971,6 @@ public:
 	virtual RID get_ray_tracing_tlas() const override;
 
 private:
-
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
 	// The denoised scaler (GODOT_MFX_DENOISE=1) and the pass that unpacks its guides.

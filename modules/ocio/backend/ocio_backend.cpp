@@ -73,7 +73,10 @@ OCIO::ConstConfigRcPtr find_config(ConfigID p_config) {
 }
 
 // The name ACES configs give plain linear Rec. 709. Kept in step with
-// OCIOServer::LINEAR_REC709_SPACE.
+// OCIOServer::LINEAR_REC709_SPACE. The display processor below hard-codes
+// it where the texture path resolves an alias (OCIOServer::_resolve_linear_rec709):
+// a config knowing the space only by an alias converts textures but fails
+// the display shader (open item, section 55).
 constexpr const char *LINEAR_REC709 = "Linear Rec.709 (sRGB)";
 
 String from_ocio(const char *p_string) {

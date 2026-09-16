@@ -9,14 +9,15 @@
 
 // Ray-traced indirect lighting ("Lumen-lite" final gather).
 // Per pixel: cosine-sampled hemisphere rays traced against the scene BVH,
-// shaded at the hit point from the SDFGI cascades (direct light volumes),
-// optionally boosted with last frame's on-screen radiance, and falling back
-// to the sky on miss. Optionally one GGX-sampled ray feeds a rough specular
-// term. Outputs demodulated irradiance (no albedo) and specular radiance;
+// shaded at the hit from last frame's screen where the hit is on it, else
+// the surface cache's cards, else the deferred material hit shading, with
+// planar-mirror chains for mirror hits and the SDFGI/VoxelGI cascades only
+// where none of those answer (trace_radiance_chain); the sky on a miss.
+// Optionally one GGX-sampled ray feeds a rough specular term. Outputs demodulated irradiance (no albedo) and specular radiance;
 // the stochastic denoiser filters both like the direct lighting pair.
 
-#include "../normal_roughness_inc.glsl"
 #include "../albedo_f0_inc.glsl"
+#include "../normal_roughness_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -68,14 +69,15 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint surface_cache_frame; // The cache's own clock, stamped on the sets hits reach.
 	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
 	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
-	float card_youth_lod; // The mip a texel relit once is read through (0 disables); a level less per doubling of its relights (see surface_cache_lookup).
+	float card_youth_lod; // The mip a texel relit once is read through (0 disables); half a level less per doubling of its relights at the default 3.0 (the setting over six, see surface_cache_lookup).
 	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
 	float memory_rate; // The cards' screen memory (see screen_radiance_boost): the rate a settled screen read is blended into a texel's memory; 0 off.
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	// x: frames of history a hit's own pixel needs before its screen colour
 	// is trusted (the boost fades in from 0 to this; 0 trusts it at once);
 	// y: the firefly ceiling's ratio over the cache value; z: the allowance
-	// added above the ceiling.
+	// added above the ceiling; w: nonzero calibrates card reads against the
+	// screen (cache_calibration).
 	vec4 screen_radiance_extra;
 	// x: diffuse rays per pixel with a history; y: rays for a pixel whose
 	// history is young (under FALLBACK_FRAMES), so the entering band of a
@@ -85,14 +87,15 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// The control variate (GODOT_GI_CV, plan section 39): x its weight (0
 	// off, 1 the cards' field under the surface as the base estimate, the
 	// rays carrying only the screen's excess over the cards), y the card
-	// relights at which the field is trusted fully.
+	// relights at which the field is trusted fully; z, w the specular ray
+	// budget's thresholds (FLAG_SPEC_BUDGET): the roughness above which and
+	// the F0 luminance below which the cards stand in for the ray.
 	vec4 cv_params;
-	// A planar mirror (GODOT_GI_MIRROR, plan section 41, a prototype): the
-	// plane (xyz its normal, w its offset: n . p = w; a zero normal is
-	// off), the one light it images (xyz world position, w energy) and
-	// x its F0, y the light's range.
-	vec4 mirror_light; // The knob's own light (GODOT_GI_MIRROR, a scene without the stochastic direct pass): xyz world position, w energy.
-	vec4 mirror_params; // y the knob light's range, z debug bits (1 the image terms alone, 2 no continuation).
+	// The GODOT_GI_MIRROR knob's own omni light to image (plan section 41;
+	// a scene without the stochastic direct pass, the box): xyz world
+	// position, w energy.
+	vec4 mirror_light;
+	vec4 mirror_params; // y the knob light's range, z debug bits (1 the image terms alone, 2 no continuation, 8 GODOT_GI_MIRROR_SPEC=0, 16 GODOT_GI_MIRROR_SCREEN=0); x unused.
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
@@ -127,7 +130,8 @@ params;
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
 // The SDFGI radiance cache: distance fields for hit normals, direct light
-// volumes (with anisotropy) for hit shading. Bound to defaults when inactive.
+// volumes (with anisotropy) for the hits nothing else shades. Bound to
+// defaults when inactive.
 layout(set = 0, binding = 5) uniform texture3D sdf_cascades[SDFGI_MAX_CASCADES];
 layout(set = 0, binding = 6) uniform texture3D light_cascades[SDFGI_MAX_CASCADES];
 layout(set = 0, binding = 7) uniform texture3D aniso0_cascades[SDFGI_MAX_CASCADES];
@@ -395,17 +399,17 @@ layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic
 // frame_index % 1024 + 1; 0 empty). See screen_radiance_boost. Zeroed by
 // the card lighting on a fresh capture.
 layout(set = 0, binding = 38, rgba16f) uniform restrict image2D card_screen_atlas;
+// The prepass G-buffer's F0 and diffuse albedo (albedo_f0_inc.glsl), for the
+// specular ray budget and the screen read's fold (FLAG_SRAD_FOLD).
+layout(set = 0, binding = 40) uniform sampler2D gbuf_f0_texture;
+layout(set = 0, binding = 41) uniform sampler2D gbuf_albedo_texture;
+
 // The lighting-change votes (FLAG_VOTES, plan section 45): per 8x8 tile of
 // this pass's pixels, the rays' luminance-weighted change on the cards
 // they read and their luminance, fixed point (x1024), summed with atomics.
 // The temporal pass restarts a pixel by its tile's ratio (a lobe-weighted
 // vote over the tile's rays) rather than the largest change one of its
 // own rays landed on.
-// The prepass G-buffer's F0 and diffuse albedo (albedo_f0_inc.glsl), for the
-// specular ray budget and the screen read's fold (FLAG_SRAD_FOLD).
-layout(set = 0, binding = 40) uniform sampler2D gbuf_f0_texture;
-layout(set = 0, binding = 41) uniform sampler2D gbuf_albedo_texture;
-
 layout(set = 0, binding = 39, std430) restrict buffer ChangeVotes {
 	uint data[];
 }
@@ -442,6 +446,8 @@ float card_dynamic_age(ivec2 tex0, vec3 static_bounce) {
 	// age to read it at.
 	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, tex0, 0);
 	vec3 dyn = max(dyn2.rgb, vec3(0.0));
+	// A share of two luminances: Rec.709 weights rather than luma_weights,
+	// which only reshapes the ratio a little and never its range.
 	float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
 	float share = dyn_lum / max(dyn_lum + dot(max(static_bounce, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
 	return dyn2.a * 64.0 / max(share, 0.05);
@@ -1331,7 +1337,6 @@ vec3 fold_above(vec3 dir, vec3 geo_normal) {
 	return below < 0.0 ? dir - 2.0 * below * geo_normal : dir;
 }
 
-
 // One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
 // miss. Positions are camera-relative world space (the cascade convention).
 // r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
@@ -1996,7 +2001,9 @@ void main() {
 					// four-by-four grid of bilinear taps four texels apart (a
 					// wider grid, eight apart, leaked light across the walls and
 					// flickered against the history it fades into), the spacing
-					// halving with every doubling of its relights.
+					// shrinking by root two with every doubling of its relights
+					// (exp2 of the youth level, which falls half a step per
+					// doubling).
 					vec4 ind0 = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0);
 					float relights = ind0.a * 64.0;
 					if (dyn_lights.count > 0u) {

@@ -260,14 +260,14 @@ void OCIOServer::reload() {
 	// behaviour, and every path that goes through a processor is unaffected.
 	linear_rec709_space = _resolve_linear_rec709();
 	if (linear_rec709_space.is_empty()) {
-		WARN_PRINT(vformat("OpenColorIO: the config knows no linear Rec. 709 colour space under any name Godot recognises (tried '%s'), so authored colours and imported textures are left unconverted.",
+		WARN_PRINT(vformat("OpenColorIO: the config knows no linear Rec. 709 colour space under any name Godot recognizes (tried '%s'), so authored colors and imported textures are left unconverted.",
 				String("', '").join(_linear_rec709_candidates())));
 	} else if (OCIOBackend::get_transform_matrix(config, working_space, linear_rec709_space, &working_to_rec709) == OK) {
 		rec709_to_working = working_to_rec709.inverse();
 	} else {
 		// A working space that is not a plain primaries change away from Rec. 709
 		// -- a log space picked by mistake, say -- cannot be reduced to a matrix.
-		WARN_PRINT(vformat("OpenColorIO: '%s' is not a linear colour space, so authored colours cannot be converted into it. Pick the config's scene-referred space (usually ACEScg) as the working space.",
+		WARN_PRINT(vformat("OpenColorIO: '%s' is not a linear colour space, so authored colors cannot be converted into it. Pick the config's scene-referred space (usually ACEScg) as the working space.",
 				working_space));
 		working_to_rec709 = Basis();
 		linear_rec709_space = String();
@@ -291,7 +291,7 @@ void OCIOServer::reload() {
 		// The display and view still work -- those go through real processors --
 		// but every authored Color is being taken at its Rec. 709 meaning while
 		// the renderer works in something else. Say so wherever the status is read.
-		status_message += " Authored colours are NOT being converted: no usable linear Rec. 709 colour space.";
+		status_message += " Authored colors are NOT being converted: no usable linear Rec. 709 colour space.";
 	}
 	print_verbose("OpenColorIO: " + status_message);
 }
@@ -318,7 +318,7 @@ String OCIOServer::_resolve_linear_rec709() const {
 void OCIOServer::_update_property_hints() const {
 	// The names a config defines are only known once it has loaded, which is
 	// after the settings were registered. Republishing the hints here is what
-	// turns five free-text fields into five lists of the choices that will
+	// turns four free-text fields into four lists of the choices that will
 	// actually work -- a suggestion list rather than a closed enum, so a project
 	// can still name a display that only exists in a collaborator's config.
 	ProjectSettings *settings = ProjectSettings::get_singleton();
@@ -527,12 +527,11 @@ void OCIOServer::_verify_authored_matrix() const {
 			return;
 		}
 		const Color fast = ColorManagement::authored_to_working(probe);
-		worst = MAX(worst, MAX(Math::abs(fast.r - reference.r),
-								MAX(Math::abs(fast.g - reference.g), Math::abs(fast.b - reference.b))));
+		worst = MAX(worst, MAX(Math::abs(fast.r - reference.r), MAX(Math::abs(fast.g - reference.g), Math::abs(fast.b - reference.b))));
 	}
 
 	if (worst > (real_t)0.002) {
-		WARN_PRINT(vformat("OpenColorIO: '%s' is not a plain sRGB encoding (authored colours differ from the exact transform by up to %.4f). Authored Colors will be slightly off; pick a texture colour space that uses the sRGB transfer function over Rec. 709 primaries.",
+		WARN_PRINT(vformat("OpenColorIO: '%s' is not a plain sRGB encoding (authored colors differ from the exact transform by up to %.4f). Authored Colors will be slightly off; pick a texture colour space that uses the sRGB transfer function over Rec. 709 primaries.",
 				default_texture_space, worst));
 	}
 }

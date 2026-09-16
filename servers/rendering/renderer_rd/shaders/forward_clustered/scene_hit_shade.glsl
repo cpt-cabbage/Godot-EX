@@ -14,8 +14,10 @@
 // the geometry pool, its attributes are interpolated the way the vertex
 // stage would have handed them to the fragment stage, the user's fragment
 // code produces the material inputs, and the hit is lit like a surface
-// cache texel (the sun and the world light grid with one shadow ray, the
-// probes or the sky for the indirect term, emission on top). The result
+// cache texel (the sun and the world light grid with one shadow ray; for
+// the indirect term the hit's own card bounce where its card holds one
+// (card_indirect), else a bounce ray into the cards, the probes or the
+// sky; emission on top). The result
 // goes to the pixel's slot for the resolve pass.
 //
 // The fragment code sees the scene shader's environment by name (see the
@@ -25,10 +27,10 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#include "../oct_inc.glsl"
-#include "../light_data_inc.glsl"
-#include "../effects/surface_cache_inc.glsl"
 #include "../effects/rt_hit_inc.glsl"
+#include "../effects/surface_cache_inc.glsl"
+#include "../light_data_inc.glsl"
+#include "../oct_inc.glsl"
 
 #define M_PI 3.14159265359
 #define SDFGI_MAX_CASCADES 8
@@ -233,7 +235,7 @@ layout(set = 0, binding = 28, std430) restrict readonly buffer AreaLights {
 }
 area_lights;
 layout(set = 0, binding = 30) uniform texture2D decal_atlas_srgb; // The lights' projector textures.
-layout(set = 0, binding = 29) uniform texture2D area_light_atlas; // Their second bounce.
+layout(set = 0, binding = 29) uniform texture2D area_light_atlas;
 
 /* Set 1: the material samplers, by the names the compiler emits. */
 
@@ -258,7 +260,7 @@ layout(set = 2, binding = 0, std430) restrict buffer Results {
 results;
 
 layout(push_constant, std430) uniform Dispatch {
-	uint packet_base; // This material's start in the sorted list.
+	uint packet_base; // Unused: the material's start in the sorted list comes from offsets.data[material_slot].
 	uint packet_count;
 	uint material_slot;
 	uint pad;
@@ -514,6 +516,8 @@ bool card_indirect(uint p_instance_id, vec3 p_world_pos, vec3 p_n_world, out vec
 	vec4 dyn2 = texelFetch(card_indirect_dyn2_atlas, ivec2(card_hit_texel), 0);
 	if (dyn2.a > 0.0) {
 		vec3 dyn = max(dyn2.rgb, vec3(0.0));
+		// A share of two luminances: Rec.709 weights rather than luma_weights,
+		// which only reshapes the ratio a little and never its range.
 		float dyn_lum = dot(dyn, vec3(0.2126, 0.7152, 0.0722));
 		float share = dyn_lum / max(dyn_lum + dot(max(ind0.rgb, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
 		relights = min(relights, dyn2.a * 64.0 / max(share, 0.05));
@@ -649,8 +653,10 @@ vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 		uint hit_instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 		vec3 cache_radiance;
 		uint src = 2u;
-		// The bounce's cone is the diffuse gather's (the pixel's own cone
-		// scale is a few pixels' worth, for texture detail at the hit).
+		// The bounce's cone is at least half a unit of hit distance, wider
+		// than the diffuse gather's (GODOT_GI_CONE, 0.25): the pixel's own
+		// cone scale is a few pixels' worth, for texture detail at the hit,
+		// too narrow for a bounce read.
 		card_lookup_footprint = t_hit * max(params.cone_scale, 0.5);
 		if (!card_lookup(hit_instance, hit, ray_dir, cache_radiance)) {
 			vec3 hit_n = hit_triangle_normal(hit_instance, rayQueryGetIntersectionGeometryIndexEXT(rq, true), rayQueryGetIntersectionPrimitiveIndexEXT(rq, true), ray_dir, -ray_dir);
@@ -672,7 +678,7 @@ vec3 trace_bounce(vec3 origin, vec3 n_world, vec3 rel_origin, inout uint seed) {
 }
 
 // Shadow rays take alpha-tested casters whole, like the gather's bounce ray
-// (the card tables that would confirm their coverage are not bound here).
+// (the card albedo atlas that would confirm their coverage is not bound here).
 bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, mask, origin, 0.0, dir, t_max);
@@ -853,8 +859,13 @@ void hit_write_discard() {
 	results.data[hit_result_index] = uvec4(rt_hit_pack_radiance(radiance), rt_hit_pack_dir(hit_dir), hit_result_flags);
 }
 #define texture(s, c) textureLod(s, c, hit_lod(vec2(textureSize(s, 0))))
-#define discard { hit_discarded = true; hit_write_discard(); return; }
-// A hit has no neighbouring fragments, and compute has no screen-space
+#define discard \
+	{ \
+		hit_discarded = true; \
+		hit_write_discard(); \
+		return; \
+	}
+// A hit has no neighboring fragments, and compute has no screen-space
 // derivatives (the material code asks for them all the same:
 // StandardMaterial3D's MSDF text path divides by fwidth(uv), alpha
 // antialiasing and grid shaders too, and the variant failed to compile).

@@ -259,6 +259,8 @@ uint rq_pcg_hash(uint v) {
 void rq_accumulate(vec3 contrib, vec3 light_pos) {
 	uint s = (rq_light_count++) % RQ_STREAMS;
 	rq_local_light[s] += contrib;
+	// Rec.709 by omission (no luma_weights bound here; the RT passes follow
+	// the working space, open item, section 55): only a sampling weight.
 	float w = max(dot(contrib, vec3(0.2126, 0.7152, 0.0722)), 1e-8);
 	rq_weight_sum[s] += w;
 	float p = w / rq_weight_sum[s];
@@ -763,7 +765,7 @@ void main() {
 							attenuation *= ltc_diffuse * cutoff;
 							vec3 light_color = area_lights.data[light_index].color * texture_color;
 
-	#ifndef USE_RAY_QUERY
+#ifndef USE_RAY_QUERY
 							if (area_lights.data[light_index].shadow_opacity > 0.001) {
 								//has shadow
 								vec4 uv_rect = area_lights.data[light_index].atlas_rect;

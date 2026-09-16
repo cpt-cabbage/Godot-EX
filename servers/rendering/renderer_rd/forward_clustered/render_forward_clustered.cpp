@@ -47,8 +47,9 @@
 #include "modules/modules_enabled.gen.h"
 
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
-#include "modules/texture_streaming/texture_streaming.h"
 #include "servers/rendering/color_management.h"
+
+#include "modules/texture_streaming/texture_streaming.h"
 #endif
 
 using namespace RendererSceneRenderImplementation;
@@ -819,7 +820,6 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Only valid where the stochastic pass runs: opaque main-view rendering,
 	// and only on frames the pass actually dispatched (no lights or a not yet
 	// ready TLAS otherwise leave last frame's lighting frozen in the buffers).
-	// 1: full resolution buffers, 2: half resolution (depth-aware upsample).
 	// 0 off, 1 full resolution, 2 half resolution composited as the denoised
 	// ratios times this shader's own per-pixel analytic term, 3 half
 	// resolution modulated at half resolution and upsampled (the first form,
@@ -831,7 +831,8 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// rough specular toward its black fallback); bit 3: re-base the gathered
 	// irradiance onto the fragment normal; bit 4: take specular occlusion from
 	// the traced bent normal; bit 5: re-fit reflection probes to the frame's
-	// irradiance.
+	// irradiance; bit 6 (64): the surface cache's mirror path is on, so the
+	// traced reflection covers every roughness and SSR is skipped.
 	// Bit 128 (experiment, GODOT_GI_NO_AO): the ambient term without the
 	// material's and the screen-space occlusion (section 33).
 	static const bool rt_gi_no_ao = OS::get_singleton()->get_environment("GODOT_GI_NO_AO") == "1";
@@ -1612,9 +1613,9 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
 		settings.directional_shadow_depth = RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture();
 		settings.directional_light_buffer = RendererRD::LightStorage::get_singleton()->get_directional_light_buffer();
-		// Ray-traced fog shadows through the stochastic lighting TLAS (this is
-		// last frame's TLAS: fog updates before the pre-opaque TLAS rebuild,
-		// which is fine for a low-frequency volume).
+		// Ray-traced fog shadows through the stochastic lighting TLAS. The
+		// cull rebuilt it for this frame before render_scene, so the fog
+		// sees the same instances as the pre-opaque passes.
 		settings.tlas = (use_stochastic_lighting && use_stochastic_fog_shadows && raytracing != nullptr) ? raytracing->get_tlas() : RID();
 
 		settings.vfog = fog;
@@ -2364,8 +2365,8 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 		}
 		if (!labelled) {
 			RENDER_TIMESTAMP("Surface Cache Capture");
-	RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
-			labelled = true;
+			RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
+			labeled = true;
 		}
 		surface_cache_capture_list.clear();
 		surface_cache_capture_list.push_back(job.instance);
@@ -5025,7 +5026,7 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED
 	{
 		RD::Uniform u;
-		u.binding = 52; // After the ray tracing textures (38-51).
+		u.binding = 52; // Between the ray tracing textures (38-51 and 53-56).
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		RID instance_buffer = TextureStreaming::get_singleton()->feedback_buffer_get_uniform_rid();
 		if (instance_buffer.is_null()) {
@@ -5327,7 +5328,7 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 	}
 	{
 		RD::Uniform u;
-		u.binding = 52; // After the ray tracing textures (38-51).
+		u.binding = 52; // Between the ray tracing textures (38-51 and 53-56).
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		RID instance_buffer = scene_shader.default_material_feedback_buffer;
 		u.append_id(instance_buffer);
@@ -6715,7 +6716,7 @@ void RenderForwardClustered::_transparent_debug_init() {
 		} else if (name == "all") {
 			transparent_debug_ablate = TRANSPARENT_ABLATE_SUN | TRANSPARENT_ABLATE_CLUSTER | TRANSPARENT_ABLATE_GI | TRANSPARENT_ABLATE_SOFT | TRANSPARENT_ABLATE_RAYS;
 		} else {
-			WARN_PRINT(vformat("GODOT_TRANSPARENT_ABLATE: unknown part \"%s\" (sun, cluster, gi, soft, rays, core, fringe, all).", part));
+			WARN_PRINT(vformat("GODOT_TRANSPARENT_ABLATE: unknown part \"%s\" (sun, cluster, gi, soft, rays, core, fringe, volume, all).", part));
 		}
 	}
 	if (transparent_debug_split > 1 || transparent_debug_ablate != 0) {

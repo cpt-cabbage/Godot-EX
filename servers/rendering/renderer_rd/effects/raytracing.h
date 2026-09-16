@@ -32,6 +32,8 @@
 
 #include "core/templates/hash_map.h"
 #include "servers/rendering/renderer_geometry_instance.h"
+#include "servers/rendering/renderer_rd/effects/raytracing_scene.h"
+#include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
@@ -42,8 +44,6 @@
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_reflection_resolve.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/translucency_volume.glsl.gen.h"
-#include "servers/rendering/renderer_rd/effects/raytracing_scene.h"
-#include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -110,7 +110,7 @@
 // A young pixel's card bounce stand-in (rgb) and its confidence (a), ping-ponged: the temporal pass modulates the history by the change between the two.
 #define RB_RT_GI_FALLBACK_0 SNAME("gi_fallback_0")
 #define RB_RT_GI_FALLBACK_1 SNAME("gi_fallback_1")
-// The rough reflection ray's direction and density (the gather), and the reflection resolved over the neighbourhood's rays (the resolve pass, what the temporal pass accumulates).
+// The rough reflection ray's direction and density (the gather), and the reflection resolved over the neighbourhood's rays (the resolve pass; the temporal pass accumulates it only under GODOT_GI_SPEC_RESOLVE=1, the raw reflection otherwise).
 #define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
@@ -285,8 +285,8 @@ private:
 		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
 		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
-		DENOISE_FLAG_HAS_DIRECTIONAL = 8, // The GI directional buffer travels with the diffuse signal.
-		DENOISE_FLAG_HAS_HIT_DISTANCE = 16, // Spatial: hit distance joins the edge-stopping weights.
+		// 8 and 16 are free: the GI directional buffer rides on the shader's
+		// FILTER_DIRECTIONAL variant rather than a runtime flag.
 		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
 		DENOISE_FLAG_SPEC_NO_SMEAR = 128, // ... nor capped by the parallax smear.
@@ -623,7 +623,7 @@ private:
 	static_assert(sizeof(TranslucencyParamsUBO) == 256, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
 
 	static void _tier_stats_readback(const Vector<uint8_t> &p_data); // GODOT_GI_TIER_PRINT: the gather's tier counts.
-	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 prints the frame's packet counts.
+	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 and GODOT_GI_TIER_PRINT print the frame's packet counts.
 	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
 
 public:

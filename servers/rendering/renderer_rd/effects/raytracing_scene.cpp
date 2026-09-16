@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  raytracing_scene.cpp                                                */
+/*  raytracing_scene.cpp                                                  */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -774,10 +774,8 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			continue;
 		}
 
-		// Surface cache cards for this instance (one set per geometry
-		// instance; a multimesh's sub-instances share none, they fall back to
-		// the coarse cache at hits).
-		// A multimesh gets one set too: the capture is of the whole multimesh
+		// Surface cache cards for this instance, one set per geometry
+		// instance. A multimesh gets one set too: the capture is of the whole multimesh
 		// in the instance's local space (the material pass draws every
 		// sub-instance), and every sub-instance's record maps the world into
 		// that space, so a hit on any of them reads the shared cards. Coarse

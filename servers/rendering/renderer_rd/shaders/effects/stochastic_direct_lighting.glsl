@@ -11,14 +11,15 @@
 // Per pixel: weighted reservoir sampling over a candidate set built from the
 // previous frame's visible light list (guided) and a strided subset of the
 // clustered light grid cell (discovery), one ray-query visibility ray per
-// unique selected sample. The outputs are fully demodulated: the noisy part
+// unique selected sample (per reservoir for lights with a sampling extent,
+// whose duplicates draw fresh points). The outputs are fully demodulated: the noisy part
 // of the shading is a bounded [0;1] visibility ratio per signal (what the
 // denoiser filters), while the analytic unshadowed lighting (diffuse without
 // albedo, full specular) goes into its own buffers and is multiplied back in
 // after denoising, so lighting detail never passes through the filter.
 
-#include "../normal_roughness_inc.glsl"
 #include "../albedo_f0_inc.glsl"
+#include "../normal_roughness_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -91,11 +92,10 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint flags; // FLAG_*.
 	float cluster_z0; // Nonzero: exponential depth slices from this depth (see ClusterBuilderRD).
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
-	// A planar mirror (GODOT_GI_MIRROR, plan section 43, a prototype), in
-	// view space: xyz its normal, w its offset (n . p = w; a zero normal is
-	// off), and x its F0. Every local light then has an image entry beside
-	// it (IMAGE_BIT): the light evaluated at the mirrored point with the
-	// mirrored normal and view vector, times the Fresnel at the crossing.
+	// The scene's planar mirrors (plan sections 43-44). Every local light
+	// then has image entries beside it (IMAGE_BIT, IMAGE2_BIT, IMAGE3_BIT):
+	// the light evaluated at the mirrored point with the mirrored normal and
+	// view vector, times the Fresnel at each crossing.
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), view space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
@@ -187,8 +187,8 @@ layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_ana
 #define TILE_SIZE 8
 #define LIST_SIZE 8
 #define INVALID_LIGHT 0xFFFFFFFFu
-// Entry encoding: bit 31 spot, bit 30 area, bits 26..29 payload, bits 0..25
-// the per-type light index. The payload is a 2x2 rect visibility bitmask for
+// Entry encoding: bit 31 spot, bit 30 area, bits 26..29 payload, bits 17..25
+// the mirror-image fields (below), bits 0..16 the per-type light index. The payload is a 2x2 rect visibility bitmask for
 // area lights (quadrant order (-u,-v),(+u,-v),(-u,+v),(+u,+v)) and a 4-bit
 // quantized visibility ratio for omni/spot lights, so guiding can down-weight
 // lights the tile found mostly shadowed (STB lighting's shadow-in-PDF idea,
@@ -458,7 +458,7 @@ float candidate_luminance(vec3 f, vec4 ss) {
 //
 // It stayed invisible while the denominator was a second estimate from the same
 // draw, because then the compression divided straight back out (see the ratio
-// estimator). It was never doing the job its name claims; it was cancelling.
+// estimator). It was never doing the job its name claims; it was canceling.
 float light_weight(float lum) {
 	return lum;
 }
@@ -554,9 +554,6 @@ void light_eval_at(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, vec3
 	float fd_l = 1.0 + fd90_minus_1 * pow(1.0 - ndotl, 5.0);
 	diffuse = color * (ndotl * (1.0 / M_PI) * fd_v * fd_l * attenuation);
 
-	// Schlick-GGX, dielectric F0. The prepass has no albedo/metallic, so the
-	// specular is an approximation the composite cannot recover exactly.
-
 	// Godot's D_GGX and V_GGX (scene_forward_lights_inc.glsl), term for term,
 	// with the same half-float ceiling. V is the height-correlated Smith
 	// visibility and includes the 1 / (4 NdotL NdotV) of the microfacet BRDF;
@@ -568,11 +565,12 @@ void light_eval_at(bool is_spot, uint idx, vec3 view_pos, vec3 view_normal, vec3
 	float ggx_k = alpha / max(1.0 - ndoth * ndoth + ndoth_alpha * ndoth_alpha, 1e-8);
 	float D = min(ggx_k * ggx_k * (1.0 / M_PI), D_GGX_MAX);
 	float V = min(0.5 / max(mix(2.0 * ndotl * ndotv, ndotl + ndotv, alpha), 1e-8), D_GGX_MAX);
-	// The prepass has no albedo or metallic, so the Fresnel term cannot be
-	// evaluated here. spec_split carries the lobe without it (rgb) and the
-	// Schlick weight (1 - LdotH)^5 (a); the scene shader, which knows the
-	// material's f0 and f90, reassembles F = f0 + (f90 - f0) * a there. The
-	// dielectric estimate below only feeds sampling weights and the ratio.
+	// The Fresnel term is left out here: spec_split carries the lobe without
+	// it (rgb) and the Schlick weight (1 - LdotH)^5 (a); the scene shader
+	// reassembles F = f0 + (f90 - f0) * a at the full-resolution pixel, and
+	// the sampling weights fold the prepass G-buffer's f0/f90 in the same
+	// way (candidate_luminance, FLAG_GBUF). The dielectric estimate below is
+	// the pre-G-buffer stand-in for the ratio.
 	vec3 spec_base = color * attenuation * ndotl * D * V * ld.specular_amount;
 	float fc = pow(1.0 - ldoth, 5.0);
 	spec_split = vec4(spec_base, fc);
@@ -616,9 +614,9 @@ void light_eval_image(uint mi, uint mj, uint mk, bool is_spot, uint idx, vec3 vi
 }
 
 // Unshadowed LTC diffuse and specular contribution of an area light, the
-// analytic core of the scene shader's light_process_area (clearcoat,
-// transmittance and material-dependent terms cannot apply here: the prepass
-// carries only normal and roughness, so the specular assumes a dielectric).
+// analytic core of the scene shader's light_process_area (clearcoat and
+// transmittance cannot apply here; the specular assumes a dielectric, the
+// G-buffer's f0/f90 entering through candidate_luminance and the composite).
 void area_light_eval_at(uint idx, vec3 view_pos, vec3 view_normal, vec3 eye_vec, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
 	diffuse = vec3(0.0);
 	specular = vec3(0.0);
@@ -723,7 +721,6 @@ void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, ou
 		}
 	}
 }
-
 
 // Coverage of a non-opaque candidate hit (an alpha-tested caster), from its
 // instance's cards: the card facing the ray most squarely whose stored depth
@@ -1346,7 +1343,7 @@ void main() {
 	// sum_i L_i V_i / sum_i L_i. Every weight this pass applies for sampling
 	// reasons -- light_weight's log2 compression, the stride subset, the guided
 	// list's visibility hint, the hidden-light budget -- then landed in the
-	// image as bias instead of cancelling. Dividing by a fixed reference is
+	// image as bias instead of canceling. Dividing by a fixed reference is
 	// what makes them cancel; dividing by another estimate from the same draw
 	// is what stopped them.
 	float vis_num_d = 0.0;
@@ -1546,9 +1543,9 @@ void main() {
 		// probability that this candidate was offered at all, averaged over the
 		// reservoirs. The second factor is what lifts a strided subset's
 		// estimate to the cell the analytic denominator covers; guided
-		// candidates were offered unconditionally, so theirs is 1. It costs no
-		// storage -- a candidate is guided exactly when its index is below
-		// guided_count.
+		// candidates were offered unconditionally, so theirs is 1.
+		// selected_hidden remembers which reservoirs settled on a discovery
+		// candidate (reservoir_merge).
 		//
 		// There is no clamp on weight_sum / selected_weight any more. It bounded
 		// fireflies back when the estimator cancelled between numerator and
