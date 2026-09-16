@@ -252,6 +252,10 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// takes it too (GODOT_GI_FIREFLY_ROUGH).
 	float firefly_k;
 	float firefly_rough;
+	float mark_age; // Temporal (GI): 1 restarts the history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
+	float pad0; // std140 rounds the block to 16 bytes (scalars: an array would take 16 a member); the C++ struct carries the same.
+	float pad1;
+	float pad2;
 }
 reprojection;
 #endif
@@ -854,8 +858,22 @@ void main() {
 			// noisy pair, it doubled the frame within a hundred frames
 			// ungated, and gated by the mark it lost the jumps the mark
 			// missed).
-			change_age = max(change_age, hist_d4.a - 0.125);
+			// The mark decays an eighth a frame in the history, and the
+			// restart below is to 1 / mark frames every frame it lasts, so a
+			// full mark restarts the history to 1, 1.14, 1.33, 1.6, 2, 2.67,
+			// 4, 8 frames at +0..+7 -- four frames of restart for one
+			// change (GODOT_GI_MARK_AGE=0). With mark_age the cap applies
+			// only where this frame's own mark exceeds the decayed one (a
+			// new change, or a larger one); the decayed mark is still
+			// carried out for the gather's propagation and the reflection's
+			// fix, which read the age, not the restart. The game flick's
+			// error after the stop 5-12% lower at every capture, its
+			// flicker level (section 58).
+			float mark_now = change_age;
+			float mark_hist = hist_d4.a - 0.125;
+			change_age = max(change_age, mark_hist);
 			bool changed = change_age > 0.02;
+			bool mark_new = reprojection.mark_age <= 0.0 || mark_now > mark_hist;
 			float field_change = 0.0;
 			if (mod_on && reprojection.mod_motion > 0.0) {
 				vec4 fb_now = texelFetch(fallback_current, pixel, 0);
@@ -881,12 +899,14 @@ void main() {
 					}
 				}
 			}
-			if (changed) {
+			if (changed && mark_new) {
 				float keep = max(1.0, 1.0 / change_age);
 				// The field's correction accounts for the mark's change in
 				// proportion; what it explains is not restarted.
 				keep = max(keep, mix(1.0, reprojection.mod_floor, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
 				frames_d = min(frames_d, keep);
+			}
+			if (changed) {
 				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
 					// The reflection is one GGX sample per pixel with no
 					// stand-in for its young frames (the diffuse has the

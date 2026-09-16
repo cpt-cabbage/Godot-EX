@@ -701,6 +701,17 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		static const float firefly_rough = OS::get_singleton()->get_environment("GODOT_GI_FIREFLY_ROUGH") == "" ? 0.35f : float(OS::get_singleton()->get_environment("GODOT_GI_FIREFLY_ROUGH").to_float());
 		ubo.firefly_k = MAX(firefly_k, 0.0f);
 		ubo.firefly_rough = firefly_rough;
+		// GODOT_GI_MARK_AGE=0: the change mark restarts the diffuse history
+		// every frame its decayed copy lasts, four frames of restart after
+		// one change (section 56 D). Default 1: only where this frame's own
+		// mark exceeds the decayed one. Measured on the game flick (three
+		// runs each): the error after the stop 0.0279 / 0.0200 / 0.0171 /
+		// 0.0146 / 0.0127 / 0.0095 / 0.0052 -> 0.0266 / 0.0188 / 0.0158 /
+		// 0.0134 / 0.0120 / 0.0084 / 0.0048 at +0 / 1 / 2 / 4 / 8 / 16 / 32,
+		// the frame-to-frame flicker level; the lab's light cases within
+		// their noise (section 58).
+		static const bool mark_age = OS::get_singleton()->get_environment("GODOT_GI_MARK_AGE") != "0";
+		ubo.mark_age = mark_age ? 1.0f : 0.0f;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
