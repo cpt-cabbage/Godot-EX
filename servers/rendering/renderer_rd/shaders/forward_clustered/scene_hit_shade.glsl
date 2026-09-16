@@ -27,10 +27,15 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#include "../effects/rt_hit_inc.glsl"
-#include "../effects/surface_cache_inc.glsl"
-#include "../light_data_inc.glsl"
+// In dependency order (rt_hit_inc packs directions with oct_inc's
+// vec3_to_oct): the includes are expanded textually, so clang-format's
+// alphabetical sort would leave the packer undeclared.
+// clang-format off
 #include "../oct_inc.glsl"
+#include "../light_data_inc.glsl"
+#include "../effects/surface_cache_inc.glsl"
+#include "../effects/rt_hit_inc.glsl"
+// clang-format on
 
 #define M_PI 3.14159265359
 #define SDFGI_MAX_CASCADES 8
