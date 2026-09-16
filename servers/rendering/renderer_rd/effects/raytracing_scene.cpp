@@ -679,7 +679,7 @@ void RaytracingScene::_find_mirror_planes(const PagedArray<RenderGeometryInstanc
 	if (print && frame % 120 == 1) {
 		for (uint32_t i = 0; i < mirror_planes.size(); i++) {
 			const MirrorPlane &m = mirror_planes[i];
-			print_line(vformat("Mirror %d: n %s w %.3f centre %s half %.2f x %.2f F0 %.3f roughness %.3f", (int)i, m.normal, m.offset, m.center, m.half_u, m.half_v, m.f0, m.roughness));
+			print_line(vformat("Mirror %d: n %s w %.3f center %s half %.2f x %.2f F0 %.3f roughness %.3f", (int)i, m.normal, m.offset, m.center, m.half_u, m.half_v, m.f0, m.roughness));
 		}
 	}
 }
@@ -1018,7 +1018,7 @@ void RaytracingScene::HitPool::free(uint32_t p_offset, uint32_t p_count) {
 	if (p_count == 0) {
 		return;
 	}
-	// Merge with a neighbour where there is one.
+	// Merge with a neighbor where there is one.
 	for (Range &r : free_ranges) {
 		if (r.offset + r.count == p_offset) {
 			r.count += p_count;

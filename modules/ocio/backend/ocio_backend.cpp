@@ -278,7 +278,7 @@ String get_default_builtin_config_name() {
 	OCIO_GUARD_V(String(), {
 		// "ocio://default" tracks whichever built-in config the library currently
 		// recommends; resolving it yields the concrete versioned name, which is
-		// what should be shown and stored so behaviour cannot shift under a
+		// what should be shown and stored so behavior cannot shift under a
 		// project when OCIO is next updated.
 		return from_ocio(OCIO::ResolveConfigPath("ocio://default")).trim_prefix("ocio://");
 	});

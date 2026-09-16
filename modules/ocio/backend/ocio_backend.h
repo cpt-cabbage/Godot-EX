@@ -157,7 +157,7 @@ Error transform_image(ConfigID p_config, const String &p_src, const String &p_ds
 // Recovers the 3x3 matrix of a transform by pushing the three basis vectors
 // through it. Only meaningful when the transform really is a pure matrix — a
 // primaries change between two linear spaces, which is the case Godot needs for
-// converting authored colours outside the renderer. Fails if the transform
+// converting authored colors outside the renderer. Fails if the transform
 // turns out not to be linear.
 Error get_transform_matrix(ConfigID p_config, const String &p_src, const String &p_dst, Basis *r_matrix, String *r_error = nullptr);
 

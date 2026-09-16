@@ -1096,7 +1096,7 @@ bool stochastic_analytic_unshadowed = false;
 // keyed to the opaque depth, and the local shadow maps it replaces are no
 // longer rendered. So on the frames the stochastic pass owns local shadows,
 // the transparent pass traces one hard shadow ray per light itself, from the
-// fragment toward the light's centre, up to a per-fragment budget. The TLAS
+// fragment toward the light's center, up to a per-fragment budget. The TLAS
 // is the same one every other traced pass uses (world space, absolute).
 // (Declared with the render-pass bindings above, since every variant must
 // carry it.)
@@ -2312,7 +2312,7 @@ void fragment_shader(in SceneData scene_data) {
 			// the reciprocal (truncation lands one pixel short for sizes whose
 			// inverse is inexact), and place the taps where the gather actually
 			// sampled -- full-res pixel 2p for half-res texel p, i.e. continuous
-			// coordinate 2p + 0.5, not the centre of the 2x2 block.
+			// coordinate 2p + 0.5, not the center of the 2x2 block.
 			ivec2 rtgi_full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
 			ivec2 rtgi_half_size = (rtgi_full_size + ivec2(1)) >> 1;
 			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5) * 0.5;
@@ -2647,7 +2647,7 @@ void fragment_shader(in SceneData scene_data) {
 		// bent normal map is one source of them, and the ray-traced gather is
 		// another, measured rather than authored. Its visibility is range
 		// limited, which is what makes it usable: raw ray occlusion would
-		// count a wall a hundred metres away as an occluder.
+		// count a wall a hundred meters away as an occluder.
 		vec3 so_bent_normal;
 		float so_visibility;
 		bool so_use_cone;
@@ -3550,7 +3550,7 @@ void fragment_shader(in SceneData scene_data) {
 	// The specular buffer holds the lobe without its Fresnel term (rgb) and the
 	// Schlick weight (a): the compute pass has no material, so the Fresnel is
 	// applied here with this fragment's f0 / f90, as light_compute would. That
-	// is what lets metals and coloured f0 keep their highlights.
+	// is what lets metals and colored f0 keep their highlights.
 	float stochastic_f90 = clamp(50.0 * f0.g, metallic, 1.0);
 	if (implementation_data.stochastic_direct_lights == 1u) {
 #ifdef USE_MULTIVIEW
@@ -3589,8 +3589,8 @@ void fragment_shader(in SceneData scene_data) {
 		ivec2 half_size = (full_size + ivec2(1)) >> 1;
 		// The sampling pass lit full-res pixel 2 * p for half-res texel p, so
 		// its result describes continuous full-res coordinate 2p + 0.5 -- the
-		// centre of that one pixel, not the centre of the 2x2 block. Placing
-		// the taps at block centres instead (screen_uv * half_size - 0.5) put
+		// center of that one pixel, not the center of the 2x2 block. Placing
+		// the taps at block centers instead (screen_uv * half_size - 0.5) put
 		// every weight half a full pixel off. Solve 2p + 0.5 <= f + 0.5 for the
 		// tap index. The denoised signal is smooth enough that correcting this
 		// is not visible in the scenes measured so far; it is fixed because the

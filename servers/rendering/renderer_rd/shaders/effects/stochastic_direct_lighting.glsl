@@ -1152,7 +1152,7 @@ void main() {
 		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
 		// The cluster the pass reads has exponential depth slices when the
 		// compute cull built it (cells of the linear slicing are z_far / 32
-		// deep and, with a far plane of kilometres, hold every light).
+		// deep and, with a far plane of kilometers, hold every light).
 		float cluster_depth = -view_pos.z;
 		uint cluster_z = params.cluster_z0 > 0.0
 				? uint(clamp(log(max(cluster_depth, params.cluster_z0) / params.cluster_z0) / log(params.z_far / params.cluster_z0) * 32.0, 0.0, 31.0))
@@ -1489,7 +1489,7 @@ void main() {
 			if (shadow_opacity < 0.001 || caster_mask == 0u) {
 				visibility = 1.0;
 			} else if ((entry & IMAGE_BIT) != 0u) {
-				// The image's shadow in legs: to a centimetre above each
+				// The image's shadow in legs: to a centimeter above each
 				// mirror of the chain (along its normal), the target
 				// mirrored back a step each time, then from the last mirror
 				// to the real light (the jittered target).

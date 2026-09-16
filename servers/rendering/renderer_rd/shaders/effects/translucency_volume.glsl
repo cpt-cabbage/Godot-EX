@@ -10,7 +10,7 @@
 // The translucency lighting volume (MegaLights' translucency: light the
 // blended surfaces from a sampled volume rather than per fragment). A
 // view-aligned froxel grid, each froxel holding the shadowed direct light
-// arriving at its centre as a first-order spherical-harmonic sum: the
+// arriving at its center as a first-order spherical-harmonic sum: the
 // irradiance-like intensity of every light reaching it (A, per channel)
 // and that intensity times the light's direction (B, per channel), so a
 // surface of normal n reads E(n) = A / 4 + (B . n) / 2, the L1
@@ -18,7 +18,7 @@
 // light grid's cell, as the fog's do; the shadows from one ray per
 // stream, the lights dealt to two streams and one contribution-sampled
 // per stream (the fog's estimator); the sun from its own ray. The froxel
-// centre is jittered each frame and the result accumulated against the
+// center is jittered each frame and the result accumulated against the
 // previous frame's volume, reprojected.
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;

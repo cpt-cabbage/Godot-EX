@@ -3749,7 +3749,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/skip_local_shadow_maps"), true);
 	// On those frames the transparent pass has no shadow map to sample either,
 	// so it traces one hard ray per light per fragment instead, toward the
-	// light's centre, up to max_rays local lights per fragment (the rest stay
+	// light's center, up to max_rays local lights per fragment (the rest stay
 	// unshadowed). The ray-traced sun is traced the same way there.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/enabled"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/max_rays", PROPERTY_HINT_RANGE, "1,16,1"), 4);
@@ -4029,7 +4029,7 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
 	// The cluster bake as a compute cull (a froxel against every element)
-	// rather than rasterised proxies, whose cost grows with their screen area.
+	// rather than rasterized proxies, whose cost grows with their screen area.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/limits/cluster_builder/compute_cull"), true);
 
 	// OpenGL limits

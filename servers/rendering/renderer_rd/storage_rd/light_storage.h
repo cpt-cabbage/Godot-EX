@@ -249,7 +249,7 @@ private:
 	const ProjectorTable &_projector_table(RID p_texture);
 	LocalVector<float> card_dynamic_projector_tables; // CARD_PROJECTOR_TABLE_FLOATS per dynamic entry (zeros without a table).
 	uint32_t card_dynamic_projector_mask = 0; // Bit i: dynamic entry i has a table.
-	float card_dynamic_motion = 0.0f; // The most any dynamic light moved this frame, in metres (its origin, and its axis three metres out).
+	float card_dynamic_motion = 0.0f; // The most any dynamic light moved this frame, in meters (its origin, and its axis three meters out).
 	float card_dynamic_change = 0.0f; // The most any light's intensity or colour changed this frame, relative (1 = whole).
 	uint32_t card_dynamic_generation = 0; // Counts the frames a light joined or left the dynamic set (the cards relight everything then).
 	float card_dynamic_join = 0.0f; // This frame, the largest share of a joining light's bounce the cards' static accumulation holds: 1 for a light that was static, what the fade had already handed back for one changing again while fading.

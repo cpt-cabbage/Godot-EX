@@ -257,7 +257,7 @@ void OCIOServer::reload() {
 	// Cache the primaries change. If the config does not name Rec.709 linear
 	// under any of the spellings we know, leave the matrices at identity and say
 	// so: an identity here only means the few non-OCIO call sites keep their old
-	// behaviour, and every path that goes through a processor is unaffected.
+	// behavior, and every path that goes through a processor is unaffected.
 	linear_rec709_space = _resolve_linear_rec709();
 	if (linear_rec709_space.is_empty()) {
 		WARN_PRINT(vformat("OpenColorIO: the config knows no linear Rec. 709 colour space under any name Godot recognizes (tried '%s'), so authored colors and imported textures are left unconverted.",
@@ -273,7 +273,7 @@ void OCIOServer::reload() {
 		linear_rec709_space = String();
 	}
 
-	// Hand the matrix to the engine so that converting authored colours costs a
+	// Hand the matrix to the engine so that converting authored colors costs a
 	// transfer function and a 3x3 multiply instead of an OCIO processor lookup.
 	ColorManagement::configure(true, rec709_to_working, working_to_rec709);
 	if (!linear_rec709_space.is_empty()) {

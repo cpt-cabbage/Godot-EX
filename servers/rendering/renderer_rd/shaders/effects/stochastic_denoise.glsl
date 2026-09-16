@@ -44,7 +44,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // the reflection fetch); the whole-pixel mismatch restart begins at 0.1.
 #define SPEC_TAP_DEPTH_TOLERANCE 0.2
 // The frame count a borrowed history is trusted as: it is lighting from a
-// neighbouring column, so it starts the accumulation and is then replaced by
+// neighboring column, so it starts the accumulation and is then replaced by
 // the pixel's own samples over the next few frames.
 #define BORROW_FRAMES 4.0
 // Spatial pass (GI): frames of accumulation under which the pixel's
@@ -346,7 +346,7 @@ vec3 ycocg_to_rgb(vec3 c) {
 // The direct lighting signals are one visibility ratio replicated across all
 // three channels, so they carry no chroma of their own. What YCoCg then reads
 // as Co and Cg is the r11f_g11f_b10f rounding -- B keeps five mantissa bits
-// where R and G keep six, so a grey value does not survive the round trip grey.
+// where R and G keep six, so a gray value does not survive the round trip gray.
 // The neighborhood's chroma extent is the spread of that rounding, microscopic
 // and floored at 1e-5, while the history's chroma differs from the mean's by a
 // comparable amount, so the normalized distance_outside comes back large for a
@@ -1013,7 +1013,7 @@ void main() {
 
 	// The history never holds a non-finite value: it would keep it for the
 	// whole temporal window, and the spatial filter's taps would carry it to
-	// the neighbours, a stride further every frame (growing black voids). A
+	// the neighbors, a stride further every frame (growing black voids). A
 	// poisoned history restarts at this pixel instead.
 	if (any(isnan(result_diffuse)) || any(isinf(result_diffuse))) {
 		result_diffuse = vec3(0.0);
@@ -1210,7 +1210,7 @@ void main() {
 	// threshold above, so a settled pixel is filtered at the full stride for
 	// ever. The even and odd frames' means are two independent estimates of
 	// the accumulated value; (a - b)^2 / 4 is one draw of its error, and a
-	// settled pixel whose halves agree needs less of its neighbours: half
+	// settled pixel whose halves agree needs less of its neighbors: half
 	// the stride under split_threshold, none under split_skip. A single
 	// draw reads low a quarter of the time, so mode 2 averages the 3x3
 	// neighbourhood's draws. Young histories (both halves a few samples)

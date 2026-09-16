@@ -2947,7 +2947,7 @@
 			Requires [member rendering/color_management/enabled].
 		</member>
 		<member name="rendering/color_management/enabled" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], colours are managed through OpenColorIO: textures, authored colours and light colours are converted into [member rendering/color_management/working_space], and an OpenColorIO display and view can replace the built-in tonemapper (see [constant Environment.TONE_MAPPER_OCIO]).
+			If [code]true[/code], colors are managed through OpenColorIO: textures, authored colors and light colors are converted into [member rendering/color_management/working_space], and an OpenColorIO display and view can replace the built-in tonemapper (see [constant Environment.TONE_MAPPER_OCIO]).
 			A project that leaves this off renders exactly as it did before. Requires the [code]ocio[/code] module and a restart.
 			[b]Note:[/b] Textures have the working space baked in at import, so turning this on or changing the working space reimports them.
 			[method OCIOServer.get_status] and [method OCIOServer.get_status_message] say what actually happened at startup, which is worth checking before concluding that colour management is doing nothing: a config that fails to load falls back to a built-in one, and one that fails entirely leaves the engine rendering as though this setting were off.
@@ -2966,7 +2966,7 @@
 		<member name="rendering/color_management/working_space" type="String" setter="" getter="" default="&quot;ACEScg&quot;">
 			The colour space the renderer works in. ACEScg is a wide, scene-referred space whose primaries enclose Rec. 709, so nothing an sRGB source can express falls outside it.
 			This is where the difference shows up: lighting multiplies albedo by light per channel, and a per-channel product depends on the basis it is taken in. A teal surface with no red component in sRGB has a small positive red component in ACEScg, so it can pick up warmth from an orange light instead of staying stubbornly green.
-			Falls back to the config's [code]scene_linear[/code] role if the named space is not defined, with a warning naming both. It has to be a linear space: authored colours reach it through a 3×3 matrix, and a log or display-encoded space cannot be expressed as one, which the engine says at startup rather than rendering something quietly wrong.
+			Falls back to the config's [code]scene_linear[/code] role if the named space is not defined, with a warning naming both. It has to be a linear space: authored colors reach it through a 3×3 matrix, and a log or display-encoded space cannot be expressed as one, which the engine says at startup rather than rendering something quietly wrong.
 			Requires [member rendering/color_management/enabled], and a restart: this is baked into every imported texture.
 		</member>
 		<member name="rendering/driver/depth_prepass/disable_for_vendors" type="String" setter="" getter="" default="&quot;PowerVR,Mali,Adreno,Apple&quot;">
@@ -3273,7 +3273,7 @@
 			Enables the use of physically based units for light sources. Physically based units tend to be much larger than the arbitrary units used by Godot, but they can be used to match lighting within Godot to real-world lighting. Due to the large dynamic range of lighting conditions present in nature, Godot bakes exposure into the various lighting quantities before rendering. Most light sources bake exposure automatically at run time based on the active [CameraAttributes] resource, but [LightmapGI] and [VoxelGI] require a [CameraAttributes] resource to be set at bake time to reduce the dynamic range. At run time, Godot will automatically reconcile the baked exposure with the active exposure to ensure lighting remains consistent.
 		</member>
 		<member name="rendering/limits/cluster_builder/compute_cull" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], the light/decal/probe cluster is built by a compute pass that tests each element's bounds against the froxels' six planes, instead of by rasterising the elements' proxy geometry into the cluster. The image is identical; the compute cull scales to hundreds of lights where the rasterised bake did not (measured 2.5/12/29 ms down to 0.14/0.61/1.5 ms at 40/200/500 lights on an Apple M4). Off restores the rasterised bake.
+			If [code]true[/code], the light/decal/probe cluster is built by a compute pass that tests each element's bounds against the froxels' six planes, instead of by rasterizing the elements' proxy geometry into the cluster. The image is identical; the compute cull scales to hundreds of lights where the rasterized bake did not (measured 2.5/12/29 ms down to 0.14/0.61/1.5 ms at 40/200/500 lights on an Apple M4). Off restores the rasterized bake.
 			[b]Note:[/b] This setting is only effective when using the Forward+ rendering method.
 		</member>
 		<member name="rendering/limits/cluster_builder/max_clustered_elements" type="float" setter="" getter="" default="512">
@@ -3478,7 +3478,7 @@
 			Bounce rays per volume cell per frame. More settle faster after lighting changes; cost scales with the cell count.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/length" type="float" setter="" getter="" default="64.0">
-			How far from the camera the volume reaches, in metres. Transparent surfaces past it fall back to per-pixel lighting.
+			How far from the camera the volume reaches, in meters. Transparent surfaces past it fall back to per-pixel lighting.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/size" type="int" setter="" getter="" default="64">
 			Volume resolution across the screen, in cells. Higher gives sharper shadows on transparent surfaces at a higher cost.
@@ -3518,7 +3518,7 @@
 			Instances captured into the cache per frame. Higher warms up and updates moved objects faster at a higher per-frame cost.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/density_distance" type="float" setter="" getter="" default="12.0">
-			Beyond this distance in metres, cached resolution falls off with distance. Keeps large scenes within budget. [code]0.0[/code] keeps full resolution everywhere.
+			Beyond this distance in meters, cached resolution falls off with distance. Keeps large scenes within budget. [code]0.0[/code] keeps full resolution everywhere.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame" type="int" setter="" getter="" default="64">
 			Instances re-lit per frame. Higher follows moving and switching lights faster; the cache lighting is one of the larger passes and scales with this.

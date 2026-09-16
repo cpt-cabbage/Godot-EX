@@ -2357,13 +2357,13 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 		exposure = 1.0f;
 	}
 	const uint32_t budget = MAX(cache->get_settings().captures_per_frame, 1u);
-	bool labelled = false;
+	bool labeled = false;
 	for (uint32_t i = 0; i < budget; i++) {
 		RendererRD::SurfaceCache::CaptureJob job;
 		if (!cache->next_capture(job)) {
 			break;
 		}
-		if (!labelled) {
+		if (!labeled) {
 			RENDER_TIMESTAMP("Surface Cache Capture");
 			RD::get_singleton()->draw_command_begin_label("Surface Cache Capture");
 			labeled = true;
@@ -2376,7 +2376,7 @@ void RenderForwardClustered::_surface_cache_capture(RenderDataRD *p_render_data)
 		}
 		cache->finish_capture(job);
 	}
-	if (labelled) {
+	if (labeled) {
 		RD::get_singleton()->draw_command_end_label();
 	}
 	surface_cache_capture_list.clear();

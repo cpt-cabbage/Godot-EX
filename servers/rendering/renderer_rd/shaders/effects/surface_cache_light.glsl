@@ -1050,7 +1050,7 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 			// The area light's image through each chain the texel faces:
 			// the rect stays, the texel mirrors. The chain's weight (the
 			// Fresnel and the rectangle's coverage) is taken through the
-			// rect's centre, and the drawn point on the rect names only the
+			// rect's center, and the drawn point on the rect names only the
 			// shadow legs' target. Taking the weight through the drawn
 			// point too (mirror_debug bit 16, the first form) made the
 			// unshadowed sum a random variable on every texel an area
@@ -1231,7 +1231,7 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 			float dist = length(to_light);
 			bool blocked;
 			if (sel_image) {
-				// Legs: to a centimetre above each mirror of the chain (along
+				// Legs: to a centimeter above each mirror of the chain (along
 				// its normal), the target mirrored back a step each time,
 				// then from the last mirror to the real light.
 				uint mchain[3];
@@ -1845,7 +1845,7 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 // lights' visibility ratio and the bounce.
 // bounce_gradient is the re-traced previous ray's relative change (or a
 // negative value when there was no previous ray to re-trace); card_min /
-// card_max bound the card, so the change read from the neighbours never
+// card_max bound the card, so the change read from the neighbors never
 // crosses into another card packed beside it in the atlas.
 void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
 	vec4 old = imageLoad(lighting_atlas, texel);
@@ -1900,7 +1900,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// The bounce gradient is one ray's verdict, so only the texels whose
 	// last ray happened to see what moved would restart on their own and
 	// the rest would hold the stale bounce beside them: the change spreads
-	// to the eight neighbours, a texel per relight, fading as it goes.
+	// to the eight neighbors, a texel per relight, fading as it goes.
 	if (!fresh) {
 		change = max(change, bounce_gradient);
 		float spread = 0.0;
@@ -1965,7 +1965,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// for a light. Two softer forms were measured against rt_lab's moving
 	// box and neither kept: a quarter-strength change (a restart to four
 	// relights) left the descend at 0.058 eight frames after the stop, the
-	// same as no gradient, because the spread to the neighbours dies a
+	// same as no gradient, because the spread to the neighbors dies a
 	// texel out and the glow stays wherever no ray saw the box leave; and a
 	// floor of four relights on the bounce alone, with the change carried
 	// whole, cleared the glow as the full restart does and left the flicker
@@ -2084,7 +2084,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn2 = vec3(0.0);
 	} else if ((params.debug & 2048u) != 0u) {
 		// (paint5) The share of the dynamic rays that landed and connected,
-		// as grey: a luminance readout (rt_lab/radiosity_box.gd prints it
+		// as gray: a luminance readout (rt_lab/radiosity_box.gd prints it
 		// at its sample points).
 		indirect = vec3(dyn_landed);
 		dyn = vec3(0.0);

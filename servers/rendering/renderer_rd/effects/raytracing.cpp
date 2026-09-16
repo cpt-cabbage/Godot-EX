@@ -1569,7 +1569,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.screen_radiance_clamp = MAX(srad_clamp == "" ? p_quality.screen_radiance_clamp : srad_clamp.to_float(), 0.0f);
 	// GODOT_GI_SRAD_YOUNG=<frames>: the screen term fades in with the hit
 	// pixel's own history over this many frames (0: trusted at once, the old
-	// behaviour); GODOT_GI_SRAD_RATIO=<x>: the firefly ceiling over the cache.
+	// behavior); GODOT_GI_SRAD_RATIO=<x>: the firefly ceiling over the cache.
 	// Measured on the game's flick (section 33): the fade-in takes a quarter
 	// off the flash and nothing off the settle, so it is off by default.
 	static const float srad_young = OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SRAD_YOUNG").to_float());

@@ -74,7 +74,7 @@ public:
 
 	// A planar mirror found in the scene (plan section 44): a flat instance
 	// (one extent of its local box under a tenth of the others, a face
-	// of a square metre or more) whose material reflects (roughness 0.3 or
+	// of a square meter or more) whose material reflects (roughness 0.3 or
 	// under, or an F0 of 0.3 or over, read from the material's parameters
 	// and the means of its textures). Both faces of a slab are candidates;
 	// the one the camera is behind is dropped, and the largest

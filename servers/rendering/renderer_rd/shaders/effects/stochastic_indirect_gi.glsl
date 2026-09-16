@@ -251,7 +251,7 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint fold_sum[4];
 	uint fold_screen[4]; // The diffuse target's luminance before the fold, 1/1024 units.
 	uint fold_card[4]; // The card's, the same.
-	uint fold_near[4]; // Reads within a quarter metre of a mirror's rectangle (a hit the mirror path should have taken?).
+	uint fold_near[4]; // Reads within a quarter meter of a mirror's rectangle (a hit the mirror path should have taken?).
 	uint fold_near_screen[4]; // Their diffuse target and card luminance sums, as above.
 	uint fold_near_card[4];
 	uint fold_near_spec[4]; // Of the near reads, the reflection rays'.
@@ -769,7 +769,7 @@ vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	for (uint c = 0u; c < sdfgi.max_cascades; c++) {
 		// At the hit, not half a cell back along the ray. The pull-back put
 		// the tap on the air side of the surface, where the cascade holds
-		// nothing: filtered against empty neighbours every tap came back
+		// nothing: filtered against empty neighbors every tap came back
 		// scaled by how the ray happened to enter the cell, which is a
 		// voxel-scale mottle rather than a radiance.
 		vec3 cell_pos = (p - sdfgi.cascades[c].position) * sdfgi.cascades[c].to_cell;
@@ -1176,7 +1176,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	// filter averages (a flashlight sweeping the room left the ceiling and
 	// walls blotched for the cards' whole window). The level halves the
 	// noise per step: a texel relit once reads eight by eight of its
-	// neighbours, and the level falls half a step per doubling of its
+	// neighbors, and the level falls half a step per doubling of its
 	// relights until the texel stands on its own at sixty-four.
 	if (params.card_youth_lod > 0.0) {
 		ivec2 tex0 = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
@@ -1233,7 +1233,7 @@ bool screen_trace_hit(vec3 view_origin, vec3 view_normal, vec3 view_dir, float j
 	// Start off the surface, as the BVH ray does. Starting on it, a ray leaving
 	// at a grazing angle stays within the acceptance window of the very surface
 	// it left, and the first step reports a hit against it -- which lands in
-	// r_hit_distance as a contact at a few centimetres and drives this pixel's
+	// r_hit_distance as a contact at a few centimeters and drives this pixel's
 	// visibility term to zero while its neighbour's stays at one.
 	view_origin += view_normal * params.ray_bias;
 	float trace_dist = SCREEN_TRACE_DISTANCE;
@@ -1277,8 +1277,8 @@ vec3 view_position_at(ivec2 full_pixel) {
 }
 
 // The geometric normal of the visible surface at a pixel, from the depth
-// buffer: the plane through the pixel and its nearest neighbours, taking on
-// each axis the neighbour closer in depth so the plane does not straddle a
+// buffer: the plane through the pixel and its nearest neighbors, taking on
+// each axis the neighbor closer in depth so the plane does not straddle a
 // silhouette. Faces the camera by construction, which is the side the rays
 // have to leave from. Falls back to p_fallback where the neighbourhood is sky.
 vec3 geometric_normal(ivec2 full_pixel, vec3 view_pos, vec3 p_fallback) {
@@ -1305,12 +1305,12 @@ vec3 geometric_normal(ivec2 full_pixel, vec3 view_pos, vec3 p_fallback) {
 	return dot(n, view_pos) > 0.0 ? -n : n;
 }
 
-// The surface's curvature at a pixel from the depth buffer, per metre, the
+// The surface's curvature at a pixel from the depth buffer, per meter, the
 // larger of the two screen axes, convex only (concave reads as flat). For a
 // plane the second difference of the neighbours' positions lies in the
 // plane, so its component along the normal is zero exactly; for a convex
-// surface the neighbours fall behind the tangent plane by k |dP|^2 / 2 each,
-// which is what is read back. Axes that cross a silhouette (a neighbour far
+// surface the neighbors fall behind the tangent plane by k |dP|^2 / 2 each,
+// which is what is read back. Axes that cross a silhouette (a neighbor far
 // off in depth) are skipped.
 float surface_curvature(ivec2 full_pixel, vec3 view_pos, vec3 geo_normal) {
 	float k = 0.0;
@@ -1729,7 +1729,7 @@ void main() {
 	// - A normal map tilts the shading normal, and a cosine lobe around a
 	//   tilted normal puts part of itself below the real surface. Those rays
 	//   meet the wall two march steps in and read its own colour back, and
-	//   report a hit distance of centimetres that the near-field visibility
+	//   report a hit distance of centimeters that the near-field visibility
 	//   takes for contact occlusion: the wall's bumps come out as bright
 	//   self-lit patches ringed by dark bands.
 	//
@@ -1810,7 +1810,7 @@ void main() {
 		// image solve does. A light's image at a point is the light itself
 		// at the mirrored point with the mirrored normal, times the Fresnel
 		// at the crossing, seen through a shadow ray in two legs (to a
-		// centimetre above the mirror measured along its normal, then from
+		// centimeter above the mirror measured along its normal, then from
 		// the mirror to the light). The knob's own light only (a scene
 		// without the stochastic direct pass, the box): the scene's lights,
 		// the dynamic ones included, are imaged by that pass (their caustic
@@ -1929,7 +1929,7 @@ void main() {
 		// A curved mirror's image is not at the hit distance behind it: a
 		// convex surface of curvature k images a point at distance t at
 		// t / (1 + 2 k t) -- a pillar of 0.4 m radius images the far wall a
-		// fifth of a metre behind its surface, not four metres. Reprojected
+		// fifth of a meter behind its surface, not four meters. Reprojected
 		// at the hit distance instead, the temporal filter fetched the
 		// pillar's reflection history from where the wall would have
 		// reprojected, and every highlight on it doubled and smeared under a

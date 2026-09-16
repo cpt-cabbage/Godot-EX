@@ -1086,8 +1086,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// (1): the history then has its whole window of relights to average.
 	static const int64_t dyn_rays_rest = OS::get_singleton()->get_environment("GODOT_CARD_DYN_RAYS_REST") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_CARD_DYN_RAYS_REST").to_int();
 	// The histories' length follows the lights' motion: a light that moved
-	// GODOT_CARD_DYN_MOTION metres this frame (its origin, or its axis
-	// three metres out; 0.1) refreshes the term whole, a slower one keeps
+	// GODOT_CARD_DYN_MOTION meters this frame (its origin, or its axis
+	// three meters out; 0.1) refreshes the term whole, a slower one keeps
 	// as many relights as the inverse of its motion, a resting one
 	// accumulates the window. A fixed short window lagged a fast sweep by
 	// its length (the beam's bounce stayed on a wall it had left), and at

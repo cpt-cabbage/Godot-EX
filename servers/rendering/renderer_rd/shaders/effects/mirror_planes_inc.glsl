@@ -35,7 +35,7 @@ bool mirror_in_rect(uint i, vec3 p) {
 	return abs(dot(d, params.mirrors[i].u_axis.xyz)) <= params.mirrors[i].params.z && abs(dot(d, params.mirrors[i].v_axis.xyz)) <= params.mirrors[i].params.w;
 }
 
-// The mirror a point lies on (within two centimetres of its plane, inside
+// The mirror a point lies on (within two centimeters of its plane, inside
 // its rectangle), or MAX_MIRROR_PLANES for none.
 uint mirror_at(vec3 p) {
 	for (uint i = 0u; i < mirror_count(); i++) {
@@ -230,7 +230,7 @@ bool mirror_chain(uint mi, uint mj, uint mk, vec3 p, vec3 n_p, vec3 light, float
 	return true;
 }
 
-// Whether a mirror is a major one (four square metres or more): the
+// Whether a mirror is a major one (four square meters or more): the
 // chains of two and three run between major mirrors only (a floor and a
 // ceiling); a tabletop gets single images alone. The chains' cost is in
 // the evaluations that the crossing tests reject only after the chain's

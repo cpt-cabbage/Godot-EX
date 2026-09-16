@@ -120,8 +120,8 @@ bool cone_frustum(vec3 apex, vec3 dir, float height, float base_radius, vec4 pla
 	return true;
 }
 
-// Oriented box (centre, unit axes, half extents): behind a plane when its
-// centre is farther behind than its projected radius.
+// Oriented box (center, unit axes, half extents): behind a plane when its
+// center is farther behind than its projected radius.
 bool obb_frustum(vec3 c, vec3 ax, vec3 ay, vec3 az, vec3 h, vec4 planes[6]) {
 	for (uint i = 0u; i < 6u; i++) {
 		vec3 n = planes[i].xyz;
@@ -177,7 +177,7 @@ void main() {
 	float d1 = float(slice + 1u) / 32.0 * state.z_far;
 	vec3 near_p[4];
 	vec3 far_p[4];
-	vec3 centre = vec3(0.0);
+	vec3 center = vec3(0.0);
 	for (uint i = 0u; i < 4u; i++) {
 		vec3 a = unproject(corners[i], 0.0);
 		vec3 b = unproject(corners[i], 1.0);
@@ -191,13 +191,13 @@ void main() {
 		float da = -a.z;
 		float db = -b.z;
 		float inv = 1.0 / max(db - da, 1e-6);
-		centre += a + (b - a) * (((d0 + d1) * 0.5 - da) * inv);
+		center += a + (b - a) * (((d0 + d1) * 0.5 - da) * inv);
 	}
-	centre *= 0.25;
+	center *= 0.25;
 	vec4 planes[6];
 	for (uint i = 0u; i < 4u; i++) {
 		uint k = (i + 1u) & 3u;
-		planes[i] = plane_through(near_p[i], near_p[k], far_p[i], centre);
+		planes[i] = plane_through(near_p[i], near_p[k], far_p[i], center);
 	}
 	planes[4] = vec4(0.0, 0.0, 1.0, d1); // z >= -d1
 	planes[5] = vec4(0.0, 0.0, -1.0, -d0); // z <= -d0
