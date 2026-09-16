@@ -1,11 +1,7 @@
 # Godot-EX
 
 > **Godot-EX is my personal fork of [Godot Engine](https://github.com/godotengine/godot)**,
-> tracking upstream `master` and shaped around how I work and the game I'm building. I come from
-> CGI and games development, and this is the engine made the way I want it: the rendering,
-> lighting and colour pipeline I'm used to from film, editor workflow changes that fit my habits,
-> and fixes for whatever else gets in the way of making the game. Everything not listed below is
-> stock Godot. Expect rough edges — this is a working tool, not a release.
+> tracking upstream `master` and shaped around how I work and the game I'm building.
 
 ## Godot-EX Features
 
@@ -17,7 +13,7 @@ engine falls back to stock shadow maps, SDFGI and SSR.
 
 | Backend | Status |
 | --- | --- |
-| **macOS / Metal** — Apple Silicon | Working; everything is developed and measured here (`--rendering-driver metal`) |
+| **macOS / Metal** — Apple Silicon | Working, but still WIP (`--rendering-driver metal`) |
 | **Windows / Vulkan** — NVIDIA RTX and other `VK_KHR_ray_query` GPUs | Planned; upstream's Vulkan driver implements the API, the passes have not been run on it yet |
 
 **Metal driver**
@@ -68,7 +64,7 @@ engine falls back to stock shadow maps, SDFGI and SSR.
 
 ### Lights
 
-- **AreaLight3D**: a rectangular area light with a visible emitting rect, its own gizmo (clicking
+- **AreaLight3D**: added visibility toggle and the ability to see in camera, its own gizmo (clicking
   the rect selects the light) and traced soft shadows
 - **Range display**: selecting a light no longer draws the orange AABB selection box around its
   attenuation range, which read as a cube-shaped radius. The gizmo alone shows the range — a
