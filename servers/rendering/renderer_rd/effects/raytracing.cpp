@@ -1710,6 +1710,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
 	}
 	params.memory_rate = use_cards ? CLAMP(memory_rate, 0.0f, 1.0f) : 0.0f;
+	// GODOT_GI_MEMORY_EDGE=1 (experiment, section 65): settled pixels inside
+	// the screen's border fade teach the memory too.
+	static const bool memory_edge = OS::get_singleton()->get_environment("GODOT_GI_MEMORY_EDGE") == "1";
+	if (memory_edge && params.memory_rate > 0.0f) {
+		params.flags |= 8388608; // FLAG_MEMORY_EDGE
+	}
 	params.surface_cache_frame = scene.get_frame();
 	// Diagnostics: GODOT_GI_FALLBACK=all shows the cards' bounce fallback at
 	// every pixel in place of the gathered GI (its bias and coverage against

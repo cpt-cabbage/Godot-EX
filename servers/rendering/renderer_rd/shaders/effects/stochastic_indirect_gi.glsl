@@ -126,6 +126,7 @@ params;
 #define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_SPEC_BUDGET 1048576u // Rough dielectrics skip the GGX ray: the cosine rays' mean radiance stands in for their reflection (GODOT_GI_SPEC_BUDGET).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
+#define FLAG_MEMORY_EDGE 8388608u // Experiment (GODOT_GI_MEMORY_EDGE=1): settled pixels inside the border fade teach the screen memory too, at the fade's share of the rate.
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -1066,20 +1067,28 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		// of a flick, taught by the dim young reflections of pixels that
 		// counted as settled (measured: the stop's reflection 30% dark
 		// against 46% without the memory, instead of level).
-		if (screen_share >= 0.999 && hit_frames >= MEMORY_WRITE_FRAMES) {
+		// FLAG_MEMORY_EDGE (GODOT_GI_MEMORY_EDGE=1): a settled pixel inside
+		// the border fade teaches too, at the rate scaled by its border
+		// share -- the fade is for the reads, a settled pixel's colour at the
+		// edge is as good as one inside; without it what sits at the frame
+		// edge (pose E's right-hand furniture, section 60) is never taught.
+		bool edge_teach = bool(params.flags & FLAG_MEMORY_EDGE) && border_share > 0.0 && settled >= 0.999;
+		if ((screen_share >= 0.999 || edge_teach) && hit_frames >= MEMORY_WRITE_FRAMES) {
 			float stamp = float(params.frame_index % 1024u + 1u);
 			vec4 mem = imageLoad(card_screen_atlas, ivec2(card_atlas_texel));
 			if (mem.a != stamp) {
 				vec3 diff = (col - cache_radiance) / max(luminance(cache_radiance), MEMORY_FLOOR);
-				mem.rgb = (mem.a <= 0.0 || any(isnan(mem.rgb))) ? diff : mix(mem.rgb, diff, params.memory_rate);
+				mem.rgb = (mem.a <= 0.0 || any(isnan(mem.rgb))) ? diff : mix(mem.rgb, diff, params.memory_rate * border_share);
 				mem.a = stamp;
 				imageStore(card_screen_atlas, ivec2(card_atlas_texel), mem);
 				if (bool(params.flags & FLAG_TIER_STATS)) {
 					atomicAdd(calibration.spec_count[7], 1u);
 				}
 			}
-			boost_source = SPEC_SRC_SCREEN;
-			return col;
+			if (screen_share >= 0.999) {
+				boost_source = SPEC_SRC_SCREEN;
+				return col;
+			}
 		}
 		vec3 base = memory_base(cache_radiance);
 		if (screen_share > 0.0) {
