@@ -2238,10 +2238,6 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	translucency_quality.spread = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/spread");
 	translucency_quality.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/temporal_frames"));
 	translucency_quality.ray_bias = stochastic_quality.ray_bias;
-	// The froxels' bounce rays against the surface cache: with them the volume
-	// carries the blended fragments' indirect light too, so they need no
-	// per-fragment SDFGI. Off without the cache, which is what the rays read.
-	translucency_quality.indirect = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect") && use_surface_cache && use_rt_gi;
 	translucency_quality.indirect_rays = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect_rays"));
 	if (scene_shader_ray_query) {
 		// Outside any draw list, which is where an acceleration structure
@@ -2276,6 +2272,15 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_gi_directionality = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/directional/directionality");
 	use_surface_cache = GLOBAL_GET("rendering/ray_tracing/surface_cache/enabled");
 	use_surface_cache_mirror = GLOBAL_GET("rendering/ray_tracing/surface_cache/mirror_reflections");
+	// The froxels' bounce rays against the surface cache: with them the volume
+	// carries the blended fragments' indirect light too, so they need no
+	// per-fragment SDFGI. Off without the cache, which is what the rays read.
+	// Read after use_rt_gi and use_surface_cache: until 2026-09-16 it sat with
+	// the other translucency settings above them and, this function running
+	// once per settings version, took the header's false for both on the
+	// first pass, so the default-on bounce rays stayed off until any project
+	// setting changed.
+	translucency_quality.indirect = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/indirect") && use_surface_cache && use_rt_gi;
 	rt_gi_hit_shading = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/mode"));
 	rt_gi_hit_mirror = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/mirror");
 	rt_gi_hit_lod_bias = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/hit_shading/lod_bias");
