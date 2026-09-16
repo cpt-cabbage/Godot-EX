@@ -1,50 +1,92 @@
-# Godot Engine — experimental ray-tracing fork
+# Godot-EX
 
-> **This is a personal fork of [Godot Engine](https://github.com/godotengine/godot)**, tracking
-> upstream `master` and adding my own experimental rendering features on top. It targets the
-> Forward+ renderer on macOS/Metal (Apple Silicon); everything else is stock Godot. Expect rough
-> edges — this is a research playground, not a release.
+> **Godot-EX is my personal fork of [Godot Engine](https://github.com/godotengine/godot)**,
+> tracking upstream `master` and shaped around how I work and the game I'm building. I come from
+> CGI and games development, and this is the engine made the way I want it: the rendering,
+> lighting and colour pipeline I'm used to from film, editor workflow changes that fit my habits,
+> and fixes for whatever else gets in the way of making the game. Everything not listed below is
+> stock Godot. Expect rough edges — this is a working tool, not a release.
 
-## What this fork adds
+## Godot-EX Features
 
-- **Metal ray tracing**: hardware acceleration structures and ray queries in the Metal driver
-  (`GL_EXT_ray_query` compute shaders → SPIR-V → MSL), per-mesh BLAS and a per-frame TLAS over
-  the whole scene, including skinned/blend-shaped meshes, multimeshes and GPU particles; GPU
-  timestamp queries for per-pass profiling on Metal
-- **Ray-traced shadows**: directional and area-light shadows that replace the shadow maps —
-  soft shadows from the sun's angular size, temporal accumulation, depth-aware denoise, alpha-tested
-  casters, per-light and per-instance control, ray-traced volumetric fog shadows
-- **Stochastic direct lighting**: many-light sampling with blue-noise
-  candidates, visibility-guided light lists, screen-space contact traces, area lights, a ratio
-  estimator with an SVGF-style variance-driven denoiser, half-resolution mode
-- **Ray-traced GI**: hardware final gather with directional irradiance and traced specular
-  occlusion, glossy reflections (stock SSR skipped where they cover it), depth-validated temporal
-  history, a-trous denoiser with propagated variance, restart on lighting changes, extra rays on
-  young pixels, screen-radiance memory
-- **Surface cache**: per-instance orthographic material "cards" (albedo/normal/emission/depth
-  atlases) lit on the GPU every frame with a budget — direct light with shadow rays, a world light
-  grid, area lights, spot cookies/projectors, bounce histories for moving lights, a mip chain —
-  and read at every ray hit instead of running the material
-- **Deferred hit shading**: the scene shader's material runs in compute on binned ray hits the
-  cards cannot answer
-- **Translucency volume**: a froxel lighting volume for the transparent pass, with traced bounce
-  rays, replacing the per-fragment light loops
-- **Planar mirrors**: detected from the scene, with image lights, image chains and glossy lobes
-  flowing through the stochastic direct and GI passes
-- **Prepass G-buffer**: albedo, F0 and flags from the depth prepass feeding the direct and GI
-  passes; material-weighted light selection
-- **Denoiser infrastructure**: per-viewport temporal state, moving-object reprojection,
-  frame-edge history borrowing, working-space luminance, NaN-safe histories, MetalFX / FSR2
-  aware velocity
-- **SDFGI / VoxelGI**: SDFGI probe rays traced with hardware ray queries; VoxelGI as a fallback
-  radiance cache; reflection probes re-fit to the frame's irradiance
-- **AreaLight3D**: a visible emitting rect, gizmo selection and range display for lights
-- **Colour management (OpenColorIO)**: vendored OCIO 2.4.2, a config-driven working space
-  (e.g. ACEScg), OCIO views spliced into the tonemapper, texture import converted into the working
-  space, display and view chosen separately
-- **Cluster builder**: the bake as a compute cull, an exponential-depth cluster for the sampling pass
-- **Editor**: gizmos kept out of SSR/screen-space traces; the editor keeps repainting until the
-  temporal histories have settled
+### Hardware ray tracing
+
+Ray-traced lighting on the Forward+ renderer, built on Godot's own acceleration-structure API in
+`RenderingDevice` rather than on any one GPU vendor. Where a backend has no ray-query support the
+engine falls back to stock shadow maps, SDFGI and SSR.
+
+| Backend | Status |
+| --- | --- |
+| **macOS / Metal** — Apple Silicon | Working; everything is developed and measured here (`--rendering-driver metal`) |
+| **Windows / Vulkan** — NVIDIA RTX and other `VK_KHR_ray_query` GPUs | Planned; upstream's Vulkan driver implements the API, the passes have not been run on it yet |
+
+**Metal driver**
+- Acceleration structures and ray queries: `GL_EXT_ray_query` compute shaders → SPIR-V → MSL
+- A BLAS per mesh and a per-frame TLAS over the scene, including skinned and blend-shaped meshes,
+  multimeshes and GPU particles
+- GPU timestamp queries, so `--gpu-profile` gives per-pass timings on Metal
+
+**Shadows**
+- Directional and area-light shadows traced in place of shadow maps
+- Penumbrae from the sun's angular size and the light's size, temporal accumulation, depth-aware
+  denoise
+- Alpha-tested casters, per-light and per-instance control, traced volumetric-fog shadows
+
+**Stochastic direct lighting**
+- Many-light sampling with blue-noise candidates and visibility-guided light lists
+- Area lights, screen-space contact traces, material-weighted light selection
+- A ratio estimator with an SVGF-style variance-driven denoiser; half-resolution mode
+
+**Global illumination**
+- Hardware final gather with directional irradiance and traced specular occlusion
+- Glossy reflections, with stock SSR skipped wherever the traced band covers it
+- Depth-validated temporal history, an à-trous denoiser with propagated variance
+- Restart on lighting changes, extra rays on young pixels, screen-radiance memory
+
+**Surface cache**
+- Per-instance orthographic material "cards" — albedo, normal, emission and depth atlases —
+  read at every ray hit instead of running the material
+- Lit on the GPU every frame under a budget: direct light with shadow rays, a world light grid,
+  area lights, spot cookies and projectors, bounce histories for moving lights, a mip chain
+- Deferred hit shading runs the scene shader's material in compute on the binned hits the cards
+  cannot answer
+
+**Transparency, mirrors and probes**
+- A froxel translucency volume with traced bounce rays replaces the transparent pass's
+  per-fragment light loops
+- Planar mirrors detected from the scene, with image lights, image chains and glossy lobes through
+  the direct and GI passes
+- SDFGI probe rays traced with hardware ray queries; VoxelGI as a fallback radiance cache;
+  reflection probes re-fit to the frame's irradiance
+
+**Shared infrastructure**
+- A prepass G-buffer (albedo, F0, flags) feeding the direct and GI passes
+- Per-viewport temporal state, moving-object reprojection, frame-edge history borrowing,
+  working-space luminance, NaN-safe histories
+- MetalFX / FSR2 aware velocity and jitter
+- Cluster builder: the bake as a compute cull, an exponential-depth cluster for the sampling pass
+
+### Lights
+
+- **AreaLight3D**: a rectangular area light with a visible emitting rect, its own gizmo (clicking
+  the rect selects the light) and traced soft shadows
+- **Range display**: selecting a light no longer draws the orange AABB selection box around its
+  attenuation range, which read as a cube-shaped radius. The gizmo alone shows the range — a
+  sphere for omni and area lights, a cone for spots — and an eye button next to `omni_range`,
+  `spot_range` and `area_range` in the inspector shows or hides it per light, saved with the scene
+- Shadow-map-only properties are hidden on lights whose shadows are traced
+
+### Colour management
+
+- OpenColorIO 2.4.2 vendored as a module, with a config-driven working space (e.g. ACEScg)
+- OCIO views spliced into the tonemapper; display and view chosen separately
+- Texture import converted into the working space
+
+### Editor
+
+- Gizmos kept out of SSR and screen-space shadow traces
+- The editor keeps repainting until the temporal histories have settled, so a still viewport
+  converges instead of freezing mid-denoise
 
 ---
 
