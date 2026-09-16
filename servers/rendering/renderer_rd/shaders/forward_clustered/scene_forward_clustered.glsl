@@ -3615,15 +3615,23 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 near_analytic_diffuse = vec3(0.0);
 		vec4 near_analytic_specular = vec4(0.0);
 		float near_depth_weight = -1.0;
+		// The pixel's normal faced the way the sampling pass faces the
+		// prepass normal it lit each texel with (toward the viewer), for the
+		// normal test below.
+		vec3 stochastic_face = dot(normal, view) < 0.0 ? -normal : normal;
 		for (int i = 0; i < 4; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
+			// The full-res pixel the sampling pass lit texel hp at (it clamps
+			// the same way for odd sizes).
+			ivec2 fp = min(hp * 2, full_size - ivec2(1));
 			vec3 tap_image_diffuse = vec3(0.0);
 			vec4 tap_image_specular = vec4(0.0);
 			vec3 tap_analytic_diffuse = vec3(0.0);
 			vec4 tap_analytic_specular = vec4(0.0);
 #ifdef USE_MULTIVIEW
 			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
+			vec3 sn = nr_normal(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(fp, int(ViewIndex)), 0));
 			vec3 tap_diffuse = texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
 			if (pixel_analytic) {
@@ -3636,6 +3644,7 @@ void fragment_shader(in SceneData scene_data) {
 			}
 #else
 			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
+			vec3 sn = nr_normal(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), fp, 0));
 			vec3 tap_diffuse = texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
 			if (pixel_analytic) {
@@ -3649,6 +3658,16 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 			float depth_weight = exp(-abs(sd - own_depth) / max(own_depth * 0.1, 1e-4));
 			float w = (1.0 - abs(float(off.x) - fr.x)) * (1.0 - abs(float(off.y) - fr.y)) * depth_weight;
+			// The depth test alone (a tenth of the depth) lets a shelf's edge
+			// take the wall's visibility a hand behind it, and a wall's top
+			// the ceiling's: with the ratios raw (the denoiser off) that is a
+			// one-pixel bright line along every silhouette whose two sides
+			// see a light differently, and denoised a faint rim (plan section
+			// 62). The GI upsample's normal test, with the prepass normal the
+			// sampling pass lit the texel with, keeps the taps on this
+			// pixel's own surface; the exponent tolerates a normal map's bumps.
+			sn = dot(sn, view) < 0.0 ? -sn : sn;
+			w *= pow(max(dot(stochastic_face, sn), 0.0), 8.0);
 			up_diffuse += tap_diffuse * w;
 			up_specular += tap_specular * w;
 			up_image_diffuse += tap_image_diffuse * w;
