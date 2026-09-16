@@ -2187,6 +2187,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (spatial_off) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_OFF;
 		}
+		// GODOT_GI_MIRROR_YOUNG=1 (experiment): the first iteration filters a
+		// young mirror pixel's reflection at stride 1 (section 64; measured without gain, off).
+		static const bool mirror_young = OS::get_singleton()->get_environment("GODOT_GI_MIRROR_YOUNG") == "1";
+		if (mirror_young && iteration == 0) {
+			denoise_push_constant.flags |= DENOISE_FLAG_MIRROR_YOUNG;
+		}
 		// GODOT_GI_FALLBACK_RAMP=<relights>: the card accumulation at which
 		// the young pixel's stand-in reaches full weight.
 		static const float fallback_ramp = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP") == "" ? 8.0f : float(OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_RAMP").to_float());

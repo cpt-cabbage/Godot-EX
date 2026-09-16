@@ -38,6 +38,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
 #define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
 #define FLAG_BORROW_SPEC 524288u // Experiment (GODOT_GI_BORROW_SPEC=1): a borrowed history serves the reflection on a mirror too (the form before section 59).
+#define FLAG_MIRROR_YOUNG 16u // Experiment (GODOT_GI_MIRROR_YOUNG=1, set on the first iteration only): a young mirror pixel's reflection is filtered at stride 1.
 #define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel rather than at the history's (the form before the flick fix).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
 
@@ -1389,9 +1390,18 @@ void main() {
 		float r = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
 		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
 		if (spec_scale < 0.25) {
-			filter_s = false;
+			// A mirror's image is never filtered once it has a history. Its
+			// first frames are one shaded sample each (the entering band of a
+			// slow turn over the mirror floor, since section 59 stopped the
+			// frame-edge borrow copying an image there), so with
+			// GODOT_GI_MIRROR_YOUNG the first iteration alone filters a young
+			// mirror pixel at stride 1: the image blurs by a pixel or two for
+			// under four frames, the shading noise averages.
+			filter_s = (params.flags & FLAG_MIRROR_YOUNG) != 0u && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u && (young_s || newly_revealed);
+			stride_s = 1;
+		} else {
+			stride_s = max(1, int(round(float(stride_s) * spec_scale)));
 		}
-		stride_s = max(1, int(round(float(stride_s) * spec_scale)));
 	}
 	// The split history's verdict (above): a settled pixel whose halves
 	// agree reaches half as far.
