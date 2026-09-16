@@ -600,6 +600,25 @@ bool sdfgi_probe_irradiance(vec3 rel_pos, vec3 normal, out vec3 r_irradiance) {
 	return false;
 }
 
+// A texel's diffuse albedo. The capture folded the material's F0 into the
+// albedo as if Lambertian (the energy a card can hold); a planar mirror's
+// texel takes that fold back out of the specular atlas, since the mirror's
+// reflection is carried by the image lights and the reflected rays instead.
+// Every reader of a texel's albedo comes through here: the dynamic
+// estimator (the light rays' landings, the cosine rays' analytic first
+// bounce, the gather's direct term at a hit) once multiplied the folded
+// albedo where the static radiance used the diffuse one, so a lamp that
+// changed once read its bounce off a mirror floor as diffuse for the hold,
+// then darkened over the fade as the static accumulation took the bounce
+// back (4% on the lab's pillar, section 57).
+vec3 card_diffuse_albedo(ivec2 texel, vec3 world_pos) {
+	vec3 albedo = texelFetch(albedo_atlas, texel, 0).rgb;
+	if (mirror_on() && (params.mirror_debug & 4u) == 0u && mirror_at(world_pos) < MAX_MIRROR_PLANES) {
+		albedo = max(albedo - texelFetch(specular_atlas, texel, 0).rgb, vec3(0.0));
+	}
+	return albedo;
+}
+
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup),
 // over this pass's own bindings: nearest texel of the lit atlas.
 // Diagnostics (tier_stat): why the last card_lookup() failed. 0 the hit's
@@ -705,7 +724,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_radiance = imageLoad(lighting_atlas, best_texel).rgb;
 	r_change = change_load_gradient(best_texel);
 	r_change_total = change_load_total(best_texel);
-	r_albedo = texelFetch(albedo_atlas, best_texel, 0).rgb;
+	r_albedo = card_diffuse_albedo(best_texel, p_world_hit);
 	r_texel = best_texel;
 	// The captured normal, as read_texel decodes it: the dynamic bounce needs
 	// the surface's orientation at the hit for its geometry terms.
@@ -927,7 +946,6 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 	if (depth <= 0.0) {
 		return false;
 	}
-	t.albedo = texelFetch(albedo_atlas, texel, 0).rgb;
 	vec3 n_cam = normalize(texelFetch(normal_atlas, texel, 0).rgb * 2.0 - 1.0);
 	t.emission = texelFetch(emission_atlas, texel, 0).rgb;
 	vec2 uv01 = (vec2(texel_in_card) + 0.5) / vec2(dims);
@@ -936,14 +954,7 @@ bool read_texel(CardSet s, uint card, ivec2 dims, ivec2 texel_in_card, ivec2 tex
 	card_basis(card, axis, u, v);
 	vec3 n_local = u * n_cam.x + v * n_cam.y + axis * n_cam.z;
 	t.world_pos = (s.world_from_local * vec4(local_pos, 1.0)).xyz;
-	if (mirror_on() && (params.mirror_debug & 4u) == 0u && mirror_at(t.world_pos) < MAX_MIRROR_PLANES) {
-		// A planar mirror's texel keeps its diffuse albedo alone: the capture
-		// folded its F0 into the albedo as if Lambertian (the energy a card
-		// can hold), and here that fold comes back out of the specular
-		// atlas, since the mirror's reflection is carried by the image
-		// lights and the reflected rays instead.
-		t.albedo = max(t.albedo - texelFetch(specular_atlas, texel, 0).rgb, vec3(0.0));
-	}
+	t.albedo = card_diffuse_albedo(texel, t.world_pos);
 	t.n_world = normalize(mat3(s.world_from_local) * n_local);
 	t.origin = t.world_pos + t.n_world * params.ray_bias;
 	return true;
@@ -1592,7 +1603,19 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 								pdf_light = pdf_omega * cos_hl / (d * d);
 							}
 						}
-						r_dyn1 += albedo_hit * c * vis_hit * (p_cos / (p_cos + n_light * pdf_light));
+						// A hit reached through a mirror is a path the light
+						// rays cannot make (they land and connect straight to
+						// the texel): the cosine ray is its only estimator and
+						// takes the whole weight. It had none: p_cos is the
+						// direct path's, with the texel's cosine of the ray as
+						// it is after the reflection (clamped to zero for a
+						// ceiling texel's ray bouncing back up), so the weight
+						// read zero against the light rays' density; and as a
+						// zero light density instead of this branch, 0 / 0
+						// poisoned the histories to a restart (the lab's pillar
+						// 0.8% under its static level over the hold either way).
+						float w = mirror_bounces > 0u ? 1.0 : (p_cos > 0.0 ? p_cos / (p_cos + n_light * pdf_light) : 0.0);
+						r_dyn1 += albedo_hit * c * vis_hit * w;
 					}
 				}
 				indirect_sample = card_radiance;

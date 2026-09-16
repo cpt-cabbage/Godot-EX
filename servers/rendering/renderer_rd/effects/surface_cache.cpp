@@ -31,6 +31,7 @@
 #include "surface_cache.h"
 
 #include "core/config/engine.h"
+#include "core/io/file_access.h"
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "servers/rendering/color_management.h"
@@ -156,7 +157,9 @@ void SurfaceCache::_create_atlases() {
 	RD::TextureFormat tf;
 	tf.width = settings.atlas_size;
 	tf.height = settings.atlas_size;
-	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	// GODOT_CARD_DUMP (diagnostics, see update_lighting) reads the atlases back.
+	const uint32_t dump_bit = OS::get_singleton()->has_environment("GODOT_CARD_DUMP") ? RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT : 0;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | dump_bit;
 	tf.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 	albedo_atlas = rd->texture_create(tf, RD::TextureView());
 	normal_atlas = rd->texture_create(tf, RD::TextureView());
@@ -167,7 +170,7 @@ void SurfaceCache::_create_atlases() {
 	depth_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(depth_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | dump_bit;
 	tf.mipmaps = LIGHTING_MIPS;
 	lighting_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(lighting_atlas, Color(0, 0, 0, 0), 0, LIGHTING_MIPS, 0, 1);
@@ -600,6 +603,12 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		if (s->size > 0 && !s->pending_capture) {
 			s->pending_capture = true;
 			pending_captures.push_back(set_index);
+			// GODOT_CARD_CAPTURE_PRINT=1 (diagnostics): every capture queued, with
+			// why (a set captured mid-run at rest restarts its lighting history).
+			static const bool capture_print = OS::get_singleton()->get_environment("GODOT_CARD_CAPTURE_PRINT") == "1";
+			if (capture_print) {
+				print_line(vformat("Surface cache capture: frame %d set %d size %d (wanted %d) box changed %d skinned %d distance %.2f extent %.2f", frame, set_index, s->size, s->wanted_size, int(d_box_changed), int(p_skinned), distance, world_extent));
+			}
 		}
 	}
 	return set_index;
@@ -1395,4 +1404,42 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	rd->draw_command_end_label();
 	// The coarsest level cleared the tiles' marks as it read them.
 	mip_full_rebuild = false;
+
+	// GODOT_CARD_DUMP=<frame,frame,...> (diagnostics): the atlases read back
+	// at those frames into /tmp/card_dump_<name>_<frame> -- the half atlases
+	// raw (atlas_size squared RGBA float16, numpy reads them), the captures
+	// as PNG. A stall each; what the cards hold between two screen captures
+	// is otherwise invisible (a field climbing 2.5x over a light's fade back
+	// to static was found this way, section 57).
+	static const Vector<String> dump_frames = OS::get_singleton()->get_environment("GODOT_CARD_DUMP").split(",", false);
+	for (const String &f : dump_frames) {
+		if (f.to_int() == int64_t(p_inputs.frame)) {
+			struct Entry {
+				const char *name;
+				RID tex;
+				Image::Format fmt;
+			};
+			Entry entries[] = {
+				{ "lighting", lighting_atlas_mips[0], Image::FORMAT_RGBAH },
+				{ "indirect", indirect_atlas, Image::FORMAT_RGBAH },
+				{ "indirect_filtered", indirect_filtered_atlas, Image::FORMAT_RGBAH },
+				{ "static", static_atlas, Image::FORMAT_RGBAH },
+				{ "screen", screen_atlas, Image::FORMAT_RGBAH },
+				{ "albedo", albedo_atlas, Image::FORMAT_RGBA8 },
+				{ "specular", specular_atlas, Image::FORMAT_RGBA8 },
+			};
+			for (const Entry &e : entries) {
+				Vector<uint8_t> data = rd->texture_get_data(e.tex, 0);
+				if (e.fmt == Image::FORMAT_RGBAH) {
+					Ref<FileAccess> fa = FileAccess::open(vformat("/tmp/card_dump_%s_%d.raw", e.name, p_inputs.frame), FileAccess::WRITE);
+					if (fa.is_valid()) {
+						fa->store_buffer(data.ptr(), data.size());
+					}
+				} else {
+					Image::create_from_data(settings.atlas_size, settings.atlas_size, false, e.fmt, data)->save_png(vformat("/tmp/card_dump_%s_%d.png", e.name, p_inputs.frame));
+				}
+			}
+			print_line(vformat("Surface cache dump: frame %d", p_inputs.frame));
+		}
+	}
 }

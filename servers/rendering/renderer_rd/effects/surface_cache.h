@@ -481,6 +481,7 @@ public:
 	RID get_indirect_filtered_atlas() const { return indirect_filtered_atlas; }
 	RID get_dynamic_lights_buffer() const { return dynamic_lights_buffer; }
 	RID get_static_atlas() const { return static_atlas; }
+	RID get_specular_atlas() const { return specular_atlas; }
 	RID get_screen_atlas() const { return screen_atlas; }
 	uint32_t get_dynamic_light_count() const { return dynamic_light_count; }
 	// The world light grid as the last update_lighting left it (the hit

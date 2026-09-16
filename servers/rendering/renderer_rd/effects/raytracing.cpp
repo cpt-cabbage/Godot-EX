@@ -1658,6 +1658,18 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (surface_cache_mirror_reflections && p_quality.specular) {
 			params.flags |= 1024; // FLAG_MIRROR
 		}
+		// The cards light a planar mirror's texels with the F0 folded back
+		// out of the albedo (surface_cache_light.glsl card_diffuse_albedo,
+		// off under GODOT_MIRROR_ABLATE bit 4); a hit's dynamic direct term
+		// takes the same albedo, else the two estimators of a dynamic
+		// light's bounce disagree by the mirror's reflection and the frame
+		// steps as the light fades back to static (section 57).
+		uint32_t card_mirror_count = 0;
+		mirror_planes_for_pass(1u, card_mirror_count);
+		static const uint32_t mirror_ablate = OS::get_singleton()->get_environment("GODOT_MIRROR_ABLATE").to_int();
+		if (card_mirror_count > 0 && (mirror_ablate & 4) == 0) {
+			params.flags |= 4194304; // FLAG_CARD_MIRROR_FOLD
+		}
 		params.surface_cache_atlas_size = surface_cache->get_settings().atlas_size;
 	}
 	params.memory_rate = use_cards ? CLAMP(memory_rate, 0.0f, 1.0f) : 0.0f;
@@ -1841,6 +1853,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_sc_normal_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 34, Vector<RID>({ sampler, sc_normal_atlas }));
 	RD::Uniform u_sc_dyn_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ use_cards ? surface_cache->get_dynamic_lights_buffer() : rt_gi_dummy_buffer }));
 	RD::Uniform u_sc_static(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 36, Vector<RID>({ sampler, use_cards ? surface_cache->get_static_atlas() : default_black }));
+	RD::Uniform u_sc_specular_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 42, Vector<RID>({ sampler, use_cards ? surface_cache->get_specular_atlas() : default_black }));
 	// The projector textures of the dynamic lights (never sampled without a
 	// projector rect, so the atlas may be absent).
 	RID gather_decal_atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
@@ -1888,7 +1901,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	rd->draw_command_begin_label("RT GI Gather");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_decal_atlas, u_sc_screen, u_votes, u_gbuf_f0, u_gbuf_albedo), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_sc_screen, u_votes, u_gbuf_f0, u_gbuf_albedo), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray), 1);
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

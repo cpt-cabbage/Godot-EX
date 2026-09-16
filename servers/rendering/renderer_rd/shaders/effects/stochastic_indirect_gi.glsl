@@ -126,6 +126,7 @@ params;
 #define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_SPEC_BUDGET 1048576u // Rough dielectrics skip the GGX ray: the cosine rays' mean radiance stands in for their reflection (GODOT_GI_SPEC_BUDGET).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
+#define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
 
@@ -392,6 +393,7 @@ layout(set = 0, binding = 33) uniform sampler2D card_albedo_atlas;
 layout(set = 0, binding = 34) uniform sampler2D card_normal_atlas;
 layout(set = 0, binding = 36) uniform sampler2D card_static_atlas; // Alpha: the dynamic lights' visibility ratio.
 layout(set = 0, binding = 37) uniform sampler2D decal_atlas_srgb; // The dynamic lights' projector textures (see card_dynamic_direct).
+layout(set = 0, binding = 42) uniform sampler2D card_specular_atlas; // The capture's F0 (rgb): what a mirror texel's albedo folded in (FLAG_CARD_MIRROR_FOLD).
 // The cards' screen memory (params.memory_rate > 0): per texel, what the
 // rendered screen showed over the card's radiance the last times a hit read
 // it settled (rgb, the difference over the card's luminance, see
@@ -1199,6 +1201,14 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		// visibility ratio for the shadow.
 		ivec2 tex0 = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
 		vec3 albedo = texelFetch(card_albedo_atlas, tex0, 0).rgb;
+		if ((params.flags & FLAG_CARD_MIRROR_FOLD) != 0u && mirror_at(p_world_hit) < MAX_MIRROR_PLANES) {
+			// The same diffuse albedo the cards lit the texel with (the
+			// capture folded F0 in as Lambertian; the mirror's reflection
+			// is the image lights' and the mirror path's): with the folded
+			// one here, a lamp's bounce off a mirror floor read diffuse
+			// while the lamp was dynamic and darkened over the fade.
+			albedo = max(albedo - texelFetch(card_specular_atlas, tex0, 0).rgb, vec3(0.0));
+		}
 		vec3 n_cam = normalize(texelFetch(card_normal_atlas, tex0, 0).rgb * 2.0 - 1.0);
 		vec3 axis, u, v;
 		card_basis(best_k, axis, u, v);
