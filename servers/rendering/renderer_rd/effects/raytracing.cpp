@@ -93,6 +93,14 @@ static bool _luma_compress() {
 	return compress;
 }
 
+// GODOT_GI_OBJECTS=pixel (experiment): every temporal pass's moving-object test
+// reads the velocity at the current pixel, the form before the flick fix
+// (section 61), which classified every pixel of a fast yaw as a moving object.
+static bool _objects_at_pixel() {
+	static const bool at_pixel = OS::get_singleton()->get_environment("GODOT_GI_OBJECTS") == "pixel";
+	return at_pixel;
+}
+
 // The split history (measured and left off): its textures exist only
 // while GODOT_GI_SPLIT (the kernel verdicts) or GODOT_GI_SPLIT_SIGMA=2
 // (the luminance stop) reads it.
@@ -830,7 +838,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 		float shadow_frames = float(MAX(shadow_temporal_frames, 1u));
 		temporal_push_constant.blend_alpha = 1.0f / shadow_frames;
 		temporal_push_constant.frames_max = shadow_frames;
-		temporal_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
+		temporal_push_constant.flags = (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
 
 		// The dummy is never fetched (DENOISE_FLAG_HAS_VELOCITY unset).
 		RID velocity = p_velocity.is_valid() ? p_velocity : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
@@ -1261,7 +1269,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	// Temporal pass.
 	{
-		denoise_push_constant.flags = DENOISE_FLAG_HAS_META | (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0);
+		denoise_push_constant.flags = DENOISE_FLAG_HAS_META | (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL);
 		RD::Uniform u_raw_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, diffuse_slice }));
 		RD::Uniform u_raw_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, specular_slice }));
@@ -2047,7 +2055,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RID reproject_ubo = _update_reproject_ubo(p_view, p_reproject);
 
 	{
-		denoise_push_constant.flags = p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0;
+		denoise_push_constant.flags = (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
 		if (_luma_compress()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
 		}

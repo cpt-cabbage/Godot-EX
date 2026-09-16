@@ -38,6 +38,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
 #define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
 #define FLAG_BORROW_SPEC 524288u // Experiment (GODOT_GI_BORROW_SPEC=1): a borrowed history serves the reflection on a mirror too (the form before section 59).
+#define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel rather than at the history's (the form before the flick fix).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
@@ -568,12 +569,25 @@ void main() {
 		// rendered with: only where the two disagree is the pixel a moving
 		// object, and the stale velocity is then the best predictor available
 		// of where its history lives.
+		// The buffer being the previous frame's, the point's velocity sits
+		// at its previous-frame pixel, prev_uv, not at the current one: the
+		// current pixel held other geometry a frame ago, and under a fast
+		// rotation the flow there differs from the flow here by tens of
+		// pixels (the flow of a yaw varies across the frame with the
+		// perspective), which classified every pixel of an 84-degree flick as a
+		// moving object (section 59, every pixel cyan under =why). Read at
+		// prev_uv the field is the one the matrix predicts for static geometry
+		// at any speed, and a moving object at a static camera reads as before
+		// (prev_uv is uv). GODOT_GI_OBJECTS=pixel reads at the current pixel
+		// as before.
 		// A moving object's shift beyond the camera's, carried to the
 		// reflection's reprojection below (the reflector took its image
 		// along).
 		vec2 object_delta = vec2(0.0);
-		if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u) {
-			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
+		bool velocity_in_frame = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThan(prev_uv, vec2(1.0)));
+		if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
+			ivec2 velocity_pixel = (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u ? pixel * params.depth_scale : ivec2(prev_uv * vec2(params.screen_size * params.depth_scale));
+			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			// Under FSR2 the pixels no geometry wrote carry a (-1, -1)
 			// sentinel, not a motion.

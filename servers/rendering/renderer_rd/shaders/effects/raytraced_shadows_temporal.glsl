@@ -27,6 +27,7 @@ layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
 layout(set = 1, binding = 1, rg8) uniform restrict writeonly image2D dest_history;
 
 #define FLAG_HAS_VELOCITY 1u
+#define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the velocity read at the current pixel, the form before the flick fix.
 // Frame-edge history borrowing (see the reprojection block); the band is
 // fixed here where the stochastic denoiser's comes from GODOT_GI_BORROW,
 // equal at that knob's default.
@@ -90,8 +91,13 @@ void main() {
 		// frame pair the buffer was rendered with; only where the two disagree
 		// is the pixel a moving object, and the stale velocity is then the
 		// best predictor available of where its history lives.
-		if ((params.flags & FLAG_HAS_VELOCITY) != 0u) {
-			vec2 velocity = texelFetch(velocity_texture, pixel, 0).xy;
+		// The stale buffer holds the point's velocity at its previous-frame
+		// pixel, prev_uv, not at the current one (see the GI temporal pass:
+		// read here, a fast yaw classified every pixel as a moving object).
+		bool velocity_in_frame = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThan(prev_uv, vec2(1.0)));
+		if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
+			ivec2 velocity_pixel = (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u ? pixel : ivec2(prev_uv * vec2(params.screen_size));
+			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			if (velocity != vec2(0.0) && prevprev_ndc.w > 0.0) {
 				vec2 static_motion = (prevprev_ndc.xy / prevprev_ndc.w) * 0.5 + 0.5 - prev_uv;

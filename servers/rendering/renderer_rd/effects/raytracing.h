@@ -285,7 +285,8 @@ private:
 		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
 		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
-		// 8 and 16 are free: the GI directional buffer rides on the shader's
+		DENOISE_FLAG_OBJECTS_AT_PIXEL = 8, // Temporal (experiment, GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel, not at the history's.
+		// 16 is free: the GI directional buffer rides on the shader's
 		// FILTER_DIRECTIONAL variant rather than a runtime flag.
 		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
