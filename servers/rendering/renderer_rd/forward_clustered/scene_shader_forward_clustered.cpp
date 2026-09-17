@@ -38,6 +38,43 @@
 
 using namespace RendererSceneRenderImplementation;
 
+// A texture() without an explicit level cannot be sampled from compute, so
+// the hit shading template offers hit_texture() / hit_texture_bias() in its
+// place (the ray cone's level, one macro per arity since the preprocessor
+// has no variadic macros). The compiler prefixes the shader's own
+// identifiers with "m_", so a call is only renamed where the name is not
+// the tail of a longer identifier.
+static String _hit_rename_texture_calls(const String &p_code) {
+	const String from = "texture(";
+	String code = p_code;
+	int pos = 0;
+	while ((pos = code.find(from, pos)) != -1) {
+		if (pos > 0 && is_ascii_identifier_char(code[pos - 1])) {
+			pos += from.length();
+			continue;
+		}
+		int depth = 0;
+		int args = 1;
+		for (int i = pos + from.length(); i < code.length(); i++) {
+			const char32_t c = code[i];
+			if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				if (depth == 0) {
+					break;
+				}
+				depth--;
+			} else if (c == ',' && depth == 0) {
+				args++;
+			}
+		}
+		const String to = args >= 3 ? "hit_texture_bias(" : "hit_texture(";
+		code = code.substr(0, pos) + to + code.substr(pos + from.length());
+		pos += to.length();
+	}
+	return code;
+}
+
 void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	//compile
 
@@ -252,9 +289,9 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 			HashMap<String, String> hit_code;
 			String fragment = gen_code.code["fragment"];
 			fragment = fragment.replace("gl_FragCoord", "hit_fragcoord").replace("gl_FrontFacing", "hit_front_facing").replace("gl_FragDepth", "hit_fragdepth");
-			hit_code["fragment"] = fragment;
+			hit_code["fragment"] = _hit_rename_texture_calls(fragment);
 			if (gen_code.code.has("vertex")) {
-				hit_code["vertex"] = gen_code.code["vertex"];
+				hit_code["vertex"] = _hit_rename_texture_calls(gen_code.code["vertex"]);
 			}
 			String hit_globals;
 			for (const String &line : gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT].split("\n")) {
@@ -266,6 +303,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 				hit_globals += "\n";
 			}
 			hit_globals += gen_code.vertex_only_functions; // What vertex() calls that fragment() does not: the compiler placed it in the vertex stage's globals.
+			hit_globals = _hit_rename_texture_calls(hit_globals);
 			if (hit_version.is_null()) {
 				hit_version = SceneShaderForwardClustered::singleton->hit_shader.version_create(false);
 			}

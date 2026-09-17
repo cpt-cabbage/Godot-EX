@@ -863,7 +863,16 @@ void hit_write_discard() {
 	}
 	results.data[hit_result_index] = uvec4(rt_hit_pack_radiance(radiance), rt_hit_pack_dir(hit_dir), hit_result_flags);
 }
-#define texture(s, c) textureLod(s, c, hit_lod(vec2(textureSize(s, 0))))
+// The material code's texture() calls arrive renamed by arity (the scene
+// shader renames them for this variant, as it does the fragment
+// built-ins): the optional bias is an offset on the ray cone's level, as
+// it is on the fragment's. Two macros because the preprocessor has no
+// variadic macros (a texture() macro of two parameters failed the compile
+// of a material sampling with a bias), and macros rather than overloads
+// because Vulkan GLSL admits the sampler constructor the compiler emits
+// only at a built-in's point of use.
+#define hit_texture(s, c) textureLod(s, c, hit_lod(vec2(textureSize(s, 0))))
+#define hit_texture_bias(s, c, b) textureLod(s, c, hit_lod(vec2(textureSize(s, 0))) + (b))
 #define discard \
 	{ \
 		hit_discarded = true; \
