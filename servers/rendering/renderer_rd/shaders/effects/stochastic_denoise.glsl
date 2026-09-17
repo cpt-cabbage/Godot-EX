@@ -263,8 +263,12 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	float firefly_k;
 	float firefly_rough;
 	float mark_age; // Temporal (GI): 1 restarts the history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
-	float pad0; // std140 rounds the block to 16 bytes (scalars: an array would take 16 a member); the C++ struct carries the same.
-	float pad1;
+	// Temporal (GI): the card correction's delta form (GODOT_GI_MOD_DELTA=1):
+	// the history is carried by the field's change, hist + (field_now -
+	// field_prev), instead of the changed fraction being replaced by the
+	// field, and is not shortened for it (see the lighting-change block).
+	float mod_delta;
+	float pad1; // std140 rounds the block to 16 bytes (scalars: an array would take 16 a member); the C++ struct carries the same.
 	float pad2;
 }
 reprojection;
@@ -919,10 +923,41 @@ void main() {
 					float l_prev = luminance(hist_fb.rgb);
 					vec3 d = abs(fb_now.rgb - hist_fb.rgb);
 					float rel = max(d.r, max(d.g, d.b)) / max(max(l_now, l_prev), 1e-4);
-					field_change = clamp((rel - reprojection.mod_dead) / (1.0 - reprojection.mod_dead), 0.0, 1.0) * reprojection.mod_strength;
+					const bool delta_form = reprojection.mod_delta > 0.0;
+					// The delta form (GODOT_GI_MOD_DELTA=1, section 67): the
+					// mix above hands the history the field's *level*, which
+					// is the cards' diffuse-only one -- 8-12% under the
+					// screen's on the ceiling of pose E and 37-41% under it on
+					// the right-hand furniture (section 56 B), so a corrected
+					// pixel reads as the base and climbs back from there.
+					// Carrying the history by the field's change instead,
+					// hist + (field_now - field_prev), keeps the screen's own
+					// level (the specular, the textures, the emissives, the
+					// screen bounces) and moves it by what the cards say the
+					// light did; the frame count is kept, so the samples keep
+					// refining the shifted history rather than restarting it.
+					// The gate ramps over the dead band (dead to twice it)
+					// rather than to the whole range: a jump is applied whole
+					// once it is a jump at all, since the shift is unbiased
+					// either way and a partial one leaves the rest to the mark.
+					// Measured on the game flick (three runs each, section 67):
+					// worse at the stop and through +8 in every run (stop
+					// 0.0280-0.0297 against 0.0256-0.0274, hot pixels 46-49
+					// against 38-43 per thousand, twice the default's at +2),
+					// inside the spread from +16 on, the flicker level. The
+					// field's change is only the cards' part of the screen's
+					// (the screen term's quarter of the furniture's light
+					// moves with the beam too, and the relights add their
+					// noise), and a history carried without a restart keeps
+					// that remainder for the window. Off.
+					field_change = delta_form
+							? clamp((rel - reprojection.mod_dead) / max(reprojection.mod_dead, 1e-4), 0.0, 1.0) * reprojection.mod_strength
+							: clamp((rel - reprojection.mod_dead) / (1.0 - reprojection.mod_dead), 0.0, 1.0) * reprojection.mod_strength;
 					paint_change = field_change;
 					if (field_change > 0.0) {
-						vec3 fixed_d = mix(hist_d, fb_now.rgb, field_change);
+						vec3 fixed_d = delta_form
+								? max(hist_d + (fb_now.rgb - hist_fb.rgb) * field_change, vec3(0.0))
+								: mix(hist_d, fb_now.rgb, field_change);
 						float l_hist = luminance(hist_d);
 						float lr = l_hist > 1e-6 ? luminance(fixed_d) / l_hist : 1.0;
 						hist_d = fixed_d;
@@ -931,15 +966,19 @@ void main() {
 						hist_dir.xyz *= lr;
 						hist_moments.x *= lr;
 						hist_moments.y *= lr * lr;
-						frames_d = min(frames_d, reprojection.mod_floor);
+						if (!delta_form) {
+							frames_d = min(frames_d, reprojection.mod_floor);
+						}
 					}
 				}
 			}
 			if (changed && mark_new) {
 				float keep = max(1.0, 1.0 / change_age);
 				// The field's correction accounts for the mark's change in
-				// proportion; what it explains is not restarted.
-				keep = max(keep, mix(1.0, reprojection.mod_floor, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
+				// proportion; what it explains is not restarted (the delta
+				// form keeps the whole count for it).
+				float explained_keep = reprojection.mod_delta > 0.0 ? max(frames_d, reprojection.mod_floor) : reprojection.mod_floor;
+				keep = max(keep, mix(1.0, explained_keep, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
 				frames_d = min(frames_d, keep);
 			}
 			if (changed) {

@@ -663,6 +663,13 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 			print_line(vformat("GI card correction: frame %d motion %.4f", rb_state->frame_index, ubo.mod_motion));
 		}
 		ubo.mod_dead = mod_dead;
+		// GODOT_GI_MOD_DELTA=1 (with GODOT_GI_MOD=<strength>): the delta
+		// form of the correction, hist + (field_now - field_prev) with the
+		// frame count kept, in place of the mix with the field and the
+		// shortening to mod_floor. Measured worse at the stop of the game
+		// flick and level after (section 67); off.
+		static const bool mod_delta = OS::get_singleton()->get_environment("GODOT_GI_MOD_DELTA") == "1";
+		ubo.mod_delta = mod_delta ? 1.0f : 0.0f;
 		// GODOT_GI_SPEC_FIX=<frames>: a rough reflection restarted by the
 		// change mark takes the raw 5x5 resolve for its changed part and is
 		// worth this many frames (0: the one sample, as before).

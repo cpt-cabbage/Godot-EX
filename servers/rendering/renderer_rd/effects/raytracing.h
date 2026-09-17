@@ -506,7 +506,8 @@ private:
 		float firefly_k; // Temporal (GI): a raw sample above its neighbours' mean by this many deviations is scaled to that bound (GODOT_GI_FIREFLY; 0 off).
 		float firefly_rough; // The roughness from which the reflection takes the firefly test too (GODOT_GI_FIREFLY_ROUGH).
 		float mark_age; // Temporal (GI): 1 restarts the diffuse history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
-		float pad[3]; // The std140 block is 144 bytes.
+		float mod_delta; // Temporal (GI): 1 carries a corrected history by the field's change instead of replacing its changed fraction by the field (GODOT_GI_MOD_DELTA=1).
+		float pad[2]; // The std140 block is 144 bytes.
 	};
 	static_assert(sizeof(ReprojectUBO) == 144, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
