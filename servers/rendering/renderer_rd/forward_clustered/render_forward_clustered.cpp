@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -2211,6 +2212,20 @@ bool RenderForwardClustered::_rt_gi_owns_reflections() const {
 	return use_rt_gi && use_rt_gi_specular && use_surface_cache && use_surface_cache_mirror && !force_ssr;
 }
 
+// The GODOT_RT_STATE_PRINT lines: to stdout, and appended to the file
+// GODOT_RT_STATE_FILE names so a harness can put them in its run header.
+static void _rt_state_out(const String &p_line) {
+	print_line(p_line);
+	const String path = OS::get_singleton()->get_environment("GODOT_RT_STATE_FILE");
+	if (!path.is_empty()) {
+		Ref<FileAccess> fa = FileAccess::open(path, FileAccess::exists(path) ? FileAccess::READ_WRITE : FileAccess::WRITE);
+		if (fa.is_valid()) {
+			fa->seek_end();
+			fa->store_line(p_line);
+		}
+	}
+}
+
 void RenderForwardClustered::_update_ray_tracing_settings() {
 	bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
@@ -2336,6 +2351,18 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	stochastic_quality.variance_threshold = GLOBAL_GET("rendering/ray_tracing/denoiser/variance_threshold");
 
 	_update_ray_tracing_backend();
+
+	// GODOT_RT_STATE_PRINT=1: the effective feature state, once per re-read
+	// of the settings (the gates above -- ray query support, the depth
+	// pre-pass -- can turn a setting off without a trace in the image).
+	if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT")) {
+		_rt_state_out(vformat("RT STATE settings: shadows %s rays %d | stochastic %s half %s rays %d denoise %s tframes %d iter %d vthresh %.3f guiding %s straces %s tvol %s | gi %s half %s rays %d tframes %d iter %d vthresh %.3f spec %s dir %s so %s srad %s straces %s mirrors %s hit %d | cache %s mirror %s atlas %d texels/m %.1f caps %d sets %d tframes %d | sdfgi_rq %s",
+				use_raytraced_shadows ? "on" : "off", rt_shadow_rays,
+				use_stochastic_lighting ? "on" : "off", use_stochastic_half_res ? "on" : "off", stochastic_quality.rays_per_pixel, stochastic_quality.denoise ? "on" : "off", stochastic_quality.temporal_frames, stochastic_quality.spatial_iterations, stochastic_quality.variance_threshold, stochastic_quality.light_guiding ? "on" : "off", stochastic_quality.screen_traces ? "on" : "off", translucency_quality.enabled ? "on" : "off",
+				use_rt_gi ? "on" : "off", use_rt_gi_half_res ? "on" : "off", rt_gi_rays, rt_gi_temporal_frames, rt_gi_spatial_iterations, rt_gi_variance_threshold, use_rt_gi_specular ? "on" : "off", use_rt_gi_directional ? "on" : "off", use_rt_gi_specular_occlusion ? "on" : "off", use_rt_gi_screen_radiance ? "on" : "off", use_rt_gi_screen_traces ? "on" : "off", use_rt_gi_planar_mirrors ? "on" : "off", rt_gi_hit_shading,
+				use_surface_cache ? "on" : "off", use_surface_cache_mirror ? "on" : "off", int(surface_cache_settings.atlas_size), float(surface_cache_settings.texels_per_meter), int(surface_cache_settings.captures_per_frame), int(surface_cache_settings.lighting_sets_per_frame), int(surface_cache_settings.temporal_frames),
+				use_rt_sdfgi_probes ? "on" : "off"));
+	}
 }
 
 void RenderForwardClustered::_update_ray_tracing_backend() {
@@ -3300,6 +3327,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 			RD::get_singleton()->draw_command_end_label();
 			_request_ray_tracing_convergence(p_render_data, rb_data.ptr());
+			// The per-pass buffers of this frame to disk, when a harness asked
+			// (GODOT_RT_DUMP_NOW; a stall, dump frames only).
+			raytracing->dump_aovs(rb);
+			// GODOT_RT_STATE_PRINT=1: what this frame actually rendered with,
+			// printed whenever it changes. The run header of the harnesses
+			// reads it from stdout, so the numbers cannot describe one state
+			// while the frame ran in another (the TAA= no-op, fog on in every
+			// number, an upscaler nobody asked for: all found the hard way).
+			if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT")) {
+				const String state = vformat("internal %dx%d target %dx%d views %d scaling %d taa %s jitter %s fog %s dynamic_lights %d",
+						rb->get_internal_size().x, rb->get_internal_size().y, rb->get_target_size().x, rb->get_target_size().y, rb->get_view_count(),
+						int(rb->get_scaling_3d_mode()), rb->get_use_taa() ? "on" : "off", scene_data->taa_jitter.is_zero_approx() ? "off" : "on",
+						(p_render_data->environment.is_valid() && environment_get_volumetric_fog_enabled(p_render_data->environment)) ? "on" : "off",
+						raytracing->get_surface_cache() ? int(raytracing->get_surface_cache()->get_dynamic_light_count()) : -1);
+				static String last_state;
+				if (state != last_state) {
+					last_state = state;
+					_rt_state_out("RT STATE frame: " + state);
+				}
+			}
 		}
 	}
 

@@ -840,6 +840,15 @@ public:
 	// another's history.
 	void advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers);
 
+	// GODOT_RT_DUMP_NOW=<path prefix> (diagnostics): the RT passes' buffers
+	// of this frame read back and saved as <prefix>_<aov>.exr, then the
+	// variable unset; GODOT_RT_DUMP_SET=a,b limits the set (see the table in
+	// dump_aovs). Needs GODOT_RT_DUMP=1 at start-up so the textures are
+	// created readable. Called by the clustered renderer after the last RT
+	// pass of the frame; the harnesses raise it for their capture frames
+	// (AOV=gi,age,...), so an AOV file pairs with a capture of the same frame.
+	void dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers);
+
 	// Which ping-pong slot the current frame writes (for bindings that must
 	// pick the freshly written texture, like the GI view depth). Valid for the
 	// buffer named by the most recent advance_frame().

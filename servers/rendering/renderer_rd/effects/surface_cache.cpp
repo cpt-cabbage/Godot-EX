@@ -1329,14 +1329,30 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
+	// The readbacks are asked for on fixed frames but land when the GPU is
+	// done, a few frames later or fewer depending on the pacing: the one
+	// place the cards' decisions (the idle verdict, the set states) depend on
+	// timing rather than on the frame index. GODOT_RT_DETERMINISTIC=1
+	// (diagnostics) reads them back synchronously, a stall each, so a run
+	// is a function of its frame count alone; the harnesses' spread test
+	// tells what non-determinism is left.
+	static const bool deterministic = OS::get_singleton()->get_environment("GODOT_RT_DETERMINISTIC") == "1";
 	if (!set_state_pending && p_inputs.frame % 4 == 2 && !sets.is_empty()) {
 		set_state_pending = true;
-		rd->buffer_get_data_async(set_state_buffer, callable_mp_static(&SurfaceCache::_set_state_readback), 0, sets.size() * 2 * sizeof(uint32_t));
+		if (deterministic) {
+			_set_state_readback(rd->buffer_get_data(set_state_buffer, 0, sets.size() * 2 * sizeof(uint32_t)));
+		} else {
+			rd->buffer_get_data_async(set_state_buffer, callable_mp_static(&SurfaceCache::_set_state_readback), 0, sets.size() * 2 * sizeof(uint32_t));
+		}
 	}
 	if (count_convergence && !converge_pending && p_inputs.frame % 4 == 0) {
 		// One readback in flight; the count lands a few frames later.
 		converge_pending = true;
-		rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
+		if (deterministic) {
+			_converge_readback(rd->buffer_get_data(converge_buffer, 0, 4 * sizeof(uint32_t)));
+		} else {
+			rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
+		}
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
 		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d; lights: %d omni, %d spot, %d area, %d mirrors", sets.size(), budget, push.round_robin_period, push.idle_divisor, params.omni_light_count, params.spot_light_count, params.area_light_count, params.mirror_count));

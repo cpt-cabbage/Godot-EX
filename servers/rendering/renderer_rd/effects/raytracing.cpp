@@ -30,6 +30,7 @@
 
 #include "raytracing.h"
 
+#include "core/io/image.h"
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "servers/rendering/color_management.h"
@@ -49,8 +50,11 @@
 // the history accepted stayed for the whole temporal window and the spatial
 // filter carried it a stride further every frame: growing black voids.
 static RID _create_cleared_texture(const Ref<RenderSceneBuffersRD> &p_render_buffers, const StringName &p_context, const StringName &p_texture_name, RD::DataFormat p_data_format, uint32_t p_usage_bits, RD::TextureSamples p_texture_samples = RD::TEXTURE_SAMPLES_1, Size2i p_size = Size2i()) {
-	// The clear is a copy to the texture, which needs its usage bit.
-	RID texture = p_render_buffers->create_texture(p_context, p_texture_name, p_data_format, p_usage_bits | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT, p_texture_samples, p_size);
+	// The clear is a copy to the texture, which needs its usage bit. The AOV
+	// dump (GODOT_RT_DUMP, see dump_aovs) reads every RT texture back, which
+	// needs the other one; it is set only when the variable is present.
+	static const uint32_t dump_bit = OS::get_singleton()->has_environment("GODOT_RT_DUMP") ? RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT : 0;
+	RID texture = p_render_buffers->create_texture(p_context, p_texture_name, p_data_format, p_usage_bits | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | dump_bit, p_texture_samples, p_size);
 	if (texture.is_valid()) {
 		RD::get_singleton()->texture_clear(texture, Color(0, 0, 0, 0), 0, 1, 0, p_render_buffers->get_view_count());
 	}
@@ -608,6 +612,146 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 	surface_cache->update_lighting(in);
 	hit_lighting = in;
 	hit_lighting_valid = true;
+}
+
+// A B10G11R11 texel as three floats (the packed formats have no Image format).
+static void _unpack_r11g11b10(uint32_t p_v, float *r_out) {
+	auto f11 = [](uint32_t b) -> float {
+		uint32_t e = (b >> 6) & 0x1f, m = b & 0x3f;
+		if (e == 0) {
+			return m == 0 ? 0.0f : Math::pow(2.0f, -14.0f) * (m / 64.0f);
+		}
+		return e == 31 ? (m ? NAN : INFINITY) : Math::pow(2.0f, float(e) - 15.0f) * (1.0f + m / 64.0f);
+	};
+	auto f10 = [](uint32_t b) -> float {
+		uint32_t e = (b >> 5) & 0x1f, m = b & 0x1f;
+		if (e == 0) {
+			return m == 0 ? 0.0f : Math::pow(2.0f, -14.0f) * (m / 32.0f);
+		}
+		return e == 31 ? (m ? NAN : INFINITY) : Math::pow(2.0f, float(e) - 15.0f) * (1.0f + m / 32.0f);
+	};
+	r_out[0] = f11(p_v & 0x7ff);
+	r_out[1] = f11((p_v >> 11) & 0x7ff);
+	r_out[2] = f10((p_v >> 22) & 0x3ff);
+}
+
+void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	if (!OS::get_singleton()->has_environment("GODOT_RT_DUMP_NOW")) {
+		return;
+	}
+	const String prefix = OS::get_singleton()->get_environment("GODOT_RT_DUMP_NOW");
+	OS::get_singleton()->unset_environment("GODOT_RT_DUMP_NOW");
+	const Vector<String> set = OS::get_singleton()->get_environment("GODOT_RT_DUMP_SET").split(",", false);
+	// The AOV names the harnesses use, and the texture behind each. The
+	// ping-ponged histories are saved as both slots (_0 / _1): the reader
+	// knows the parity from the frame's index and the pair shows a restart.
+	struct Entry {
+		const char *name;
+		StringName scope;
+		StringName tex;
+	};
+	const Entry entries[] = {
+		{ "gi", RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT },
+		{ "gi_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT },
+		{ "spec", RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION },
+		{ "spec_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION },
+		{ "spec_resolved", RB_SCOPE_RT_GI, RB_RT_GI_RESOLVED_REFLECTION },
+		{ "directional", RB_SCOPE_RT_GI, RB_RT_GI_DIRECTIONAL },
+		{ "age_0", RB_SCOPE_RT_GI, RB_RT_GI_META_0 },
+		{ "age_1", RB_SCOPE_RT_GI, RB_RT_GI_META_1 },
+		{ "var_0", RB_SCOPE_RT_GI, RB_RT_GI_MOMENTS_0 },
+		{ "var_1", RB_SCOPE_RT_GI, RB_RT_GI_MOMENTS_1 },
+		{ "fallback_0", RB_SCOPE_RT_GI, RB_RT_GI_FALLBACK_0 },
+		{ "fallback_1", RB_SCOPE_RT_GI, RB_RT_GI_FALLBACK_1 },
+		{ "hist_gi_0", RB_SCOPE_RT_GI, RB_RT_GI_HIST_AMBIENT_0 },
+		{ "hist_gi_1", RB_SCOPE_RT_GI, RB_RT_GI_HIST_AMBIENT_1 },
+		{ "hist_spec_0", RB_SCOPE_RT_GI, RB_RT_GI_HIST_REFLECTION_0 },
+		{ "hist_spec_1", RB_SCOPE_RT_GI, RB_RT_GI_HIST_REFLECTION_1 },
+		{ "direct", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE },
+		{ "direct_spec", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR },
+		{ "direct_raw", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_DIFFUSE },
+		{ "direct_analytic", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE },
+		{ "direct_meta_0", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_META_0 },
+		{ "direct_meta_1", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_META_1 },
+		{ "direct_var_0", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_MOMENTS_0 },
+		{ "direct_var_1", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_MOMENTS_1 },
+		{ "sun", RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK },
+		{ "sun_raw", RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW },
+		{ "area", RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK },
+		{ "vel", RB_SCOPE_RT_STATE, RB_RT_VELOCITY },
+	};
+	RD *rd = RD::get_singleton();
+	int saved = 0;
+	for (const Entry &e : entries) {
+		bool wanted = set.is_empty();
+		for (const String &w : set) {
+			if (String(e.name) == w || String(e.name).begins_with(w + "_")) {
+				wanted = true;
+			}
+		}
+		if (!wanted || !p_render_buffers->has_texture(e.scope, e.tex)) {
+			continue;
+		}
+		RID tex = p_render_buffers->get_texture(e.scope, e.tex);
+		const RD::TextureFormat tf = rd->texture_get_format(tex);
+		const Vector<uint8_t> data = rd->texture_get_data(tex, 0);
+		const int w = tf.width, h = tf.height;
+		Ref<Image> img;
+		switch (tf.format) {
+			case RD::DATA_FORMAT_R16G16B16A16_SFLOAT:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RGBAH, data);
+				break;
+			case RD::DATA_FORMAT_R16_SFLOAT:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RH, data);
+				break;
+			case RD::DATA_FORMAT_R16G16_SFLOAT:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RGH, data);
+				break;
+			case RD::DATA_FORMAT_R8_UNORM:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_R8, data);
+				break;
+			case RD::DATA_FORMAT_R8G8_UNORM:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RG8, data);
+				break;
+			case RD::DATA_FORMAT_R8G8B8A8_UNORM:
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RGBA8, data);
+				break;
+			case RD::DATA_FORMAT_B10G11R11_UFLOAT_PACK32: {
+				Vector<uint8_t> out;
+				out.resize(w * h * 3 * sizeof(float));
+				const uint32_t *src = (const uint32_t *)data.ptr();
+				float *dst = (float *)out.ptrw();
+				for (int i = 0; i < w * h; i++) {
+					_unpack_r11g11b10(src[i], dst + i * 3);
+				}
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RGBF, out);
+			} break;
+			case RD::DATA_FORMAT_R32_UINT:
+			case RD::DATA_FORMAT_R32_SFLOAT: {
+				// Integer contents are saved as their float reinterpretation
+				// only when they are floats; a uint field becomes a plain
+				// float of its value.
+				Vector<uint8_t> out;
+				out.resize(w * h * sizeof(float));
+				const uint32_t *src = (const uint32_t *)data.ptr();
+				float *dst = (float *)out.ptrw();
+				for (int i = 0; i < w * h; i++) {
+					dst[i] = tf.format == RD::DATA_FORMAT_R32_UINT ? float(src[i]) : *(const float *)&src[i];
+				}
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RF, out);
+			} break;
+			default:
+				WARN_PRINT(vformat("RT dump: %s has an unhandled format %d", e.name, int(tf.format)));
+				continue;
+		}
+		if (img.is_valid()) {
+			// EXR keeps the values; the 8-bit masks go the same way so one
+			// reader covers them (rtm.load reads EXR through oiiotool).
+			img->save_exr(vformat("%s_%s.exr", prefix, e.name));
+			saved++;
+		}
+	}
+	print_line(vformat("RT dump: %d buffers as %s_<aov>.exr", saved, prefix));
 }
 
 void Raytracing::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
