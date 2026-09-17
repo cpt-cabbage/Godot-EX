@@ -1151,6 +1151,14 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	if (use_gbuf) {
 		params.flags |= 8; // FLAG_GBUF
 	}
+	// A guided entry the pixel's cluster cell does not hold stays out of the
+	// proposal: the ratio's denominator is the cell's sum, so a light offered
+	// from outside it would count in the numerator alone (plan section 53's
+	// open note). GODOT_STOCH_GUIDE_CELL=0 offers it as before,
+	// GODOT_STOCH_GUIDE_PAINT=1 paints where it happens.
+	static const bool guide_cell_off = OS::get_singleton()->get_environment("GODOT_STOCH_GUIDE_CELL") == "0";
+	static const uint32_t guide_paint = CLAMP(OS::get_singleton()->get_environment("GODOT_STOCH_GUIDE_PAINT").to_int(), 0, 3);
+	params.flags |= (guide_cell_off ? 0 : 16) | (guide_paint << 5); // FLAG_GUIDE_CELL, FLAG_GUIDE_PAINT
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);

@@ -115,6 +115,9 @@ params;
 #define FLAG_SCREEN_TRACES 2u
 #define FLAG_ALPHA_CASTERS 4u // Some TLAS instances are non-opaque: their hits are candidates, confirmed from the cards' coverage.
 #define FLAG_GBUF 8u // Weigh the candidates with the pixel's material (GODOT_RT_GBUF=0 reverts to a 4% dielectric with unit albedo).
+#define FLAG_GUIDE_CELL 16u // A guided entry the pixel's cluster cell does not hold is dropped from the proposal (GODOT_STOCH_GUIDE_CELL=0 offers it as before).
+#define FLAG_GUIDE_PAINT 96u // Bits 5-6, GODOT_STOCH_GUIDE_PAINT=1|2|3: the diffuse ratio painted with the guided entries the cell lacks (1), holds (2), or zero (3).
+#define FLAG_GUIDE_PAINT_SHIFT 5u
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -910,6 +913,36 @@ uint image_entry_bits(uint c) {
 	return bits;
 }
 
+// Whether the cluster cell holds a list entry: the cell's element index
+// (a light's own, or light * chains + chain past the type's lights for an
+// image, the chain found by its code) inside the slice's range (item_range,
+// the three types' min | max << 16 words read once) and set in the cell's
+// bitmask -- the cell walk's test for one element.
+bool cell_holds(uint cluster_offset, uvec3 item_range, uint entry, uint image_chains) {
+	uint type = (entry & SPOT_BIT) != 0u ? 1u : ((entry & AREA_BIT) != 0u ? 2u : 0u);
+	uint type_light_count = type == 1u ? params.spot_light_count : (type == 2u ? params.area_light_count : params.omni_light_count);
+	uint raw = entry & ENTRY_ID_MASK;
+	if ((entry & IMAGE_BIT) != 0u) {
+		uint image_bits = entry & (IMAGE_BIT | IMAGE_PLANE_MASK | IMAGE2_BIT | IMAGE2_PLANE_MASK | IMAGE3_BIT | IMAGE3_PLANE_MASK);
+		uint chain = image_chains;
+		for (uint c = 0u; c < image_chains; c++) {
+			if (image_entry_bits(params.image_chains[c >> 2u][c & 3u]) == image_bits) {
+				chain = c;
+				break;
+			}
+		}
+		if (chain == image_chains) {
+			return false; // A chain the frame no longer has.
+		}
+		raw = type_light_count + raw * image_chains + chain;
+	}
+	uint range = type == 1u ? item_range.y : (type == 2u ? item_range.z : item_range.x);
+	if (raw < (range & 0xFFFFu) || raw >= (range >> 16u)) {
+		return false;
+	}
+	return (cluster_buffer.data[cluster_offset + type * params.cluster_type_size + (raw >> 5u)] & (1u << (raw & 31u))) != 0u;
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
@@ -1014,6 +1047,17 @@ void main() {
 		}
 	}
 
+	// The pixel's cluster cell. The cluster the pass reads has exponential
+	// depth slices when the compute cull built it (cells of the linear
+	// slicing are z_far / 32 deep and, with a far plane of kilometers, hold
+	// every light).
+	uvec2 cluster_pos = uvec2(full_pixel) >> params.cluster_shift;
+	uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
+	float cluster_depth = -view_pos.z;
+	uint cluster_z = params.cluster_z0 > 0.0
+			? uint(clamp(log(max(cluster_depth, params.cluster_z0) / params.cluster_z0) / log(params.z_far / params.cluster_z0) * 32.0, 0.0, 31.0))
+			: uint(clamp((cluster_depth / params.z_far) * 32.0, 0.0, 31.0));
+
 	// Guided candidates: the lights the tile saw last frame.
 	float guided_weight_sum = 0.0;
 	// Total unshadowed luminance estimate, for the sample culling threshold.
@@ -1024,7 +1068,8 @@ void main() {
 	// population is the pixel's cluster cell, accumulated by the discovery
 	// block below -- the guided list is a sampling hint, not a light set, and
 	// contributes nothing here. (A guided entry outside the cell evaluates to
-	// zero radiance anyway and is dropped by the w <= 0.0 test.)
+	// zero radiance while the cluster is conservative, and is dropped by the
+	// w <= 0.0 test; cell_holds below is the guard for when it is not.)
 	vec3 analytic_diffuse = vec3(0.0);
 	vec3 analytic_specular = vec3(0.0);
 	// The specular lobe without its Fresnel term, and the luminance-weighted
@@ -1076,8 +1121,28 @@ void main() {
 	}
 	uint guided_count = 0u;
 	uint guided_budget = guide_miss ? MISS_GUIDED_CANDIDATES : MAX_GUIDED_CANDIDATES;
+	// A guided entry the cell does not hold is not in the ratio's
+	// population: the list is a reprojected neighbour's, and the cluster's
+	// proxies decide the denominator, so a light shining here without a
+	// proxy here would enter the numerator alone and read as extra
+	// visibility (what painted the blue band of plan section 53 while the
+	// images lived outside the cluster). The cluster is conservative, so
+	// this is a guard (the paint of section 72 found none in the game), at
+	// one buffer read per entry once the three types' ranges are read.
+	// FLAG_GUIDE_PAINT counts them instead.
+	uint image_chain_total = mirror_on() ? min(params.image_chain_count, IMAGE_CHAINS_MAX) : 0u;
+	uint guided_outside = 0u;
+	uvec3 item_range = uvec3(0u);
+	for (uint type = 0u; type < (sc_has_area_lights ? 3u : 2u); type++) {
+		uint range = cluster_buffer.data[cluster_offset + type * params.cluster_type_size + params.max_cluster_element_count_div_32 + cluster_z];
+		item_range = type == 0u ? uvec3(range, item_range.yz) : (type == 1u ? uvec3(item_range.x, range, item_range.z) : uvec3(item_range.xy, range));
+	}
 	for (uint i = 0u; i < visible_count && guided_count < guided_budget; i++) {
 		uint entry = visible_list[i];
+		bool in_cell = cell_holds(cluster_offset, item_range, entry, image_chain_total);
+		if (!in_cell && (params.flags & (FLAG_GUIDE_CELL | FLAG_GUIDE_PAINT)) == FLAG_GUIDE_CELL) {
+			continue;
+		}
 		vec3 f, s;
 		vec4 ss;
 		entry_eval(entry, view_pos, view_normal, roughness, f, s, ss);
@@ -1096,6 +1161,12 @@ void main() {
 		w *= max(vis_guide, 0.125);
 		if (w <= 0.0) {
 			continue;
+		}
+		if (!in_cell) {
+			guided_outside++;
+			if ((params.flags & FLAG_GUIDE_CELL) != 0u) {
+				continue;
+			}
 		}
 		for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
 			if (r < params.reservoir_count) {
@@ -1118,7 +1189,7 @@ void main() {
 	// image through every chain, placed where the image shines; one whose
 	// chain this pixel does not face, or whose crossings miss the
 	// rectangles, evaluates to nothing (mirror_chain).
-	uint image_chains = mirror_on() ? min(params.image_chain_count, IMAGE_CHAINS_MAX) : 0u;
+	uint image_chains = image_chain_total;
 	// The mirrors this pixel faces (mirror_chains_at's test): an image
 	// through a chain whose last mirror it does not face is nothing, and
 	// is dropped before its evaluation. The wide lights' images (a spot of
@@ -1153,16 +1224,6 @@ void main() {
 	// results with whichever lights the stride also picks as candidates. The
 	// stride governs sampling; it no longer governs the analytic sum.
 	{
-		uvec2 cluster_pos = uvec2(full_pixel) >> params.cluster_shift;
-		uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32u);
-		// The cluster the pass reads has exponential depth slices when the
-		// compute cull built it (cells of the linear slicing are z_far / 32
-		// deep and, with a far plane of kilometers, hold every light).
-		float cluster_depth = -view_pos.z;
-		uint cluster_z = params.cluster_z0 > 0.0
-				? uint(clamp(log(max(cluster_depth, params.cluster_z0) / params.cluster_z0) / log(params.z_far / params.cluster_z0) * 32.0, 0.0, 31.0))
-				: uint(clamp((cluster_depth / params.z_far) * 32.0, 0.0, 31.0));
-
 		// First pass: count the candidates in the cell (omni, spot, area).
 		const uint type_count = sc_has_area_lights ? 3u : 2u;
 		uint cell_count = 0u;
@@ -1654,6 +1715,16 @@ void main() {
 	// downstream inspects them again before they are multiplied back in. The
 	// unsigned buffer format drops negative-light energy, as the modulated
 	// signal always did.
+	// The paint rides the diffuse ratio, which is what every consumer
+	// multiplies in (the half-resolution composite takes the analytic term
+	// from its own loops): the pixel lit by its direct term once per guided
+	// entry the cell lacks (GODOT_STOCH_GUIDE_PAINT=1), or by the share of
+	// the guided budget it holds (=2), or not at all (=3, the baseline).
+	if ((params.flags & FLAG_GUIDE_PAINT) != 0u) {
+		uint mode = (params.flags >> FLAG_GUIDE_PAINT_SHIFT) & 3u;
+		ratio_d = mode == 1u ? float(guided_outside) : (mode == 2u ? float(guided_count) * 0.125 : 0.0);
+		ratio_s = 0.0;
+	}
 	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
 	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
 	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
