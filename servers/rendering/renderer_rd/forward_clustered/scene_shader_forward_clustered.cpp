@@ -233,10 +233,14 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 #endif
 	SceneShaderForwardClustered::singleton->shader.version_set_code(version, gen_code.code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_VERTEX], gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
 
-	// The hit shading variant: the fragment code in the compute template,
-	// with the fragment stage's built-ins the template stands in for
-	// renamed to its own. Materials that read the screen have nothing to
-	// read at a hit and are left out; the rest compile on first use.
+	// The hit shading variant: the vertex and fragment code in the compute
+	// template, with the fragment stage's built-ins the template stands in
+	// for renamed to its own. The vertex stage's varyings reach the fragment
+	// globals as `layout(location = n) in` declarations, which a compute
+	// shader cannot hold; at a hit they are plain globals the vertex code
+	// fills before the fragment code reads them. Materials that read the
+	// screen have nothing to read at a hit and are left out; the rest
+	// compile on first use.
 	{
 		if (hit_pipeline.is_valid()) {
 			RD::get_singleton()->free_rid(hit_pipeline);
@@ -249,10 +253,23 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 			String fragment = gen_code.code["fragment"];
 			fragment = fragment.replace("gl_FragCoord", "hit_fragcoord").replace("gl_FrontFacing", "hit_front_facing").replace("gl_FragDepth", "hit_fragdepth");
 			hit_code["fragment"] = fragment;
+			if (gen_code.code.has("vertex")) {
+				hit_code["vertex"] = gen_code.code["vertex"];
+			}
+			String hit_globals;
+			for (const String &line : gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT].split("\n")) {
+				if (line.begins_with("layout(location=")) {
+					hit_globals += line.substr(line.find(") ") + 2).replace_first("flat ", "").replace_first("smooth ", "").replace_first("noperspective ", "").replace_first("in ", "");
+				} else {
+					hit_globals += line;
+				}
+				hit_globals += "\n";
+			}
+			hit_globals += gen_code.vertex_only_functions; // What vertex() calls that fragment() does not: the compiler placed it in the vertex stage's globals.
 			if (hit_version.is_null()) {
 				hit_version = SceneShaderForwardClustered::singleton->hit_shader.version_create(false);
 			}
-			SceneShaderForwardClustered::singleton->hit_shader.version_set_compute_code(hit_version, hit_code, gen_code.uniforms, gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT], gen_code.defines);
+			SceneShaderForwardClustered::singleton->hit_shader.version_set_compute_code(hit_version, hit_code, gen_code.uniforms, hit_globals, gen_code.defines);
 		} else if (hit_version.is_valid()) {
 			SceneShaderForwardClustered::singleton->hit_shader.version_free(hit_version);
 			hit_version = RID();

@@ -80,6 +80,7 @@ public:
 		uint32_t uniform_total_size = 0;
 		String uniforms;
 		String stage_globals[STAGE_MAX];
+		String vertex_only_functions; // The vertex entry point's dependencies the fragment stage does not hold, for a variant that runs both stages' code in one.
 
 		HashMap<String, String> code;
 

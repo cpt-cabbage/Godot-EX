@@ -807,6 +807,17 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 				function = nullptr;
 			}
 
+			for (int i = 0; i < pnode->vfunctions.size(); i++) {
+				const StringName &name = pnode->vfunctions[i].name;
+				if (p_actions.entry_point_stages.has(name) && p_actions.entry_point_stages[name] == STAGE_VERTEX) {
+					HashSet<StringName> added;
+					for (const StringName &E : added_funcs_per_stage[STAGE_FRAGMENT]) {
+						added.insert(E);
+					}
+					_dump_function_deps(pnode, name, function_code, r_gen_code.vertex_only_functions, added);
+				}
+			}
+
 			//code+=dump_node_code(pnode->body,p_level);
 		} break;
 		case SL::Node::NODE_TYPE_STRUCT: {
@@ -1651,6 +1662,7 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 	for (int i = 0; i < STAGE_MAX; i++) {
 		r_gen_code.stage_globals[i] = String();
 	}
+	r_gen_code.vertex_only_functions = String();
 	r_gen_code.uses_fragment_time = false;
 	r_gen_code.uses_vertex_time = false;
 	r_gen_code.uses_global_textures = false;

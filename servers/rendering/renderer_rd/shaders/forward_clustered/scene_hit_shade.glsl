@@ -985,17 +985,6 @@ void main() {
 		geo_normal = -geo_normal; // Toward the ray, whichever side the winding puts first.
 	}
 	vec3 n_local = b0 * n0 + bary.x * n1 + bary.y * n2;
-	vec3 n_vertex = normalize(normal_from_local * n_local);
-	vec3 n_world = (g.flags & RT_HIT_GEOMETRY_NORMAL) != 0u ? n_vertex : geo_normal;
-	if (dot(n_world, geo_normal) < 0.0) {
-		n_world = -n_world; // The face's own plane settles a normal wound against it, as the scene shader does.
-	}
-	vec3 t_world = vec3(0.0);
-	vec3 b_world = vec3(0.0);
-	if ((g.flags & RT_HIT_GEOMETRY_TANGENT) != 0u) {
-		t_world = normalize(world_from_local * (b0 * t0 + bary.x * t1 + bary.y * t2));
-		b_world = normalize(cross(n_world, t_world)) * s0;
-	}
 	vec2 uv = b0 * uv0 + bary.x * uv1 + bary.y * uv2;
 	vec2 uv2_i = b0 * uv20 + bary.x * uv21 + bary.y * uv22;
 	vec4 color = b0 * c0 + bary.x * c1 + bary.y * c2;
@@ -1012,18 +1001,101 @@ void main() {
 		hit_uv_footprint = cone_width * uv_per_world / max(abs(dot(geo_normal, dir)), 0.2);
 	}
 
-	// The fragment stage's inputs, in view space as the scene shader has them.
+	// The material's vertex function, run once at the hit on the
+	// interpolated attributes. A hit shader would run it at the three
+	// vertices and interpolate its outputs; for what materials write there
+	// (StandardMaterial3D's uv scale and offset, its triplanar position and
+	// blend weights, grow) the two agree, at one evaluation instead of
+	// three. Without it the varyings never existed at a hit (a triplanar
+	// material failed to compile) and the uv scale was silently skipped.
+	// The names are the vertex stage's, in model space as it hands them over.
+	HitSceneData scene_data;
+	scene_data.main_cam_inv_view_matrix = params.world_from_view;
+	scene_data.camera_visible_layers = 0xFFFFFFFFu;
+	scene_data.emissive_exposure_normalization = params.emissive_exposure_normalization;
+	scene_data.flags = 0u;
+	scene_data.screen_pixel_size = 1.0 / vec2(params.screen_size);
+	scene_data_block.data = scene_data;
+	instances.data[0].instance_uniforms_ofs = rec.instance_uniforms_ofs;
 	mat3 view_from_world3 = mat3(params.view_from_world);
-	vec3 vertex = (params.view_from_world * vec4(world_pos, 1.0)).xyz;
-	vec3 view_highp = normalize(view_from_world3 * -dir); // Toward whoever is looking: the ray's origin.
+	mat4 read_view_matrix = params.view_from_world;
+	mat4 inv_view_matrix = params.world_from_view;
+	mat4 projection_matrix = mat4(1.0);
+	mat4 inv_projection_matrix = mat4(1.0);
+	mat4 read_model_matrix = mat4(vec4(world_from_local[0], 0.0), vec4(world_from_local[1], 0.0), vec4(world_from_local[2], 0.0), vec4(-(world_from_local * rec.local_from_world[3].xyz), 1.0));
+	mat4 model_matrix = read_model_matrix;
+	mat3 model_normal_matrix = normal_from_local;
+	mat4 modelview = read_view_matrix * read_model_matrix;
+	mat3 modelview_normal = view_from_world3 * model_normal_matrix;
+	vec2 read_viewport_size = vec2(params.screen_size);
 	vec3 eye_offset = vec3(0.0);
-	vec3 normal_highp = view_from_world3 * n_world;
-	vec3 tangent = view_from_world3 * t_world;
-	vec3 binormal = view_from_world3 * b_world;
+	vec4 instance_custom = vec4(0.0);
+	float roughness_highp = 1.0;
+	float global_time = params.time;
+	vec3 vertex = b0 * p0 + bary.x * p1 + bary.y * p2;
+	vec3 normal_highp = n_local;
+	vec3 tangent = b0 * t0 + bary.x * t1 + bary.y * t2;
+	vec3 binormal = cross(n_local, tangent) * s0;
 	vec2 uv_interp = uv;
 	vec2 uv2_interp = uv2_i;
-	vec2 streaming_uv = uv;
 	vec4 color_interp = color;
+	// The attributes the pool does not carry read as zero (Trail3D's
+	// vertex function widens the strip along CUSTOM0 and takes its
+	// no-tangent branch on zero: the mesh as the BLAS holds it).
+	vec4 custom0_attrib = vec4(0.0);
+	vec4 custom1_attrib = vec4(0.0);
+	vec4 custom2_attrib = vec4(0.0);
+	vec4 custom3_attrib = vec4(0.0);
+	uvec4 bone_attrib = uvec4(0u);
+	vec4 weight_attrib = vec4(0.0);
+#ifdef VERTEX_WORLD_COORDS_USED
+	vertex = world_pos;
+	normal_highp = normal_from_local * normal_highp;
+	tangent = world_from_local * tangent;
+	binormal = world_from_local * binormal;
+#endif
+#ifdef OVERRIDE_POSITION
+	vec4 position = vec4(1.0);
+#endif
+#ifdef Z_CLIP_SCALE_USED
+	float z_clip_scale = 1.0;
+#endif
+#ifdef POINT_SIZE_USED
+	float point_size = 1.0;
+#endif
+	{
+#CODE : VERTEX
+	}
+
+	// The normal the vertex function handed over, oriented as before: the
+	// face's own plane settles one wound against it, as the scene shader does.
+#ifdef VERTEX_WORLD_COORDS_USED
+	vec3 n_vertex = normalize(normal_highp);
+	vec3 t_vertex = tangent;
+#else
+	vec3 n_vertex = normalize(normal_from_local * normal_highp);
+	vec3 t_vertex = world_from_local * tangent;
+#endif
+	vec3 n_world = (g.flags & RT_HIT_GEOMETRY_NORMAL) != 0u ? n_vertex : geo_normal;
+	if (dot(n_world, geo_normal) < 0.0) {
+		n_world = -n_world;
+	}
+	vec3 t_world = vec3(0.0);
+	vec3 b_world = vec3(0.0);
+	if ((g.flags & RT_HIT_GEOMETRY_TANGENT) != 0u) {
+		t_world = normalize(t_vertex);
+		b_world = normalize(cross(n_world, t_world)) * s0;
+	}
+
+	// The fragment stage's inputs, in view space as the scene shader has
+	// them. The position is the traced hit's, whatever the vertex function
+	// did to VERTEX: the acceleration structure holds the mesh as stored.
+	vertex = (params.view_from_world * vec4(world_pos, 1.0)).xyz;
+	vec3 view_highp = normalize(view_from_world3 * -dir); // Toward whoever is looking: the ray's origin.
+	normal_highp = view_from_world3 * n_world;
+	tangent = view_from_world3 * t_world;
+	binormal = view_from_world3 * b_world;
+	vec2 streaming_uv = uv_interp;
 	hit_front_facing = (pflags & RT_HIT_PACKET_FRONT_FACE) != 0u;
 
 	vec3 albedo_highp = vec3(1.0);
@@ -1034,7 +1106,6 @@ void main() {
 	float metallic_highp = 0.0;
 	float specular = 0.5;
 	vec3 emission = vec3(0.0);
-	float roughness_highp = 1.0;
 	float rim = 0.0;
 	float rim_tint = 0.0;
 	float clearcoat = 0.0;
@@ -1060,27 +1131,7 @@ void main() {
 	float alpha_antialiasing_edge = 0.0;
 	vec2 alpha_texture_coordinate = vec2(0.0);
 	vec2 point_coord = vec2(0.5);
-	vec4 instance_custom = vec4(0.0);
 	vec3 light_vertex = vertex;
-	float global_time = params.time;
-
-	mat4 inv_view_matrix = params.world_from_view;
-	mat4 read_view_matrix = params.view_from_world;
-	mat4 projection_matrix = mat4(1.0);
-	mat4 inv_projection_matrix = mat4(1.0);
-	mat4 read_model_matrix = inverse(rec.local_from_world);
-	mat3 model_normal_matrix = normal_from_local;
-	mat4 modelview = read_view_matrix * read_model_matrix;
-	mat3 modelview_normal = view_from_world3 * model_normal_matrix;
-	vec2 read_viewport_size = vec2(params.screen_size);
-	HitSceneData scene_data;
-	scene_data.main_cam_inv_view_matrix = params.world_from_view;
-	scene_data.camera_visible_layers = 0xFFFFFFFFu;
-	scene_data.emissive_exposure_normalization = params.emissive_exposure_normalization;
-	scene_data.flags = 0u;
-	scene_data.screen_pixel_size = 1.0 / vec2(params.screen_size);
-	scene_data_block.data = scene_data;
-	instances.data[0].instance_uniforms_ofs = rec.instance_uniforms_ofs;
 
 	{
 #CODE : FRAGMENT
