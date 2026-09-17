@@ -128,7 +128,7 @@ Error build_display_shader(ConfigID p_config,
 		const String &p_look,
 		const String &p_function_name,
 		int p_descriptor_set,
-		bool p_output_linear,
+		const String &p_output_linear_space, // Empty: encoded for the display; else the linear Rec. 709 space the view's output is converted back to.
 		GPUShader *r_shader,
 		String *r_error = nullptr);
 
@@ -145,7 +145,7 @@ Error apply_display_transform(ConfigID p_config,
 		const String &p_display,
 		const String &p_view,
 		const String &p_look,
-		bool p_output_linear,
+		const String &p_output_linear_space, // Empty: encoded for the display; else the linear Rec. 709 space the view's output is converted back to.
 		Color *r_colors,
 		int p_count,
 		String *r_error = nullptr);

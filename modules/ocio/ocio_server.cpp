@@ -460,9 +460,16 @@ bool OCIOServer::get_display_shader(const String &p_display, const String &p_vie
 
 	OCIOBackend::GPUShader shader;
 	// Always linear: the renderer treats the view like any other tonemapper and
-	// applies whatever encoding the target needs itself.
+	// applies whatever encoding the target needs itself. The linear space by
+	// the name this config knows it (an alias in some configs), the same
+	// resolution the texture path uses; a config that names none cannot
+	// build the shader, and said so when it loaded.
+	if (linear_rec709_space.is_empty()) {
+		failed_shaders.insert(key);
+		return false;
+	}
 	if (OCIOBackend::build_display_shader(config, working_space, use_display, use_view, use_look,
-				DISPLAY_FUNCTION_NAME, p_descriptor_set, /* output_linear = */ true, &shader) != OK) {
+				DISPLAY_FUNCTION_NAME, p_descriptor_set, linear_rec709_space, &shader) != OK) {
 		failed_shaders.insert(key);
 		return false;
 	}
@@ -548,7 +555,7 @@ Color OCIOServer::display_transform(const Color &p_color, const String &p_displa
 	Color color = p_color;
 	const String use_display = p_display.is_empty() ? display : p_display;
 	const String use_view = p_view.is_empty() ? view : p_view;
-	if (OCIOBackend::apply_display_transform(config, working_space, use_display, use_view, p_look, p_output_linear, &color, 1) != OK) {
+	if (OCIOBackend::apply_display_transform(config, working_space, use_display, use_view, p_look, p_output_linear ? linear_rec709_space : String(), &color, 1) != OK) {
 		return p_color;
 	}
 	return color;

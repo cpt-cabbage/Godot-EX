@@ -72,13 +72,6 @@ OCIO::ConstConfigRcPtr find_config(ConfigID p_config) {
 	return found ? *found : OCIO::ConstConfigRcPtr();
 }
 
-// The name ACES configs give plain linear Rec. 709. Kept in step with
-// OCIOServer::LINEAR_REC709_SPACE. The display processor below hard-codes
-// it where the texture path resolves an alias (OCIOServer::_resolve_linear_rec709):
-// a config knowing the space only by an alias converts textures but fails
-// the display shader (open item, section 55).
-constexpr const char *LINEAR_REC709 = "Linear Rec.709 (sRGB)";
-
 String from_ocio(const char *p_string) {
 	return p_string ? String::utf8(p_string) : String();
 }
@@ -116,8 +109,12 @@ String qualify_sampler_declarations(const String &p_source, const Vector<GPUText
 // paths so that the two can be compared meaningfully: a difference between them
 // then really is a difference in evaluation, not in what was asked for.
 //
-// With `p_output_linear` the result is expressed in linear Rec. 709 rather than
-// encoded for the display. The tone mapping and gamut mapping the view performs
+// With `p_output_linear_space` named, the result is expressed in that linear
+// Rec. 709 space rather than encoded for the display (the server passes the
+// name the config knows the space by, alias or not -- the same resolution the
+// texture path uses, so a config that spells it differently from the ACES
+// configs' "Linear Rec.709 (sRGB)" builds its display shader all the same).
+// The tone mapping and gamut mapping the view performs
 // are unaffected; only the encoding on the way out changes. That is what lets
 // the renderer treat an OpenColorIO view exactly like a built-in tonemapper: it
 // hands back a linear value and Godot's existing machinery decides how to encode
@@ -128,16 +125,17 @@ OCIO::ConstProcessorRcPtr make_display_processor(const OCIO::ConstConfigRcPtr &p
 		const String &p_display,
 		const String &p_view,
 		const String &p_look,
-		bool p_output_linear) {
+		const String &p_output_linear_space) {
 	const CharString display = p_display.utf8();
 	const CharString view = p_view.utf8();
+	const bool output_linear = !p_output_linear_space.is_empty();
 
 	OCIO::DisplayViewTransformRcPtr display_view = OCIO::DisplayViewTransform::Create();
 	display_view->setSrc(p_input_color_space.utf8().get_data());
 	display_view->setDisplay(display.get_data());
 	display_view->setView(view.get_data());
 
-	if (p_look.is_empty() && !p_output_linear) {
+	if (p_look.is_empty() && !output_linear) {
 		return p_config->getProcessor(display_view, OCIO::TRANSFORM_DIR_FORWARD);
 	}
 
@@ -158,7 +156,7 @@ OCIO::ConstProcessorRcPtr make_display_processor(const OCIO::ConstConfigRcPtr &p
 
 	group->appendTransform(display_view);
 
-	if (p_output_linear) {
+	if (output_linear) {
 		// Undo the view's output encoding by converting from whatever colour
 		// space it writes into back to linear Rec. 709. For an SDR view that is
 		// the inverse of the encode it just applied, which OpenColorIO collapses;
@@ -184,7 +182,7 @@ OCIO::ConstProcessorRcPtr make_display_processor(const OCIO::ConstConfigRcPtr &p
 
 		OCIO::ColorSpaceTransformRcPtr to_linear = OCIO::ColorSpaceTransform::Create();
 		to_linear->setSrc(view_color_space);
-		to_linear->setDst(LINEAR_REC709);
+		to_linear->setDst(p_output_linear_space.utf8().get_data());
 		group->appendTransform(to_linear);
 	}
 
@@ -401,7 +399,7 @@ Error build_display_shader(ConfigID p_config,
 		const String &p_look,
 		const String &p_function_name,
 		int p_descriptor_set,
-		bool p_output_linear,
+		const String &p_output_linear_space,
 		GPUShader *r_shader,
 		String *r_error) {
 	ERR_FAIL_NULL_V(r_shader, ERR_INVALID_PARAMETER);
@@ -410,7 +408,7 @@ Error build_display_shader(ConfigID p_config,
 
 	OCIO_GUARD(r_error, {
 		OCIO::ConstProcessorRcPtr processor =
-				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear);
+				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear_space);
 		// make_display_processor() returns null when it rejected the request; it
 		// has already said why, and dereferencing it here would take the process
 		// with it rather than raise something the guard could catch.
@@ -520,7 +518,7 @@ Error apply_display_transform(ConfigID p_config,
 		const String &p_display,
 		const String &p_view,
 		const String &p_look,
-		bool p_output_linear,
+		const String &p_output_linear_space,
 		Color *r_colors,
 		int p_count,
 		String *r_error) {
@@ -533,7 +531,7 @@ Error apply_display_transform(ConfigID p_config,
 
 	OCIO_GUARD(r_error, {
 		OCIO::ConstProcessorRcPtr processor =
-				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear);
+				make_display_processor(config, p_input_color_space, p_display, p_view, p_look, p_output_linear_space);
 		ERR_FAIL_COND_V(!processor, ERR_INVALID_PARAMETER);
 		OCIO::ConstCPUProcessorRcPtr cpu = processor->getDefaultCPUProcessor();
 
