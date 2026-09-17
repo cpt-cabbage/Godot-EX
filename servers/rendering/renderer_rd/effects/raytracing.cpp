@@ -2566,6 +2566,11 @@ void Raytracing::process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_
 	const bool cards_ready = p_quality.indirect && surface_cache != nullptr && surface_cache->is_ready();
 	params.flags = (st.history_valid ? 1 : 0) | (p_quality.shadow_rays ? 0 : 2) | (cards_ready ? 4 : 0);
 	params.indirect[3] = float(CLAMP(p_quality.indirect_rays, 1, 8));
+	// The light selection's weights follow the working space, as every
+	// other RT pass's luminance does (a weight only: the estimate is
+	// unbiased for any positive weights; this sets which light the froxel's
+	// shadow ray is most often spent on).
+	_set_luma_weights(params.indirect);
 	st.carries_indirect = cards_ready;
 	rd->buffer_update(st.ubo, 0, sizeof(TranslucencyParamsUBO), &params);
 

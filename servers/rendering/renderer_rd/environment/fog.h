@@ -187,14 +187,14 @@ private:
 			float temporal_blend;
 
 			float sky_border_size[2];
-			float pad[2];
+			float luma_rg[2]; // The working space's luminance weights, red and green (the ray-query light selection's; blue is luma_b below).
 
 			float cam_rotation[12];
 			float to_prev_view[16];
 			float radiance_inverse_xform[12];
 
 			float cam_origin[3];
-			float pad_rq;
+			float luma_b;
 		};
 
 		VolumetricFogProcessShaderRD process_shader;

@@ -626,7 +626,7 @@ private:
 		float temporal_alpha;
 		uint32_t sun_caster_mask;
 		uint32_t flags;
-		float indirect[4]; // a: the bounce rays per froxel; rgb unused.
+		float indirect[4]; // rgb: the working space's luminance weights (the light selection's); a: the bounce rays per froxel.
 	};
 	static_assert(sizeof(TranslucencyParamsUBO) == 256, "TranslucencyParamsUBO layout must match translucency_volume.glsl.");
 

@@ -30,13 +30,13 @@
 
 #include "fog.h"
 
+#include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
-#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_default.h"
-#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -1149,6 +1149,14 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.cam_origin[0] = p_cam_transform.origin.x;
 	params.cam_origin[1] = p_cam_transform.origin.y;
 	params.cam_origin[2] = p_cam_transform.origin.z;
+	{
+		// The ray-query light selection's weights follow the working space,
+		// as the RT passes' luminance does.
+		const Vector3 luma = ColorManagement::get_luminance_weights();
+		params.luma_rg[0] = luma.x;
+		params.luma_rg[1] = luma.y;
+		params.luma_b = luma.z;
+	}
 	params.filter_axis = 0;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;

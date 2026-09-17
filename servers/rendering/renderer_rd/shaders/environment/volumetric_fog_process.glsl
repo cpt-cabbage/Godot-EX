@@ -189,7 +189,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	float temporal_blend;
 
 	vec2 sky_border_size;
-	vec2 pad;
+	vec2 luma_rg; // The working space's luminance weights, red and green (luma_b the blue): the ray-query light selection's.
 
 	mat3x4 cam_rotation;
 	mat4 to_prev_view;
@@ -197,7 +197,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	mat3 radiance_inverse_xform;
 
 	vec3 cam_origin;
-	float pad_rq;
+	float luma_b;
 }
 params;
 #ifndef MODE_COPY
@@ -206,13 +206,13 @@ layout(set = 0, binding = 16) uniform texture3D prev_density_texture;
 #ifdef NO_IMAGE_ATOMICS
 layout(set = 0, binding = 17) buffer density_only_map_buffer {
 	uint density_only_map[];
-};
+}
 layout(set = 0, binding = 18) buffer light_only_map_buffer {
 	uint light_only_map[];
-};
+}
 layout(set = 0, binding = 19) buffer emissive_only_map_buffer {
 	uint emissive_only_map[];
-};
+}
 #else
 layout(r32ui, set = 0, binding = 17) uniform uimage3D density_only_map;
 layout(r32ui, set = 0, binding = 18) uniform uimage3D light_only_map;
@@ -259,9 +259,9 @@ uint rq_pcg_hash(uint v) {
 void rq_accumulate(vec3 contrib, vec3 light_pos) {
 	uint s = (rq_light_count++) % RQ_STREAMS;
 	rq_local_light[s] += contrib;
-	// Rec.709 by omission (no luma_weights bound here; the RT passes follow
-	// the working space, open item, section 55): only a sampling weight.
-	float w = max(dot(contrib, vec3(0.2126, 0.7152, 0.0722)), 1e-8);
+	// The working space's luminance, as in the RT passes: only a sampling
+	// weight here (unbiased for any positive weights).
+	float w = max(dot(contrib, vec3(params.luma_rg, params.luma_b)), 1e-8);
 	rq_weight_sum[s] += w;
 	float p = w / rq_weight_sum[s];
 	if (rq_rng[s] < p) {

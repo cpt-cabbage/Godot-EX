@@ -75,7 +75,7 @@ layout(set = 0, binding = 5, std140) uniform Params {
 	float temporal_alpha;
 	uint sun_caster_mask;
 	uint flags;
-	vec4 indirect; // a: the froxel's bounce rays; rgb unused.
+	vec4 indirect; // rgb: the working space's luminance weights; a: the froxel's bounce rays.
 }
 params;
 
@@ -117,10 +117,10 @@ float hash_to_float(uint h) {
 	return float(h & 0x00FFFFFFu) / float(0x01000000u);
 }
 
-// Rec.709 by omission: this pass has no luma_weights bound, unlike the
-// other RT passes, which follow the working space (open item, section 55).
+// The working space's luminance (ColorManagement), as in the other RT
+// passes; here only the light selection's weight.
 float luminance(vec3 c) {
-	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+	return dot(c, params.indirect.rgb);
 }
 
 float get_omni_attenuation(float dist, float inv_range, float decay) {
@@ -168,7 +168,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		return false;
 	}
 	CardSet s = card_sets.data[inst.set];
-	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
 		return false;
 	}
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
