@@ -623,6 +623,32 @@ void Raytracing::advance_frame(Ref<RenderSceneBuffersRD> p_render_buffers) {
 	rb_state = state.ptr();
 }
 
+RID Raytracing::ensure_velocity(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_STATE, RB_RT_VELOCITY)) {
+		// An attachment of the prepass and a texture of the temporal passes.
+		return _create_cleared_texture(p_render_buffers, RB_SCOPE_RT_STATE, RB_RT_VELOCITY, RenderSceneBuffersRD::get_velocity_format(), RenderSceneBuffersRD::get_velocity_usage_bits(false, false, p_render_buffers->get_can_be_storage()));
+	}
+	return p_render_buffers->get_texture(RB_SCOPE_RT_STATE, RB_RT_VELOCITY);
+}
+
+RID Raytracing::get_velocity(Ref<RenderSceneBuffersRD> p_render_buffers) const {
+	return p_render_buffers->has_texture(RB_SCOPE_RT_STATE, RB_RT_VELOCITY) ? p_render_buffers->get_texture(RB_SCOPE_RT_STATE, RB_RT_VELOCITY) : RID();
+}
+
+void Raytracing::set_velocity_current(bool p_current, const Vector2 &p_jitter_delta) {
+	velocity_current = p_current;
+	velocity_jitter_delta = p_jitter_delta;
+}
+
+// The temporal passes' velocity flags: a real buffer bound, whether it is this
+// frame's, and the experiment that reads a stale one at the current pixel.
+uint32_t Raytracing::_velocity_flags(RID p_velocity) const {
+	if (p_velocity.is_null()) {
+		return 0;
+	}
+	return DENOISE_FLAG_HAS_VELOCITY | (velocity_current ? DENOISE_FLAG_VELOCITY_CURRENT : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
+}
+
 RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
 	while (rb_state->reproject_history.size() <= p_view) {
 		rb_state->reproject_history.push_back(RenderBuffersRT::ReprojectHistory());
@@ -670,6 +696,8 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// flick and level after (section 67); off.
 		static const bool mod_delta = OS::get_singleton()->get_environment("GODOT_GI_MOD_DELTA") == "1";
 		ubo.mod_delta = mod_delta ? 1.0f : 0.0f;
+		ubo.jitter_delta[0] = velocity_jitter_delta.x;
+		ubo.jitter_delta[1] = velocity_jitter_delta.y;
 		// GODOT_GI_SPEC_FIX=<frames>: a rough reflection restarted by the
 		// change mark takes the raw 5x5 resolve for its changed part and is
 		// worth this many frames (0: the one sample, as before).
@@ -845,7 +873,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 		float shadow_frames = float(MAX(shadow_temporal_frames, 1u));
 		temporal_push_constant.blend_alpha = 1.0f / shadow_frames;
 		temporal_push_constant.frames_max = shadow_frames;
-		temporal_push_constant.flags = (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
+		temporal_push_constant.flags = _velocity_flags(p_velocity);
 
 		// The dummy is never fetched (DENOISE_FLAG_HAS_VELOCITY unset).
 		RID velocity = p_velocity.is_valid() ? p_velocity : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
@@ -1276,7 +1304,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	// Temporal pass.
 	{
-		denoise_push_constant.flags = DENOISE_FLAG_HAS_META | (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
+		denoise_push_constant.flags = DENOISE_FLAG_HAS_META | _velocity_flags(p_velocity);
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, DENOISE_VARIANT_TEMPORAL);
 		RD::Uniform u_raw_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, diffuse_slice }));
 		RD::Uniform u_raw_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, specular_slice }));
@@ -2068,7 +2096,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RID reproject_ubo = _update_reproject_ubo(p_view, p_reproject);
 
 	{
-		denoise_push_constant.flags = (p_velocity.is_valid() ? DENOISE_FLAG_HAS_VELOCITY : 0) | (_objects_at_pixel() ? DENOISE_FLAG_OBJECTS_AT_PIXEL : 0);
+		denoise_push_constant.flags = _velocity_flags(p_velocity);
 		if (_luma_compress()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_LUMA_COMPRESS;
 		}

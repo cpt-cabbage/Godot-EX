@@ -1067,7 +1067,14 @@ layout(location = 0) out vec4 frag_color;
 #endif // RENDER DEPTH
 
 #ifdef MOTION_VECTORS
+#ifdef MODE_RENDER_NORMAL_ROUGHNESS
+// The prepass writing motion vectors for the ray-traced temporal passes
+// (render_forward_clustered.cpp PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION):
+// after the normal and the G-buffer.
+layout(location = 3) out vec2 motion_vector;
+#else
 layout(location = 2) out vec2 motion_vector;
+#endif
 #endif
 
 #include "../scene_forward_aa_inc.glsl"

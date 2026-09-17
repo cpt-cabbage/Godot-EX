@@ -286,6 +286,18 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_depth_fb(Depth
 
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, f0_buffer);
 		} break;
+		case DEPTH_FB_ROUGHNESS_MOTION: {
+			ensure_normal_roughness_texture();
+			ERR_FAIL_COND_V_MSG(use_msaa, RID(), "The motion-vector prepass has no MSAA form.");
+
+			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS);
+			RID albedo_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_ALBEDO);
+			RID f0_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_GBUF_F0);
+			RID velocity_buffer = render_buffers->get_texture(RB_SCOPE_RT_STATE, RB_RT_VELOCITY);
+			ERR_FAIL_COND_V(velocity_buffer.is_null(), RID());
+
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, albedo_buffer, f0_buffer, velocity_buffer);
+		} break;
 		case DEPTH_FB_ROUGHNESS_VOXELGI: {
 			ensure_normal_roughness_texture();
 			ensure_voxelgi();
@@ -565,6 +577,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
 				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW : SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
 			} break;
+			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION: {
+				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for the motion-vector prepass");
+				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_MOTION;
+			} break;
 			case PASS_MODE_DEPTH_MATERIAL: {
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
 				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL;
@@ -591,7 +607,8 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		while (pipeline_key.ubershader < ubershader_iterations) {
 			// Skeleton and blend shape.
 			RD::VertexFormatID vertex_format = -1;
-			bool pipeline_motion_vectors = pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+			// The previous frame's vertex buffers (skinned meshes, blend shapes) for the motion vectors: the colour pass's flag, or the prepass that writes them.
+			bool pipeline_motion_vectors = (pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS) || pipeline_key.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_MOTION;
 			uint64_t input_mask = shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.color_pass_flags, pipeline_key.ubershader);
 			if (surf->owner->mesh_instance.is_valid()) {
 				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
@@ -759,6 +776,9 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 		} break;
 		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
 			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+		} break;
+		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION: {
+			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
 		} break;
 		case PASS_MODE_DEPTH_MATERIAL: {
 			_render_list_template<PASS_MODE_DEPTH_MATERIAL>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
@@ -1287,7 +1307,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					inst->gi_offset_cache = 0xFFFFFFFF;
 				}
 			}
-			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_COLOR) {
+			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION || p_pass_mode == PASS_MODE_COLOR) {
 				bool transform_changed = inst->transform_status == GeometryInstanceForwardClustered::TransformStatus::MOVED;
 				bool has_mesh_instance = inst->mesh_instance.is_valid();
 				bool uses_particles = inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES;
@@ -2446,6 +2466,14 @@ void RenderForwardClustered::_request_ray_tracing_convergence(RenderDataRD *p_re
 	}
 }
 
+// GODOT_RT_PREPASS_MOTION=0: the ray-traced temporal passes go back to the
+// colour pass's velocity buffer, a frame stale, with the moving-object
+// classification of section 61 (the form before section 71).
+bool RenderForwardClustered::_prepass_motion_enabled() {
+	static const bool enabled = OS::get_singleton()->get_environment("GODOT_RT_PREPASS_MOTION") != "0";
+	return enabled;
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -2709,6 +2737,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else if (use_stochastic_lighting || use_rt_gi || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
+		// The ray-traced temporal passes run before the colour pass, whose
+		// velocity buffer is therefore a frame stale for them: the prepass
+		// writes this frame's motion vectors into a buffer of theirs, and
+		// they reproject every pixel by it (raytracing.cpp set_velocity_current).
+		// One view, no MSAA (no resolve for it), no VoxelGI (its variant has
+		// no motion form); the passes keep the stale-buffer classification
+		// otherwise. GODOT_RT_PREPASS_MOTION=0 restores the old form.
+		rt_velocity_current = false;
+		if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS && rb_data.is_valid() && !is_reflection_probe && rb->get_view_count() == 1 && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED &&
+				(use_raytraced_shadows || use_stochastic_lighting || use_rt_gi) && _prepass_motion_enabled()) {
+			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION;
+			rt_velocity_current = true;
+			scene_shader.enable_advanced_shader_group();
+		}
 
 		switch (depth_pass_mode) {
 			case PASS_MODE_DEPTH: {
@@ -2726,6 +2768,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf albedo
 				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf f0
 				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // voxel_gi
+			} break;
+			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION: {
+				raytracing->ensure_velocity(rb);
+				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataForwardClustered::DEPTH_FB_ROUGHNESS_MOTION);
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // normal_roughness
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf albedo
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // gbuf f0
+				depth_pass_clear.push_back(Color(0, 0, 0, 0)); // the ray-traced passes' velocity
 			} break;
 			default: {
 			};
@@ -2789,8 +2839,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 
 	// Update the global pipeline requirements with all the features found to be in use in this scene.
-	if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || global_surface_data.normal_texture_used) {
+	if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION || global_surface_data.normal_texture_used) {
 		global_pipeline_data_required.use_normal_and_roughness = true;
+	}
+	if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION) {
+		global_pipeline_data_required.use_prepass_motion = true;
 	}
 
 	if (scene_state.used_lightmap || scene_state.lightmaps_used > 0) {
@@ -3202,6 +3255,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				// in the opaque pass); helps the temporal filters follow moving
 				// objects. Null on the first frame the buffer exists.
 				RID velocity = rb->has_velocity_buffer(false) ? rb->get_velocity_buffer(false, v) : RID();
+				// This frame's own, from the motion-vector prepass, where it ran.
+				if (rt_velocity_current) {
+					velocity = raytracing->get_velocity(rb);
+				}
+				raytracing->set_velocity_current(rt_velocity_current, (scene_data->prev_taa_jitter - scene_data->taa_jitter) * 0.5f);
 				if (has_sun) {
 					raytracing->process(rb, v, world_from_ndc, prev_ndc_from_world * world_from_ndc, to_sun, tan_half_angle, sun_caster_mask, rt_shadow_rays, velocity);
 				}
@@ -5990,7 +6048,7 @@ static RD::FramebufferFormatID _get_reflection_probe_color_framebuffer_format_fo
 	return RD::get_singleton()->framebuffer_format_create(attachments);
 }
 
-static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p_can_be_storage, RD::TextureSamples p_samples, bool p_normal_roughness, bool p_voxelgi) {
+static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p_can_be_storage, RD::TextureSamples p_samples, bool p_normal_roughness, bool p_voxelgi, bool p_motion = false) {
 	const bool multisampling = p_samples > RD::TEXTURE_SAMPLES_1;
 	RD::AttachmentFormat attachment;
 	attachment.samples = p_samples;
@@ -6017,6 +6075,13 @@ static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p
 	if (p_voxelgi) {
 		attachment.format = RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_format();
 		attachment.usage_flags = RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_usage_bits(false, multisampling, p_can_be_storage);
+		attachments.push_back(attachment);
+	}
+
+	if (p_motion) {
+		// The ray-traced passes' velocity (raytracing.cpp ensure_velocity).
+		attachment.format = RenderSceneBuffersRD::get_velocity_format();
+		attachment.usage_flags = RenderSceneBuffersRD::get_velocity_usage_bits(false, false, p_can_be_storage) | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 		attachments.push_back(attachment);
 	}
 
@@ -6073,7 +6138,7 @@ static RD::FramebufferFormatID _get_reflection_probe_depth_framebuffer_format_fo
 void RenderForwardClustered::_mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t input_mask = p_shader->get_vertex_input_mask(r_pipeline_key.version, r_pipeline_key.color_pass_flags, p_ubershader);
-	bool pipeline_motion_vectors = r_pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+	bool pipeline_motion_vectors = (r_pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS) || r_pipeline_key.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_MOTION;
 	bool emulate_point_size = p_shader->uses_point_size && scene_shader.emulate_point_size;
 	r_pipeline_key.vertex_format_id = mesh_storage->mesh_surface_get_vertex_format(p_mesh_surface, input_mask, p_instanced_surface, pipeline_motion_vectors, emulate_point_size);
 	r_pipeline_key.ubershader = p_ubershader;
@@ -6172,6 +6237,13 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 		// A lot of different effects rely on normal and roughness being written to during the depth pass.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
 		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, false);
+		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+	}
+
+	if (p_global.use_prepass_motion && !p_global.use_multiview) {
+		// The ray-traced passes' motion-vector prepass.
+		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_MOTION;
+		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, false, true);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 

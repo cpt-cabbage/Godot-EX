@@ -119,6 +119,9 @@
 // Per-viewport temporal state, attached to the render buffers rather than held
 // on the (single, renderer-wide) Raytracing object.
 #define RB_SCOPE_RT_STATE SNAME("rb_rt_state")
+// This frame's motion vectors, written by the prepass for the temporal passes
+// (render_forward_clustered.cpp PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).
+#define RB_RT_VELOCITY SNAME("velocity")
 
 namespace RendererRD {
 
@@ -302,6 +305,7 @@ private:
 		DENOISE_FLAG_SPATIAL_OFF = 262144, // Spatial (GI, experiment, GODOT_GI_SPATIAL=0): the pass stores its input unfiltered.
 		DENOISE_FLAG_BORROW_SPEC = 524288, // Temporal (GI, experiment, GODOT_GI_BORROW_SPEC=1): the frame-edge borrow serves a mirror's reflection too.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
+		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -309,6 +313,15 @@ private:
 	// from members: this object is shared by every viewport the renderer draws,
 	// while the history textures it ping-pongs are owned per render buffer.
 	RenderBuffersRT *rb_state = nullptr;
+
+	// Whether the velocity buffer the temporal passes are handed this frame
+	// is the prepass's (this frame's motion) rather than the colour pass's
+	// (a frame stale), and the half difference of the two frames' TAA
+	// jitters in NDC: the motion vectors are unjittered where the passes'
+	// pixels are not (set_velocity_current).
+	bool velocity_current = false;
+	Vector2 velocity_jitter_delta;
+	uint32_t _velocity_flags(RID p_velocity) const;
 
 	RID _update_reproject_ubo(uint32_t p_view, const Projection &p_reproject);
 
@@ -507,7 +520,7 @@ private:
 		float firefly_rough; // The roughness from which the reflection takes the firefly test too (GODOT_GI_FIREFLY_ROUGH).
 		float mark_age; // Temporal (GI): 1 restarts the diffuse history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
 		float mod_delta; // Temporal (GI): 1 carries a corrected history by the field's change instead of replacing its changed fraction by the field (GODOT_GI_MOD_DELTA=1).
-		float pad[2]; // The std140 block is 144 bytes.
+		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's. The std140 block is 144 bytes.
 	};
 	static_assert(sizeof(ReprojectUBO) == 144, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
@@ -831,6 +844,15 @@ public:
 	// pick the freshly written texture, like the GI view depth). Valid for the
 	// buffer named by the most recent advance_frame().
 	bool get_history_parity() const { return rb_state != nullptr && rb_state->history_parity; }
+
+	// The temporal passes' own velocity buffer, written by the prepass with
+	// this frame's motion vectors (the colour pass's is a frame stale for
+	// passes that run before it). Created cleared on first use.
+	RID ensure_velocity(Ref<RenderSceneBuffersRD> p_render_buffers);
+	RID get_velocity(Ref<RenderSceneBuffersRD> p_render_buffers) const;
+	// Whether the velocity handed to this frame's passes is that buffer, and
+	// the jitter difference the reprojection by it needs (see the member).
+	void set_velocity_current(bool p_current, const Vector2 &p_jitter_delta);
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return scene.get_tlas(); }

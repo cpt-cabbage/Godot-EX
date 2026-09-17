@@ -138,7 +138,8 @@ public:
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
-			DEPTH_FB_ROUGHNESS_VOXELGI
+			DEPTH_FB_ROUGHNESS_VOXELGI,
+			DEPTH_FB_ROUGHNESS_MOTION, // ... plus the ray-traced passes' own velocity (RB_SCOPE_RT_MOTION); no MSAA form.
 		};
 
 		RID render_sdfgi_uniform_set;
@@ -239,6 +240,7 @@ private:
 		PASS_MODE_DEPTH,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
+		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION, // The prepass writing motion vectors for the ray-traced temporal passes (see _pre_opaque_render).
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_SDF,
 		PASS_MODE_MAX
@@ -717,6 +719,7 @@ private:
 				uint32_t use_separate_specular : 1;
 				uint32_t use_motion_vectors : 1;
 				uint32_t use_normal_and_roughness : 1;
+				uint32_t use_prepass_motion : 1; // The ray-traced passes' motion-vector prepass.
 				uint32_t use_lightmaps : 1;
 				uint32_t use_voxelgi : 1;
 				uint32_t use_sdfgi : 1;
@@ -872,6 +875,10 @@ private:
 	RID _get_scene_shader_tlas() const;
 	bool use_rt_sdfgi_probes = false;
 	bool use_rt_gi = false;
+	// The prepass wrote this frame's motion vectors for the ray-traced
+	// temporal passes (PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).
+	bool rt_velocity_current = false;
+	static bool _prepass_motion_enabled();
 	bool use_rt_gi_half_res = true;
 	uint32_t rt_gi_rays = 1;
 	bool use_rt_gi_screen_radiance = true;

@@ -41,6 +41,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_MIRROR_YOUNG 16u // Experiment (GODOT_GI_MIRROR_YOUNG=1, set on the first iteration only): a young mirror pixel's reflection is filtered at stride 1.
 #define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel rather than at the history's (the form before the flick fix).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
+#define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
 // how far outside the previous frame a history may lie and still borrow the
@@ -268,8 +269,13 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// field_prev), instead of the changed fraction being replaced by the
 	// field, and is not shortened for it (see the lighting-change block).
 	float mod_delta;
-	float pad1; // std140 rounds the block to 16 bytes (scalars: an array would take 16 a member); the C++ struct carries the same.
-	float pad2;
+	// Half the previous frame's TAA jitter minus this frame's, in NDC: the
+	// motion vectors are unjittered (the scene shader subtracts both
+	// frames' jitters) where this pass's pixels sit in the jittered image,
+	// so a history predicted by uv + velocity lands here short of that
+	// (FLAG_VELOCITY_CURRENT). The block is 144 bytes; the C++ struct
+	// carries the same.
+	vec2 jitter_delta;
 }
 reprojection;
 #endif
@@ -590,7 +596,20 @@ void main() {
 		// along).
 		vec2 object_delta = vec2(0.0);
 		bool velocity_in_frame = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThan(prev_uv, vec2(1.0)));
-		if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
+		if ((params.flags & FLAG_VELOCITY_CURRENT) != 0u && (params.flags & FLAG_HAS_VELOCITY) != 0u) {
+			// This frame's motion vectors, from the prepass (section 71): the
+			// point under this pixel was at uv + velocity last frame, whatever
+			// moved -- the camera, the object, or both -- so every history is
+			// fetched there and the classification below, built for a buffer
+			// a frame stale, is not needed. A static pixel lands where the
+			// camera reprojection puts it to the precision of the two; the
+			// difference is kept as the object's own motion for the
+			// reflection's virtual image.
+			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
+			vec2 predicted = uv + velocity + reprojection.jitter_delta;
+			object_delta = predicted - prev_uv;
+			prev_uv = predicted;
+		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
 			ivec2 velocity_pixel = (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u ? pixel * params.depth_scale : ivec2(prev_uv * vec2(params.screen_size * params.depth_scale));
 			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
@@ -1141,6 +1160,12 @@ void main() {
 		// Diagnostics: red where this frame's sample was scaled down.
 		result_diffuse = firefly_hit ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
 		result_specular = vec3(0.0);
+	}
+	if ((params.flags & FLAG_SPEC_PAINT_WHY) != 0u && paint_why != 0) {
+		// The diffuse takes the reflection's paint (below) for the four
+		// verdicts, so they show on a rough surface too (a gray box's
+		// specular is too faint to read).
+		result_diffuse = paint_why == 1 ? vec3(1.0, 0.0, 0.0) : (paint_why == 2 ? vec3(1.0, 1.0, 0.0) : (paint_why == 3 ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0)));
 	}
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, clamp(change_age, 0.0, 1.0)));
 #else
