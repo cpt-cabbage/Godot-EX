@@ -976,6 +976,8 @@ struct Direct {
 	float local_geom; // Their geometric sum.
 	float vis; // The drawn light's visibility, when one was drawn.
 	bool sampled;
+	uint local_count; // The lights the texel's list held, and the nearest one's distance over its range (diagnostics, paintl).
+	float local_nearest;
 };
 
 // The image lights' part of a texel's direct term (the planar mirrors,
@@ -1153,12 +1155,16 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 	uint light_count;
 	bool from_grid;
 	light_list(entry, t.world_pos, base, light_count, from_grid);
+	float nearest = 1.0;
 	for (uint j = 0u; j < light_count; j++) {
 		bool is_spot;
 		LightData ld = light_at(base, j, from_grid, is_spot);
 		vec3 pos;
 		float geom;
 		vec3 c = light_contribution(ld, is_spot, t.world_pos, t.n_world, pos, geom);
+		if ((params.debug & 524288u) != 0u) {
+			nearest = min(nearest, length(pos - t.world_pos) * ld.inv_radius);
+		}
 		float w = luminance(abs(c));
 		if (w <= 0.0) {
 			continue;
@@ -1280,6 +1286,8 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 	d.unshadowed = direct_unshadowed;
 	d.local_sum = sum;
 	d.dyn_sum = dynamic_direct(t.world_pos, t.n_world);
+	d.local_count = light_count;
+	d.local_nearest = nearest;
 }
 
 // The dynamic lights' bounce. A flashlight's spot on the floor is small
@@ -2167,6 +2175,13 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		// (paintn) The captured world-space normal, as colour (seen through
 		// GODOT_GI_FALLBACK=all): a texel lit from the wrong side shows here.
 		radiance = t.n_world * 0.5 + 0.5;
+	} else if ((params.debug & 524288u) != 0u) {
+		// (paintl) The local lights' unshadowed sum (r), how many the texel's
+		// list held over eight (g) and the nearest one's distance over its
+		// range (b, 1 when none is in range): a level whose cards stay dark
+		// (the TPS demo's) is read here as lights that never reach the
+		// texels or lights that do and contribute nothing.
+		radiance = vec3(luminance(d.local_sum), float(d.local_count) / 8.0, d.local_nearest);
 	}
 	vec3 static_radiance = max(t.albedo * (direct + ind_read) + t.emission, vec3(0.0));
 	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(static_radiance)) || any(isinf(static_radiance))) {

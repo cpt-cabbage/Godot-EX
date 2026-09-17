@@ -1051,8 +1051,16 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	last_grid_built = use_grid;
 	last_grid_origin = grid_origin;
 	last_grid_cell = grid_cell;
+	// GODOT_CARD_STATE_PRINT (diagnostics, with the set-state readback): the
+	// light population the cards are lit with, every 60 frames. A level whose
+	// cards came out unlit (the TPS demo's, section 76) is told apart from one
+	// whose lights never reached them by this line alone.
+	static const bool state_print = OS::get_singleton()->has_environment("GODOT_CARD_STATE_PRINT");
+	if (state_print && p_inputs.frame % 60 == 0) {
+		print_line(vformat("Surface cache lights: %d omni, %d spot, %d area, %d directional, radius %.1f, grid %s (cell %.1f m)", p_inputs.omni_light_count, p_inputs.spot_light_count, p_inputs.area_light_count, p_inputs.directional_light_count, p_inputs.light_radius, use_grid ? "on" : "off", grid_cell));
+	}
 	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart,visrestart,strict;
-	// diagnostics paint,paint2,paint3,paint5,paint8,paintn,stats (see the shader's debug bits).
+	// diagnostics paint,paint2,paint3,paint5,paint8,paintn,paintl,stats (see the shader's debug bits).
 	// switches parts of the texel shading off (gradient: the bounce ray
 	// re-traced for the temporal gradient; restart: the bounce accumulation's
 	// restart on a change), read once.
@@ -1074,6 +1082,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 					: name == "strict"						? 16384
 					: name == "paint8"						? 131072
 					: name == "paintn"						? 262144
+					: name == "paintl"						? 524288
 															: 0;
 		}
 		if (bits != 0) {
