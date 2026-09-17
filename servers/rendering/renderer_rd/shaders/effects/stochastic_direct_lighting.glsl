@@ -798,28 +798,33 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	// Non-opaque instances (alpha-tested casters) hand their hits back as
 	// candidates, confirmed where the cards say the material covers the
 	// point; without any of them the opaque flag skips that loop.
+	// The two branches use two queries: the Metal driver rewrites a query
+	// that never inspects a candidate into an intersector call
+	// (GODOT_RT_INTERSECTOR, rendering_shader_container_metal.cpp), and one
+	// variable serving both branches would keep the query form for both.
 	vec3 dir = delta / dist;
-	rayQueryEXT rq;
 	if ((params.flags & FLAG_ALPHA_CASTERS) == 0u) {
-		rayQueryInitializeEXT(rq, tlas,
+		rayQueryEXT rq_opaque;
+		rayQueryInitializeEXT(rq_opaque, tlas,
 				gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
 				caster_mask, world_origin, params.ray_bias, dir, dist - params.ray_bias);
-		rayQueryProceedEXT(rq);
-	} else {
-		rayQueryInitializeEXT(rq, tlas,
-				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
-				caster_mask, world_origin, params.ray_bias, dir, dist - params.ray_bias);
-		// Past a few layers the ray is inside foliage, where it is dark
-		// anyway and every further leaf would cost a card lookup.
-		uint passed = 0u;
-		while (rayQueryProceedEXT(rq)) {
-			if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-				vec3 hit = world_origin + dir * rayQueryGetIntersectionTEXT(rq, false);
-				if (passed >= 4u || card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), hit, dir)) {
-					rayQueryConfirmIntersectionEXT(rq);
-				} else {
-					passed++;
-				}
+		rayQueryProceedEXT(rq_opaque);
+		return rayQueryGetIntersectionTypeEXT(rq_opaque, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
+	}
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+			caster_mask, world_origin, params.ray_bias, dir, dist - params.ray_bias);
+	// Past a few layers the ray is inside foliage, where it is dark
+	// anyway and every further leaf would cost a card lookup.
+	uint passed = 0u;
+	while (rayQueryProceedEXT(rq)) {
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			vec3 hit = world_origin + dir * rayQueryGetIntersectionTEXT(rq, false);
+			if (passed >= 4u || card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), hit, dir)) {
+				rayQueryConfirmIntersectionEXT(rq);
+			} else {
+				passed++;
 			}
 		}
 	}

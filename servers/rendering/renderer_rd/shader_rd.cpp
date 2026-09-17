@@ -177,6 +177,12 @@ void ShaderRD::setup(const char *p_vertex_code, const char *p_fragment_code, con
 	tohash.append(p_compute_code ? p_compute_code : "");
 	tohash.append("[DebugInfo]");
 	tohash.append(Engine::get_singleton()->is_generate_spirv_debug_info_enabled() ? "1" : "0");
+	// The Metal driver's intersector rewrite (GODOT_RT_INTERSECTOR, default
+	// 2; rendering_shader_container_metal.cpp) changes the compiled MSL of a
+	// ray-query shader without changing its GLSL: the cached binaries must
+	// not be shared across its levels.
+	tohash.append("[Intersector]");
+	tohash.append(OS::get_singleton()->get_environment("GODOT_RT_INTERSECTOR").is_empty() ? String("2") : OS::get_singleton()->get_environment("GODOT_RT_INTERSECTOR"));
 
 	base_sha256 = tohash.as_string().sha256_text();
 }

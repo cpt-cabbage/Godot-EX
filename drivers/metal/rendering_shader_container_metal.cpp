@@ -43,6 +43,8 @@
 #include <spirv_msl.hpp>
 #include <spirv_parser.hpp>
 
+#include <unordered_set>
+
 void RenderingShaderContainerMetal::_initialize_toolchain_properties() {
 	if (compiler_props.is_valid()) {
 		return;
@@ -706,6 +708,166 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			source = compiler.compile();
 		} catch (CompilerError &e) {
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
+		}
+
+		// GODOT_RT_INTERSECTOR=0|1|2 (default 2; the plan's section 48 / 68):
+		// SPIRV-Cross emits every ray query as an MSL intersection_query --
+		// reset, a next() loop, the committed getters -- which on Apple GPUs
+		// is the general form (the loop can inspect candidates), where the
+		// intersector's one intersect() call is the fast path the hardware
+		// schedules whole. Our ray-query shaders never look at a candidate
+		// except the direct pass and the card lighting (the alpha-tested
+		// casters' confirmation), so the query type is rewritten after
+		// conversion into a wrapper with the same method names: reset()
+		// runs an intersector (every ray that takes this path forces
+		// opacity, so every hit is committed and there is nothing to
+		// inspect), next() then reports none pending and the committed
+		// getters read the result. The intersection_params helper's call
+		// sites hand the wrapper their flags instead. =1 rewrites the
+		// shaders that never call a candidate getter; =2 rewrites every
+		// shader, keeping the query type for the variables a candidate
+		// getter, a commit or an abort is called on (their hoisted
+		// declaration in main, the parameters they travel as, and their
+		// reset's helper call). An intersection_query cannot be a struct
+		// member, so no wrapper can hold both forms behind one variable. A
+		// mismatch between a variable and a parameter it is passed as is
+		// a compile error, never a silent change. Measured (section 68, the
+		// game project at pose E, 1440p): the GI gather 5.6 -> 5.4 ms, the
+		// translucency volume 1.03 -> 0.85 ms, the frame identical; the
+		// sampling pass and the hit shading unchanged. ShaderRD folds the
+		// level into its cache key.
+		static const int64_t use_intersector = OS::get_singleton()->get_environment("GODOT_RT_INTERSECTOR").is_empty() ? 2 : OS::get_singleton()->get_environment("GODOT_RT_INTERSECTOR").to_int();
+		const bool has_candidates = source.find("get_candidate_") != std::string::npos || source.find("commit_") != std::string::npos || source.find(".abort()") != std::string::npos;
+		if (use_intersector > 0 && source.find("intersection_query") != std::string::npos && (use_intersector >= 2 || !has_candidates)) {
+			const std::string helper = "intersection_params spvMakeIntersectionParams(uint flags)";
+			const std::string query_type = "raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data>";
+			size_t helper_pos = source.find(helper);
+			size_t helper_end = helper_pos == std::string::npos ? std::string::npos : source.find("\n}\n", helper_pos);
+			if (helper_end != std::string::npos) {
+				const std::string original = source;
+				const std::string wrapper =
+						"\n\nstruct spvIntersectorQuery\n"
+						"{\n"
+						"    raytracing::intersection_result<raytracing::instancing, raytracing::triangle_data> res;\n"
+						"    void reset(raytracing::ray r, raytracing::acceleration_structure<raytracing::instancing> as, uint mask, uint flags)\n"
+						"    {\n"
+						"        raytracing::intersector<raytracing::instancing, raytracing::triangle_data> i;\n"
+						"        i.assume_geometry_type(raytracing::geometry_type::triangle);\n"
+						"        i.force_opacity(raytracing::forced_opacity::opaque);\n"
+						"        if ((flags & 4) != 0) i.accept_any_intersection(true);\n"
+						"        if ((flags & 16) != 0) i.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);\n"
+						"        if ((flags & 32) != 0) i.set_triangle_cull_mode(raytracing::triangle_cull_mode::front);\n"
+						"        res = i.intersect(r, as, mask);\n"
+						"    }\n"
+						"    bool next() { return false; }\n"
+						"    uint get_committed_intersection_type() { return uint(res.type); }\n"
+						"    float get_committed_distance() { return res.distance; }\n"
+						"    int get_committed_user_instance_id() { return int(res.user_instance_id); }\n"
+						"    int get_committed_instance_id() { return int(res.instance_id); }\n"
+						"    int get_committed_geometry_id() { return int(res.geometry_id); }\n"
+						"    int get_committed_primitive_id() { return int(res.primitive_id); }\n"
+						"    float2 get_committed_triangle_barycentric_coord() { return res.triangle_barycentric_coord; }\n"
+						"    bool is_committed_triangle_front_facing() { return res.triangle_front_facing; }\n"
+						"};\n";
+				source.insert(helper_end + 3, wrapper);
+				const size_t body = helper_end + 3 + wrapper.size();
+				auto is_ident = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+				// The identifier a method is called on, for ".method(" at p_pos.
+				auto callee_name = [&source, &is_ident](size_t p_pos) -> std::string {
+					size_t e = p_pos;
+					size_t b = e;
+					while (b > 0 && is_ident(source[b - 1])) {
+						b--;
+					}
+					return source.substr(b, e - b);
+				};
+				// The variables that inspect candidates keep the query type.
+				std::unordered_set<std::string> query_vars;
+				for (const char *method : { ".get_candidate_", ".commit_", ".abort()" }) {
+					size_t pos = body;
+					while ((pos = source.find(method, pos)) != std::string::npos) {
+						query_vars.insert(callee_name(pos));
+						pos += strlen(method);
+					}
+				}
+				// Every declaration and parameter takes the wrapper, then the
+				// query variables take their type back; their reset keeps the
+				// helper call, every other reset hands the flags over.
+				auto replace_all = [&source](const std::string &p_from, const std::string &p_to, size_t p_start) {
+					size_t pos = p_start;
+					while ((pos = source.find(p_from, pos)) != std::string::npos) {
+						source.replace(pos, p_from.size(), p_to);
+						pos += p_to.size();
+					}
+				};
+				replace_all(query_type, "spvIntersectorQuery", body);
+				for (const std::string &var : query_vars) {
+					replace_all("spvIntersectorQuery " + var + ";", query_type + " " + var + ";", body);
+					replace_all("thread spvIntersectorQuery& " + var + ",", "thread " + query_type + "& " + var + ",", body);
+					replace_all("thread spvIntersectorQuery& " + var + ")", "thread " + query_type + "& " + var + ")", body);
+				}
+				{
+					const std::string call = "spvMakeIntersectionParams(";
+					size_t pos = body;
+					while ((pos = source.find(call, pos)) != std::string::npos) {
+						size_t line = source.rfind('\n', pos);
+						size_t reset = source.rfind(".reset(", pos);
+						const bool keep = reset != std::string::npos && reset > line && query_vars.count(callee_name(reset)) > 0;
+						if (keep) {
+							pos += call.size();
+						} else {
+							source.replace(pos, call.size(), "(");
+							pos += 1;
+						}
+					}
+				}
+				// A wrapper ray that did not force opacity would hit what the
+				// query form leaves as unconfirmed candidates: such a shader
+				// keeps the query form whole.
+				{
+					bool safe = true;
+					size_t pos = body;
+					while ((pos = source.find(", (", pos)) != std::string::npos) {
+						size_t line = source.rfind('\n', pos);
+						size_t reset = source.rfind(".reset(", pos);
+						pos += 3;
+						if (reset == std::string::npos || reset < line) {
+							continue;
+						}
+						size_t num_end = pos;
+						while (num_end < source.size() && source[num_end] >= '0' && source[num_end] <= '9') {
+							num_end++;
+						}
+						if (num_end == pos || source.compare(num_end, 3, "u))") != 0) {
+							continue;
+						}
+						if ((std::stoul(source.substr(pos, num_end - pos)) & 1u) == 0u) {
+							safe = false;
+						}
+					}
+					if (!safe) {
+						WARN_PRINT(vformat("Shader '%s': a ray query without the opaque flag keeps the intersection_query form (GODOT_RT_INTERSECTOR).", String(shader_name.ptr())));
+						source = original;
+					}
+				}
+			}
+		}
+
+		// GODOT_MSL_DUMP=<dir>: every stage that carries a ray query is written
+		// as <dir>/<shader name>.<stage>.<n>.metal after conversion, to read what
+		// SPIRV-Cross made of the queries (the intersector experiment of the
+		// plan's section 48 needs the text to rewrite).
+		{
+			static const String dump_dir = OS::get_singleton()->get_environment("GODOT_MSL_DUMP");
+			if (!dump_dir.is_empty() && (source.find("intersection_query") != std::string::npos || source.find("spvIntersectorQuery") != std::string::npos)) {
+				static uint32_t dump_index = 0;
+				String name(shader_name.ptr());
+				name = name.replace_char(':', '_').replace_char('/', '_');
+				Ref<FileAccess> f = FileAccess::open(dump_dir.path_join(vformat("%s.%s.%d.metal", name, RDC::SHADER_STAGE_NAMES[stage], dump_index++)), FileAccess::WRITE);
+				if (f.is_valid()) {
+					f->store_string(String(source.c_str()));
+				}
+			}
 		}
 
 		ERR_FAIL_COND_V_MSG(compiler.get_entry_points_and_stages().size() != 1, false, "Expected a single entry point and stage.");
