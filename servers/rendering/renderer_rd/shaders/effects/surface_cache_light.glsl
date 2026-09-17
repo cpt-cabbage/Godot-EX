@@ -647,7 +647,7 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_set = inst.set;
 	CardSet s = sets.data[inst.set];
 	card_reject = 2u;
-	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
 		return false;
 	}
 	card_reject = 3u;
@@ -760,7 +760,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 		return true;
 	}
 	CardSet s = sets.data[inst.set];
-	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
 		return true;
 	}
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
@@ -2188,9 +2188,9 @@ void main() {
 	}
 	uint set = active_sets.list[entry];
 	CardSet s = sets.data[set];
-	// Sets under eight texels an edge are captured but never lit (the
-	// lookups accept four): harmless at the default min_card_size of 8,
-	// a set at edge 4 would read as black (open item, section 55).
+	// The workgroup tiles 8x8 texels, so a set under eight an edge cannot
+	// be lit here; min_card_size is clamped to 8 (surface_cache.cpp), so
+	// none is ever captured smaller, and the lookups gate at the same edge.
 	if (s.card_size < 8.0) {
 		return;
 	}

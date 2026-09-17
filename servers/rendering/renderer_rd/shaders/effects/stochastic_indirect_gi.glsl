@@ -1148,7 +1148,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		return false;
 	}
 	CardSet s = card_sets.data[inst.set];
-	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 4.0) {
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
 		return false;
 	}
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;

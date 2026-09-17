@@ -140,7 +140,7 @@ SurfaceCache::~SurfaceCache() {
 void SurfaceCache::set_settings(const Settings &p_settings) {
 	bool resize = p_settings.atlas_size != settings.atlas_size;
 	settings = p_settings;
-	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 4u, PAGE_SIZE);
+	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 8u, PAGE_SIZE); // The lighting pass tiles 8x8 texels: nothing smaller is ever lit.
 	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, MAX_CARD_EDGE);
 	if (resize) {
 		_free_atlases();
@@ -151,7 +151,7 @@ void SurfaceCache::set_settings(const Settings &p_settings) {
 void SurfaceCache::_create_atlases() {
 	RD *rd = RD::get_singleton();
 	settings.atlas_size = CLAMP(Math::next_power_of_2(settings.atlas_size), 256u, 8192u);
-	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 4u, PAGE_SIZE);
+	settings.min_card_size = CLAMP(Math::next_power_of_2(settings.min_card_size), 8u, PAGE_SIZE); // The lighting pass tiles 8x8 texels: nothing smaller is ever lit.
 	settings.max_card_size = CLAMP(Math::next_power_of_2(settings.max_card_size), settings.min_card_size, MAX_CARD_EDGE);
 
 	RD::TextureFormat tf;
