@@ -2396,8 +2396,14 @@ static MTL::AccelerationStructureUsage _convert_accel_usage(BitField<RDD::Accele
 	if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT)) {
 		usage |= MTL::AccelerationStructureUsagePreferFastBuild;
 	}
-	// ALLOW_COMPACTION requires no build-time usage bit on Metal; PREFER_FAST_TRACE is the
-	// default behavior, and LOW_MEMORY maps to an OS-gated bit that is left unmapped for now.
+	// PREFER_FAST_TRACE is Metal's default below macOS 26; from 26 the builder
+	// takes an explicit hint. ALLOW_COMPACTION needs no build-time bit, and
+	// LOW_MEMORY's bit (MinimizeMemory) is left unmapped.
+	if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT)) {
+		if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)) {
+			usage |= MTL::AccelerationStructureUsagePreferFastIntersection;
+		}
+	}
 	return usage;
 }
 
@@ -2448,7 +2454,9 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<
 	info->accel = accel;
 	info->descriptor = NS::RetainPtr((MTL::AccelerationStructureDescriptor *)desc.get());
 	info->geometry_descriptors = garray;
-	info->scratch_size = (uint32_t)sizes.buildScratchBufferSize;
+	// One scratch buffer serves the build and the refits that follow it.
+	info->scratch_size = (uint32_t)MAX(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize);
+	info->refittable = p_flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 
 	blas_registry.insert(accel.get());
 	_track_resource(accel.get());
@@ -3097,14 +3105,24 @@ void RenderingDeviceDriverMetal::encode_imported_resources(MTL::ComputeCommandEn
 void RenderingDeviceDriverMetal::_track_resource(MTL::Resource *p_resource) {
 	if (main_residency_set) {
 		main_residency_set->addAllocation(p_resource);
-		main_residency_set->commit();
+		residency_dirty = true;
 	}
 }
 
 void RenderingDeviceDriverMetal::_untrack_resource(MTL::Resource *p_resource) {
 	if (main_residency_set) {
 		main_residency_set->removeAllocation(p_resource);
+		residency_dirty = true;
+	}
+}
+
+// Before command buffers are committed: the allocations added or removed
+// since the last submission become resident (or stop being) for the
+// command buffers that follow on the queue.
+void RenderingDeviceDriverMetal::_commit_residency() {
+	if (main_residency_set && residency_dirty) {
 		main_residency_set->commit();
+		residency_dirty = false;
 	}
 }
 

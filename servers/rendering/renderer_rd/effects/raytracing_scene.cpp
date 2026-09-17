@@ -239,7 +239,34 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 	if (geometries.is_empty()) {
 		return;
 	}
-	r_entry.blas = RD::get_singleton()->blas_create(geometries, 0);
+	// A static mesh is built once and traced for the rest of its life: the
+	// fast-trace hint. A skinned or blend-shaped instance is rebuilt every
+	// frame over its decoded vertices: refittable, and built fast.
+	r_entry.blas = RD::get_singleton()->blas_create(geometries, p_mesh_instance.is_valid() ? _deforming_blas_flags() : _static_blas_flags());
+}
+
+// The acceleration structure usage hints (Apple's WWDC22 list: refit for
+// deforming meshes, fast-build for per-frame rebuilds, fast-intersection for
+// the rest). GODOT_RT_AS_USAGE=0 restores the hint-less structures of before
+// 2026-09-17 for an A/B.
+BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_static_blas_flags() {
+	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	return hints ? BitField<RD::AccelerationStructureFlagBits>(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT) : BitField<RD::AccelerationStructureFlagBits>();
+}
+
+BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_deforming_blas_flags() {
+	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	BitField<RD::AccelerationStructureFlagBits> flags;
+	if (hints) {
+		flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		flags.set_flag(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+	}
+	return flags;
+}
+
+BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_rebuilt_flags() {
+	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	return hints ? BitField<RD::AccelerationStructureFlagBits>(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT) : BitField<RD::AccelerationStructureFlagBits>();
 }
 
 void RaytracingScene::_free_particles_blas(ParticlesBlas &p_entry) {
@@ -318,7 +345,9 @@ RaytracingScene::ParticlesBlas *RaytracingScene::_resolve_particles_blas(RID p_p
 		geometry.vertex_stride = sizeof(float) * 3;
 		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 		geometry.vertex_count = soup_vertices;
-		new_entry.blas = rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), 0);
+		// Particles change count every frame: a rebuild, built fast (a refit
+		// needs the same triangles).
+		new_entry.blas = rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), _rebuilt_flags());
 		entry = &particles_blas_cache.insert(p_particles, new_entry)->value;
 	}
 
@@ -978,6 +1007,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 		}
 	}
 
+	tlas_instance_count = as_instances.size();
 	if (as_instances.is_empty()) {
 		return false;
 	}
@@ -987,7 +1017,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			rd->free_rid(tlas);
 		}
 		tlas_capacity = MAX(16u, Math::next_power_of_2(as_instances.size()));
-		tlas = rd->tlas_create(tlas_capacity, 0);
+		tlas = rd->tlas_create(tlas_capacity, _rebuilt_flags()); // Rebuilt every frame.
 		ERR_FAIL_COND_V(tlas.is_null(), false);
 	}
 
@@ -1294,4 +1324,14 @@ void RaytracingScene::_unpack_hit_geometry(MeshBlas &r_entry) {
 	rd->compute_list_end();
 	rd->draw_command_end_label();
 	r_entry.unpacked = true;
+}
+
+uint32_t RaytracingScene::get_blas_count() const {
+	uint32_t n = 0;
+	for (const KeyValue<RID, LocalVector<MeshBlas>> &E : blas_cache) {
+		n += E.value.size();
+	}
+	n += skinned_blas_cache.size();
+	n += particles_blas_cache.size();
+	return n;
 }

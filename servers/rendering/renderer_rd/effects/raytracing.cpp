@@ -1836,7 +1836,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// shader, cascades, probes, sky), counted in the calibration buffer and
 	// printed every sixty frames, with the hit shader's and the cards' own
 	// bounce sources alongside.
-	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
+	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT") || OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT");
 	if (tier_stats) {
 		params.flags |= 262144; // FLAG_TIER_STATS
 	}
@@ -2649,7 +2649,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 	}
 	rd->draw_command_end_label();
 
-	static const bool debug_counts = OS::get_singleton()->has_environment("RT_HIT_DEBUG") || OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
+	static const bool debug_counts = OS::get_singleton()->has_environment("RT_HIT_DEBUG") || OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT") || OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT");
 	if (debug_counts && (scene.get_frame() % 60) == 0) {
 		rd->buffer_get_data_async(hit_counts, callable_mp_static(&Raytracing::_hit_counts_readback), 0, (HIT_MAX_MATERIALS + 20) * sizeof(uint32_t));
 	}
@@ -2829,6 +2829,30 @@ bool Raytracing::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_ren
 	return true;
 }
 
+float Raytracing::last_tier_share[7] = {};
+uint32_t Raytracing::last_tier_rays = 0;
+uint32_t Raytracing::last_hit_appended = 0;
+uint32_t Raytracing::last_hit_slots = 0;
+
+// The RT STATE scale line (GODOT_RT_STATE_PRINT, every sixty frames): the
+// frame's structures and budgets as numbers a harness can diff between two
+// binaries, the way the pass timings are. Where a level stands against the
+// stack's fixed sizes: BLASes and TLAS instances, the packets the gather
+// handed the hit shader and the material slots they span, which tier
+// answered the gather's rays, and how the card atlas took the level's sets.
+String Raytracing::get_state_scale_line() const {
+	String line = vformat("RT STATE scale: blas %d tlas %d hit_packets %d hit_slots %d gather_rays %d", scene.get_blas_count(), scene.get_tlas_instance_count(), last_hit_appended, last_hit_slots, last_tier_rays);
+	const char *tiers[7] = { "screen", "card", "hit", "cascade", "probe", "sky", "none" };
+	for (int i = 0; i < 7; i++) {
+		line += vformat(" tier_%s %.1f", tiers[i], last_tier_share[i]);
+	}
+	if (surface_cache) {
+		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
+		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used);
+	}
+	return line;
+}
+
 void Raytracing::_hit_counts_readback(const Vector<uint8_t> &p_data) {
 	if (p_data.size() < int((HIT_MAX_MATERIALS + 2) * sizeof(uint32_t))) {
 		return;
@@ -2842,6 +2866,8 @@ void Raytracing::_hit_counts_readback(const Vector<uint8_t> &p_data) {
 			in_slots += counts[i];
 		}
 	}
+	last_hit_appended = counts[HIT_MAX_MATERIALS];
+	last_hit_slots = slots_used;
 	if (OS::get_singleton()->has_environment("RT_HIT_DEBUG")) {
 		print_line(vformat("RT_HIT_DEBUG appended=%d overflow=%d in_slots=%d materials=%d", counts[HIT_MAX_MATERIALS], counts[HIT_MAX_MATERIALS + 1], in_slots, slots_used));
 	}
@@ -2882,7 +2908,12 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 	const char *names[7] = { "screen", "card", "hit-shaded", "cascade", "probe", "sky", "none" };
 	String line = vformat("RT_GI_TIERS gather: %d rays", int(n));
 	for (int i = 0; i < 7; i++) {
-		line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], n > 0.0 ? 100.0 * t[i] / n : 0.0, l > 0.0 ? 100.0 * t[8 + i] / l : 0.0);
+		last_tier_share[i] = n > 0.0 ? float(100.0 * t[i] / n) : 0.0f;
+		line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], last_tier_share[i], l > 0.0 ? 100.0 * t[8 + i] / l : 0.0);
+	}
+	last_tier_rays = uint32_t(n);
+	if (!OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT")) {
+		return; // The scale line carries the shares.
 	}
 	// Slot 7: the pixels whose gather came out non-finite and were zeroed
 	// (a NaN anywhere in the ray tiers; the growing-black-voids guard).

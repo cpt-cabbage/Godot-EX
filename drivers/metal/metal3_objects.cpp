@@ -51,7 +51,6 @@
 #include "metal3_objects.h"
 
 #include "core/os/os.h"
-
 #include "drivers/metal/metal_utils.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_device_driver_metal3.h"
@@ -600,7 +599,12 @@ void MDCommandBuffer::build_blas(RDD::AccelerationStructureID p_accel, RDD::Buff
 	const RDM::BufferInfo *scratch = (const RDM::BufferInfo *)(p_scratch.id);
 
 	MTL::AccelerationStructureCommandEncoder *enc = _ensure_accel_encoder();
-	enc->buildAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), scratch->buffer.get(), 0);
+	if (as_info->refittable && as_info->built) {
+		enc->refitAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), as_info->accel.get(), scratch->buffer.get(), 0);
+	} else {
+		enc->buildAccelerationStructure(as_info->accel.get(), as_info->descriptor.get(), scratch->buffer.get(), 0);
+		as_info->built = true;
+	}
 }
 
 void MDCommandBuffer::build_tlas(RDD::AccelerationStructureID p_accel, RDD::BufferID p_scratch, RDD::BufferID p_instances, uint32_t p_instance_offset, uint32_t p_instance_count) {

@@ -1501,3 +1501,29 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		}
 	}
 }
+
+SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
+	ScaleStats st;
+	double texels = 0.0;
+	for (const CardSet &set : sets) {
+		if (!set.in_use) {
+			continue;
+		}
+		st.sets++;
+		if (set.captured) {
+			st.captured++;
+		}
+		if (set.size == 0) {
+			st.no_room++;
+		} else if (set.size < set.wanted_size) {
+			st.shrunk++;
+		}
+		for (int k = 0; k < CARDS_PER_SET; k++) {
+			texels += double(set.dims[k].x) * double(set.dims[k].y);
+		}
+	}
+	st.pages = pages.size();
+	st.pages_used = pages.size() - free_pages.size();
+	st.texels_used = float(texels / (double(settings.atlas_size) * double(settings.atlas_size)));
+	return st;
+}

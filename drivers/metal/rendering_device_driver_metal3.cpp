@@ -84,6 +84,25 @@ Error RenderingDeviceDriverMetal::_create_device() {
 	ERR_FAIL_NULL_V(device_queue.get(), ERR_CANT_CREATE);
 	device_queue->setLabel(MTLSTR("Godot Main Command Queue"));
 
+	// The queue's residency set, which every BLAS joins on create (see
+	// blas_residency_is_implicit). GODOT_RT_RESIDENCY=0 leaves it out, so
+	// the encoders fall back to marking each live BLAS resident by hand.
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+		if (OS::get_singleton()->get_environment("GODOT_RT_RESIDENCY") != "0") {
+			MTL::ResidencySetDescriptor *desc = MTL::ResidencySetDescriptor::alloc()->init();
+			desc->setInitialCapacity(1024);
+			desc->setLabel(MTLSTR("Godot Main Residency Set"));
+			NS::Error *error = nullptr;
+			main_residency_set = NS::TransferPtr(device->newResidencySet(desc, &error));
+			desc->release();
+			if (main_residency_set) {
+				device_queue->addResidencySet(main_residency_set.get());
+			} else {
+				WARN_PRINT(vformat("Metal: residency set unavailable (%s); BLASes are marked resident per encoder.", error ? String::utf8(error->localizedDescription()->utf8String()) : String("no error")));
+			}
+		}
+	}
+
 	return OK;
 }
 
@@ -109,9 +128,15 @@ Error RenderingDeviceDriverMetal::initialize(uint32_t p_device_index, uint32_t p
 #pragma mark - Residency
 
 void RenderingDeviceDriverMetal::add_residency_set_to_main_queue(MTL::ResidencySet *p_set) {
+	if (p_set) {
+		device_queue->addResidencySet(p_set);
+	}
 }
 
 void RenderingDeviceDriverMetal::remove_residency_set_to_main_queue(MTL::ResidencySet *p_set) {
+	if (p_set) {
+		device_queue->removeResidencySet(p_set);
+	}
 }
 
 #pragma mark - Fences
@@ -159,6 +184,7 @@ Error RenderingDeviceDriverMetal::_execute_and_present_barriers(CommandQueueID p
 	if (size == 0) {
 		return OK;
 	}
+	_commit_residency();
 
 	if (p_wait_sem.size() > 0) {
 		MTL::CommandBuffer *cb = device_queue->commandBuffer();
@@ -212,6 +238,7 @@ Error RenderingDeviceDriverMetal::_execute_and_present(CommandQueueID p_cmd_queu
 	if (size == 0) {
 		return OK;
 	}
+	_commit_residency();
 
 	for (uint32_t i = 0; i < size - 1; i++) {
 		MDCommandBuffer *cmd_buffer = (MDCommandBuffer *)(p_cmd_buffers[i].id);

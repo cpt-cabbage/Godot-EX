@@ -645,6 +645,11 @@ private:
 
 	static void _tier_stats_readback(const Vector<uint8_t> &p_data); // GODOT_GI_TIER_PRINT: the gather's tier counts.
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 and GODOT_GI_TIER_PRINT print the frame's packet counts.
+	// The last readbacks, for the RT STATE scale line.
+	static float last_tier_share[7];
+	static uint32_t last_tier_rays;
+	static uint32_t last_hit_appended;
+	static uint32_t last_hit_slots;
 	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
 
 public:
@@ -871,6 +876,8 @@ public:
 	// process_rt_gi() lights and reads it.
 	void set_surface_cache_enabled(bool p_enabled, const SurfaceCache::Settings &p_settings, bool p_mirror_reflections);
 	SurfaceCache *get_surface_cache() const { return surface_cache; }
+	// GODOT_RT_STATE_PRINT's scale line: the frame's counts (see the definition).
+	String get_state_scale_line() const;
 
 	// Lights the surface cache for this frame; call before process_rt_gi.
 	void update_surface_cache_lighting(const Transform3D &p_world_from_view, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, uint32_t p_directional_light_count, float p_ray_bias, float p_light_radius, const GiCascades &p_cascades, const GiSky &p_sky);

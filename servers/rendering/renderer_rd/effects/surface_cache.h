@@ -498,6 +498,20 @@ public:
 	Vector3 get_grid_origin() const { return last_grid_origin; }
 	float get_grid_cell() const { return last_grid_cell; }
 	uint32_t get_set_count() const { return sets.size(); }
+	// The atlas at level scale (the RT STATE scale line): sets in use, of
+	// which captured, given a smaller edge than they asked for, and left
+	// without room at all; atlas pages taken and the share of texels the
+	// cards cover.
+	struct ScaleStats {
+		uint32_t sets = 0;
+		uint32_t captured = 0;
+		uint32_t shrunk = 0;
+		uint32_t no_room = 0;
+		uint32_t pages_used = 0;
+		uint32_t pages = 0;
+		float texels_used = 0.0f; // Of the atlas, 0..1.
+	};
+	ScaleStats get_scale_stats() const;
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
 	bool is_ready() const { return sets_buffer.is_valid() && instances_buffer.is_valid(); }
 

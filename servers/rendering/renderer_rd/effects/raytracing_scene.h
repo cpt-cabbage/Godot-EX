@@ -201,10 +201,14 @@ private:
 	uint32_t tlas_capacity = 0;
 
 	uint32_t frame = 0; // Counts update() calls: the surface cache's clock.
+	uint32_t tlas_instance_count = 0;
 	uint32_t alpha_tested_instances = 0; // TLAS instances flagged non-opaque this frame (see update).
 
 	RID _decode_compressed_positions(RID p_source_buffer, uint32_t p_vertex_count, const AABB &p_aabb, RID p_reuse_buffer = RID());
 	void _create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint32_t p_surface_mask, RID p_mesh_instance = RID());
+	static BitField<RD::AccelerationStructureFlagBits> _static_blas_flags();
+	static BitField<RD::AccelerationStructureFlagBits> _deforming_blas_flags();
+	static BitField<RD::AccelerationStructureFlagBits> _rebuilt_flags();
 	// Finds (or creates) the cached BLAS variant for a mesh + surface mask,
 	// healing stale cache entries whose buffers were freed behind our back.
 	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
@@ -304,6 +308,10 @@ public:
 	RID get_tlas() const { return tlas; }
 	uint32_t get_frame() const { return frame; }
 	uint32_t get_alpha_tested_instances() const { return alpha_tested_instances; }
+	// The scale of the frame's structures (the RT STATE scale line): live
+	// BLASes across the three caches, and the instances the last TLAS held.
+	uint32_t get_blas_count() const;
+	uint32_t get_tlas_instance_count() const { return tlas_instance_count; }
 
 	// The hit shading's inputs, as update() left them: the geometry records
 	// and the pools they index, the per-geometry material slot table, and the

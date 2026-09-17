@@ -3346,6 +3346,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					last_state = state;
 					_rt_state_out("RT STATE frame: " + state);
 				}
+				// The scale counts every sixty frames (the readbacks behind them
+				// land on the same period); a harness reads the last one.
+				static uint64_t state_frames = 0;
+				if ((state_frames++ % 60) == 59) {
+					_rt_state_out(raytracing->get_state_scale_line());
+				}
 			}
 		}
 	}

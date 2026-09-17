@@ -158,7 +158,16 @@ protected:
 	GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability")
 	virtual void add_residency_set_to_main_queue(MTL::ResidencySet *p_set) = 0;
 	virtual void remove_residency_set_to_main_queue(MTL::ResidencySet *p_set) = 0;
+	// The queue's own residency set (macOS 15+): every BLAS joins it on
+	// create, so a TLAS build or a dispatch binding the TLAS need not mark
+	// each live BLAS resident by hand. On the TPS level that loop was 529
+	// useResource calls per TLAS-binding dispatch, once per material dispatch
+	// in hit shading. Additions are committed once per submission
+	// (_commit_residency), not per allocation: a level load creates
+	// hundreds of BLASes in a frame.
 	NS::SharedPtr<MTL::ResidencySet> main_residency_set;
+	bool residency_dirty = false;
+	void _commit_residency();
 	GODOT_CLANG_WARNING_POP
 
 	SyncMode sync_mode = Barriers;
@@ -500,6 +509,12 @@ public:
 		NS::SharedPtr<MTL::Buffer> instance_count_buffer; // TLAS only; 4-byte shared buffer holding the instance count for the indirect build.
 		uint32_t scratch_size = 0;
 		bool is_tlas = false;
+		// Created with ALLOW_UPDATE: after the first build, a build command
+		// refits the structure in place over its (rewritten) vertex buffers
+		// instead of rebuilding it (a deforming mesh's triangle count does not
+		// change; Apple measures refit at ~38% of a build).
+		bool refittable = false;
+		bool built = false;
 	};
 
 private:
@@ -510,9 +525,10 @@ private:
 public:
 	const HashSet<MTL::AccelerationStructure *> &get_blas_registry() const { return blas_registry; }
 
-	// Under barriers every BLAS joins the queue's residency set on create
-	// (_track_resource), so encoders can skip the O(live BLASes) useResource
-	// loops. BLASes are not heap allocated, so useHeaps() never covers them.
+	// Every BLAS joins the queue's residency set on create (_track_resource),
+	// so encoders can skip the O(live BLASes) useResource loops. BLASes are
+	// not heap allocated, so useHeaps() never covers them. GODOT_RT_RESIDENCY=0
+	// keeps the loops (the pre-2026-09-17 behavior) for an A/B.
 	bool blas_residency_is_implicit() const { return main_residency_set.get() != nullptr; }
 
 private:
@@ -520,7 +536,6 @@ private:
 	void _untrack_resource(MTL::Resource *p_resource);
 
 public:
-
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
