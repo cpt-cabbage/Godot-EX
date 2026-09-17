@@ -70,13 +70,14 @@ void main() {
 	float visibility;
 
 #ifdef MODE_AREA
-	// Sample the light's rectangle with jittered points, stratified over a
-	// 2x2 grid: samples past the fourth wrap onto the same four cells (fract),
-	// so rays_per_pixel above 4 adds samples but no finer stratification.
+	// Sample the light's rectangle along the R2 sequence (Roberts' additive
+	// recurrence, the 2D golden ratio), rotated per pixel and frame by the
+	// noise: well spread for any sample count, where the 2x2 grid it
+	// replaced wrapped samples past the fourth onto the same four cells, so
+	// rays_per_pixel above 4 added samples but no finer stratification.
 	uint hits = 0u;
 	for (uint s = 0u; s < SOFT_SHADOW_SAMPLES; s++) {
-		vec2 strat = vec2(float(s % 2u), float(s / 2u)) * 0.5;
-		vec2 jitter = fract(vec2(noise, noise * 1.6180339887) + strat + vec2(0.25));
+		vec2 jitter = fract(vec2(noise, noise * 1.6180339887) + float(s) * vec2(0.7548776662, 0.5698402910));
 		vec3 target = params.light_pos.xyz + params.axis_u.xyz * (jitter.x - 0.5) + params.axis_v.xyz * (jitter.y - 0.5);
 		vec3 delta = target - world.xyz;
 		float dist = length(delta);
