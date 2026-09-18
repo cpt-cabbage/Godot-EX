@@ -3542,7 +3542,7 @@
 			Sets the window the cache's bounce light and its shadow-visibility ratio are averaged over: twice this many relights, capped at 64. Higher is smoother and slower to follow lighting changes. Free.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/texels_per_meter" type="float" setter="" getter="" default="16.0">
-			Resolution of the cached surfaces near the camera. Sets how sharp bounce light and reflections of the cache are; doubling it costs four times the texels.
+			Resolution of the cached surfaces near the camera. Sets how sharp bounce light and reflections of the cache are; doubling it costs four times the texels. A level whose surfaces do not fit the atlas at this density is cached at a lower one, every surface by the same factor (halved until it fits, from an estimate at load), and a sixteenth of the atlas is kept for the smallest cards so every surface has one: raise [member rendering/ray_tracing/surface_cache/quality/atlas_size] to keep the density on large levels.
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

@@ -282,6 +282,17 @@ bool SurfaceCache::_alloc_slot(uint32_t p_size_class, Slot &r_slot) {
 	uint32_t slots_per_side = 1u << p_size_class;
 	uint32_t slot_count = slots_per_side * slots_per_side;
 	if (avail.is_empty()) {
+		// The last pages are the smallest cards': a set that finds no room at
+		// its size halves down to the smallest, and once the atlas is full
+		// of larger cards that too found nothing -- 466 of the TPS bridge's
+		// 1048 sets had no card at 2048, and 84% of the gather's rays went to
+		// the hit shader for it (section 77). A page of the smallest class
+		// holds 64 cards; a sixteenth of the atlas holds the smallest cards
+		// of some 680 sets.
+		const uint32_t reserve = MAX(pages.size() / 16u, 1u);
+		if (free_pages.size() <= reserve && p_size_class != _size_class_for(settings.min_card_size)) {
+			return false;
+		}
 		if (free_pages.is_empty()) {
 			return false;
 		}
@@ -316,6 +327,10 @@ bool SurfaceCache::_alloc_slot(uint32_t p_size_class, Slot &r_slot) {
 // free pool and marked as the block's.
 bool SurfaceCache::_alloc_block(uint32_t p_run_x, uint32_t p_run_y, Slot &r_slot) {
 	if (p_run_x > pages_per_row || p_run_y > pages_per_row) {
+		return false;
+	}
+	// The smallest cards' reserve (see _alloc_slot).
+	if (free_pages.size() <= MAX(pages.size() / 16u, 1u) + p_run_x * p_run_y) {
 		return false;
 	}
 	for (uint32_t py = 0; py + p_run_y <= pages_per_row; py++) {
@@ -468,7 +483,7 @@ void SurfaceCache::begin_frame(uint32_t p_frame, const Vector3 &p_camera_positio
 // travelled far and land coarsely anyway; what its full density costs is
 // atlas room, which is what fills up in a furnished level at 2048.
 uint32_t SurfaceCache::_wanted_size(float p_world_extent, float p_distance) const {
-	float density = settings.texels_per_meter;
+	float density = settings.texels_per_meter * density_scale;
 	if (settings.density_distance > 0.0f && p_distance > settings.density_distance) {
 		density *= settings.density_distance / p_distance;
 	}
@@ -571,7 +586,16 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		// extents. When the atlas has no room at this size, a smaller card is
 		// worth more than none: the edge halves down to the smallest before
 		// the instance falls back to the coarse cache at hits.
-		if (size != s->size || d_box_changed) {
+		if (density_scale_frame == 0) {
+			// The first frame registers the sets and end_frame estimates the
+			// density every set is asked at from what they asked for; the
+			// slots are allocated from the next frame at that density (an
+			// allocation at full density first cost a recapture wave).
+			s->local_aabb = local_aabb;
+			s->wanted_size = size;
+			s->size = 0;
+			needs_capture = false;
+		} else if (size != s->size || d_box_changed) {
 			_free_set_slots(*s);
 			s->local_aabb = local_aabb;
 			bool ok = false;
@@ -651,6 +675,60 @@ uint32_t SurfaceCache::add_instance_record(uint32_t p_set, const Transform3D &p_
 
 void SurfaceCache::end_frame() {
 	RD *rd = RD::get_singleton();
+
+	// The density controller (density_scale): once per round-robin period.
+	// The sets follow a new scale as their own resize period allows, so the
+	// atlas empties or fills over a few periods and the scale settles where
+	// everything fits. GODOT_CARD_DENSITY_SCALE=<fraction> pins it.
+	// A change is judged only once the captures it caused are done (a
+	// halving every period while the sets were still recapturing ran the
+	// scale down to a sixteenth on the bridge and the atlas three quarters
+	// empty), and a halving only when the atlas is in fact full.
+	static const float pinned = OS::get_singleton()->get_environment("GODOT_CARD_DENSITY_SCALE").to_float();
+	if (density_scale_frame == 0 && !sets.is_empty() && frame >= 2) {
+		// The first estimate, before the captures: what every set asked for
+		// at full density against three quarters of the atlas, the scale the
+		// nearest power of two under the square root of the ratio (a set's
+		// texels go as the square of its edge). Stepping down from full
+		// density took the bridge two recapture waves and 250 frames.
+		density_scale_frame = frame;
+		double wanted = 0.0;
+		for (const CardSet &set : sets) {
+			if (set.in_use && set.wanted_size > 0) {
+				wanted += 6.0 * double(set.wanted_size) * double(set.wanted_size);
+			}
+		}
+		// Half the atlas: the square slots of thin cards and the page classes
+		// leave a quarter of it unusable, and the estimate must hold without
+		// a second step (each step is a recapture wave the screen sees).
+		const double capacity = 0.5 * double(settings.atlas_size) * double(settings.atlas_size);
+		float estimate = wanted > capacity ? float(Math::sqrt(capacity / wanted)) : 1.0f;
+		float scale = 1.0f;
+		while (scale > estimate && scale > 1.0f / 16.0f) {
+			scale *= 0.5f;
+		}
+		density_scale = pinned > 0.0f ? CLAMP(pinned, 1.0f / 16.0f, 1.0f) : scale;
+	} else if (frame - density_scale_frame >= 8 * settings.round_robin_period && !sets.is_empty() && pending_captures.is_empty()) {
+		// Rarely after that (a recapture wave is a visible transition), and
+		// only for a set left without any card, or an atlas mostly empty.
+		density_scale_frame = frame;
+		if (pinned > 0.0f) {
+			density_scale = CLAMP(pinned, 1.0f / 16.0f, 1.0f);
+		} else {
+			uint32_t no_room = 0;
+			for (const CardSet &set : sets) {
+				if (set.in_use && set.size == 0) {
+					no_room++;
+				}
+			}
+			const float free_fraction = pages.is_empty() ? 1.0f : float(free_pages.size()) / float(pages.size());
+			if (no_room > 0 && free_fraction < 0.1f) {
+				density_scale = MAX(density_scale * 0.5f, 1.0f / 16.0f);
+			} else if (free_fraction > 0.7f && density_scale < 1.0f) {
+				density_scale = MIN(density_scale * 2.0f, 1.0f);
+			}
+		}
+	}
 
 	// Sets whose instance did not come through this frame are gone (hidden or
 	// freed; the pointer may be reused, so nothing is kept for it).
@@ -1582,6 +1660,7 @@ SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	st.relit_blocks = last_items;
 	st.pending_blocks = last_pending;
 	st.period = last_period;
+	st.density_scale = density_scale;
 	double texels = 0.0;
 	for (const CardSet &set : sets) {
 		if (!set.in_use) {

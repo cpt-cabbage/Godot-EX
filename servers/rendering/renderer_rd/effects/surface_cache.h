@@ -205,6 +205,13 @@ private:
 	LocalVector<LocalVector<uint32_t>> pages_by_class; // Pages with free slots, per class.
 	LocalVector<uint32_t> free_pages;
 	uint32_t pages_per_row = 0;
+	// The density every set is asked at, as a fraction of texels_per_meter:
+	// halved when the atlas overflows (a set shrunk below what it asked, or
+	// without room), doubled back when it stands mostly empty, once per
+	// round-robin period, so a level that does not fit degrades the same
+	// everywhere instead of first come first served (section 78).
+	float density_scale = 1.0f;
+	uint32_t density_scale_frame = 0;
 	bool atlas_full_warned = false;
 	bool atlas_degraded_warned = false;
 
@@ -543,6 +550,7 @@ public:
 		uint32_t relit_blocks = 0;
 		uint32_t pending_blocks = 0; // Requested blocks that frame, and the turn period they set.
 		uint32_t period = 0;
+		float density_scale = 1.0f;
 	};
 	ScaleStats get_scale_stats() const;
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
