@@ -43,7 +43,8 @@ layout(set = 0, binding = 2, std430) restrict buffer Active {
 	uint item_count;
 	uint pending; // The requested blocks this frame, their turn or not.
 	uint period; // Frames between two relights of a requested tile (from last frame's pending over the cap).
-	uint pad[3];
+	uint item_count_full; // The whole-set pass's items (mode 1), counted apart; the cull pass folds them into item_count.
+	uint pad[2];
 	uint list[SURFACE_CACHE_MAX_SETS];
 	uint items[];
 }
@@ -192,13 +193,35 @@ void main() {
 
 // Whether the item made the list: past the cap it is dropped, and a
 // dropped block is not relit, so its tile keeps its stamps and its request.
+// The two passes count apart: the requested tiles' pass counted its dropped
+// items too, so when they overran their three quarters the whole-set pass
+// began past the cap and dropped everything, and the lighting dispatch,
+// sized by the count, ran the slots between the cap and the count on
+// whatever items an earlier frame had left there -- tiles relit without a
+// listing, so their stamps named a relight that was not the record's, and
+// the bounce gradient re-traced another frame's ray: about 300 false
+// restarts a frame on the TPS bridge at rest, spreading into a third of
+// the screen's history (2026-09-18). The whole-set pass's items go after
+// the requested ones actually stored (a compare-and-swap cap on one
+// counter did the same for +0.35 ms of contention).
 bool emit_item(uint entry, uint card, uint block) {
-	uint idx = atomicAdd(active_sets.item_count, 1u);
-	if (idx < (push.mode == 0u ? requests_cap() : push.max_items)) {
-		active_sets.items[idx] = entry | (card << 16u) | (block << 19u);
-		return true;
+	uint item;
+	if (push.mode == 0u) {
+		uint idx = atomicAdd(active_sets.item_count, 1u);
+		if (idx >= requests_cap()) {
+			return false;
+		}
+		item = idx;
+	} else {
+		uint base = min(active_sets.item_count, requests_cap());
+		uint idx = atomicAdd(active_sets.item_count_full, 1u);
+		if (base + idx >= push.max_items) {
+			return false;
+		}
+		item = base + idx;
 	}
-	return false;
+	active_sets.items[item] = entry | (card << 16u) | (block << 19u);
+	return true;
 }
 
 uint tile_stamp_index(uint packed, uvec2 block, uint tile) {
@@ -332,7 +355,7 @@ void main() {
 	uint entry = gl_WorkGroupID.x;
 	uint count = min(active_sets.count, SURFACE_CACHE_MAX_SETS);
 	if (entry == 0u && gl_LocalInvocationID.x == 0u) {
-		uint items = min(active_sets.item_count, push.max_items);
+		uint items = min(min(active_sets.item_count, requests_cap()) + active_sets.item_count_full, push.max_items);
 		active_sets.item_count = items;
 		dispatch_args.x = items;
 		dispatch_args.y = 1u;
@@ -347,7 +370,14 @@ void main() {
 	if (entry >= count) {
 		return;
 	}
-	CardSet s = sets.data[active_sets.list[entry]];
+	// The set's own light list (by the set, not its place in the frame's
+	// list), the full-relight bit masked off: read as an index it named a
+	// record far past the buffer, and every set relit in full (a fresh
+	// capture, the round robin) was lit from a garbage box's list -- a
+	// static term that changed at every such relight, marked as a light
+	// change, and restarted the screen's history under it (2026-09-18).
+	uint set = active_sets.list[entry] & ~ACTIVE_FULL;
+	CardSet s = sets.data[set];
 	vec3 box_min = s.world_aabb_min;
 	vec3 box_max = s.world_aabb_min + s.world_aabb_size;
 	uint total = push.omni_light_count + push.spot_light_count;
@@ -367,7 +397,7 @@ void main() {
 	}
 	barrier();
 	uint n = min(found_count, MAX_LIGHTS_PER_SET);
-	uint base = entry * (1u + MAX_LIGHTS_PER_SET);
+	uint base = set * (1u + MAX_LIGHTS_PER_SET);
 	if (gl_LocalInvocationID.x == 0u) {
 		set_lights.data[base] = n;
 	}

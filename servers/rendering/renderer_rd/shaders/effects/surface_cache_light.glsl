@@ -47,7 +47,8 @@ layout(set = 0, binding = 2, std430) restrict readonly buffer Active {
 	uint item_count;
 	uint pending;
 	uint period;
-	uint pad[3];
+	uint item_count_full;
+	uint pad[2];
 	uint list[SURFACE_CACHE_MAX_SETS];
 	uint items[];
 }
@@ -351,8 +352,19 @@ layout(set = 0, binding = 35, std430) restrict buffer Converge {
 	uint up;
 	uint down;
 	uint gradient_t[8]; // Diagnostics (gradset): the bounce gradient's verdicts: same / near / far / another set, then the other-set ones by their distance: same / near / far.
+	// Diagnostics (GODOT_CARD_CHANGE_PRINT): of the texels relit this frame
+	// with a change mark over 0.05, which term set it (CHANGE_SRC_*), and
+	// in [7] the texels reset.
+	uint change_src[8];
 }
 converge;
+#define CHANGE_SRC_STATIC 0u // The static lights' unshadowed term moved.
+#define CHANGE_SRC_DYN 1u // The dynamic lights' direct term moved.
+#define CHANGE_SRC_HIT 2u // The bounce ray's hit carried a change.
+#define CHANGE_SRC_GRADIENT 3u // The re-traced bounce ray hit at another distance.
+#define CHANGE_SRC_SPREAD 4u // A neighbour's mark.
+#define CHANGE_SRC_PREV 5u // The texel's own mark, fading.
+#define CHANGE_SRC_GEOM 6u // The local lights' geometric sum moved (not a mark; counted when over 0.02).
 #define PROJ_TABLE_N 16u
 #define PROJ_TABLE_FLOATS 528u
 
@@ -861,8 +873,8 @@ bool occluded_opaque(vec3 origin, vec3 dir, float t_max) {
 // The local lights that reach a point: its cell of the world light grid
 // (every light that reaches it), or the set's list (the first 32
 // overlapping its box) where the grid is off or the point lies outside it.
-void light_list(uint entry, vec3 world_pos, out uint r_base, out uint r_count, out bool r_from_grid) {
-	r_base = entry * (1u + MAX_LIGHTS_PER_SET);
+void light_list(uint set, vec3 world_pos, out uint r_base, out uint r_count, out bool r_from_grid) {
+	r_base = set * (1u + MAX_LIGHTS_PER_SET);
 	r_count = min(set_lights.data[r_base], MAX_LIGHTS_PER_SET);
 	r_from_grid = false;
 	if (bool(params.flags & FLAG_GRID)) {
@@ -1027,7 +1039,7 @@ struct ImageCache {
 	uint sel_mask;
 };
 
-void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
+void shade_images(uint set, Texel t, inout uint seed, out ImageCache c) {
 	c.valid = true;
 	c.sum = vec3(0.0);
 	c.geom = 0.0;
@@ -1048,7 +1060,7 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 	uint base;
 	uint light_count;
 	bool from_grid;
-	light_list(entry, t.world_pos, base, light_count, from_grid);
+	light_list(set, t.world_pos, base, light_count, from_grid);
 	for (uint j = 0u; j < light_count; j++) {
 		bool is_spot;
 		LightData ld = light_at(base, j, from_grid, is_spot);
@@ -1145,7 +1157,7 @@ void shade_images(uint entry, Texel t, inout uint seed, out ImageCache c) {
 	}
 }
 
-void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images, out Direct d) {
+void shade_direct(uint set, Texel t, inout uint seed, inout ImageCache images, out Direct d) {
 	vec3 direct = vec3(0.0);
 	vec3 direct_unshadowed = vec3(0.0);
 	d.local_geom = 0.0;
@@ -1183,7 +1195,7 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 	uint base;
 	uint light_count;
 	bool from_grid;
-	light_list(entry, t.world_pos, base, light_count, from_grid);
+	light_list(set, t.world_pos, base, light_count, from_grid);
 	float nearest = 1.0;
 	for (uint j = 0u; j < light_count; j++) {
 		bool is_spot;
@@ -1252,7 +1264,7 @@ void shade_direct(uint entry, Texel t, inout uint seed, inout ImageCache images,
 	// image is shadowed in legs, to each mirror then to the light).
 	if (mirror_on() && (params.mirror_debug & 1u) == 0u) {
 		if (!images.valid) {
-			shade_images(entry, t, seed, images);
+			shade_images(set, t, seed, images);
 		}
 		if (images.weight_sum > 0.0) {
 			sum += images.sum;
@@ -2007,6 +2019,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn_change = max(dyn_change, params.dynamic_change);
 	}
 	float change_total = max(max(change, dyn_change), max(prev.change - mark_decay, bounce_change_total));
+	uint change_src = change_total <= 0.05 ? 8u : (change_total == change ? CHANGE_SRC_STATIC : (change_total == dyn_change ? CHANGE_SRC_DYN : (change_total == bounce_change_total ? CHANGE_SRC_HIT : CHANGE_SRC_PREV)));
 	// The change outlives the relight that found it, fading over eight: the
 	// gather's one ray per pixel lands on a given card only now and then,
 	// and a change seen for one frame would restart almost no pixel.
@@ -2031,14 +2044,31 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 			}
 		}
 		change = max(change, spread - mark_decay);
+		if (change > change_total && change > 0.05) {
+			change_src = change == bounce_gradient ? CHANGE_SRC_GRADIENT : (change == spread - mark_decay ? CHANGE_SRC_SPREAD : CHANGE_SRC_PREV);
+		}
 	}
 	change_total = max(change_total, change);
+	if ((params.flags & 4096u) != 0u) {
+		if (change_src < 8u) {
+			atomicAdd(converge.change_src[change_src], 1u);
+		}
+		if (reset) {
+			atomicAdd(converge.change_src[7], 1u);
+		}
+	}
 
 	// The geometric gradient: the local lights' geometric sum against the
 	// last relight's. Only movement (or a light appearing or vanishing) can
 	// change a texel's visibility; a colour or intensity change leaves the
 	// ratio exactly right and is not a reason to lose its history.
-	float geom_change = fresh ? 0.0 : abs(d.local_geom - prev.geom) / max(max(d.local_geom, prev.geom), 1e-6);
+	// Floored where no light to speak of reaches the texel: the stored sum
+	// is a half, and below a thousandth its rounding alone read as a move
+	// (a few hundred texels a frame at rest restarting their ratio).
+	float geom_change = fresh ? 0.0 : abs(d.local_geom - prev.geom) / max(max(d.local_geom, prev.geom), 1e-3);
+	if ((params.flags & 4096u) != 0u && geom_change > 0.02) {
+		atomicAdd(converge.change_src[CHANGE_SRC_GEOM], 1u);
+	}
 
 	// Two histories, each restarted to the frame count its gradient leaves
 	// credible (A-SVGF: alpha = max(alpha, gradient)); a small change barely
@@ -2349,7 +2379,7 @@ void main() {
 		Direct d;
 		ImageCache images;
 		images.valid = false;
-		shade_direct(entry, t, seed, images, d);
+		shade_direct(set, t, seed, images, d);
 		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, prev_seed, have_prev));
 		vec3 indirect_sample;
 		float bounce_change;
@@ -2448,7 +2478,7 @@ void main() {
 		ivec2 texel = origin_texel + quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		Direct d;
-		shade_direct(entry, t[k], seed_k, images, d);
+		shade_direct(set, t[k], seed_k, images, d);
 		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
 }

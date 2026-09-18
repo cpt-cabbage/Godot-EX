@@ -295,9 +295,9 @@ private:
 	// the bits into the lighting pass's work list (section 77).
 	static constexpr uint32_t TILE_WORDS_PER_SET = CARDS_PER_SET * ((MAX_CARD_EDGE / 16) * (MAX_CARD_EDGE / 16) / 32);
 	RID requests_buffer;
-	// count, rr_count, item_count, pending, period, pad[3], the active set
-	// list (MAX_SETS), then the work items (MAX_ITEMS): entry | card << 16 |
-	// block << 19.
+	// count, rr_count, item_count, pending, period, item_count_full, pad[2],
+	// the active set list (MAX_SETS), then the work items (MAX_ITEMS): entry |
+	// card << 16 | block << 19.
 	static constexpr uint32_t MAX_ITEMS = 65536;
 	RID active_buffer;
 	// The relight stamps: per set the relight before the last and the last

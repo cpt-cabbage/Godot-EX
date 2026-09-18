@@ -106,8 +106,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * 2) * sizeof(uint32_t));
 	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
-	converge_buffer = rd->storage_buffer_create(12 * sizeof(uint32_t));
-	rd->buffer_clear(converge_buffer, 0, 12 * sizeof(uint32_t));
+	converge_buffer = rd->storage_buffer_create(20 * sizeof(uint32_t));
+	rd->buffer_clear(converge_buffer, 0, 20 * sizeof(uint32_t));
 	set_state_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
 	rd->buffer_clear(set_state_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
@@ -934,6 +934,14 @@ void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
 	if (p_data.size() >= 48 && OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").contains("gradset")) {
 		print_line(vformat("Surface cache gradient verdicts: same %d near %d far %d other-set %d | other-set by the gap to the previous relight: 1 %d, 2-4 %d, 5-12 %d, more %d", c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11]));
 	}
+	// GODOT_CARD_CHANGE_PRINT: the relit texels' change marks by the term
+	// that set them (CHANGE_SRC_* in the shader), and the texels reset. At
+	// rest every count but the resets (tiles on their first relight) should
+	// read zero; a term that does not names what restarts the histories.
+	static const bool change_print = OS::get_singleton()->has_environment("GODOT_CARD_CHANGE_PRINT");
+	if (change_print && p_data.size() >= 80) {
+		print_line(vformat("Surface cache change: relit %d young %d | static %d dyn %d hit %d gradient %d spread %d prev %d geom %d | reset %d", c[1], c[0], c[12], c[13], c[14], c[15], c[16], c[17], c[18], c[19]));
+	}
 	converge_readback_frame = Engine::get_singleton()->get_frames_drawn();
 	// The drift, smoothed over the readbacks: one count's share swings by
 	// a few percent between frames (which sets were relit), and a settled
@@ -1300,7 +1308,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (bounce_requests) {
 		params.flags |= 8192;
 	}
-	rd->buffer_clear(converge_buffer, 0, 12 * sizeof(uint32_t));
+	rd->buffer_clear(converge_buffer, 0, 20 * sizeof(uint32_t));
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
@@ -1352,6 +1360,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	push.spot_light_count = p_inputs.spot_light_count;
 
 	rd->buffer_clear(active_buffer, 0, 4 * sizeof(uint32_t));
+	rd->buffer_clear(active_buffer, 5 * sizeof(uint32_t), sizeof(uint32_t)); // item_count_full; the period between them persists.
 
 	RID prepare_rid_select = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_SELECT);
 	RID prepare_rid_tiles = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_TILES);
@@ -1570,9 +1579,9 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		// One readback in flight; the count lands a few frames later.
 		converge_pending = true;
 		if (deterministic) {
-			_converge_readback(rd->buffer_get_data(converge_buffer, 0, 12 * sizeof(uint32_t)));
+			_converge_readback(rd->buffer_get_data(converge_buffer, 0, 20 * sizeof(uint32_t)));
 		} else {
-			rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 12 * sizeof(uint32_t));
+			rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 20 * sizeof(uint32_t));
 		}
 	}
 	// The work list's size, for the RT STATE scale line (GODOT_RT_STATE_PRINT).
