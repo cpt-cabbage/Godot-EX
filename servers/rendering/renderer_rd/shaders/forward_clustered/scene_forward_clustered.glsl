@@ -3349,7 +3349,7 @@ void fragment_shader(in SceneData scene_data) {
 	// pixel's analytic term with its own normal, which the composite after
 	// them multiplies by the upsampled visibility ratios. (Declared outside
 	// the vertex-lighting guard: the composite reads them either way.)
-	bool stochastic_pixel_analytic = implementation_data.stochastic_direct_lights == 2u;
+	bool stochastic_pixel_analytic = (implementation_data.stochastic_direct_lights & 3u) == 2u;
 	vec3 analytic_px_diffuse = vec3(0.0);
 	vec3 analytic_px_specular = vec3(0.0);
 #ifndef USE_VERTEX_LIGHTING
@@ -3570,7 +3570,7 @@ void fragment_shader(in SceneData scene_data) {
 		vec4 stochastic_spec = textureLod(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
 		direct_specular_light += stochastic_spec.rgb * (f0 + (stochastic_f90 - f0) * stochastic_spec.a) * energy_compensation;
-	} else if (implementation_data.stochastic_direct_lights >= 2u) {
+	} else if ((implementation_data.stochastic_direct_lights & 3u) >= 2u) {
 		// Half resolution buffers: depth-aware upsample. Each half-res texel
 		// stores the view depth it was lit at; weight the four nearest by
 		// bilinear distance and how well that depth matches ours, so lighting
@@ -3588,14 +3588,16 @@ void fragment_shader(in SceneData scene_data) {
 		// (2.4x the full-res frame-to-frame change with no upscaler, 8.5x
 		// under MetalFX's jitter, plan section 52). The ratios are smooth;
 		// the bumps belong to the pixel.
-		bool pixel_analytic = implementation_data.stochastic_direct_lights == 2u;
+		bool pixel_analytic = (implementation_data.stochastic_direct_lights & 3u) == 2u;
+		// The sampling grid's scale: 2, or 4 at the quarter tier (bit 2).
+		int stochastic_scale = (implementation_data.stochastic_direct_lights & 4u) != 0u ? 4 : 2;
 		//
 		// Round rather than truncate: screen_pixel_size is 1/size, and its
 		// reciprocal lands just under the integer for sizes whose inverse is
 		// not exactly representable. One pixel short here misaligns the whole
 		// grid.
 		ivec2 full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
-		ivec2 half_size = (full_size + ivec2(1)) >> 1;
+		ivec2 half_size = (full_size + ivec2(stochastic_scale - 1)) / stochastic_scale;
 		// The sampling pass lit full-res pixel 2 * p for half-res texel p, so
 		// its result describes continuous full-res coordinate 2p + 0.5 -- the
 		// center of that one pixel, not the center of the 2x2 block. Placing
@@ -3604,7 +3606,7 @@ void fragment_shader(in SceneData scene_data) {
 		// tap index. The denoised signal is smooth enough that correcting this
 		// is not visible in the scenes measured so far; it is fixed because the
 		// reconstruction should stand on the sampling grid that exists.
-		vec2 pos = (screen_uv * vec2(full_size) - 0.5) * 0.5;
+		vec2 pos = (screen_uv * vec2(full_size) - 0.5) / float(stochastic_scale);
 		ivec2 base = ivec2(floor(pos));
 		vec2 fr = pos - vec2(base);
 		float own_depth = -vertex.z;
@@ -3633,7 +3635,7 @@ void fragment_shader(in SceneData scene_data) {
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
 			// The full-res pixel the sampling pass lit texel hp at (it clamps
 			// the same way for odd sizes).
-			ivec2 fp = min(hp * 2, full_size - ivec2(1));
+			ivec2 fp = min(hp * stochastic_scale, full_size - ivec2(1));
 			vec3 tap_image_diffuse = vec3(0.0);
 			vec4 tap_image_specular = vec4(0.0);
 			vec3 tap_analytic_diffuse = vec3(0.0);

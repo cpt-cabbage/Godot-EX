@@ -831,6 +831,7 @@ private:
 	uint32_t rt_shadow_rays = 4;
 	bool use_stochastic_lighting = false;
 	bool use_stochastic_half_res = false;
+	bool use_stochastic_quarter_res = false;
 	bool use_stochastic_fog_shadows = false;
 	bool use_stochastic_skip_local_shadow_maps = true;
 	// Transparent-pass shadow rays (RT_TRANSPARENT_SHADOWS in the scene

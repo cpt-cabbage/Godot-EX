@@ -693,6 +693,7 @@ public:
 		uint32_t rays_per_pixel = 4; // Reservoir count, 1..MAX_RESERVOIRS (4).
 		uint32_t exact_lights = 512; // The most lights a cluster cell may hold for the analytic sum to be exact.
 		bool half_resolution = false;
+		bool quarter_resolution = false; // With half_resolution: a quarter each way.
 		bool light_guiding = true; // Visible light list sample guiding.
 		bool screen_traces = true; // Screen-space contact traces.
 		float ray_bias = 0.08f;

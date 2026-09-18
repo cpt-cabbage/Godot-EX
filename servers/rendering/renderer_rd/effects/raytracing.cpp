@@ -1215,9 +1215,12 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 
 	// The paper's downsampled sampling: all stochastic targets at half
 	// resolution, with a depth-aware upsample in the scene shader composite.
+	// The quarter tier is the same pass at depth_scale 4: every kernel maps
+	// its pixel to the full-resolution one at pixel * depth_scale, and the
+	// scene shader's upsample takes the scale from the mode word.
 	Size2i full_size = p_render_buffers->get_internal_size();
-	uint32_t depth_scale = p_quality.half_resolution ? 2 : 1;
-	Size2i size = p_quality.half_resolution ? Size2i((full_size.x + 1) / 2, (full_size.y + 1) / 2) : full_size;
+	uint32_t depth_scale = p_quality.half_resolution ? (p_quality.quarter_resolution ? 4 : 2) : 1;
+	Size2i size = Size2i((full_size.x + depth_scale - 1) / depth_scale, (full_size.y + depth_scale - 1) / depth_scale);
 
 	// The resolution setting is live: drop the whole context when the target
 	// size changed so everything is recreated at the new size.
@@ -1388,6 +1391,18 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	static const bool ablate_rays = OS::get_singleton()->get_environment("GODOT_STOCH_ABLATE").contains("rays");
 	if (ablate_rays) {
 		params.flags |= 128; // FLAG_NO_RAYS
+	}
+	// =guided / =cell / =eval size the select kernel's parts: the guided walk
+	// skipped, the cell walk skipped, entry_eval answering a constant.
+	static const String ablate = OS::get_singleton()->get_environment("GODOT_STOCH_ABLATE");
+	if (ablate.contains("guided")) {
+		params.flags |= 256; // FLAG_NO_GUIDED
+	}
+	if (ablate.contains("cell")) {
+		params.flags |= 512; // FLAG_NO_CELL
+	}
+	if (ablate.contains("eval")) {
+		params.flags |= 1024; // FLAG_NO_EVAL
 	}
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
@@ -1963,6 +1978,19 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.flags = 0;
 	if (use_spec_budget) {
 		params.flags |= 1048576; // FLAG_SPEC_BUDGET
+	}
+	// GODOT_GI_ABLATE=rays,spec,cards (profiling): what the gather costs
+	// without its bounce rays (a zero-length query, so the kernel keeps its
+	// ray-query registers), its reflection ray, or its card reads.
+	static const String gi_ablate = OS::get_singleton()->get_environment("GODOT_GI_ABLATE");
+	if (gi_ablate.contains("rays")) {
+		params.flags |= 33554432u; // FLAG_ABLATE_RAYS
+	}
+	if (gi_ablate.contains("spec")) {
+		params.flags |= 67108864u; // FLAG_ABLATE_SPEC
+	}
+	if (gi_ablate.contains("cards")) {
+		params.flags |= 134217728u; // FLAG_ABLATE_CARDS
 	}
 	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
 	// GODOT_GI_SRAD_CLAMP=<lum> overrides the project's absolute firefly

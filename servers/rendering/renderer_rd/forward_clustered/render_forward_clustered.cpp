@@ -845,7 +845,7 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// ratios times this shader's own per-pixel analytic term, 3 half
 	// resolution modulated at half resolution and upsampled (the first form,
 	// GODOT_RT_HALF_ANALYTIC=0; see the shader's composite).
-	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? (RendererRD::Raytracing::half_res_pixel_analytic() ? 2 : 3) : 1) : 0;
+	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? ((RendererRD::Raytracing::half_res_pixel_analytic() ? 2 : 3) | (use_stochastic_quarter_res ? 4 : 0)) : 1) : 0;
 	// Same validity rule for the ray-traced GI buffers. Bits 0-1: resolution
 	// mode (1 full, 2 half with the depth-aware upsample); bit 2: the traced
 	// reflection buffer is populated (otherwise the composite must not blend
@@ -2263,6 +2263,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	rt_shadow_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/quality/rays_per_pixel"));
 	use_stochastic_lighting = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/enabled"));
 	use_stochastic_half_res = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution");
+	use_stochastic_quarter_res = use_stochastic_half_res && bool(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/quarter_resolution"));
 	use_stochastic_fog_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/volumetric_fog_shadows");
 	use_stochastic_skip_local_shadow_maps = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/skip_local_shadow_maps");
 	use_stochastic_transparent_shadows = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/transparent_shadows/enabled");
@@ -2345,6 +2346,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel"));
 	stochastic_quality.exact_lights = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
+	stochastic_quality.quarter_resolution = use_stochastic_quarter_res;
 	stochastic_quality.light_guiding = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/light_guiding");
 	stochastic_quality.screen_traces = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces");
 	stochastic_quality.ray_bias = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/ray_bias");
@@ -2362,7 +2364,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT")) {
 		_rt_state_out(vformat("RT STATE settings: shadows %s rays %d | stochastic %s half %s rays %d denoise %s tframes %d iter %d vthresh %.3f guiding %s straces %s tvol %s | gi %s half %s rays %d tframes %d iter %d vthresh %.3f spec %s dir %s so %s srad %s straces %s mirrors %s hit %d | cache %s mirror %s atlas %d texels/m %.1f caps %d sets %d tframes %d | sdfgi_rq %s",
 				use_raytraced_shadows ? "on" : "off", rt_shadow_rays,
-				use_stochastic_lighting ? "on" : "off", use_stochastic_half_res ? "on" : "off", stochastic_quality.rays_per_pixel, stochastic_quality.denoise ? "on" : "off", stochastic_quality.temporal_frames, stochastic_quality.spatial_iterations, stochastic_quality.variance_threshold, stochastic_quality.light_guiding ? "on" : "off", stochastic_quality.screen_traces ? "on" : "off", translucency_quality.enabled ? "on" : "off",
+				use_stochastic_lighting ? "on" : "off", use_stochastic_quarter_res ? "quarter" : (use_stochastic_half_res ? "on" : "off"), stochastic_quality.rays_per_pixel, stochastic_quality.denoise ? "on" : "off", stochastic_quality.temporal_frames, stochastic_quality.spatial_iterations, stochastic_quality.variance_threshold, stochastic_quality.light_guiding ? "on" : "off", stochastic_quality.screen_traces ? "on" : "off", translucency_quality.enabled ? "on" : "off",
 				use_rt_gi ? "on" : "off", use_rt_gi_quarter_res ? "quarter" : (use_rt_gi_half_res ? "on" : "off"), rt_gi_rays, rt_gi_temporal_frames, rt_gi_spatial_iterations, rt_gi_variance_threshold, use_rt_gi_specular ? "on" : "off", use_rt_gi_directional ? "on" : "off", use_rt_gi_specular_occlusion ? "on" : "off", use_rt_gi_screen_radiance ? "on" : "off", use_rt_gi_screen_traces ? "on" : "off", use_rt_gi_planar_mirrors ? "on" : "off", rt_gi_hit_shading,
 				use_surface_cache ? "on" : "off", use_surface_cache_mirror ? "on" : "off", int(surface_cache_settings.atlas_size), float(surface_cache_settings.texels_per_meter), int(surface_cache_settings.captures_per_frame), int(surface_cache_settings.lighting_sets_per_frame), int(surface_cache_settings.temporal_frames),
 				use_rt_sdfgi_probes ? "on" : "off"));

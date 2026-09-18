@@ -3453,6 +3453,9 @@
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution" type="bool" setter="" getter="" default="true">
 			Traces and denoises at half resolution. The biggest performance lever of this pass (about a third of the cost) at some softening of shadow edges. Material detail is kept.
 		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/quarter_resolution" type="bool" setter="" getter="" default="false">
+			With [member rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution], samples at a quarter of the resolution each way: the light selection, the shadow rays, the temporal and spatial passes at a quarter of their half-resolution cost, composited by the same depth- and normal-aware upsample against this pixel's own analytic term (so material and normal-map detail stay at full resolution; the visibility ratios are what coarsen). The low-spec form to pair with the GI's quarter tier; the loss is at fine shadow edges and thin occluders.
+		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights" type="int" setter="" getter="" default="512">
 			Up to this many lights reaching a pixel (its cluster cell's), the unshadowed direct term is summed exactly, every light evaluated every frame; past it a strided estimate over the cell, re-drawn every frame. The sampling pass costs a light evaluation per pixel per light within it: a level whose long-range lights overlap by the dozen pays for every one at the default, and reads noisier at a low value.
 		</member>

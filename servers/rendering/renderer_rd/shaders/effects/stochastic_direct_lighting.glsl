@@ -144,6 +144,9 @@ params;
 #define FLAG_GUIDE_PAINT 96u // Bits 5-6, GODOT_STOCH_GUIDE_PAINT=1|2|3: the diffuse ratio painted with the guided entries the cell lacks (1), holds (2), or zero (3).
 #define FLAG_GUIDE_PAINT_SHIFT 5u
 #define FLAG_NO_RAYS 128u // Diagnostics (GODOT_STOCH_ABLATE=rays): every shadow ray reports visible.
+#define FLAG_NO_GUIDED 256u // Diagnostics (GODOT_STOCH_ABLATE=guided): the guided walk is skipped.
+#define FLAG_NO_CELL 512u // Diagnostics (GODOT_STOCH_ABLATE=cell): the cell walk is skipped.
+#define FLAG_NO_EVAL 1024u // Diagnostics (GODOT_STOCH_ABLATE=eval): entry_eval answers a constant (the walks' cost without the light models).
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -791,6 +794,12 @@ void area_light_eval_image(uint mi, uint mj, uint mk, uint idx, vec3 view_pos, v
 
 // Unshadowed contribution of any encoded light entry.
 void entry_eval(uint entry, vec3 view_pos, vec3 view_normal, float roughness, out vec3 diffuse, out vec3 specular, out vec4 spec_split) {
+	if ((params.flags & FLAG_NO_EVAL) != 0u) {
+		diffuse = vec3(0.01 * float(1u + (entry & 7u)));
+		specular = diffuse * 0.5;
+		spec_split = vec4(diffuse, 0.5);
+		return;
+	}
 	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 		if ((entry & IMAGE_BIT) != 0u) {
 			area_light_eval_image(ENTRY_MIRROR(entry), ENTRY_MIRROR2(entry), ENTRY_MIRROR3(entry), entry & ENTRY_ID_MASK, view_pos, view_normal, roughness, diffuse, specular, spec_split);
@@ -1366,6 +1375,9 @@ void sample_pixel(ivec2 pixel) {
 		uint range = cluster_buffer.data[cluster_offset + type * params.cluster_type_size + params.max_cluster_element_count_div_32 + cluster_z];
 		item_range = type == 0u ? uvec3(range, item_range.yz) : (type == 1u ? uvec3(item_range.x, range, item_range.z) : uvec3(item_range.xy, range));
 	}
+	if ((params.flags & FLAG_NO_GUIDED) != 0u) {
+		visible_count = 0u;
+	}
 	for (uint i = 0u; i < visible_count && guided_count < guided_budget; i++) {
 		uint entry = visible_list[i];
 		bool in_cell = cell_holds(cluster_offset, item_range, entry, image_chain_total);
@@ -1452,7 +1464,7 @@ void sample_pixel(ivec2 pixel) {
 	// MAX_ANALYTIC_LIGHTS the cell is summed exactly, sharing its entry_eval
 	// results with whichever lights the stride also picks as candidates. The
 	// stride governs sampling; it no longer governs the analytic sum.
-	{
+	if ((params.flags & FLAG_NO_CELL) == 0u) {
 		// First pass: count the candidates in the cell (omni, spot, area).
 		const uint type_count = sc_has_area_lights ? 3u : 2u;
 		uint cell_count = 0u;

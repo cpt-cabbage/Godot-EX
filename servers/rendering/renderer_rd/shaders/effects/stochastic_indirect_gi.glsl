@@ -133,6 +133,9 @@ params;
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 #define FLAG_NO_REQUESTS 16777216u // Diagnostics (GODOT_GI_REQUESTS=0): the card reads ask for no relight.
 #define FLAG_MEMORY_EDGE 8388608u // Experiment (GODOT_GI_MEMORY_EDGE=1): settled pixels inside the border fade teach the screen memory too, at the fade's share of the rate.
+#define FLAG_ABLATE_RAYS 33554432u // Diagnostics (GODOT_GI_ABLATE=rays): the bounce rays are not traced (every one misses to the sky).
+#define FLAG_ABLATE_SPEC 67108864u // Diagnostics (GODOT_GI_ABLATE=spec): no reflection ray; the diffuse mean stands in as under the budget.
+#define FLAG_ABLATE_CARDS 134217728u // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -1147,7 +1150,7 @@ vec3 memory_base(vec3 cache_radiance) {
 bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
-	if (p_instance_id == SURFACE_CACHE_INVALID) {
+	if (p_instance_id == SURFACE_CACHE_INVALID || bool(params.flags & FLAG_ABLATE_CARDS)) {
 		return false;
 	}
 	CardInstance inst = card_instances.data[p_instance_id];
@@ -1514,7 +1517,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 	// was measured: one ray in a hundred, and 0.5-0.8 ms on this
 	// register-bound pass for the code alone, as a loop or as a second
 	// trace.
-	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, t_max);
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, bool(params.flags & FLAG_ABLATE_RAYS) ? params.ray_bias : t_max);
 	while (rayQueryProceedEXT(rq)) {
 	}
 	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
@@ -1971,7 +1974,9 @@ void main() {
 	// return; the filter's history and the resolve see no ray (spec_ray 0).
 	bool spec_stand_in = false;
 	// cv_params.z: the roughness above which, .w: the F0 luminance below which.
-	if (bool(params.flags & FLAG_SPEC_BUDGET) && !mirror && roughness > params.cv_params.z) {
+	if (bool(params.flags & FLAG_ABLATE_SPEC)) {
+		spec_stand_in = true;
+	} else if (bool(params.flags & FLAG_SPEC_BUDGET) && !mirror && roughness > params.cv_params.z) {
 		float f0_lum = luminance(gb_f0(texelFetch(gbuf_f0_texture, full_pixel, 0)));
 		spec_stand_in = f0_lum < params.cv_params.w;
 	}

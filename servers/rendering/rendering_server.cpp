@@ -3741,6 +3741,7 @@ void RenderingServer::init() {
 	// analytic term (scene_forward_clustered.glsl, stochastic_direct_lights
 	// == 2), which holds still like the full-resolution pass.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/quarter_resolution"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights", PROPERTY_HINT_RANGE, "1,512,1"), 512);
 	// The stochastic pass ray traces every local light's shadow, so the opaque
