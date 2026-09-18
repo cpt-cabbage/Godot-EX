@@ -339,6 +339,22 @@ private:
 	RID stochastic_shader_version;
 	RID stochastic_pipeline; // sc_has_area_lights = true.
 	RID stochastic_pipeline_no_area; // Area paths compiled out; frames with no area light.
+	// The wavefront split (GODOT_STOCH_WAVEFRONT, plan section 81): the
+	// kernel above as a select kernel without ray queries (per light-type
+	// class like the single one), a trace kernel dispatched indirectly over
+	// the requests it appends, and a resolve kernel. The scratch is sized to
+	// the largest sampling target seen: a request per reservoir per pixel,
+	// a state record per pixel, a visibility per reservoir per pixel.
+	RID stochastic_select_pipeline;
+	RID stochastic_select_pipeline_no_area;
+	RID stochastic_trace_pipeline;
+	RID stochastic_resolve_pipeline;
+	RID wavefront_count;
+	RID wavefront_args;
+	RID wavefront_requests;
+	RID wavefront_state;
+	RID wavefront_visibility;
+	uint32_t wavefront_capacity = 0; // Pixels.
 
 	struct StochasticParamsUBO {
 		float view_from_ndc[16];

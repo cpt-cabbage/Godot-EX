@@ -4,8 +4,31 @@
 
 #VERSION_DEFINES
 
+// The wavefront split (plan section 81, GODOT_STOCH_WAVEFRONT): the one
+// kernel below is also built as three. WAVEFRONT_SELECT is the kernel
+// without its ray queries -- it decides which reservoirs trace, appends
+// their requests, and leaves the pixel's terms in a state buffer;
+// WAVEFRONT_TRACE is a linear dispatch over the requests, the ray and
+// nothing else (no LTC, no candidate walk); WAVEFRONT_RESOLVE folds the
+// visibilities back into the ratios. The point is register pressure: the
+// candidate loop's state and the intersector's never share a kernel, so
+// each runs at the occupancy it earns alone. The select kernel must not
+// mention the acceleration structure at all -- declaring it is what puts
+// the ray-query capability in the SPIR-V, and the Metal container routes
+// on that.
+#ifndef WAVEFRONT_SELECT
 #extension GL_EXT_ray_query : require
+#endif
 #extension GL_EXT_samplerless_texture_functions : enable
+#ifdef WAVEFRONT_SELECT
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
+
+#if defined(WAVEFRONT_SELECT) || defined(WAVEFRONT_TRACE) || defined(WAVEFRONT_RESOLVE)
+#define WAVEFRONT
+#endif
 
 // Stochastic direct lighting.
 // Per pixel: weighted reservoir sampling over a candidate set built from the
@@ -39,7 +62,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // carries the code at all. Every area branch below tests this first.
 layout(constant_id = 0) const bool sc_has_area_lights = true;
 
+#ifndef WAVEFRONT_SELECT
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+#endif
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
 layout(set = 0, binding = 3, std430) restrict readonly buffer OmniLights {
@@ -186,6 +211,62 @@ layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ana
 // images from here, since it cannot evaluate them itself.
 layout(set = 1, binding = 7, r11f_g11f_b10f) uniform restrict writeonly image2D out_analytic_image_diffuse;
 layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_analytic_image_specular;
+
+#ifdef WAVEFRONT
+// The split's hand-over. The select kernel appends a request per shadow
+// ray -- the pixel and its reservoir, and the entry, eight bytes: the
+// trace kernel rebuilds the origin from the depth buffer and the target
+// from the light, which is cheaper to redo than to carry (a request with
+// both points is four times the size, and the select kernel's writes are
+// what the compaction is paying for). The count and the dispatch's group
+// count are two buffers: the trace kernel is dispatched indirectly from
+// the second, which a compute list cannot also bind as storage.
+layout(set = 1, binding = 9, std430) restrict buffer WavefrontCount {
+	uint count;
+}
+wavefront_count;
+layout(set = 1, binding = 10, std430) restrict buffer WavefrontArgs {
+	uvec4 groups; // x: (count + 63) / 64, y and z 1.
+}
+wavefront_args;
+layout(set = 1, binding = 11, std430) restrict buffer WavefrontRequests {
+	uvec2 data[]; // x: pixel.x | pixel.y << 14 | reservoir << 28, y: the entry.
+}
+wavefront_requests;
+// Per pixel, WAVEFRONT_STATE_WORDS: the ratio's terms per reservoir as
+// halves, normalized by the analytic sums (the ratio is then a plain sum of
+// term times visibility), the dominance energies per reservoir normalized
+// the same way, a meta word, the chosen entry for the tile lists, and the
+// two analytic sums.
+#define WAVEFRONT_STATE_WORDS 10u
+#define WAVEFRONT_STATE_TERMS 0u
+#define WAVEFRONT_STATE_ENERGY 4u
+#define WAVEFRONT_STATE_META 6u
+#define WAVEFRONT_STATE_CHOSEN 7u
+#define WAVEFRONT_STATE_LUM_D 8u
+#define WAVEFRONT_STATE_LUM_S 9u
+// The meta word: five bits per reservoir (a ray's answer to read, which
+// reservoir's, the dedupe slot), then the chosen light's reservoir,
+// quadrant and kind, and the sky.
+#define WAVEFRONT_META_HAS_SRC 1u
+#define WAVEFRONT_META_SRC_SHIFT 1u
+#define WAVEFRONT_META_SLOT_SHIFT 3u
+#define WAVEFRONT_META_CHOSEN (1u << 20u)
+#define WAVEFRONT_META_CHOSEN_R_SHIFT 21u
+#define WAVEFRONT_META_CHOSEN_QUAD_SHIFT 23u
+#define WAVEFRONT_META_CHOSEN_AREA (1u << 25u)
+#define WAVEFRONT_META_SKY (1u << 26u)
+layout(set = 1, binding = 12, std430) restrict buffer WavefrontState {
+	uint data[];
+}
+wavefront_state;
+// One float per (pixel, reservoir): the ray's visibility, shadow opacity
+// applied.
+layout(set = 1, binding = 13, std430) restrict buffer WavefrontVisibility {
+	float data[];
+}
+wavefront_visibility;
+#endif
 
 #define MAX_RESERVOIRS 4u
 #define TILE_SIZE 8
@@ -786,6 +867,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 	return best_alpha >= 0.5;
 }
 
+#ifndef WAVEFRONT_SELECT
 bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	if ((params.flags & FLAG_NO_RAYS) != 0u) {
 		return true;
@@ -837,6 +919,8 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	}
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
 }
+
+#endif // WAVEFRONT_SELECT
 
 #define SCREEN_TRACE_STEPS 6
 #define SCREEN_TRACE_DISTANCE 0.4
@@ -947,8 +1031,146 @@ bool cell_holds(uint cluster_offset, uvec3 item_range, uint entry, uint image_ch
 	return (cluster_buffer.data[cluster_offset + type * params.cluster_type_size + (raw >> 5u)] & (1u << (raw & 31u))) != 0u;
 }
 
-void main() {
-	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+// The random pair of a reservoir's sample point on its light. The first
+// reservoir keeps the blue-noise stream; duplicates decorrelate with a
+// per-reservoir Cranley-Patterson rotation.
+vec2 shadow_sample_rnd(ivec2 pixel, uint pixel_seed, uint r) {
+	vec2 sample_rnd = stbn_sample(pixel, 6u);
+	if (r > 0u) {
+		sample_rnd = fract(sample_rnd + vec2(hash_to_float(pcg_hash(pixel_seed + 0x9E37u * r)), hash_to_float(pcg_hash(pixel_seed + 0x85EBu * r))));
+	}
+	return sample_rnd;
+}
+
+// The light's own shadow settings: shadows disabled (or a caster mask
+// matching nothing) skips the ray entirely, partial opacity blends toward
+// unshadowed, and the caster mask culls which objects can occlude this
+// light's rays (render layers 1-8).
+void shadow_settings(uint entry, out float shadow_opacity, out uint caster_mask) {
+	uint light_index = entry & ENTRY_ID_MASK;
+	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
+		shadow_opacity = area_lights.data[light_index].shadow_opacity;
+		caster_mask = area_lights.data[light_index].shadow_caster_mask;
+	} else if ((entry & SPOT_BIT) != 0u) {
+		shadow_opacity = spot_lights.data[light_index].shadow_opacity;
+		caster_mask = spot_lights.data[light_index].shadow_caster_mask;
+	} else {
+		shadow_opacity = omni_lights.data[light_index].shadow_opacity;
+		caster_mask = omni_lights.data[light_index].shadow_caster_mask;
+	}
+}
+
+#ifndef WAVEFRONT_SELECT
+// One reservoir's shadow ray: the sample point on the light, the image's
+// legs through its mirrors or the screen trace, then the ray. Returns the
+// visibility with the light's shadow opacity applied. The single kernel
+// and the trace kernel both call this, so the split traces the same rays.
+float shadow_ray(uint entry, uint r, ivec2 pixel, uint pixel_seed, vec3 view_pos, float shadow_opacity, uint caster_mask) {
+	vec2 sample_rnd = shadow_sample_rnd(pixel, pixel_seed, r);
+	vec3 view_target;
+	if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
+		// Sample the rect uniformly.
+		//
+		// This used to warp the sample toward the quadrants the tile saw
+		// unoccluded, which is a place a ratio estimator cannot follow.
+		// The importance weight that would undo the warp cancels: a light
+		// contributes one sample per frame, so the frame's ratio is that
+		// sample's visibility whatever weight it carries, and the temporal
+		// average then converges to the visibility of the quadrants we
+		// chose to look at rather than of the light. Measured against a
+		// converged uniformly-sampled reference on stochastic_area_demo,
+		// the warp sat 62% further from the truth (0.00112 vs 0.00069) for
+		// 3% less noise: it read penumbrae as brighter than they are. The
+		// 2x2 mask keeps its other job, down-weighting mostly-shadowed
+		// lights in the candidate weights, where the estimator does divide
+		// the same weight back out.
+		LightData ld = area_lights.data[entry & ENTRY_ID_MASK];
+		view_target = ld.position + ld.area_width * (sample_rnd.x - 0.5) + ld.area_height * (sample_rnd.y - 0.5);
+		if ((entry & IMAGE_BIT) != 0u) {
+			if ((entry & IMAGE3_BIT) != 0u) {
+				view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
+			}
+			if ((entry & IMAGE2_BIT) != 0u) {
+				view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
+			}
+			view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
+		}
+	} else {
+		LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
+		view_target = ld.position;
+		if ((entry & IMAGE_BIT) != 0u) {
+			if ((entry & IMAGE3_BIT) != 0u) {
+				view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
+			}
+			if ((entry & IMAGE2_BIT) != 0u) {
+				view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
+			}
+			view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
+		}
+		// Light size drives the penumbra: sample a disk of that
+		// radius perpendicular to the shadow ray, like the paper's
+		// area sampling but for the sphere approximation.
+		if (ld.size > 0.0) {
+			vec3 dir = normalize(view_target - view_pos);
+			vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+			vec3 tangent = normalize(cross(up, dir));
+			vec3 bitangent = cross(dir, tangent);
+			float ang = sample_rnd.x * 6.2831853;
+			float rad = sqrt(sample_rnd.y) * ld.size;
+			view_target += (tangent * cos(ang) + bitangent * sin(ang)) * rad;
+		}
+	}
+	vec3 world_pos = (params.world_from_view * vec4(view_pos, 1.0)).xyz;
+	mat3 world_basis = mat3(params.world_from_view);
+	bool occluded = false;
+	if ((entry & IMAGE_BIT) != 0u) {
+		// The image's shadow in legs: to a centimeter above each
+		// mirror of the chain (along its normal), the target
+		// mirrored back a step each time, then from the last mirror
+		// to the real light (the jittered target).
+		uint chain[3];
+		chain[0] = ENTRY_MIRROR(entry);
+		chain[1] = ENTRY_MIRROR2(entry);
+		chain[2] = ENTRY_MIRROR3(entry);
+		vec3 from = view_pos;
+		vec3 w_from = world_pos;
+		vec3 target = view_target;
+		for (uint s = 0u; s < 3u && !occluded; s++) {
+			uint m = chain[s];
+			if (m >= MAX_MIRROR_PLANES) {
+				break;
+			}
+			vec3 n = params.mirrors[m].plane.xyz;
+			float hp = mirror_height(m, from);
+			vec3 dir = normalize(target - from);
+			float cos_p = max(-dot(n, dir), 1e-3);
+			vec3 leg_end = from + dir * (max(hp - 0.01, 0.0) / cos_p);
+			occluded = hp <= 0.0 || !trace_visible(w_from, world_pos + world_basis * (leg_end - view_pos), caster_mask);
+			from = from + dir * (hp / cos_p) + n * 0.01;
+			w_from = world_pos + world_basis * (from - view_pos);
+			target = mirror_point(m, target);
+		}
+		occluded = occluded || !trace_visible(w_from, world_pos + world_basis * (target - view_pos), caster_mask);
+	} else if (caster_mask == 0xFFu && (params.flags & FLAG_SCREEN_TRACES) != 0u && screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
+		// Screen traces cannot honor caster masks; skip them when the
+		// light culls casters so the BVH ray decides alone.
+		occluded = true;
+	} else {
+		vec3 world_light = world_pos + world_basis * (view_target - view_pos);
+		occluded = !trace_visible(world_pos, world_light, caster_mask);
+	}
+	return occluded ? 1.0 - shadow_opacity : 1.0;
+}
+#endif
+
+#ifdef WAVEFRONT_SELECT
+// The pixel's ray requests, appended by main once every lane is back.
+uint request_count = 0u;
+uint request_entry[MAX_RESERVOIRS];
+uint request_reservoir[MAX_RESERVOIRS];
+#endif
+
+void sample_pixel(ivec2 pixel) {
 	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
 		return;
 	}
@@ -965,6 +1187,9 @@ void main() {
 		imageStore(out_analytic_specular, pixel, vec4(0.0));
 		imageStore(out_analytic_image_diffuse, pixel, vec4(0.0));
 		imageStore(out_analytic_image_specular, pixel, vec4(0.0));
+#ifdef WAVEFRONT_SELECT
+		wavefront_state.data[uint(pixel.y * params.screen_size.x + pixel.x) * WAVEFRONT_STATE_WORDS + WAVEFRONT_STATE_META] = WAVEFRONT_META_SKY;
+#endif
 		return;
 	}
 
@@ -1389,14 +1614,27 @@ void main() {
 		selected_hidden[r] = r < params.reservoir_count && reservoir_merge(reservoirs[r], discovery[r], hidden_scale, rngs[r]);
 	}
 
-	vec3 world_pos = (params.world_from_view * vec4(view_pos, 1.0)).xyz;
-	mat3 world_basis = mat3(params.world_from_view);
-
 	// Trace each unique selected light once (reservoirs frequently agree when
 	// few lights dominate; duplicate rays would hit the same target).
 	uint traced_keys[MAX_RESERVOIRS];
-	float traced_visibility[MAX_RESERVOIRS];
 	uint traced_quadrant[MAX_RESERVOIRS];
+#ifdef WAVEFRONT_SELECT
+	// The slot's answer is a reservoir's ray, read by the resolve kernel:
+	// WAVEFRONT_META_HAS_SRC and the reservoir, or zero for a light that
+	// casts no shadow.
+	uint traced_src[MAX_RESERVOIRS];
+	uint state_terms[MAX_RESERVOIRS];
+	float state_energy[MAX_RESERVOIRS];
+	uint state_meta = 0u;
+	uint state_chosen = INVALID_LIGHT;
+	for (uint t = 0u; t < MAX_RESERVOIRS; t++) {
+		traced_src[t] = 0u;
+		state_terms[t] = 0u;
+		state_energy[t] = 0.0;
+	}
+#else
+	float traced_visibility[MAX_RESERVOIRS];
+#endif
 	uint traced_count = 0u;
 
 	// Ratio estimator: the rays only measure what fraction of the unshadowed
@@ -1452,9 +1690,16 @@ void main() {
 		uint quadrant = 0u;
 		uint slot = 0u;
 		bool found = false;
+#ifdef WAVEFRONT_SELECT
+		uint src = 0u;
+#endif
 		for (uint t = 0u; t < traced_count; t++) {
 			if (traced_keys[t] == key) {
+#ifdef WAVEFRONT_SELECT
+				src = traced_src[t];
+#else
 				visibility = traced_visibility[t];
+#endif
 				quadrant = traced_quadrant[t];
 				slot = t;
 				found = true;
@@ -1475,134 +1720,38 @@ void main() {
 			has_extent = ((entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK].size : omni_lights.data[entry & ENTRY_ID_MASK].size) > 0.0;
 		}
 		if (!culled && (!found || has_extent)) {
-			// The first reservoir keeps the blue-noise stream; duplicates
-			// decorrelate with a per-reservoir Cranley-Patterson rotation.
-			vec2 sample_rnd = stbn_sample(pixel, 6u);
-			if (r > 0u) {
-				sample_rnd = fract(sample_rnd + vec2(hash_to_float(pcg_hash(pixel_seed + 0x9E37u * r)), hash_to_float(pcg_hash(pixel_seed + 0x85EBu * r))));
-			}
-			vec3 view_target;
 			if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
-				// Sample the rect uniformly, recording which quadrant the sample
-				// landed in so the tile mask still says where the light was
-				// reachable.
-				//
-				// This used to warp the sample toward the quadrants the tile saw
-				// unoccluded, which is a place a ratio estimator cannot follow.
-				// The importance weight that would undo the warp cancels: a light
-				// contributes one sample per frame, so the frame's ratio is that
-				// sample's visibility whatever weight it carries, and the temporal
-				// average then converges to the visibility of the quadrants we
-				// chose to look at rather than of the light. Measured against a
-				// converged uniformly-sampled reference on stochastic_area_demo,
-				// the warp sat 62% further from the truth (0.00112 vs 0.00069) for
-				// 3% less noise: it read penumbrae as brighter than they are. The
-				// 2x2 mask keeps its other job, down-weighting mostly-shadowed
-				// lights in the candidate weights, where the estimator does divide
-				// the same weight back out.
-				LightData ld = area_lights.data[entry & ENTRY_ID_MASK];
-				vec2 rnd = sample_rnd;
+				// The rect is sampled uniformly (shadow_ray); which quadrant
+				// the sample lands in is what the tile mask records, so
+				// guiding still knows where the light was reachable.
+				vec2 rnd = shadow_sample_rnd(pixel, pixel_seed, r);
 				quadrant = (rnd.x < 0.5 ? 0u : 1u) | (rnd.y < 0.5 ? 0u : 2u);
-				view_target = ld.position + ld.area_width * (rnd.x - 0.5) + ld.area_height * (rnd.y - 0.5);
-				if ((entry & IMAGE_BIT) != 0u) {
-					if ((entry & IMAGE3_BIT) != 0u) {
-						view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
-					}
-					if ((entry & IMAGE2_BIT) != 0u) {
-						view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
-					}
-					view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
-				}
-			} else {
-				LightData ld = (entry & SPOT_BIT) != 0u ? spot_lights.data[entry & ENTRY_ID_MASK] : omni_lights.data[entry & ENTRY_ID_MASK];
-				view_target = ld.position;
-				if ((entry & IMAGE_BIT) != 0u) {
-					if ((entry & IMAGE3_BIT) != 0u) {
-						view_target = mirror_point(ENTRY_MIRROR3(entry), view_target);
-					}
-					if ((entry & IMAGE2_BIT) != 0u) {
-						view_target = mirror_point(ENTRY_MIRROR2(entry), view_target);
-					}
-					view_target = mirror_point(ENTRY_MIRROR(entry), view_target);
-				}
-				// Light size drives the penumbra: sample a disk of that
-				// radius perpendicular to the shadow ray, like the paper's
-				// area sampling but for the sphere approximation.
-				if (ld.size > 0.0) {
-					vec3 dir = normalize(view_target - view_pos);
-					vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
-					vec3 tangent = normalize(cross(up, dir));
-					vec3 bitangent = cross(dir, tangent);
-					vec2 rnd = sample_rnd;
-					float ang = rnd.x * 6.2831853;
-					float rad = sqrt(rnd.y) * ld.size;
-					view_target += (tangent * cos(ang) + bitangent * sin(ang)) * rad;
-				}
 			}
-			// The light's own shadow settings: shadows disabled (or a caster
-			// mask matching nothing) skips the ray entirely, partial opacity
-			// blends toward unshadowed, and the caster mask culls which
-			// objects can occlude this light's rays (render layers 1-8).
-			uint light_index = entry & ENTRY_ID_MASK;
 			float shadow_opacity;
 			uint caster_mask;
-			if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
-				shadow_opacity = area_lights.data[light_index].shadow_opacity;
-				caster_mask = area_lights.data[light_index].shadow_caster_mask;
-			} else if ((entry & SPOT_BIT) != 0u) {
-				shadow_opacity = spot_lights.data[light_index].shadow_opacity;
-				caster_mask = spot_lights.data[light_index].shadow_caster_mask;
-			} else {
-				shadow_opacity = omni_lights.data[light_index].shadow_opacity;
-				caster_mask = omni_lights.data[light_index].shadow_caster_mask;
-			}
+			shadow_settings(entry, shadow_opacity, caster_mask);
 			if (shadow_opacity < 0.001 || caster_mask == 0u) {
 				visibility = 1.0;
-			} else if ((entry & IMAGE_BIT) != 0u) {
-				// The image's shadow in legs: to a centimeter above each
-				// mirror of the chain (along its normal), the target
-				// mirrored back a step each time, then from the last mirror
-				// to the real light (the jittered target).
-				uint chain[3];
-				chain[0] = ENTRY_MIRROR(entry);
-				chain[1] = ENTRY_MIRROR2(entry);
-				chain[2] = ENTRY_MIRROR3(entry);
-				vec3 from = view_pos;
-				vec3 w_from = world_pos;
-				vec3 target = view_target;
-				bool occluded = false;
-				for (uint s = 0u; s < 3u && !occluded; s++) {
-					uint m = chain[s];
-					if (m >= MAX_MIRROR_PLANES) {
-						break;
-					}
-					vec3 n = params.mirrors[m].plane.xyz;
-					float hp = mirror_height(m, from);
-					vec3 dir = normalize(target - from);
-					float cos_p = max(-dot(n, dir), 1e-3);
-					vec3 leg_end = from + dir * (max(hp - 0.01, 0.0) / cos_p);
-					occluded = hp <= 0.0 || !trace_visible(w_from, world_pos + world_basis * (leg_end - view_pos), caster_mask);
-					from = from + dir * (hp / cos_p) + n * 0.01;
-					w_from = world_pos + world_basis * (from - view_pos);
-					target = mirror_point(m, target);
-				}
-				occluded = occluded || !trace_visible(w_from, world_pos + world_basis * (target - view_pos), caster_mask);
-				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
+#ifdef WAVEFRONT_SELECT
+				src = 0u;
+#endif
 			} else {
-				bool occluded;
-				// Screen traces cannot honor caster masks; skip them when the
-				// light culls casters so the BVH ray decides alone.
-				if (caster_mask == 0xFFu && (params.flags & FLAG_SCREEN_TRACES) != 0u && screen_trace_occluded(view_pos, view_target, stbn_sample(pixel, 7u).r)) {
-					occluded = true;
-				} else {
-					vec3 world_light = world_pos + world_basis * (view_target - view_pos);
-					occluded = !trace_visible(world_pos, world_light, caster_mask);
-				}
-				visibility = occluded ? 1.0 - shadow_opacity : 1.0;
+#ifdef WAVEFRONT_SELECT
+				request_entry[request_count] = entry;
+				request_reservoir[request_count] = r;
+				request_count++;
+				src = WAVEFRONT_META_HAS_SRC | (r << WAVEFRONT_META_SRC_SHIFT);
+#else
+				visibility = shadow_ray(entry, r, pixel, pixel_seed, view_pos, shadow_opacity, caster_mask);
+#endif
 			}
 			if (!found) {
 				traced_keys[traced_count] = key;
+#ifdef WAVEFRONT_SELECT
+				traced_src[traced_count] = src;
+#else
 				traced_visibility[traced_count] = visibility;
+#endif
 				traced_quadrant[traced_count] = quadrant;
 				slot = traced_count;
 				traced_count++;
@@ -1638,6 +1787,11 @@ void main() {
 		if (!culled) {
 			traced_found++;
 			if (hash_to_float(pcg_hash(pixel_seed + 0xB5u + traced_found)) < 1.0 / float(traced_found)) {
+#ifdef WAVEFRONT_SELECT
+				// The visibility is the resolve kernel's to fill in.
+				state_chosen = entry & ENTRY_KEY_MASK;
+				state_meta = (state_meta & ((1u << 20u) - 1u)) | WAVEFRONT_META_CHOSEN | (r << WAVEFRONT_META_CHOSEN_R_SHIFT) | (quadrant << WAVEFRONT_META_CHOSEN_QUAD_SHIFT) | ((sc_has_area_lights && (entry & AREA_BIT) != 0u) ? WAVEFRONT_META_CHOSEN_AREA : 0u);
+#else
 				chosen_visible_light = entry & ENTRY_KEY_MASK;
 				if (sc_has_area_lights && (entry & AREA_BIT) != 0u) {
 					if (visibility > 0.0) {
@@ -1646,12 +1800,10 @@ void main() {
 				} else {
 					chosen_visible_light |= uint(clamp(visibility, 0.0, 1.0) * 15.0 + 0.5) << QUAD_MASK_SHIFT;
 				}
+#endif
 			}
 		}
 
-		if (visibility <= 0.0) {
-			continue;
-		}
 		// Firefly bound. A reservoir's term is an estimate of the cell's whole
 		// shadowed sum divided by the reservoir count, so its natural scale is
 		// analytic_lum / reservoir_count -- which is exactly why the bound has
@@ -1667,6 +1819,20 @@ void main() {
 		// small lum_d by a small probability) and no amount of averaging brings
 		// it back.
 		float share = FIREFLY_HEADROOM / float(params.reservoir_count);
+#ifdef WAVEFRONT_SELECT
+		// The term normalized by its analytic sum: the resolve kernel's ratio
+		// is then the plain sum of term times visibility, and a half holds it
+		// (the ratio lands in an 11-bit float image anyway). The energy is
+		// normalized the same way, by the two sums together.
+		float term_d = analytic_lum_d > 0.0 ? min(estimator * lum_d, analytic_lum_d * share) / analytic_lum_d : 0.0;
+		float term_s = analytic_lum_s > 0.0 ? min(estimator * lum_s, analytic_lum_s * share) / analytic_lum_s : 0.0;
+		state_terms[r] = packHalf2x16(vec2(term_d, term_s));
+		state_energy[r] = culled ? 0.0 : min(estimator * (lum_d + lum_s) / max(analytic_lum_d + analytic_lum_s, 1e-6), 65504.0);
+		state_meta |= (src | (slot << WAVEFRONT_META_SLOT_SHIFT)) << (r * 5u);
+#else
+		if (visibility <= 0.0) {
+			continue;
+		}
 		vis_num_d += min(estimator * lum_d, analytic_lum_d * share) * visibility;
 		vis_num_s += min(estimator * lum_s, analytic_lum_s * share) * visibility;
 		// A culled sample has no slot of its own (it never traced), and its
@@ -1675,8 +1841,28 @@ void main() {
 		if (!culled) {
 			traced_energy[slot] += estimator * (lum_d + lum_s) * visibility;
 		}
+#endif
 	}
 
+	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
+	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_spec_base), analytic_fc_den > 0.0 ? analytic_fc_num / analytic_fc_den : 0.0));
+	imageStore(out_analytic_image_diffuse, pixel, vec4(bound_analytic(analytic_image_diffuse), 0.0));
+	imageStore(out_analytic_image_specular, pixel, vec4(bound_analytic(analytic_image_spec_base), analytic_image_fc_den > 0.0 ? analytic_image_fc_num / analytic_image_fc_den : 0.0));
+	imageStore(out_view_depth, pixel, vec4(-view_pos.z));
+
+#ifdef WAVEFRONT_SELECT
+	// The rest is the resolve kernel's, once the rays are back.
+	uint base = uint(pixel.y * params.screen_size.x + pixel.x) * WAVEFRONT_STATE_WORDS;
+	for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+		wavefront_state.data[base + WAVEFRONT_STATE_TERMS + r] = state_terms[r];
+	}
+	wavefront_state.data[base + WAVEFRONT_STATE_ENERGY] = packHalf2x16(vec2(state_energy[0], state_energy[1]));
+	wavefront_state.data[base + WAVEFRONT_STATE_ENERGY + 1u] = packHalf2x16(vec2(state_energy[2], state_energy[3]));
+	wavefront_state.data[base + WAVEFRONT_STATE_META] = state_meta;
+	wavefront_state.data[base + WAVEFRONT_STATE_CHOSEN] = state_chosen;
+	wavefront_state.data[base + WAVEFRONT_STATE_LUM_D] = floatBitsToUint(analytic_lum_d);
+	wavefront_state.data[base + WAVEFRONT_STATE_LUM_S] = floatBitsToUint(analytic_lum_s);
+#else
 	// The ceiling is FIREFLY_HEADROOM, not 1, and that is not a rounding of the
 	// physical bound -- it is the difference between an unbiased estimator and a
 	// darkened one.
@@ -1724,6 +1910,7 @@ void main() {
 	// from its own loops): the pixel lit by its direct term once per guided
 	// entry the cell lacks (GODOT_STOCH_GUIDE_PAINT=1), or by the share of
 	// the guided budget it holds (=2), or not at all (=3, the baseline).
+	// (The single kernel only: the split has no paint.)
 	if ((params.flags & FLAG_GUIDE_PAINT) != 0u) {
 		uint mode = (params.flags >> FLAG_GUIDE_PAINT_SHIFT) & 3u;
 		ratio_d = mode == 1u ? float(guided_outside) : (mode == 2u ? float(guided_count) * 0.125 : 0.0);
@@ -1731,11 +1918,141 @@ void main() {
 	}
 	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
 	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
-	imageStore(out_analytic_diffuse, pixel, vec4(bound_analytic(analytic_diffuse), 0.0));
-	imageStore(out_analytic_specular, pixel, vec4(bound_analytic(analytic_spec_base), analytic_fc_den > 0.0 ? analytic_fc_num / analytic_fc_den : 0.0));
-	imageStore(out_analytic_image_diffuse, pixel, vec4(bound_analytic(analytic_image_diffuse), 0.0));
-	imageStore(out_analytic_image_specular, pixel, vec4(bound_analytic(analytic_image_spec_base), analytic_image_fc_den > 0.0 ? analytic_image_fc_num / analytic_image_fc_den : 0.0));
 	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
 	imageStore(out_meta, pixel, vec4(dominance));
-	imageStore(out_view_depth, pixel, vec4(-view_pos.z));
+#endif
+}
+
+#ifdef WAVEFRONT_TRACE
+// The trace kernel: one request, one ray. The origin comes back from the
+// depth buffer and the target from the light, exactly as the single kernel
+// derives them, so the two paths trace the same rays.
+void trace_main() {
+	uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+	if (i >= wavefront_count.count) {
+		return;
+	}
+	uvec2 req = wavefront_requests.data[i];
+	ivec2 pixel = ivec2(req.x & 0x3FFFu, (req.x >> 14u) & 0x3FFFu);
+	uint r = req.x >> 28u;
+	uint entry = req.y;
+	ivec2 full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	float depth = texelFetch(depth_texture, full_pixel, 0).r;
+	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
+	vec4 view_pos4 = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	vec3 view_pos = view_pos4.xyz / view_pos4.w;
+	uint pixel_seed = pcg_hash(uint(pixel.x) + pcg_hash(uint(pixel.y) + pcg_hash(params.frame_index)));
+	float shadow_opacity;
+	uint caster_mask;
+	shadow_settings(entry, shadow_opacity, caster_mask);
+	float visibility = shadow_ray(entry, r, pixel, pixel_seed, view_pos, shadow_opacity, caster_mask);
+	wavefront_visibility.data[uint(pixel.y * params.screen_size.x + pixel.x) * MAX_RESERVOIRS + r] = visibility;
+}
+#endif
+
+#ifdef WAVEFRONT_RESOLVE
+// The resolve kernel: the single kernel's tail, from the visibilities.
+void resolve_main(ivec2 pixel) {
+	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
+		return;
+	}
+	uint index = uint(pixel.y * params.screen_size.x + pixel.x);
+	uint base = index * WAVEFRONT_STATE_WORDS;
+	uint meta = wavefront_state.data[base + WAVEFRONT_STATE_META];
+	if ((meta & WAVEFRONT_META_SKY) != 0u) {
+		imageStore(out_diffuse, pixel, vec4(0.0));
+		imageStore(out_specular, pixel, vec4(0.0));
+		imageStore(out_visible_light, pixel, uvec4(INVALID_LIGHT));
+		imageStore(out_meta, pixel, vec4(0.0));
+		return;
+	}
+	float analytic_lum_d = uintBitsToFloat(wavefront_state.data[base + WAVEFRONT_STATE_LUM_D]);
+	float analytic_lum_s = uintBitsToFloat(wavefront_state.data[base + WAVEFRONT_STATE_LUM_S]);
+	vec4 energy = vec4(unpackHalf2x16(wavefront_state.data[base + WAVEFRONT_STATE_ENERGY]), unpackHalf2x16(wavefront_state.data[base + WAVEFRONT_STATE_ENERGY + 1u]));
+	uint chosen_r = (meta >> WAVEFRONT_META_CHOSEN_R_SHIFT) & 3u;
+	float chosen_visibility = 1.0;
+	// The single kernel's sums, in units of the analytic sums (see the
+	// select kernel's terms).
+	float ratio_d = 0.0;
+	float ratio_s = 0.0;
+	float traced_energy[MAX_RESERVOIRS];
+	for (uint t = 0u; t < MAX_RESERVOIRS; t++) {
+		traced_energy[t] = 0.0;
+	}
+	for (uint r = 0u; r < MAX_RESERVOIRS; r++) {
+		uint m = (meta >> (r * 5u)) & 31u;
+		float visibility = 1.0;
+		if ((m & WAVEFRONT_META_HAS_SRC) != 0u) {
+			visibility = wavefront_visibility.data[index * MAX_RESERVOIRS + ((m >> WAVEFRONT_META_SRC_SHIFT) & 3u)];
+		}
+		if (r == chosen_r) {
+			chosen_visibility = visibility;
+		}
+		if (visibility <= 0.0) {
+			continue;
+		}
+		vec2 term = unpackHalf2x16(wavefront_state.data[base + WAVEFRONT_STATE_TERMS + r]);
+		ratio_d += term.x * visibility;
+		ratio_s += term.y * visibility;
+		traced_energy[(m >> WAVEFRONT_META_SLOT_SHIFT) & 3u] += energy[r] * visibility;
+	}
+	// The dominance is a ratio of energies, so the normalization drops out
+	// once both sides are put back in the same units.
+	float visible_energy = ratio_d * analytic_lum_d + ratio_s * analytic_lum_s;
+	float dominance = 0.0;
+	if (visible_energy > 0.0) {
+		for (uint t = 0u; t < MAX_RESERVOIRS; t++) {
+			dominance = max(dominance, traced_energy[t]);
+		}
+		dominance *= (analytic_lum_d + analytic_lum_s) / visible_energy;
+	}
+	ratio_d = clamp(ratio_d, 0.0, FIREFLY_HEADROOM);
+	ratio_s = clamp(ratio_s, 0.0, FIREFLY_HEADROOM);
+	uint chosen_visible_light = INVALID_LIGHT;
+	if ((meta & WAVEFRONT_META_CHOSEN) != 0u) {
+		chosen_visible_light = wavefront_state.data[base + WAVEFRONT_STATE_CHOSEN];
+		if ((meta & WAVEFRONT_META_CHOSEN_AREA) != 0u) {
+			if (chosen_visibility > 0.0) {
+				chosen_visible_light |= 1u << (QUAD_MASK_SHIFT + ((meta >> WAVEFRONT_META_CHOSEN_QUAD_SHIFT) & 3u));
+			}
+		} else {
+			chosen_visible_light |= uint(clamp(chosen_visibility, 0.0, 1.0) * 15.0 + 0.5) << QUAD_MASK_SHIFT;
+		}
+	}
+	imageStore(out_diffuse, pixel, vec4(vec3(ratio_d), 0.0));
+	imageStore(out_specular, pixel, vec4(vec3(ratio_s), 0.0));
+	imageStore(out_visible_light, pixel, uvec4(chosen_visible_light));
+	imageStore(out_meta, pixel, vec4(dominance));
+}
+#endif
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+#if defined(WAVEFRONT_TRACE)
+	trace_main();
+#elif defined(WAVEFRONT_RESOLVE)
+	resolve_main(pixel);
+#else
+	sample_pixel(pixel);
+#ifdef WAVEFRONT_SELECT
+	// The append, in uniform control flow (the lanes past the screen and on
+	// the sky hold nothing): one atomic per SIMD group for the count and one
+	// for the dispatch's group count, instead of two per ray. Nothing bounds
+	// the index: the buffer holds a request per reservoir per pixel, which
+	// is the most the kernel can append.
+	uint base = subgroupExclusiveAdd(request_count);
+	uint total = subgroupAdd(request_count);
+	uint first = 0u;
+	if (subgroupElect() && total > 0u) {
+		first = atomicAdd(wavefront_count.count, total);
+		atomicMax(wavefront_args.groups.x, (first + total + 63u) / 64u);
+	}
+	first = subgroupBroadcastFirst(first);
+	for (uint i = 0u; i < MAX_RESERVOIRS; i++) {
+		if (i < request_count) {
+			wavefront_requests.data[first + base + i] = uvec2(uint(pixel.x) | (uint(pixel.y) << 14u) | (request_reservoir[i] << 28u), request_entry[i]);
+		}
+	}
+#endif
+#endif
 }

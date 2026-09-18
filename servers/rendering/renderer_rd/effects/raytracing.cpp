@@ -160,12 +160,17 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 
 	Vector<String> stochastic_modes;
 	stochastic_modes.push_back("");
+	stochastic_modes.push_back("#define WAVEFRONT_SELECT\n");
+	stochastic_modes.push_back("#define WAVEFRONT_TRACE\n");
+	stochastic_modes.push_back("#define WAVEFRONT_RESOLVE\n");
 	stochastic_shader.initialize(stochastic_modes);
 	stochastic_shader_version = stochastic_shader.version_create();
 	{
 		// One pipeline per light-type class (see sc_has_area_lights in the
 		// shader): the LTC area paths are compiled out of the second, which
-		// serves every frame whose area light count is zero.
+		// serves every frame whose area light count is zero. The split's
+		// select kernel gets the same pair; its trace and resolve kernels
+		// carry no LTC code either way.
 		Vector<RD::PipelineSpecializationConstant> sc_list;
 		RD::PipelineSpecializationConstant sc;
 		sc.constant_id = 0;
@@ -173,8 +178,12 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 		sc.bool_value = true;
 		sc_list.push_back(sc);
 		stochastic_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0), sc_list);
+		stochastic_select_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 1), sc_list);
+		stochastic_trace_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 2), sc_list);
+		stochastic_resolve_pipeline = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 3), sc_list);
 		sc_list.write[0].bool_value = false;
 		stochastic_pipeline_no_area = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 0), sc_list);
+		stochastic_select_pipeline_no_area = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 1), sc_list);
 	}
 
 	Vector<String> light_list_modes;
@@ -261,7 +270,7 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 
 Raytracing::~Raytracing() {
 	// The scene (TLAS, BLASes, geometry pools) frees itself as a member.
-	for (RID rid : { hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo }) {
+	for (RID rid : { hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo, wavefront_count, wavefront_args, wavefront_requests, wavefront_state, wavefront_visibility }) {
 		if (rid.is_valid()) {
 			RD::get_singleton()->free_rid(rid);
 		}
@@ -1375,17 +1384,100 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	// RT_LAB_FORCE_AREA_PIPELINE=1 keeps the full pipeline on frames without
 	// area lights, so the two can be timed against each other from one build.
 	static const bool force_area_pipeline = OS::get_singleton()->get_environment("RT_LAB_FORCE_AREA_PIPELINE") == "1";
-	RID pipeline = (p_area_light_count > 0 || force_area_pipeline) ? stochastic_pipeline : stochastic_pipeline_no_area;
+	const bool has_area = p_area_light_count > 0 || force_area_pipeline;
 
-	RENDER_TIMESTAMP("Stochastic Sampling");
-	rd->draw_command_begin_label("Stochastic Sampling");
-	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out), 1);
-	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
-	rd->compute_list_end();
-	rd->draw_command_end_label();
+	// The pass as three kernels (see the shader's header): the selection
+	// without ray-query state, the rays as a compacted linear dispatch, the
+	// resolve. On the TPS bridge (plan section 81) the single kernel took
+	// 24.8 ms and reported 18 of them as its rays; split, the selection is
+	// 5.3, the rays 3.4 and the resolve 0.4 -- the rays had never cost 18
+	// ms, the intersector's registers had cost the whole kernel its
+	// occupancy. GODOT_STOCH_WAVEFRONT=0 runs the single kernel (it is also
+	// the only form of the guide paint diagnostics).
+	static const bool wavefront = OS::get_singleton()->get_environment("GODOT_STOCH_WAVEFRONT") != "0";
+	if (!wavefront) {
+		RID pipeline = has_area ? stochastic_pipeline : stochastic_pipeline_no_area;
+
+		RENDER_TIMESTAMP("Stochastic Sampling");
+		rd->draw_command_begin_label("Stochastic Sampling");
+		RD::ComputeListID compute_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out), 1);
+		rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+	} else {
+		const uint32_t pixels = uint32_t(size.x) * uint32_t(size.y);
+		if (wavefront_requests.is_null() || pixels > wavefront_capacity) {
+			for (RID rid : { wavefront_requests, wavefront_state, wavefront_visibility }) {
+				if (rid.is_valid()) {
+					rd->free_rid(rid);
+				}
+			}
+			wavefront_capacity = pixels;
+			wavefront_requests = rd->storage_buffer_create(pixels * 4 * 2 * sizeof(uint32_t)); // MAX_RESERVOIRS uvec2 per pixel.
+			wavefront_state = rd->storage_buffer_create(pixels * 10 * sizeof(uint32_t)); // WAVEFRONT_STATE_WORDS.
+			wavefront_visibility = rd->storage_buffer_create(pixels * 4 * sizeof(float));
+		}
+		if (wavefront_count.is_null()) {
+			wavefront_count = rd->storage_buffer_create(4 * sizeof(uint32_t));
+			wavefront_args = rd->storage_buffer_create(4 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+		}
+		if (rt_gi_dummy_rw_buffer.is_null()) {
+			rt_gi_dummy_rw_buffer = rd->storage_buffer_create(256);
+		}
+		const uint32_t zero[4] = { 0, 0, 0, 0 };
+		const uint32_t args[4] = { 0, 1, 1, 0 };
+		rd->buffer_update(wavefront_count, 0, sizeof(zero), zero);
+		rd->buffer_update(wavefront_args, 0, sizeof(args), args);
+
+		RID select_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 1);
+		RID trace_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 2);
+		RID resolve_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 3);
+		RD::Uniform w_count(RD::UNIFORM_TYPE_STORAGE_BUFFER, 9, Vector<RID>({ wavefront_count }));
+		RD::Uniform w_args(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, Vector<RID>({ wavefront_args }));
+		// The trace kernel takes the arguments as its indirect buffer, which
+		// a list cannot combine with the storage binding; it never reads them.
+		RD::Uniform w_args_dummy(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, Vector<RID>({ rt_gi_dummy_rw_buffer }));
+		RD::Uniform w_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 11, Vector<RID>({ wavefront_requests }));
+		RD::Uniform w_state(RD::UNIFORM_TYPE_STORAGE_BUFFER, 12, Vector<RID>({ wavefront_state }));
+		RD::Uniform w_visibility(RD::UNIFORM_TYPE_STORAGE_BUFFER, 13, Vector<RID>({ wavefront_visibility }));
+
+		RENDER_TIMESTAMP("Stochastic Sampling");
+		rd->draw_command_begin_label("Stochastic Sampling");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, has_area ? stochastic_select_pipeline : stochastic_select_pipeline_no_area);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(select_rid, 0, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(select_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args, w_requests, w_state, w_visibility), 1);
+			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+		RENDER_TIMESTAMP("Stochastic Shadow Rays");
+		rd->draw_command_begin_label("Stochastic Shadow Rays");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, stochastic_trace_pipeline);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args_dummy, w_requests, w_state, w_visibility), 1);
+			rd->compute_list_dispatch_indirect(list, wavefront_args, 0);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+		RENDER_TIMESTAMP("Stochastic Resolve");
+		rd->draw_command_begin_label("Stochastic Resolve");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, stochastic_resolve_pipeline);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args, w_requests, w_state, w_visibility), 1);
+			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+	}
 
 	// Gather the lights that were actually visible into this frame's tile
 	// lists, which the next frame's sampling pass will use for guidance.
