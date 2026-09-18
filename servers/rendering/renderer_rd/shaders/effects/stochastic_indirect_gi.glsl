@@ -99,8 +99,13 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 	uint mirror_count;
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
-	uint mirror_pad1;
-	uint mirror_pad2;
+	// A card whose texel is wider than this (meters) is not read by the
+	// gather: the hit goes to hit shading (0 disables; see the coarse-card
+	// leak in surface_cache_lookup).
+	float card_coarse_limit;
+	// The card pick's weight on the depth mismatch, in texels (0: the card
+	// facing the ray most squarely; see surface_cache_lookup).
+	float card_pick_weight;
 }
 params;
 
@@ -1157,6 +1162,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
 	float best_w = 0.0;
+	float best_score = 0.0;
 	vec2 best_uv = vec2(0.0);
 	uint best_packed = 0u;
 	uint best_k = 0u;
@@ -1186,12 +1192,37 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		// cards were square: a card's own (shorter) texel made the tolerance
 		// reject grazing hits that then paid for the probe fallback.
 		float texel_world = (longest + 2.0 * s.margin) / float(max(dims.x, dims.y));
-		float tolerance = max(2.0 * texel_world, 0.02 * longest);
+		// A coarse card of an open module (a lattice ceiling at a 25 cm
+		// texel, plan section 79) stores whatever won the depth test
+		// through its bars, and the tolerance below, sized to the module,
+		// cannot tell a hit on a bar from the surface behind it: the hit
+		// reads the lit surface through the bar. Past the limit the hit is
+		// shaded exactly instead (the gather's hit packets; the cards' own
+		// bounce rays have no such path and keep reading).
+		// The limit in meters, or negative: that many times the ray's own
+		// footprint at the hit (a near hit resolves finer than a coarse
+		// card, a far one no better than it).
+		if (params.card_coarse_limit > 0.0 && texel_world > params.card_coarse_limit) {
+			continue;
+		}
+		if (params.card_coarse_limit < 0.0 && card_lookup_footprint > 0.0 && texel_world > -params.card_coarse_limit * card_lookup_footprint) {
+			continue;
+		}
+		float tolerance = max(uintBitsToFloat(params.ray_params.z) * texel_world, uintBitsToFloat(params.ray_params.w) * longest);
 		if (abs(stored - depth) > tolerance) {
 			continue;
 		}
-		if (facing > best_w) {
+		// Which card holds the hit: the one facing the ray most squarely
+		// was the rule, and it read a beam's side face from the card below
+		// it, whose texel there is the emissive strip mounted under the
+		// beam -- a few centimeters of depth apart, inside any tolerance,
+		// while the side-facing card matched the hit's depth exactly (plan
+		// section 82). The mismatch in texels, weighted, decides against
+		// the facing; the facing alone still breaks the ties.
+		float score = facing - params.card_pick_weight * abs(stored - depth) / texel_world;
+		if (best_w <= 0.0 || score > best_score) {
 			best_w = facing;
+			best_score = score;
 			best_uv = uv01;
 			best_packed = packed;
 			best_k = k;

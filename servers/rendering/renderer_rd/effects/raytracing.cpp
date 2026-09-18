@@ -1879,8 +1879,15 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	const bool use_spec_budget = spec_budget.size() >= 2 && p_gbuf_f0.is_valid();
 	params.cv_params[2] = use_spec_budget ? float(spec_budget[0]) : 2.0f;
 	params.cv_params[3] = use_spec_budget ? float(spec_budget[1]) : 0.0f;
-	params.ray_params[2] = 0;
-	params.ray_params[3] = 0;
+	// GODOT_GI_CARD_TOL=<texels>,<fraction>: the card lookup's depth
+	// tolerance, the larger of that many texels of the card and that
+	// fraction of the box's longest extent (default 2, 0.02; plan section
+	// 79's leak test). Both as float bits.
+	static const Vector<double> card_tol = OS::get_singleton()->get_environment("GODOT_GI_CARD_TOL").split_floats(",");
+	const float tol_texels = card_tol.size() >= 1 ? float(card_tol[0]) : 2.0f;
+	const float tol_fraction = card_tol.size() >= 2 ? float(card_tol[1]) : 0.02f;
+	memcpy(&params.ray_params[2], &tol_texels, sizeof(float));
+	memcpy(&params.ray_params[3], &tol_fraction, sizeof(float));
 	params.flags = 0;
 	if (use_spec_budget) {
 		params.flags |= 1048576; // FLAG_SPEC_BUDGET
@@ -2028,6 +2035,14 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// through (0 reads young texels raw).
 	static const float card_youth_lod = OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD") == "" ? 3.0f : float(OS::get_singleton()->get_environment("GODOT_GI_YOUTH_LOD").to_float());
 	params.card_youth_lod = use_cards ? card_youth_lod : 0.0f;
+	// GODOT_GI_CARD_COARSE=<meters>: the widest card texel the gather reads;
+	// a coarser card's hits are shaded exactly (plan section 79's leak).
+	static const float card_coarse_limit = OS::get_singleton()->get_environment("GODOT_GI_CARD_COARSE").to_float();
+	params.card_coarse_limit = use_cards ? card_coarse_limit : 0.0f;
+	// GODOT_GI_CARD_PICK=<weight>: the card pick's weight on the depth
+	// mismatch (texels) against the facing; 0 is the facing alone.
+	static const float card_pick_weight = OS::get_singleton()->get_environment("GODOT_GI_CARD_PICK").to_float();
+	params.card_pick_weight = card_pick_weight;
 	// Diagnostics: GODOT_GI_FALLBACK_PARTS=n shows only some of the cards'
 	// bounce histories in the fallback (1 the static, 2 the dynamic lights'
 	// first bounce, 4 their later bounces; 0 all).
@@ -2955,7 +2970,7 @@ String Raytracing::get_state_scale_line() const {
 	}
 	if (surface_cache) {
 		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
-		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d period %d density_scale %.3f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.period, st.density_scale);
+		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels);
 	}
 	return line;
 }

@@ -447,7 +447,8 @@ private:
 		SurfaceCache::MirrorPlaneGPU mirrors[SurfaceCache::MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 		uint32_t mirror_count;
 		uint32_t mirror_order;
-		uint32_t mirror_pad[2];
+		float card_coarse_limit; // Cards with a texel wider than this (meters) are not read by the gather, their hits go to hit shading (GODOT_GI_CARD_COARSE; 0 off).
+		float card_pick_weight; // The card pick's weight on the depth mismatch in texels against the facing (GODOT_GI_CARD_PICK; 0 picks by facing alone).
 	};
 
 	// The surface cache the gather shades hits from, when enabled (owned here;

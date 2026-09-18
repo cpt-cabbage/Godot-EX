@@ -846,6 +846,28 @@ bool SurfaceCache::converge_pending = false;
 bool SurfaceCache::set_state_pending = false;
 LocalVector<uint8_t> SurfaceCache::set_state;
 
+bool SurfaceCache::read_frames_pending = false;
+LocalVector<uint32_t> SurfaceCache::read_frames;
+
+void SurfaceCache::_read_frames_readback(const Vector<uint8_t> &p_data) {
+	read_frames_pending = false;
+	const uint32_t *d = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	uint32_t n = p_data.size() / sizeof(uint32_t);
+	read_frames.resize(n);
+	for (uint32_t i = 0; i < n; i++) {
+		read_frames[i] = d[i];
+	}
+	if (OS::get_singleton()->has_environment("GODOT_CARD_READ_PRINT")) {
+		uint32_t nonzero = 0;
+		uint32_t newest = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			nonzero += d[i] != 0 ? 1 : 0;
+			newest = MAX(newest, d[i]);
+		}
+		print_line(vformat("Surface cache read stamps: %d sets, %d stamped, newest %d", n, nonzero, newest));
+	}
+}
+
 void SurfaceCache::_set_state_readback(const Vector<uint8_t> &p_data) {
 	set_state_pending = false;
 	const uint32_t *d = reinterpret_cast<const uint32_t *>(p_data.ptr());
@@ -1374,6 +1396,58 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->draw_command_end_label();
 	}
 
+	// Diagnostics (GODOT_CARD_READ_PRINT): the frame's read footprint, from
+	// the request bits before the prepare pass spends them -- the tiles rays
+	// asked for this frame against the tiles the atlas holds, by card edge.
+	// What a card's texels are worth is what this measures (plan section 82).
+	static const bool read_print = OS::get_singleton()->has_environment("GODOT_CARD_READ_PRINT");
+	if (read_print && p_inputs.frame % 60 == 45 && !sets.is_empty()) {
+		Vector<uint8_t> data = rd->buffer_get_data(requests_buffer, MAX_SETS * sizeof(uint32_t), sets.size() * TILE_WORDS_PER_SET * sizeof(uint32_t));
+		const uint32_t *w = reinterpret_cast<const uint32_t *>(data.ptr());
+		const uint32_t words_per_card = TILE_WORDS_PER_SET / CARDS_PER_SET;
+		uint64_t held[16] = {};
+		uint64_t asked[16] = {};
+		uint32_t sets_asked = 0;
+		for (uint32_t i = 0; i < sets.size(); i++) {
+			const CardSet &set = sets[i];
+			if (!set.in_use || set.size == 0) {
+				continue;
+			}
+			int cls = 0;
+			while ((1u << cls) < set.size) {
+				cls++;
+			}
+			uint32_t asked_set = 0;
+			for (int k = 0; k < CARDS_PER_SET; k++) {
+				uint32_t tiles = MAX(uint32_t(set.dims[k].x) / 16u, 1u) * MAX(uint32_t(set.dims[k].y) / 16u, 1u);
+				held[cls] += tiles;
+				uint32_t n = 0;
+				for (uint32_t j = 0; j < words_per_card; j++) {
+					uint32_t v = w[i * TILE_WORDS_PER_SET + k * words_per_card + j];
+					while (v) {
+						n++;
+						v &= v - 1;
+					}
+				}
+				asked[cls] += MIN(n, tiles);
+				asked_set += n;
+			}
+			sets_asked += asked_set > 0 ? 1 : 0;
+		}
+		String line = vformat("Surface cache read footprint: frame %d, %d sets asked;", p_inputs.frame, sets_asked);
+		uint64_t th = 0;
+		uint64_t ta = 0;
+		for (int c = 3; c < 9; c++) {
+			if (held[c] > 0) {
+				line += vformat(" edge %d: %d/%d tiles (%.1f%%)", 1 << c, asked[c], held[c], 100.0 * double(asked[c]) / double(held[c]));
+			}
+			th += held[c];
+			ta += asked[c];
+		}
+		line += vformat(" | all %d/%d (%.1f%%)", ta, th, th > 0 ? 100.0 * double(ta) / double(th) : 0.0);
+		print_line(line);
+	}
+
 	RENDER_TIMESTAMP("Surface Cache Prepare");
 	rd->draw_command_begin_label("Surface Cache Prepare");
 	RD::ComputeListID list = rd->compute_list_begin();
@@ -1482,6 +1556,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			_set_state_readback(rd->buffer_get_data(set_state_buffer, 0, sets.size() * 2 * sizeof(uint32_t)));
 		} else {
 			rd->buffer_get_data_async(set_state_buffer, callable_mp_static(&SurfaceCache::_set_state_readback), 0, sets.size() * 2 * sizeof(uint32_t));
+		}
+	}
+	if (!read_frames_pending && p_inputs.frame % 4 == 3 && !sets.is_empty()) {
+		read_frames_pending = true;
+		if (deterministic) {
+			_read_frames_readback(rd->buffer_get_data(requests_buffer, 0, sets.size() * sizeof(uint32_t)));
+		} else {
+			rd->buffer_get_data_async(requests_buffer, callable_mp_static(&SurfaceCache::_read_frames_readback), 0, sets.size() * sizeof(uint32_t));
 		}
 	}
 	if (count_convergence && !converge_pending && p_inputs.frame % 4 == 0) {
@@ -1662,11 +1744,22 @@ SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	st.period = last_period;
 	st.density_scale = density_scale;
 	double texels = 0.0;
-	for (const CardSet &set : sets) {
+	double read_texels = 0.0;
+	for (uint32_t i = 0; i < sets.size(); i++) {
+		const CardSet &set = sets[i];
 		if (!set.in_use) {
 			continue;
 		}
 		st.sets++;
+		// Within the last two periods, or eight frames: the stamps land a
+		// few frames after they are asked for (every fourth frame).
+		bool read = i < read_frames.size() && read_frames[i] != 0 && frame - read_frames[i] <= MAX(2 * last_period, 8u);
+		if (read) {
+			st.read_sets++;
+			for (int k = 0; k < CARDS_PER_SET; k++) {
+				read_texels += double(set.dims[k].x) * double(set.dims[k].y);
+			}
+		}
 		if (set.captured) {
 			st.captured++;
 		}
@@ -1682,5 +1775,6 @@ SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	st.pages = pages.size();
 	st.pages_used = pages.size() - free_pages.size();
 	st.texels_used = float(texels / (double(settings.atlas_size) * double(settings.atlas_size)));
+	st.read_texels = texels > 0.0 ? float(read_texels / texels) : 0.0f;
 	return st;
 }

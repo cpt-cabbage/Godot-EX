@@ -332,6 +332,12 @@ private:
 	static bool set_state_pending;
 	static LocalVector<uint8_t> set_state; // [set * 2]: relit, [set * 2 + 1]: filled, as last read back.
 	static void _set_state_readback(const Vector<uint8_t> &p_data);
+	// The requests' frame stamps (the cache's frame a ray last read a set),
+	// read back with the set state: which sets the rays reach at all, for
+	// the density they are worth.
+	static bool read_frames_pending;
+	static LocalVector<uint32_t> read_frames;
+	static void _read_frames_readback(const Vector<uint8_t> &p_data);
 	static uint32_t converge_young;
 	static uint32_t converge_relit;
 	static uint32_t converge_up; // The settled texels' bounce luminance that rose this relight, summed (fixed point, 1/1024).
@@ -551,6 +557,8 @@ public:
 		uint32_t pending_blocks = 0; // Requested blocks that frame, and the turn period they set.
 		uint32_t period = 0;
 		float density_scale = 1.0f;
+		uint32_t read_sets = 0; // Sets a ray read within the last round-robin period (as last read back), and their share of the allocated texels.
+		float read_texels = 0.0f;
 	};
 	ScaleStats get_scale_stats() const;
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
