@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_denoise_guide.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
@@ -161,6 +162,7 @@ public:
 	LocalVector<ReprojectHistory> reproject_history; // Per view.
 
 	LocalVector<RID> stochastic_params_ubos; // Per view.
+	uint32_t denoise_guide_frame[2][4] = {}; // Per view (up to two) and scale (1, 2, 4, 8 as index 0..3): the frame the guide was produced.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
 	LocalVector<RID> rt_gi_votes_buffers; // Per view: the gather's lighting-change votes per 8x8 tile (GODOT_GI_VOTES).
 	LocalVector<uint32_t> rt_gi_votes_tiles; // Per view: the tiles the buffer holds.
@@ -560,6 +562,21 @@ private:
 	RID hit_offsets;
 	RID hit_dispatch_args;
 	RID hit_params_ubo;
+
+	// The denoisers' guide (rt_denoise_guide.glsl): the depth and normal /
+	// roughness at a signal's resolution, produced once per frame per scale
+	// and read by the spatial passes in place of the full-resolution
+	// textures (GODOT_RT_DENOISE_GUIDE=0 reads those as before).
+	RtDenoiseGuideShaderRD denoise_guide_shader;
+	RID denoise_guide_shader_version;
+	RID denoise_guide_pipeline;
+	struct DenoiseGuidePushConstant {
+		int32_t size[2];
+		int32_t full_size[2];
+		int32_t scale;
+		int32_t pad[3];
+	};
+	bool _denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness);
 
 	RtHitBinShaderRD hit_bin_shader;
 	RID hit_bin_shader_version;

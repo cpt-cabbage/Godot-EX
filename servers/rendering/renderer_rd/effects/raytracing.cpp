@@ -186,6 +186,14 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 		stochastic_select_pipeline_no_area = RD::get_singleton()->compute_pipeline_create(stochastic_shader.version_get_shader(stochastic_shader_version, 1), sc_list);
 	}
 
+	{
+		Vector<String> guide_modes;
+		guide_modes.push_back("");
+		denoise_guide_shader.initialize(guide_modes);
+		denoise_guide_shader_version = denoise_guide_shader.version_create();
+		denoise_guide_pipeline = RD::get_singleton()->compute_pipeline_create(denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 0));
+	}
+
 	Vector<String> light_list_modes;
 	light_list_modes.push_back("");
 	light_list_shader.initialize(light_list_modes);
@@ -276,6 +284,7 @@ Raytracing::~Raytracing() {
 		}
 	}
 	hit_bin_shader.version_free(hit_bin_shader_version);
+	denoise_guide_shader.version_free(denoise_guide_shader_version);
 	translucency_shader.version_free(translucency_shader_version);
 	RD::get_singleton()->free_rid(sampler);
 	RD::get_singleton()->free_rid(stbn_texture);
@@ -1135,6 +1144,65 @@ void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32
 	rd->draw_command_end_label();
 }
 
+// The spatial denoisers' edge stops read the depth and the normal at every
+// tap; at half or quarter resolution those were texelFetches at pixel *
+// depth_scale into the full-resolution textures, a stride that touches a
+// cache line per tap. The guide is those two textures point-sampled to
+// the signal's size, made once per frame per scale and bound in their
+// place with depth_scale 1: the same values, read packed. Measured on the
+// TPS bridge (plan section 83). Returns false when the guide is off or
+// the signal is at full resolution (nothing to gain).
+bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness) {
+	static const bool guide_off = OS::get_singleton()->get_environment("GODOT_RT_DENOISE_GUIDE") == "0";
+	if (guide_off || p_scale <= 1 || p_view >= 2 || p_depth.is_null() || p_normal_roughness.is_null()) {
+		return false;
+	}
+	RD *rd = RD::get_singleton();
+	const uint32_t scale_index = p_scale >= 8 ? 3 : (p_scale >= 4 ? 2 : 1);
+	const StringName depth_names[4] = { SNAME("guide_depth_1"), SNAME("guide_depth_2"), SNAME("guide_depth_4"), SNAME("guide_depth_8") };
+	const StringName nr_names[4] = { SNAME("guide_nr_1"), SNAME("guide_nr_2"), SNAME("guide_nr_4"), SNAME("guide_nr_8") };
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_STATE, depth_names[scale_index])) {
+		_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_STATE, depth_names[scale_index], RD::DATA_FORMAT_R32_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_size);
+		_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_STATE, nr_names[scale_index], RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_size);
+	}
+	r_depth = p_render_buffers->get_texture_slice(RB_SCOPE_RT_STATE, depth_names[scale_index], p_view, 0);
+	r_normal_roughness = p_render_buffers->get_texture_slice(RB_SCOPE_RT_STATE, nr_names[scale_index], p_view, 0);
+	if (r_depth.is_null() || r_normal_roughness.is_null()) {
+		return false;
+	}
+	if (rb_state->denoise_guide_frame[p_view][scale_index] == rb_state->frame_index && rb_state->frame_index != 0) {
+		return true; // This frame's already.
+	}
+	rb_state->denoise_guide_frame[p_view][scale_index] = rb_state->frame_index;
+
+	Size2i full_size = p_render_buffers->get_internal_size();
+	DenoiseGuidePushConstant pc = {};
+	pc.size[0] = p_size.x;
+	pc.size[1] = p_size.y;
+	pc.full_size[0] = full_size.x;
+	pc.full_size[1] = full_size.y;
+	pc.scale = int32_t(p_scale);
+	RID shader_rid = denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 0);
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RD::Uniform g_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_depth }));
+	RD::Uniform g_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, p_normal_roughness }));
+	RD::Uniform g_out_depth(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ r_depth }));
+	RD::Uniform g_out_nr(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ r_normal_roughness }));
+	RENDER_TIMESTAMP("RT Denoise Guide");
+	rd->draw_command_begin_label("RT Denoise Guide");
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, denoise_guide_pipeline);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 0, g_depth, g_nr), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 1, g_out_depth, g_out_nr), 1);
+	rd->compute_list_set_push_constant(list, &pc, sizeof(DenoiseGuidePushConstant));
+	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+	return true;
+}
+
 void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_gbuf_albedo, RID p_gbuf_f0, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
@@ -1617,6 +1685,10 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	// history pair is safe because next frame's parity makes it the temporal
 	// pass's output, which is written for every pixel.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
+	RID guide_depth = depth;
+	RID guide_nr = p_normal_roughness;
+	const bool guided = _denoise_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness, guide_depth, guide_nr);
+	denoise_push_constant.depth_scale = guided ? 1 : (int32_t)depth_scale;
 	RID scratch_d[2] = { diffuse_slice, hist_read_d };
 	RID scratch_s[2] = { specular_slice, hist_read_s };
 	RID moments_scratch = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_MOMENTS_SCRATCH, p_view, 0);
@@ -1641,9 +1713,9 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, variant);
 		RD::Uniform u_in_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_diffuse }));
 		RD::Uniform u_in_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, in_specular }));
-		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
+		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, guide_depth }));
 		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_in }));
-		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, p_normal_roughness }));
+		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, guide_nr }));
 		RD::Uniform u_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, meta_write }));
 		RD::Uniform u_analytic_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, analytic_diffuse }));
 		RD::Uniform u_analytic_s(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler, analytic_specular }));
@@ -2472,6 +2544,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// intermediate iterations use the variant that writes it, leaves the
 	// directional moment un-renormalized, and carries the filtered moments on.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
+	RID guide_depth = depth;
+	RID guide_nr = p_normal_roughness;
+	const bool guided = _denoise_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness, guide_depth, guide_nr);
+	denoise_push_constant.depth_scale = guided ? 1 : (int32_t)depth_scale;
 	RID scratch_a[2] = { raw_ambient, hist_read_a };
 	RID scratch_r[2] = { raw_reflection, hist_read_r };
 	RID scratch_dir[2] = { raw_directional, hist_read_d };
@@ -2516,9 +2592,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RID rid = stochastic_denoise_shader.version_get_shader(stochastic_denoise_shader_version, variant);
 		RD::Uniform u_in_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, in_ambient }));
 		RD::Uniform u_in_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, in_reflection }));
-		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
+		RD::Uniform u_dn_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, guide_depth }));
 		RD::Uniform u_moments(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, moments_in }));
-		RD::Uniform u_normal_dn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, p_normal_roughness }));
+		RD::Uniform u_normal_dn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, guide_nr }));
 		RD::Uniform u_meta(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, meta_write }));
 		RD::Uniform u_analytic_a(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ sampler, default_black }));
 		RD::Uniform u_analytic_r(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler, default_black }));
@@ -2689,6 +2765,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 	}
 
 	// One dispatch per material, over the packets binned to it.
+	RENDER_TIMESTAMP("RT Hit Materials");
 	RID default_3d = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 	RID lightprobe = p_cascades.lightprobe_texture.is_valid() ? p_cascades.lightprobe_texture : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
 	RID occlusion = p_cascades.occlusion_texture.is_valid() ? p_cascades.occlusion_texture : default_3d;
@@ -2756,6 +2833,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 		}
 		rd->compute_list_end();
 	}
+	RENDER_TIMESTAMP("RT Hit Resolve");
 	{
 		RID resolve_rid = hit_bin_shader.version_get_shader(hit_bin_shader_version, HIT_BIN_RESOLVE);
 		RD::Uniform r_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ p_raw_ambient }));
