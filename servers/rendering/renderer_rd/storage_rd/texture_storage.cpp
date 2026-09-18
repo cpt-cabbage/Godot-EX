@@ -31,13 +31,14 @@
 #include "texture_storage.h"
 
 #include "core/config/engine.h"
+#include "core/os/os.h"
+#include "servers/rendering/color_management.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
-#include "servers/rendering/color_management.h"
 
 using namespace RendererRD;
 
@@ -3617,6 +3618,9 @@ void TextureStorage::update_area_light_atlas() {
 	tformat.width = area_light_atlas.size.width;
 	tformat.height = area_light_atlas.size.height;
 	tformat.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+	if (OS::get_singleton()->has_environment("GODOT_RT_DUMP")) {
+		tformat.usage_bits |= RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT; // Readable for the harness dump (Raytracing::dump_aovs).
+	}
 	tformat.texture_type = RD::TEXTURE_TYPE_2D;
 	tformat.mipmaps = area_light_atlas.mipmaps;
 	tformat.shareable_formats.push_back(RD::DATA_FORMAT_R8G8B8A8_UNORM);
@@ -4019,6 +4023,9 @@ void TextureStorage::update_decal_atlas() {
 	tformat.width = decal_atlas.size.width;
 	tformat.height = decal_atlas.size.height;
 	tformat.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+	if (OS::get_singleton()->has_environment("GODOT_RT_DUMP")) {
+		tformat.usage_bits |= RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT; // Readable for the harness dump (Raytracing::dump_aovs).
+	}
 	tformat.texture_type = RD::TEXTURE_TYPE_2D;
 	tformat.mipmaps = decal_atlas.mipmaps;
 	tformat.shareable_formats.push_back(RD::DATA_FORMAT_R8G8B8A8_UNORM);

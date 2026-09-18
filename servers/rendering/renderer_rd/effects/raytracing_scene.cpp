@@ -248,14 +248,22 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 // The acceleration structure usage hints (Apple's WWDC22 list: refit for
 // deforming meshes, fast-build for per-frame rebuilds, fast-intersection for
 // the rest). GODOT_RT_AS_USAGE=0 restores the hint-less structures of before
-// 2026-09-17 for an A/B.
+// 2026-09-17 for an A/B; a list of static, deform, tlas keeps only those.
+static bool _as_usage_hint(const char *p_which) {
+	static const String usage = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE");
+	if (usage.is_empty() || usage == "1") {
+		return true;
+	}
+	return usage.contains(p_which);
+}
+
 BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_static_blas_flags() {
-	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	static const bool hints = _as_usage_hint("static");
 	return hints ? BitField<RD::AccelerationStructureFlagBits>(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT) : BitField<RD::AccelerationStructureFlagBits>();
 }
 
 BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_deforming_blas_flags() {
-	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	static const bool hints = _as_usage_hint("deform");
 	BitField<RD::AccelerationStructureFlagBits> flags;
 	if (hints) {
 		flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
@@ -265,7 +273,7 @@ BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_deforming_blas_fla
 }
 
 BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_rebuilt_flags() {
-	static const bool hints = OS::get_singleton()->get_environment("GODOT_RT_AS_USAGE") != "0";
+	static const bool hints = _as_usage_hint("tlas");
 	return hints ? BitField<RD::AccelerationStructureFlagBits>(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT) : BitField<RD::AccelerationStructureFlagBits>();
 }
 

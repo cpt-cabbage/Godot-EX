@@ -30,6 +30,7 @@
 
 #include "raytracing.h"
 
+#include "core/io/file_access.h"
 #include "core/io/image.h"
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
@@ -697,9 +698,55 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		{ "sun_raw", RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_RAW },
 		{ "area", RB_SCOPE_RT_SHADOWS, RB_RT_AREA_SHADOW_MASK },
 		{ "vel", RB_SCOPE_RT_STATE, RB_RT_VELOCITY },
+		// The prepass G-buffer the composites and the RT passes read (the
+		// clustered renderer's scope, named here so a harness can compare
+		// what a surface wrote against what it was lit with).
+		{ "gbuf_albedo", SNAME("forward_clustered"), SNAME("gbuf_albedo") },
+		{ "gbuf_f0", SNAME("forward_clustered"), SNAME("gbuf_f0") },
+		{ "normal_roughness", SNAME("forward_clustered"), SNAME("normal_roughness") },
 	};
 	RD *rd = RD::get_singleton();
 	int saved = 0;
+	// The projector/decal atlas, a shared texture rather than a render-buffer
+	// one: the passes sample the spots' cookies from it.
+	if (set.has("decal_atlas")) {
+		RID atlas = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture();
+		RID atlas_srgb = RendererRD::TextureStorage::get_singleton()->decal_atlas_get_texture_srgb();
+		print_line(vformat("RT dump: decal atlas %s (valid %s) srgb view %s (valid %s, same %s)", itos(atlas.get_id()), atlas.is_valid() && rd->texture_is_valid(atlas) ? "yes" : "no", itos(atlas_srgb.get_id()), atlas_srgb.is_valid() && rd->texture_is_valid(atlas_srgb) ? "yes" : "no", atlas == atlas_srgb ? "yes" : "no"));
+		if (atlas_srgb.is_valid() && rd->texture_is_valid(atlas_srgb) && atlas != atlas_srgb) {
+			const Vector<uint8_t> vdata = rd->texture_get_data(atlas_srgb, 0);
+			uint64_t sum = 0;
+			for (int i = 0; i < MIN(vdata.size(), 512 * 512 * 4); i++) {
+				sum += vdata[i];
+			}
+			print_line(vformat("RT dump: srgb view %d bytes, base level mean %.2f", vdata.size(), vdata.size() > 0 ? double(sum) / double(MIN(vdata.size(), 512 * 512 * 4)) : 0.0));
+		}
+		if (atlas.is_valid()) {
+			const RD::TextureFormat tf = rd->texture_get_format(atlas);
+			const Vector<uint8_t> data = rd->texture_get_data(atlas, 0);
+			if (data.size() >= int(tf.width * tf.height * 4)) { // The mip chain follows the base level.
+				Ref<Image> img = Image::create_from_data(tf.width, tf.height, false, Image::FORMAT_RGBA8, data.slice(0, tf.width * tf.height * 4));
+				img->save_png(vformat("%s_decal_atlas.png", prefix));
+				saved++;
+				// The mip chain's mean per level, for a stale-mips check.
+				String mips;
+				int off = tf.width * tf.height * 4;
+				for (int w2 = tf.width / 2, h2 = tf.height / 2; w2 >= 1 && off + w2 * h2 * 4 <= data.size(); w2 /= 2, h2 /= 2) {
+					uint64_t sum = 0;
+					for (int i = 0; i < w2 * h2 * 4; i++) {
+						sum += data[off + i];
+					}
+					mips += vformat(" %dx%d:%.1f", w2, h2, double(sum) / double(w2 * h2 * 4));
+					off += w2 * h2 * 4;
+				}
+				print_line("RT dump: decal atlas mip means" + mips);
+			} else {
+				print_line(vformat("RT dump: decal atlas %dx%d format %d, %d bytes: not saved", tf.width, tf.height, int(tf.format), data.size()));
+			}
+		} else {
+			print_line("RT dump: no decal atlas texture this frame");
+		}
+	}
 	for (const Entry &e : entries) {
 		bool wanted = set.is_empty();
 		for (const String &w : set) {
@@ -743,6 +790,20 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 					_unpack_r11g11b10(src[i], dst + i * 3);
 				}
 				img = Image::create_from_data(w, h, false, Image::FORMAT_RGBF, out);
+			} break;
+			case RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32: {
+				// The ten-bit channels as floats in 0..1, the two-bit alpha as 0..3 (its flag bits).
+				Vector<uint8_t> out;
+				out.resize(w * h * 4 * sizeof(float));
+				const uint32_t *src = (const uint32_t *)data.ptr();
+				float *dst = (float *)out.ptrw();
+				for (int i = 0; i < w * h; i++) {
+					dst[i * 4 + 0] = float(src[i] & 0x3FFu) / 1023.0f;
+					dst[i * 4 + 1] = float((src[i] >> 10) & 0x3FFu) / 1023.0f;
+					dst[i * 4 + 2] = float((src[i] >> 20) & 0x3FFu) / 1023.0f;
+					dst[i * 4 + 3] = float(src[i] >> 30);
+				}
+				img = Image::create_from_data(w, h, false, Image::FORMAT_RGBAF, out);
 			} break;
 			case RD::DATA_FORMAT_R32_UINT:
 			case RD::DATA_FORMAT_R32_SFLOAT: {
@@ -1418,6 +1479,32 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	}
 	if (ablate.contains("eval")) {
 		params.flags |= 1024; // FLAG_NO_EVAL
+	}
+	// Diagnostics (GODOT_STOCH_DUMP_CLUSTER=<path>): the cluster buffer this
+	// pass reads, with its layout, once; rt_lab/cluster_dump.py decodes it.
+	{
+		static const String dump_path = OS::get_singleton()->get_environment("GODOT_STOCH_DUMP_CLUSTER");
+		static bool dumped = false;
+		if (!dump_path.is_empty() && !dumped && rb_state->frame_index > 60) {
+			dumped = true;
+			Vector<uint8_t> data = rd->buffer_get_data(p_cluster_buffer);
+			Ref<FileAccess> f = FileAccess::open(dump_path, FileAccess::WRITE);
+			if (f.is_valid()) {
+				uint32_t header[8] = { params.cluster_width, uint32_t(Math::division_round_up((uint32_t)full_size.y, p_cluster_size)), params.max_cluster_element_count_div_32, params.cluster_type_size, params.omni_light_count, params.spot_light_count, uint32_t(p_cluster_z0 * 1000.0f), uint32_t(data.size()) };
+				f->store_buffer((const uint8_t *)header, sizeof(header));
+				f->store_buffer(data.ptr(), data.size());
+				f->store_buffer((const uint8_t *)&params, sizeof(params));
+				// The light buffers the pass evaluates, after the cluster.
+				RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();
+				for (const RID &lb : { ls->get_omni_light_buffer(), ls->get_spot_light_buffer() }) {
+					Vector<uint8_t> ldata = rd->buffer_get_data(lb);
+					uint32_t n = ldata.size();
+					f->store_buffer((const uint8_t *)&n, sizeof(n));
+					f->store_buffer(ldata.ptr(), ldata.size());
+				}
+				print_line(vformat("Stochastic cluster dump: %d bytes, %dx%d cells, div32 %d, z0 %.3f, lights %d omni %d spot -> %s", data.size(), header[0], header[1], header[2], p_cluster_z0, params.omni_light_count, params.spot_light_count, dump_path));
+			}
+		}
 	}
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 

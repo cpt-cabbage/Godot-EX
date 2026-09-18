@@ -348,7 +348,7 @@ RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_nor
 }
 
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
-	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+	return get_gbuf_usage_bits(p_resolve, p_msaa, p_storage);
 }
 
 RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_format() {
@@ -367,7 +367,9 @@ RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_gbu
 }
 
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuf_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
-	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+	// Readable for the harness dump (GODOT_RT_DUMP, Raytracing::dump_aovs), as the RT textures are.
+	static const uint32_t dump_bit = OS::get_singleton()->has_environment("GODOT_RT_DUMP") ? RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT : 0;
+	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage) | (p_msaa ? 0 : dump_bit);
 }
 
 void RenderForwardClustered::setup_render_buffer_data(Ref<RenderSceneBuffersRD> p_render_buffers) {
