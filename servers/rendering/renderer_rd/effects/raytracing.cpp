@@ -1152,6 +1152,21 @@ void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32
 // place with depth_scale 1: the same values, read packed. Measured on the
 // TPS bridge (plan section 83). Returns false when the guide is off or
 // the signal is at full resolution (nothing to gain).
+RID Raytracing::get_denoise_guide_normal(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_scale) const {
+	if (rb_state == nullptr || p_scale <= 1 || p_render_buffers.is_null()) {
+		return RID();
+	}
+	const uint32_t scale_index = p_scale >= 8 ? 3 : (p_scale >= 4 ? 2 : 1);
+	if (rb_state->denoise_guide_frame[0][scale_index] != rb_state->frame_index || rb_state->frame_index == 0) {
+		return RID();
+	}
+	const StringName nr_names[4] = { SNAME("guide_nr_1"), SNAME("guide_nr_2"), SNAME("guide_nr_4"), SNAME("guide_nr_8") };
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_STATE, nr_names[scale_index])) {
+		return RID();
+	}
+	return p_render_buffers->get_texture(RB_SCOPE_RT_STATE, nr_names[scale_index]);
+}
+
 bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness) {
 	static const bool guide_off = OS::get_singleton()->get_environment("GODOT_RT_DENOISE_GUIDE") == "0";
 	if (guide_off || p_scale <= 1 || p_view >= 2 || p_depth.is_null() || p_normal_roughness.is_null()) {

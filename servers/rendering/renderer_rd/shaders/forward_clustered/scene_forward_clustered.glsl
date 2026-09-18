@@ -1274,6 +1274,23 @@ vec3 encode24(vec3 v) {
 }
 #endif // MODE_RENDER_NORMAL_ROUGHNESS
 
+// The composites' fast path: the view depth the fragment's own plane
+// (through vertex, facing p_normal) has along the view ray through a
+// sampling-grid tap's full-resolution pixel, so a tap on the same flat
+// surface passes at any grazing angle (a fixed depth tolerance failed the
+// whole floor: four full-resolution pixels of a floor seen at a grazing
+// angle are more than two percent of its depth apart).
+float plane_depth_at_tap(mat4 p_inv_projection, ivec2 p_full_pixel, ivec2 p_full_size, vec3 p_vertex, vec3 p_normal) {
+	vec2 ndc = (vec2(p_full_pixel) + 0.5) / vec2(p_full_size) * 2.0 - 1.0;
+	vec4 r4 = p_inv_projection * vec4(ndc, 1.0, 1.0);
+	vec3 r = r4.xyz / r4.w;
+	float denom = dot(p_normal, r);
+	if (abs(denom) < 1e-6) {
+		return -p_vertex.z;
+	}
+	return -dot(p_normal, p_vertex) / denom * r.z;
+}
+
 void fragment_shader(in SceneData scene_data) {
 	uint instance_index = instance_index_interp;
 
@@ -2348,7 +2365,56 @@ void fragment_shader(in SceneData scene_data) {
 			vec3 rtgi_near_reflection = vec3(0.0);
 			vec4 rtgi_near_directional = vec4(0.0);
 			rt_gi_directional = vec4(0.0);
-			for (int i = 0; i < 4; i++) {
+			// The fast path, as the direct composite's: the four taps on this
+			// surface by one gather each of the gather's depth and guide
+			// normal, then the three signals through the bilinear filter.
+			bool rtgi_fast = false;
+			if ((implementation_data.rt_gi & (256u | 512u)) == 512u) {
+				vec2 gsize = vec2(rtgi_half_size);
+				vec2 corner = (vec2(rtgi_base) + 1.0) / gsize;
+#ifdef USE_MULTIVIEW
+				vec4 gd = textureGather(sampler2DArray(rt_gi_depth_buffer, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 0);
+				vec4 gnx = textureGather(sampler2DArray(rt_gi_guide_normal, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 0);
+				vec4 gny = textureGather(sampler2DArray(rt_gi_guide_normal, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 1);
+#else
+				vec4 gd = textureGather(sampler2D(rt_gi_depth_buffer, SAMPLER_LINEAR_CLAMP), corner, 0);
+				vec4 gnx = textureGather(sampler2D(rt_gi_guide_normal, SAMPLER_LINEAR_CLAMP), corner, 0);
+				vec4 gny = textureGather(sampler2D(rt_gi_guide_normal, SAMPLER_LINEAR_CLAMP), corner, 1);
+#endif
+				rtgi_fast = true;
+				// Gather order: (x0,y1) (x1,y1) (x1,y0) (x0,y0); the tap
+				// nearest this fragment carries the normal the irradiance
+				// was integrated around (the re-basing below).
+				int near_g = rtgi_fr.y >= 0.5 ? (rtgi_fr.x >= 0.5 ? 1 : 0) : (rtgi_fr.x >= 0.5 ? 2 : 3);
+				for (int k = 0; k < 4 && rtgi_fast; k++) {
+					ivec2 goff = ivec2(k == 1 || k == 2 ? 1 : 0, k < 2 ? 1 : 0);
+					ivec2 ghp = clamp(rtgi_base + goff, ivec2(0), rtgi_half_size - 1);
+					ivec2 gfp = min(ghp * rtgi_scale, rtgi_full_size - ivec2(1));
+					float pd = plane_depth_at_tap(inv_projection_matrix, gfp, rtgi_full_size, vertex, rt_gi_face);
+					vec3 gn = nr_normal(vec4(gnx[k], gny[k], 0.0, 0.0));
+					gn = dot(gn, view) < 0.0 ? -gn : gn;
+					rtgi_fast = abs(gd[k] - pd) <= 0.01 * max(rtgi_own_depth, 1e-4) && dot(rt_gi_face, gn) >= 0.9;
+					if (k == near_g) {
+						rtgi_near_n = gn;
+					}
+				}
+				rtgi_fast = subgroupAll(rtgi_fast);
+				if (rtgi_fast) {
+					vec2 guv = (rtgi_pos + 0.5) / gsize;
+#ifdef USE_MULTIVIEW
+					rt_gi_ambient = texture(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(guv, ViewIndex)).rgb;
+					rt_gi_reflection = texture(sampler2DArray(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), vec3(guv, ViewIndex)).rgb;
+					rt_gi_directional = texture(sampler2DArray(rt_gi_directional_buffer, SAMPLER_LINEAR_CLAMP), vec3(guv, ViewIndex));
+#else
+					rt_gi_ambient = texture(sampler2D(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), guv).rgb;
+					rt_gi_reflection = texture(sampler2D(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), guv).rgb;
+					rt_gi_directional = texture(sampler2D(rt_gi_directional_buffer, SAMPLER_LINEAR_CLAMP), guv);
+#endif
+					rtgi_weight = 1.0;
+					rtgi_near_w = 1.0;
+				}
+			}
+			for (int i = 0; i < 4 && !rtgi_fast; i++) {
 				ivec2 off = ivec2(i & 1, i >> 1);
 				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
 				// The full-res pixel the gather read its normal from (it clamps
@@ -2356,10 +2422,10 @@ void fragment_shader(in SceneData scene_data) {
 				ivec2 rtgi_fp = min(hp * rtgi_scale, rtgi_full_size - ivec2(1));
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
-				vec3 sn = nr_normal(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0));
+				vec3 sn = (implementation_data.rt_gi & 256u) == 0u ? nr_normal((implementation_data.rt_gi & 512u) != 0u ? texelFetch(sampler2DArray(rt_gi_guide_normal, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0) : texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0)) : rt_gi_face;
 #else
 				float sd = texelFetch(sampler2D(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
-				vec3 sn = nr_normal(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0));
+				vec3 sn = (implementation_data.rt_gi & 256u) == 0u ? nr_normal((implementation_data.rt_gi & 512u) != 0u ? texelFetch(sampler2D(rt_gi_guide_normal, SAMPLER_NEAREST_CLAMP), hp, 0) : texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), rtgi_fp, 0)) : rt_gi_face;
 #endif
 				// Faced the way the gather faced it.
 				sn = dot(sn, view) < 0.0 ? -sn : sn;
@@ -3561,7 +3627,7 @@ void fragment_shader(in SceneData scene_data) {
 	// applied here with this fragment's f0 / f90, as light_compute would. That
 	// is what lets metals and colored f0 keep their highlights.
 	float stochastic_f90 = clamp(50.0 * f0.g, metallic, 1.0);
-	if (implementation_data.stochastic_direct_lights == 1u) {
+	if ((implementation_data.stochastic_direct_lights & 3u) == 1u) {
 #ifdef USE_MULTIVIEW
 		diffuse_light += textureLod(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
 		vec4 stochastic_spec = textureLod(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0);
@@ -3591,6 +3657,17 @@ void fragment_shader(in SceneData scene_data) {
 		bool pixel_analytic = (implementation_data.stochastic_direct_lights & 3u) == 2u;
 		// The sampling grid's scale: 2, or 4 at the quarter tier (bit 2).
 		int stochastic_scale = (implementation_data.stochastic_direct_lights & 4u) != 0u ? 4 : 2;
+		// Bit 3: no image lights this frame (no planar mirror in the scene),
+		// so the two image buffers are zero and are not read. Bit 4:
+		// diagnostics, the taps' normal test skipped (GODOT_RT_OPAQUE_ABLATE=normal).
+		bool read_images = pixel_analytic && (implementation_data.stochastic_direct_lights & 8u) == 0u;
+		bool stochastic_normal_test = (implementation_data.stochastic_direct_lights & 16u) == 0u;
+		// Bit 5: the taps' normals from the denoisers' guide at the sampling
+		// grid's resolution, one packed texel a tap, instead of the
+		// full-resolution buffer at a stride of the scale (the four
+		// strided fetches were 2.3 ms of the opaque pass on the TPS bridge
+		// at 1080p, against 0.5 of the whole test with them gone).
+		bool stochastic_guide = (implementation_data.stochastic_direct_lights & 32u) != 0u;
 		//
 		// Round rather than truncate: screen_pixel_size is 1/size, and its
 		// reciprocal lands just under the integer for sizes whose inverse is
@@ -3630,7 +3707,88 @@ void fragment_shader(in SceneData scene_data) {
 		// prepass normal it lit each texel with (toward the viewer), for the
 		// normal test below.
 		vec3 stochastic_face = dot(normal, view) < 0.0 ? -normal : normal;
-		for (int i = 0; i < 4; i++) {
+		// The fast path. The opaque pass is latency-bound on this shader,
+		// and each texture instruction of the composite costs about the
+		// same whatever it reads (a strided full-resolution fetch and a
+		// packed one alike, measured on the TPS bridge at 1080p: the four
+		// normal fetches 2.3 ms either way). So the count is what matters:
+		// where the four taps sit on this fragment's surface -- nearly
+		// every fragment -- one gather each of the sampling grid's depth
+		// and guide normal decides it, and the signals are read with the
+		// hardware's bilinear filter at the same weights the loop below
+		// computes, one instruction a signal instead of four. Edges and
+		// thin features take the loop.
+		bool stochastic_fast = false;
+		vec2 stochastic_guv = vec2(0.0);
+		if (stochastic_guide && stochastic_normal_test) {
+			vec2 gsize = vec2(half_size);
+			vec2 corner = (vec2(base) + 1.0) / gsize;
+#ifdef USE_MULTIVIEW
+			vec4 gd = textureGather(sampler2DArray(stochastic_depth_buffer, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 0);
+			vec4 gnx = textureGather(sampler2DArray(stochastic_guide_normal, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 0);
+			vec4 gny = textureGather(sampler2DArray(stochastic_guide_normal, SAMPLER_LINEAR_CLAMP), vec3(corner, ViewIndex), 1);
+#else
+			vec4 gd = textureGather(sampler2D(stochastic_depth_buffer, SAMPLER_LINEAR_CLAMP), corner, 0);
+			vec4 gnx = textureGather(sampler2D(stochastic_guide_normal, SAMPLER_LINEAR_CLAMP), corner, 0);
+			vec4 gny = textureGather(sampler2D(stochastic_guide_normal, SAMPLER_LINEAR_CLAMP), corner, 1);
+#endif
+			// Within two percent of the depth (the loop's weight is then
+			// above 0.8 on every tap) and a degree or so of the normal
+			// (its weight above 0.9): the normalized blend is then the
+			// bilinear one to within a few percent of relative weight.
+			// Each tap against the depth this fragment's plane has along
+			// the tap's own view ray (a percent of the depth), and within
+			// 25 degrees of the normal (the guide's normal is the mapped
+			// one, and a bumpy floor's taps sit further apart than an
+			// edge test would like; the loop's weight is still 0.43 there,
+			// and an edge between surfaces is far past it): the loop's
+			// weights are then all near one and its normalized blend is
+			// the bilinear one.
+			stochastic_fast = true;
+			for (int k = 0; k < 4 && stochastic_fast; k++) {
+				// Gather order: (x0,y1) (x1,y1) (x1,y0) (x0,y0).
+				ivec2 goff = ivec2(k == 1 || k == 2 ? 1 : 0, k < 2 ? 1 : 0);
+				ivec2 ghp = clamp(base + goff, ivec2(0), half_size - 1);
+				ivec2 gfp = min(ghp * stochastic_scale, full_size - ivec2(1));
+				float pd = plane_depth_at_tap(inv_projection_matrix, gfp, full_size, vertex, stochastic_face);
+				vec3 gn = nr_normal(vec4(gnx[k], gny[k], 0.0, 0.0));
+				gn = dot(gn, view) < 0.0 ? -gn : gn;
+				stochastic_fast = abs(gd[k] - pd) <= 0.01 * max(own_depth, 1e-4) && dot(stochastic_face, gn) >= 0.9;
+			}
+			stochastic_guv = (pos + 0.5) / gsize;
+			// One verdict for the SIMD group: a lane on the loop makes the
+			// group execute it, and with a slow lane in most groups (every
+			// edge) the fast lanes' gathers only added to the count. The
+			// group takes the fast path when every lane may.
+			stochastic_fast = subgroupAll(stochastic_fast);
+		}
+		if (stochastic_fast) {
+#ifdef USE_MULTIVIEW
+			up_diffuse = texture(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex)).rgb;
+			up_specular = texture(sampler2DArray(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex));
+			if (read_images) {
+				up_image_diffuse = texture(sampler2DArray(stochastic_image_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex)).rgb;
+				up_image_specular = texture(sampler2DArray(stochastic_image_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex));
+			}
+			if (pixel_analytic && tv_active) {
+				up_analytic_diffuse = texture(sampler2DArray(stochastic_analytic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex)).rgb;
+				up_analytic_specular = texture(sampler2DArray(stochastic_analytic_specular_buffer, SAMPLER_LINEAR_CLAMP), vec3(stochastic_guv, ViewIndex));
+			}
+#else
+			up_diffuse = texture(sampler2D(stochastic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv).rgb;
+			up_specular = texture(sampler2D(stochastic_specular_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv);
+			if (read_images) {
+				up_image_diffuse = texture(sampler2D(stochastic_image_diffuse_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv).rgb;
+				up_image_specular = texture(sampler2D(stochastic_image_specular_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv);
+			}
+			if (pixel_analytic && tv_active) {
+				up_analytic_diffuse = texture(sampler2D(stochastic_analytic_diffuse_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv).rgb;
+				up_analytic_specular = texture(sampler2D(stochastic_analytic_specular_buffer, SAMPLER_LINEAR_CLAMP), stochastic_guv);
+			}
+#endif
+			up_weight = 1.0;
+		}
+		for (int i = 0; i < 4 && !stochastic_fast; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
 			// The full-res pixel the sampling pass lit texel hp at (it clamps
@@ -3642,12 +3800,14 @@ void fragment_shader(in SceneData scene_data) {
 			vec4 tap_analytic_specular = vec4(0.0);
 #ifdef USE_MULTIVIEW
 			float sd = texelFetch(sampler2DArray(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
-			vec3 sn = nr_normal(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(fp, int(ViewIndex)), 0));
+			vec3 sn = stochastic_normal_test ? nr_normal(stochastic_guide ? texelFetch(sampler2DArray(stochastic_guide_normal, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0) : texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(fp, int(ViewIndex)), 0)) : stochastic_face;
 			vec3 tap_diffuse = texelFetch(sampler2DArray(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2DArray(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
-			if (pixel_analytic) {
+			if (read_images) {
 				tap_image_diffuse = texelFetch(sampler2DArray(stochastic_image_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 				tap_image_specular = texelFetch(sampler2DArray(stochastic_image_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
+			}
+			if (pixel_analytic) {
 				if (tv_active) {
 					tap_analytic_diffuse = texelFetch(sampler2DArray(stochastic_analytic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).rgb;
 					tap_analytic_specular = texelFetch(sampler2DArray(stochastic_analytic_specular_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0);
@@ -3655,12 +3815,14 @@ void fragment_shader(in SceneData scene_data) {
 			}
 #else
 			float sd = texelFetch(sampler2D(stochastic_depth_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).r;
-			vec3 sn = nr_normal(texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), fp, 0));
+			vec3 sn = stochastic_normal_test ? nr_normal(stochastic_guide ? texelFetch(sampler2D(stochastic_guide_normal, SAMPLER_NEAREST_CLAMP), hp, 0) : texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), fp, 0)) : stochastic_face;
 			vec3 tap_diffuse = texelFetch(sampler2D(stochastic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 			vec4 tap_specular = texelFetch(sampler2D(stochastic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
-			if (pixel_analytic) {
+			if (read_images) {
 				tap_image_diffuse = texelFetch(sampler2D(stochastic_image_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 				tap_image_specular = texelFetch(sampler2D(stochastic_image_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
+			}
+			if (pixel_analytic) {
 				if (tv_active) {
 					tap_analytic_diffuse = texelFetch(sampler2D(stochastic_analytic_diffuse_buffer, SAMPLER_NEAREST_CLAMP), hp, 0).rgb;
 					tap_analytic_specular = texelFetch(sampler2D(stochastic_analytic_specular_buffer, SAMPLER_NEAREST_CLAMP), hp, 0);
@@ -3724,7 +3886,13 @@ void fragment_shader(in SceneData scene_data) {
 			half_analytic_diffuse = near_analytic_diffuse;
 			half_analytic_specular = near_analytic_specular;
 		}
-		if (pixel_analytic) {
+		if ((implementation_data.stochastic_direct_lights & 64u) != 0u) {
+			// Diagnostics (GODOT_RT_OPAQUE_ABLATE=paint): green where the
+			// fast path served the fragment, red where the loop did.
+			diffuse_light = stochastic_fast ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+			direct_specular_light = vec3(0.0);
+			ambient_light = vec3(0.0);
+		} else if (pixel_analytic) {
 			// The ratios (a luminance visibility fraction, replicated over
 			// rgb) times the analytic term: this pixel's own for the real
 			// lights, the half-res buffer's for the images, and -- where the

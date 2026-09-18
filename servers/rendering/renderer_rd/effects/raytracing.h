@@ -896,6 +896,12 @@ public:
 	// pick the freshly written texture, like the GI view depth). Valid for the
 	// buffer named by the most recent advance_frame().
 	bool get_history_parity() const { return rb_state != nullptr && rb_state->history_parity; }
+	// The denoisers' guide normal at a pass's scale (rt_denoise_guide.glsl),
+	// if a spatial pass wrote it this frame: the scene shader's composites
+	// read their taps' normals from it, packed like the signal, instead of
+	// striding the full-resolution buffer (2.3 ms of the TPS bridge's
+	// opaque pass at 1080p).
+	RID get_denoise_guide_normal(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_scale) const;
 
 	// The temporal passes' own velocity buffer, written by the prepass with
 	// this frame's motion vectors (the colour pass's is a frame stale for

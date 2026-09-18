@@ -802,6 +802,8 @@ void RenderForwardClustered::_render_list_with_draw_list(RenderListParameters *p
 	RD::get_singleton()->draw_list_end();
 }
 
+static void _rt_state_out(const String &p_line);
+
 uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_pancake_shadows) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -870,6 +872,38 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	}
 	if (opaque_ablate.contains("gi")) {
 		scene_state.ubo.rt_gi = 0;
+	}
+	if (opaque_ablate.contains("paint") && scene_state.ubo.stochastic_direct_lights != 0) {
+		scene_state.ubo.stochastic_direct_lights |= 64u;
+	}
+	if (opaque_ablate.contains("normal")) {
+		// The composites' taps take the pixel's own normal (bit 4, bit 8).
+		scene_state.ubo.stochastic_direct_lights |= scene_state.ubo.stochastic_direct_lights != 0 ? 16u : 0u;
+		scene_state.ubo.rt_gi |= scene_state.ubo.rt_gi != 0 ? 256u : 0u;
+	}
+	// No planar mirror, no image lights: the composite skips the two image
+	// buffers (bit 3), eight of its twenty-four fetches.
+	if (scene_state.ubo.stochastic_direct_lights != 0 && raytracing != nullptr && raytracing->get_image_chain_count() == 0) {
+		scene_state.ubo.stochastic_direct_lights |= 8u;
+	}
+	// The taps' normals from the denoisers' guide where a spatial pass
+	// wrote one this frame (bit 5 / bit 9; the bindings at 57 / 58).
+	if (raytracing != nullptr && p_opaque_render_buffers && !opaque_ablate.contains("slow")) { // =slow: the tap loops with the full-resolution normals, the form before the guide.
+		Ref<RenderSceneBuffersRD> rb_guide = p_render_data->render_buffers;
+		if (scene_state.ubo.stochastic_direct_lights != 0 && raytracing->get_denoise_guide_normal(rb_guide, use_stochastic_half_res ? (use_stochastic_quarter_res ? 4 : 2) : 1).is_valid()) {
+			scene_state.ubo.stochastic_direct_lights |= 32u;
+		}
+		if (scene_state.ubo.rt_gi != 0 && raytracing->get_denoise_guide_normal(rb_guide, use_rt_gi_half_res ? (use_rt_gi_quarter_res ? 4 : 2) : 1).is_valid()) {
+			scene_state.ubo.rt_gi |= 512u;
+		}
+	}
+	if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT") && p_opaque_render_buffers) {
+		static uint32_t last_words[2] = { UINT32_MAX, UINT32_MAX };
+		if (last_words[0] != scene_state.ubo.stochastic_direct_lights || last_words[1] != scene_state.ubo.rt_gi) {
+			last_words[0] = scene_state.ubo.stochastic_direct_lights;
+			last_words[1] = scene_state.ubo.rt_gi;
+			_rt_state_out(vformat("RT STATE composite: stochastic 0x%x gi 0x%x", last_words[0], last_words[1]));
+		}
 	}
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
@@ -5211,6 +5245,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		const StringName &name = i == 0 ? RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE : (i == 1 ? RB_RT_STOCHASTIC_ANALYTIC_SPECULAR : (i == 2 ? RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE : RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR));
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, name) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	for (uint32_t i = 0; i < 2; i++) {
+		RD::Uniform u;
+		u.binding = 57 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		const uint32_t scale = i == 0 ? (use_stochastic_half_res ? (use_stochastic_quarter_res ? 4 : 2) : 1) : (use_rt_gi_half_res ? (use_rt_gi_quarter_res ? 4 : 2) : 1);
+		RID guide = (rb.is_valid() && raytracing != nullptr) ? raytracing->get_denoise_guide_normal(rb, scale) : RID();
+		RID texture = guide.is_valid() ? guide : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
