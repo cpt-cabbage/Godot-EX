@@ -66,6 +66,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	{
 		Vector<String> modes;
 		modes.push_back("\n#define MODE_SELECT\n");
+		modes.push_back("\n#define MODE_TILES\n");
 		modes.push_back("\n#define MODE_CULL_LIGHTS\n");
 		prepare_shader.initialize(modes);
 		prepare_shader_version = prepare_shader.version_create();
@@ -97,15 +98,16 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 		mip_pipeline = rd->compute_pipeline_create(mip_shader.version_get_shader(mip_shader_version, 0));
 	}
 
-	requests_buffer = rd->storage_buffer_create(MAX_SETS * sizeof(uint32_t));
-	rd->buffer_clear(requests_buffer, 0, MAX_SETS * sizeof(uint32_t));
-	active_buffer = rd->storage_buffer_create((1 + MAX_SETS) * sizeof(uint32_t));
-	relit_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
-	rd->buffer_clear(relit_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
+	requests_buffer = rd->storage_buffer_create(MAX_SETS * (1 + TILE_WORDS_PER_SET) * sizeof(uint32_t));
+	rd->buffer_clear(requests_buffer, 0, MAX_SETS * (1 + TILE_WORDS_PER_SET) * sizeof(uint32_t));
+	active_buffer = rd->storage_buffer_create((8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
+	rd->buffer_clear(active_buffer, 0, (8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
+	relit_buffer = rd->storage_buffer_create((MAX_SETS * 2 + TILE_STAMPS * 2) * sizeof(uint32_t));
+	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * 2) * sizeof(uint32_t));
 	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
-	converge_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t));
-	rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
+	converge_buffer = rd->storage_buffer_create(12 * sizeof(uint32_t));
+	rd->buffer_clear(converge_buffer, 0, 12 * sizeof(uint32_t));
 	set_state_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
 	rd->buffer_clear(set_state_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
@@ -826,6 +828,12 @@ void SurfaceCache::_converge_readback(const Vector<uint8_t> &p_data) {
 	converge_relit = c[1];
 	converge_up = c[2];
 	converge_down = c[3];
+	if (p_data.size() >= 48 && OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").contains("gradvote")) {
+		print_line(vformat("Surface cache gradient verdicts: same %d near %d far %d other-set %d; by votes: lone %d agreed %d", c[4], c[5], c[6], c[7], c[8], c[9]));
+	}
+	if (p_data.size() >= 48 && OS::get_singleton()->get_environment("GODOT_CARD_ABLATE").contains("gradset")) {
+		print_line(vformat("Surface cache gradient verdicts: same %d near %d far %d other-set %d | other-set by the gap to the previous relight: 1 %d, 2-4 %d, 5-12 %d, more %d", c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11]));
+	}
 	converge_readback_frame = Engine::get_singleton()->get_frames_drawn();
 	// The drift, smoothed over the readbacks: one count's share swings by
 	// a few percent between frames (which sets were relit), and a settled
@@ -926,6 +934,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		r.world_aabb_size[1] = s.world_aabb.size.y;
 		r.world_aabb_size[2] = s.world_aabb.size.z;
 		r.flags = (s.captured && s.size > 0 ? SET_FLAG_CAPTURED : 0) | (s.reset ? SET_FLAG_RESET : 0);
+		r.captured_frame = s.captured_frame;
 		s.reset = false;
 		for (uint32_t c = 0; c < CARDS_PER_SET; c++) {
 			if (s.size > 0) {
@@ -995,6 +1004,11 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.camera_origin[0] = p_inputs.world_from_view.origin.x;
 	params.camera_origin[1] = p_inputs.world_from_view.origin.y;
 	params.camera_origin[2] = p_inputs.world_from_view.origin.z;
+	// The radius within which the round robin relights sets four times as
+	// often (surface_cache_prepare.glsl): the cards' light radius, what a
+	// turn of the camera can bring into view. GODOT_CARD_NEAR=<m> overrides.
+	static const float near_override = OS::get_singleton()->get_environment("GODOT_CARD_NEAR").to_float();
+	params.camera_origin[3] = near_override > 0.0f ? near_override : MAX(p_inputs.light_radius, 16.0f);
 	params.omni_light_count = p_inputs.omni_light_count;
 	params.spot_light_count = p_inputs.spot_light_count;
 	params.directional_light_count = p_inputs.directional_light_count;
@@ -1080,6 +1094,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 					: name == "paint5"						? 2048
 					: name == "stats"						? 4096
 					: name == "strict"						? 16384
+					: name == "gradset"						? 32768
+					: name == "gradvote"					? 65536
 					: name == "paint8"						? 131072
 					: name == "paintn"						? 262144
 					: name == "paintl"						? 524288
@@ -1176,13 +1192,27 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// and the idle relight budget below both read it.
 	const bool count_convergence = true;
 	params.flags |= 4096;
-	rd->buffer_clear(converge_buffer, 0, 4 * sizeof(uint32_t));
+	// GODOT_CARD_BOUNCE_REQUESTS=1: the bounce rays' landings request their
+	// relight too (measured on the TPS bridge: the pending set grows to the
+	// reachable level, 20k blocks, and the screen's surfaces converge no
+	// faster than the rest; off).
+	static const bool bounce_requests = OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_REQUESTS") == "1";
+	if (bounce_requests) {
+		params.flags |= 8192;
+	}
+	rd->buffer_clear(converge_buffer, 0, 12 * sizeof(uint32_t));
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
-	// shared per 2x2 quad (see surface_cache_light.glsl).
+	// shared per 2x2 quad (see surface_cache_light.glsl). The frame's work
+	// list holds the blocks the reads asked for, in turns that fit the
+	// texel budget, then the round robin's whole sets with what is left:
+	// what a level of a thousand sets costs is the budget, and what the
+	// budget buys is spread over what the rays touched (section 77).
+	// GODOT_CARD_ITEMS=<blocks> overrides the cap.
 	const uint32_t tile = settings.shared_bounce_ray ? 16 : 8;
-	const uint32_t max_blocks_per_set = CARDS_PER_SET * MAX(settings.max_card_size / tile, 1u) * MAX(settings.max_card_size / tile, 1u); // The longest edge squared: an upper bound, most groups of a smaller card exit at once.
+	const uint32_t blocks_per_frame = MAX(settings.lighting_texels_per_frame / (tile * tile), 1u);
+	static const int64_t items_override = OS::get_singleton()->get_environment("GODOT_CARD_ITEMS").to_int();
 
 	// Settled cards under static lights: a relight re-derives what the
 	// texels hold, so the sets take turns, one in GODOT_CARD_IDLE (8) a
@@ -1202,17 +1232,29 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	push.frame = p_inputs.frame;
 	push.budget = budget;
 	push.idle_divisor = idle ? idle_divisor : 1u;
+	push.max_items = MIN(items_override > 0 ? uint32_t(items_override) : blocks_per_frame, MAX_ITEMS);
+	push.flags = settings.shared_bounce_ray ? 0u : 1u;
+	// GODOT_CARD_TURNS=hash|age: the requested tiles take hashed turns alone
+	// (one in `period` frames at random) or turns by age alone (listed once
+	// the last relight is `period` old); the default is both, with the never
+	// relit at once (the A/B of section 77: age alone bursts).
+	static const String turns = OS::get_singleton()->get_environment("GODOT_CARD_TURNS");
+	if (turns == "hash") {
+		push.flags |= 2u;
+	} else if (turns == "age") {
+		push.flags |= 4u;
+	}
 	// Profiling: GODOT_CARD_RR=n overrides the round-robin period (1 relights
 	// every captured set every frame, within the budget).
 	static const uint32_t rr_override = OS::get_singleton()->get_environment("GODOT_CARD_RR").to_int();
 	push.round_robin_period = full_relight ? 1u : MAX(rr_override > 0 ? rr_override : settings.round_robin_period, 1u);
 	push.omni_light_count = p_inputs.omni_light_count;
 	push.spot_light_count = p_inputs.spot_light_count;
-	push.max_blocks_per_set = max_blocks_per_set;
 
-	rd->buffer_clear(active_buffer, 0, sizeof(uint32_t));
+	rd->buffer_clear(active_buffer, 0, 4 * sizeof(uint32_t));
 
 	RID prepare_rid_select = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_SELECT);
+	RID prepare_rid_tiles = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_TILES);
 	RID prepare_rid_cull = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_CULL_LIGHTS);
 	RD::Uniform u_sets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ sets_buffer }));
 	RD::Uniform u_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ requests_buffer }));
@@ -1267,11 +1309,21 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->compute_list_dispatch_threads(list, sets.size(), 1, 1);
 		rd->compute_list_add_barrier(list);
 	}
+	// Per active set: its requested tiles as work items, then the whole of
+	// the sets due in full with what the cap has left.
+	rd->compute_list_bind_compute_pipeline(list, prepare_pipelines[PREPARE_VARIANT_TILES]);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_tiles, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params, u_relit), 0);
+	for (uint32_t mode = 0; mode < 2; mode++) {
+		push.mode = mode;
+		rd->compute_list_set_push_constant(list, &push, sizeof(PreparePushConstant));
+		rd->compute_list_dispatch(list, sets.size(), 1, 1);
+		rd->compute_list_add_barrier(list);
+	}
 	// Per active set: the lights overlapping its box, and the indirect args.
 	rd->compute_list_bind_compute_pipeline(list, prepare_pipelines[PREPARE_VARIANT_CULL_LIGHTS]);
 	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(prepare_rid_cull, 0, u_sets, u_requests, u_active, u_set_lights, u_dispatch, u_omni, u_spot, u_params, u_relit), 0);
 	rd->compute_list_set_push_constant(list, &push, sizeof(PreparePushConstant));
-	rd->compute_list_dispatch(list, budget, 1, 1);
+	rd->compute_list_dispatch(list, sets.size(), 1, 1);
 	// The indirect arguments the cull pass wrote are read as such by the
 	// lighting dispatch, which the tracker only allows across lists.
 	rd->compute_list_end();
@@ -1358,10 +1410,15 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		// One readback in flight; the count lands a few frames later.
 		converge_pending = true;
 		if (deterministic) {
-			_converge_readback(rd->buffer_get_data(converge_buffer, 0, 4 * sizeof(uint32_t)));
+			_converge_readback(rd->buffer_get_data(converge_buffer, 0, 12 * sizeof(uint32_t)));
 		} else {
-			rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 4 * sizeof(uint32_t));
+			rd->buffer_get_data_async(converge_buffer, callable_mp_static(&SurfaceCache::_converge_readback), 0, 12 * sizeof(uint32_t));
 		}
+	}
+	// The work list's size, for the RT STATE scale line (GODOT_RT_STATE_PRINT).
+	static const bool state_print_items = OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT");
+	if (state_print_items && p_inputs.frame % 60 == 30) {
+		rd->buffer_get_data_async(active_buffer, callable_mp_static(&SurfaceCache::_items_readback), 0, 12 * sizeof(uint32_t));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
 		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d; lights: %d omni, %d spot, %d area, %d mirrors", sets.size(), budget, push.round_robin_period, push.idle_divisor, params.omni_light_count, params.spot_light_count, params.area_light_count, params.mirror_count));
@@ -1485,10 +1542,11 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 				{ "screen", screen_atlas, Image::FORMAT_RGBAH },
 				{ "albedo", albedo_atlas, Image::FORMAT_RGBA8 },
 				{ "specular", specular_atlas, Image::FORMAT_RGBA8 },
+				{ "change", change_atlas, Image::FORMAT_RGBA8 }, // Raw: four uints a texel (change_store in the shader).
 			};
 			for (const Entry &e : entries) {
 				Vector<uint8_t> data = rd->texture_get_data(e.tex, 0);
-				if (e.fmt == Image::FORMAT_RGBAH) {
+				if (e.fmt == Image::FORMAT_RGBAH || e.tex == change_atlas) {
 					Ref<FileAccess> fa = FileAccess::open(vformat("/tmp/card_dump_%s_%d.raw", e.name, p_inputs.frame), FileAccess::WRITE);
 					if (fa.is_valid()) {
 						fa->store_buffer(data.ptr(), data.size());
@@ -1502,8 +1560,28 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 }
 
+uint32_t SurfaceCache::last_active_sets = 0;
+uint32_t SurfaceCache::last_items = 0;
+uint32_t SurfaceCache::last_pending = 0;
+uint32_t SurfaceCache::last_period = 0;
+
+void SurfaceCache::_items_readback(const Vector<uint8_t> &p_data) {
+	if (p_data.size() < 32) {
+		return;
+	}
+	const uint32_t *v = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	last_active_sets = v[0];
+	last_items = v[2];
+	last_pending = v[3];
+	last_period = v[4];
+}
+
 SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	ScaleStats st;
+	st.active_sets = last_active_sets;
+	st.relit_blocks = last_items;
+	st.pending_blocks = last_pending;
+	st.period = last_period;
 	double texels = 0.0;
 	for (const CardSet &set : sets) {
 		if (!set.in_use) {

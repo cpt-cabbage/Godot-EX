@@ -69,7 +69,11 @@ void main() {
 		for (int dx = 0; dx < 2; dx++) {
 			ivec2 t = base + ivec2(dx, dy);
 			vec4 s = texelFetch(source, t, 0);
-			float w = params.source_is_level0 != 0u ? (texelFetch(depth_atlas, t, 0).r > 0.0 ? 1.0 : 0.0) : s.a;
+			// A captured texel that was relit at least once (level 0's alpha
+			// is its relight count): with the tiles relit in turns, a lit
+			// texel's neighbor may still be black from its capture, and a
+			// coarser level averaging the two read a quarter of the light.
+			float w = params.source_is_level0 != 0u ? ((texelFetch(depth_atlas, t, 0).r > 0.0 && s.a > 0.0) ? 1.0 : 0.0) : s.a;
 			// Nothing non-finite is carried up the chain.
 			if (any(isnan(s.rgb)) || any(isinf(s.rgb))) {
 				w = 0.0;

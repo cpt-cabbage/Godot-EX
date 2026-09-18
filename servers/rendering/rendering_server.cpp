@@ -3742,6 +3742,7 @@ void RenderingServer::init() {
 	// == 2), which holds still like the full-resolution pass.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 4);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights", PROPERTY_HINT_RANGE, "1,512,1"), 512);
 	// The stochastic pass ray traces every local light's shadow, so the opaque
 	// pass never samples their shadow maps. Rendering them anyway is the single
 	// largest cost this path can avoid. Turn this off to keep them for the
@@ -3823,6 +3824,7 @@ void RenderingServer::init() {
 	// default because full resolution doubled the frame time on the M4 at
 	// 1440p (78 -> 158 ms on the interior test scene).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/half_resolution"), true);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/quarter_resolution"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
 	// The gather's own spatial filter settings. It used to borrow the direct
@@ -3884,6 +3886,7 @@ void RenderingServer::init() {
 	// The longest edge of a card in texels; a card spans several 64-texel atlas pages past 64, and its two edges follow the instance's extents.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/max_card_size", PROPERTY_HINT_ENUM, "64:64,128:128,256:256"), 128);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/captures_per_frame", PROPERTY_HINT_RANGE, "1,64,1"), 8);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame", PROPERTY_HINT_RANGE, "16384,16777216,16384"), 524288);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 64);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/surface_cache/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 16);
 	// Card lighting ray budget: one bounce ray per 2x2 texels, shared by the

@@ -5,6 +5,7 @@
 #VERSION_DEFINES
 
 #extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_samplerless_texture_functions : enable
 
 // Surface cache lighting: shades the card texels of this frame's active card
@@ -37,9 +38,18 @@ layout(set = 0, binding = 1, std430) restrict readonly buffer Sets {
 }
 sets;
 
+// The prepare pass's work: the active sets (bit 31 of an entry: every block
+// of the set, else the requested tiles alone) and the list of blocks to
+// light, one workgroup each (entry | card << 16 | block << 19).
 layout(set = 0, binding = 2, std430) restrict readonly buffer Active {
 	uint count;
-	uint list[];
+	uint rr_count;
+	uint item_count;
+	uint pending;
+	uint period;
+	uint pad[3];
+	uint list[SURFACE_CACHE_MAX_SETS];
+	uint items[];
 }
 active_sets;
 
@@ -120,6 +130,7 @@ params;
 #define FLAG_DYN_FILTER 128u // The static and the dynamic bounce histories filtered over the card at every age (filter_bounces; GODOT_CARD_DYN_FILTER=0 clears it).
 #define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
 #define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights.
+#define FLAG_BOUNCE_REQUESTS 8192u // The bounce rays' landings ask to be relit (GODOT_CARD_BOUNCE_REQUESTS=1; see card_requests).
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -187,11 +198,16 @@ card_instances;
 
 layout(set = 0, binding = 19, rgba16f) uniform restrict image2D indirect_atlas;
 
-// Sets the card rays land on are asked for like the gather's hits are:
-// otherwise a wall only ever seen through a bounce is relit on the
-// round-robin alone, and its stale lighting feeds every card that reads it.
-layout(set = 0, binding = 20, std430) restrict writeonly buffer CardRequests {
-	uint frame[];
+// The relight requests (surface_cache_inc.glsl). The bounce rays' landings
+// do not ask: a request from here relit what the ray happened to land on,
+// whose relight's ray asked for more, and within a few frames the pending
+// set was the whole reachable level (20k blocks on the TPS bridge against
+// a 2k budget), the screen's own surfaces relit no oftener than the rest.
+// The gather's reads ask; a wall only ever seen through a bounce is the
+// round robin's, which keeps a share of the budget (section 77).
+layout(set = 0, binding = 20, std430) restrict buffer CardRequests {
+	uint frame[SURFACE_CACHE_MAX_SETS];
+	uint tiles[];
 }
 card_requests;
 
@@ -234,8 +250,12 @@ layout(set = 0, binding = 21, rgba32ui) uniform restrict uimage2D change_atlas;
 
 // Per set, two frames: the relight before the last and the last (the prepare
 // pass promotes the last to the previous when it selects the set).
+#define TILE_STAMP_STRIDE 1024u
+#define TILE_STAMPS (TILE_STAMP_STRIDE * TILE_STAMP_STRIDE)
 layout(set = 0, binding = 23, std430) restrict buffer Relit {
-	uint frame[];
+	uint frame[SURFACE_CACHE_MAX_SETS * 2u];
+	uint tile_prev[TILE_STAMPS]; // Per 8x8 atlas block (a tile's first): the relight before this one (the prepare pass promotes as it lists the tile).
+	uint tile_last[TILE_STAMPS];
 }
 relit;
 
@@ -330,6 +350,7 @@ layout(set = 0, binding = 35, std430) restrict buffer Converge {
 	// bounces (every texel's window full, all of them trending) does not.
 	uint up;
 	uint down;
+	uint gradient_t[8]; // Diagnostics (gradset): the bounce gradient's verdicts: same / near / far / another set, then the other-set ones by their distance: same / near / far.
 }
 converge;
 #define PROJ_TABLE_N 16u
@@ -621,6 +642,8 @@ vec3 card_diffuse_albedo(ivec2 texel, vec3 world_pos) {
 
 // The gather's card lookup (stochastic_indirect_gi.glsl surface_cache_lookup),
 // over this pass's own bindings: nearest texel of the lit atlas.
+uint gradient_gap = 0u; // Diagnostics (gradset): frames since the tile's previous relight.
+
 // Diagnostics (tier_stat): why the last card_lookup() failed. 0 the hit's
 // instance is not in the cache, 1 it has no card set, 2 the set is not
 // captured yet (or too small), 3 no card faces the ray with a filled texel
@@ -726,6 +749,12 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_change_total = change_load_total(best_texel);
 	r_albedo = card_diffuse_albedo(best_texel, p_world_hit);
 	r_texel = best_texel;
+	if ((params.flags & FLAG_BOUNCE_REQUESTS) != 0u) {
+		uint bit;
+		uint word = card_tile_word(inst.set, best_k, sets.data[inst.set].cards[best_k], best_texel, bit);
+		atomicOr(card_requests.tiles[word], bit);
+		card_requests.frame[inst.set] = params.frame;
+	}
 	// The captured normal, as read_texel decodes it: the dynamic bounce needs
 	// the surface's orientation at the hit for its geometry terms.
 	vec3 n_cam = normalize(texelFetch(normal_atlas, best_texel, 0).rgb * 2.0 - 1.0);
@@ -1434,7 +1463,6 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 			// The landing's radiance from this light's direct term alone.
 			vec3 l_dyn = albedo_p * c_p * weight;
 			float pdf_area = pdf_omega * cos_pl / (d_lp * d_lp);
-			card_requests.frame[hit_set] = params.frame;
 			change_total = max(change_total, hit_change_total - 0.25);
 			// The texel connected to the landing. The estimator of the
 			// irradiance over pi is radiance * geom / (pi * pdf_area); its
@@ -1533,7 +1561,6 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 				vec3 n = params.mirrors[hit_mirror].plane.xyz;
 				if (card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit)) {
 					plane_diffuse += mirror_f * max(card_radiance, vec3(0.0));
-					card_requests.frame[hit_set] = params.frame;
 				}
 				mirror_f *= mirror_fresnel(hit_mirror, abs(dot(n, ray_dir)));
 				seed = pcg_hash(seed);
@@ -1632,7 +1659,6 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 					atomicAdd(dyn_stats.count[29u], 1u); // Read through a depth mismatch (see card_lookup).
 					atomicAdd(dyn_stats.count[30u], uint(min(luminance(max(card_radiance, vec3(0.0))), 64.0) * 16.0));
 				}
-				card_requests.frame[hit_set] = params.frame;
 				// The bounce carries the change of the card it came from,
 				// weaker by a quarter per bounce, so lighting that reaches
 				// this texel only indirectly restarts it too.
@@ -1758,14 +1784,47 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 	vec3 unused_dyn1;
 	vec3 unused_dyn2;
 	trace_bounce(t, seed, 1.0, 0.0, again, unused_dyn1, unused_dyn2, unused_change, unused_total, set_now, t_now);
-	if (set_now != prev.bounce_set) {
-		return 1.0;
-	}
-	if (set_now == 0xFFFFu && (t_now <= 0.0 || prev.bounce_t <= 0.0)) {
+	// The verdict is the distance's alone. The set's identity was compared
+	// first, and on the TPS bridge it restarted 1.7% of the relit quads
+	// every relight with the geometry still: coincident faces of two
+	// instances trade the hit between two builds of the TLAS (the
+	// intersection-query traversal halves the count, so it is the
+	// traversal's tie, not a ray of ours), and the mark's spread and decay
+	// turned that into a screen history two frames long everywhere
+	// (section 77). A surface that moved into or out of the ray's way is
+	// at another distance; one that only changed its name is not a change.
+	// GODOT_CARD_ABLATE=gradset counts the verdicts (converge.gradient_t)
+	// and applies none.
+	if (set_now == 0xFFFFu && prev.bounce_set == 0xFFFFu && (t_now <= 0.0 || prev.bounce_t <= 0.0)) {
 		return 0.0; // The sky both times.
 	}
 	float rel = abs(t_now - prev.bounce_t) / max(max(t_now, prev.bounce_t), 0.05);
+	if ((params.debug & (32768u | 65536u)) != 0u) {
+		atomicAdd(converge.gradient_t[set_now != prev.bounce_set ? 3u : (rel >= 0.3 ? 2u : (rel >= 0.05 ? 1u : 0u))], 1u);
+		if (set_now != prev.bounce_set) {
+			atomicAdd(converge.gradient_t[gradient_gap <= 1u ? 4u : (gradient_gap <= 4u ? 5u : (gradient_gap <= 12u ? 6u : 7u))], 1u);
+		}
+		if ((params.debug & 32768u) != 0u) {
+			return 0.0;
+		}
+	}
 	return smoothstep(0.05, 0.3, rel);
+}
+
+// A verdict is one ray's, and one ray's verdict restarts nothing on its
+// own: the SIMD group's rays (32 quads of the block) vote, and the verdict
+// stands from three agreeing. A surface moving into or out of the way of
+// the block's rays is seen by several of them; the one ray in two thousand
+// that came back from another face of the same still level (the TPS
+// bridge's residue, section 77) is not, and through the readers' chain and
+// the neighbours' spread it had restarted the whole level's history.
+float bounce_gradient_voted(float gradient) {
+	uint votes = subgroupAdd(gradient > 0.3 ? 1u : 0u);
+	if ((params.debug & 65536u) != 0u && gradient > 0.3) {
+		// Diagnostics (GODOT_CARD_ABLATE=gradvote): verdicts by their votes.
+		atomicAdd(converge.gradient_t[votes >= 3u ? 5u : 4u], 1u);
+	}
+	return gradient * smoothstep(1.0, 3.0, float(votes));
 }
 
 // The bounce a texel hands its readers: its histories filtered over the
@@ -1878,6 +1937,15 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 // negative value when there was no previous ray to re-trace); card_min /
 // card_max bound the card, so the change read from the neighbors never
 // crosses into another card packed beside it in the atlas.
+// The change mark's decay this relight: an eighth a frame since the tile's
+// last relight, so a mark fades in the same eight frames however often the
+// tile is relit. Per relight, as it was, a level whose tiles are relit
+// every ten or fifteen frames (the TPS bridge under the texel budget)
+// kept every mark for a hundred frames, and with the neighbours' spread
+// and the readers' hops that outran the fade: the change field sat at a
+// third everywhere and the screen history at three frames (section 77).
+float mark_decay = 0.125;
+
 void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
 	vec4 old = imageLoad(lighting_atlas, texel);
 	Change prev = change_load(texel);
@@ -1890,6 +1958,21 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		// The screen's memory of this texel (the gather's) is of whatever
 		// the atlas page held before.
 		imageStore(screen_atlas, texel, vec4(0.0));
+	}
+	// The change the ray's hit carried, weighted by what the hit is worth
+	// here: the sample's luminance over the accumulation's. A wall lit by a
+	// panel reads the panel's change whole (the sample is the accumulation);
+	// a ray that landed on a dim thing that moved reads little of it. The
+	// change carried whole, a level's three actors breathing (0.3% of the
+	// rays' hits changing a relight) reached every texel within four hops
+	// and the screen's history never passed eight frames (section 77).
+	// A restarted accumulation (nothing to weigh against) reads it whole.
+	{
+		vec4 acc = imageLoad(indirect_atlas, texel);
+		float l_acc = luminance(max(acc.rgb, vec3(0.0)));
+		float share = (fresh || acc.a <= 0.0 || l_acc <= 1e-5) ? 1.0 : clamp(luminance(max(indirect_sample, vec3(0.0))) / l_acc, 0.0, 1.0);
+		bounce_change *= share;
+		bounce_change_total *= share;
 	}
 
 	// The radiance gradient: how much the deterministic part of this texel's
@@ -1923,11 +2006,11 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	if (!fresh && dyn_lum > 0.05 * total_lum) {
 		dyn_change = max(dyn_change, params.dynamic_change);
 	}
-	float change_total = max(max(change, dyn_change), max(prev.change - 0.125, bounce_change_total));
+	float change_total = max(max(change, dyn_change), max(prev.change - mark_decay, bounce_change_total));
 	// The change outlives the relight that found it, fading over eight: the
 	// gather's one ray per pixel lands on a given card only now and then,
 	// and a change seen for one frame would restart almost no pixel.
-	change = max(change, max(prev.change_static - 0.125, bounce_change));
+	change = max(change, max(prev.change_static - mark_decay, bounce_change));
 	// The bounce gradient is one ray's verdict, so only the texels whose
 	// last ray happened to see what moved would restart on their own and
 	// the rest would hold the stale bounce beside them: the change spreads
@@ -1947,7 +2030,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 				spread = max(spread, change_load_gradient(n));
 			}
 		}
-		change = max(change, spread - 0.125);
+		change = max(change, spread - mark_decay);
 	}
 	change_total = max(change_total, change);
 
@@ -2091,7 +2174,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	} else if ((params.debug & 256u) != 0u) {
 		// (paint2) The change the bounce ray carried from its hit, the
 		// neighbours' spread, and the fading change from the last relight.
-		indirect = vec3(max(bounce_change, 0.0), 0.0, max(prev.change - 0.125, 0.0));
+		indirect = vec3(max(bounce_change, 0.0), 0.0, max(prev.change - mark_decay, 0.0));
 		for (int dy = -1; dy <= 1; dy++) {
 			for (int dx = -1; dx <= 1; dx++) {
 				ivec2 n = texel + ivec2(dx, dy);
@@ -2197,11 +2280,15 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 }
 
 void main() {
-	uint entry = gl_WorkGroupID.y;
-	if (entry >= active_sets.count) {
+	// One workgroup per work item the prepare pass listed: the block of a
+	// card of an active set (a requested tile, or every block of a set due
+	// in full). Nothing here walks blocks a ray never asked for.
+	if (gl_WorkGroupID.x >= active_sets.item_count) {
 		return;
 	}
-	uint set = active_sets.list[entry];
+	uint item = active_sets.items[gl_WorkGroupID.x];
+	uint entry = item & 0xFFFFu;
+	uint set = active_sets.list[entry] & 0x7FFFFFFFu;
 	CardSet s = sets.data[set];
 	// The workgroup tiles 8x8 texels, so a set under eight an edge cannot
 	// be lit here; min_card_size is clamped to 8 (surface_cache.cpp), so
@@ -2217,41 +2304,33 @@ void main() {
 	// cards' block counts.
 	bool quad_mode = bool(params.flags & FLAG_SHARED_BOUNCE_RAY);
 	uint tile = quad_mode ? 16u : 8u;
-	uint card = SURFACE_CACHE_CARDS;
-	uint block = gl_WorkGroupID.x;
-	ivec2 dims = ivec2(0);
-	uvec2 n = uvec2(1u);
-	uint card_packed = 0u;
-	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
-		uint packed = sets.data[set].cards[k];
-		ivec2 kd = card_dims_packed(packed);
-		uvec2 kn = max(uvec2(kd) / tile, uvec2(1u));
-		uint blocks = kn.x * kn.y;
-		if (block < blocks) {
-			card = k;
-			dims = kd;
-			n = kn;
-			card_packed = packed;
-			break;
-		}
-		block -= blocks;
-	}
-	if (card >= SURFACE_CACHE_CARDS) {
+	uint card = (item >> 16u) & 7u;
+	uint block = item >> 19u;
+	uint card_packed = sets.data[set].cards[card];
+	ivec2 dims = card_dims_packed(card_packed);
+	uvec2 n = max(uvec2(dims) / tile, uvec2(1u));
+	if (card >= SURFACE_CACHE_CARDS || block >= n.x * n.y) {
 		return;
 	}
 	set_state.state[set * 2u] = 1u;
 	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
 	ivec2 origin_texel = card_origin_packed(card_packed);
-	// The relight before this one, whose bounce ray the gradient re-traces.
-	// Zero since the capture cleared it: this is the first relight after the
-	// capture, a reset whether or not the flag's one upload reached this
+	// The tile's relight before this one, whose bounce ray the gradient
+	// re-traces (the tile's own stamp: the tiles take turns, and a set's
+	// stamp named a frame most of its tiles were not relit on, so the
+	// re-traced ray was another ray and every relight read as a change).
+	// Zero, or from before the cards' capture: this is the first relight
+	// since, a reset whether or not the flag's one upload reached this
 	// frame (the select pass keeps a fresh set urgent until it is relit).
-	uint prev_frame = relit.frame[set * 2u];
-	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || prev_frame == 0u;
+	ivec2 tile_texel = origin_texel + block_origin;
+	uint prev_frame = relit.tile_prev[uint(tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(tile_texel.x >> 3)];
+	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || prev_frame == 0u || prev_frame <= s.captured_frame;
 	ivec2 card_min = origin_texel;
 	ivec2 card_max = origin_texel + dims - ivec2(1);
 	bool have_prev = !reset && prev_frame != 0u && prev_frame < params.frame;
 	relit.frame[set * 2u + 1u] = params.frame;
+	mark_decay = 0.125 * float(clamp(have_prev ? params.frame - prev_frame : 1u, 1u, 8u));
+	gradient_gap = have_prev ? params.frame - prev_frame : 0u;
 
 	if (!quad_mode) {
 		ivec2 texel_in_card = block_origin + ivec2(gl_LocalInvocationID.xy);
@@ -2271,7 +2350,7 @@ void main() {
 		ImageCache images;
 		images.valid = false;
 		shade_direct(entry, t, seed, images, d);
-		float gradient = bounce_gradient(texel, t, prev_seed, have_prev);
+		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, prev_seed, have_prev));
 		vec3 indirect_sample;
 		float bounce_change;
 		float bounce_change_total;
@@ -2340,6 +2419,7 @@ void main() {
 		uint prev_seed = pcg_hash(uint(prev_tracer_texel.x) + pcg_hash(uint(prev_tracer_texel.y) + pcg_hash(prev_frame)));
 		gradient = bounce_gradient(prev_tracer_texel, t[prev_tracer], prev_seed, true);
 	}
+	gradient = bounce_gradient_voted(gradient);
 	vec3 indirect_sample;
 	float bounce_change;
 	float bounce_change_total;

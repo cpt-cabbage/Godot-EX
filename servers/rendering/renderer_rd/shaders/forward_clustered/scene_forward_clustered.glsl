@@ -2320,9 +2320,11 @@ void fragment_shader(in SceneData scene_data) {
 			// inverse is inexact), and place the taps where the gather actually
 			// sampled -- full-res pixel 2p for half-res texel p, i.e. continuous
 			// coordinate 2p + 0.5, not the center of the 2x2 block.
+			// The gather's scale: 2 at half resolution, 4 at a quarter (rt_gi bits 1|2).
+			int rtgi_scale = 1 << int((implementation_data.rt_gi & 3u) - 1u);
 			ivec2 rtgi_full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
-			ivec2 rtgi_half_size = (rtgi_full_size + ivec2(1)) >> 1;
-			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5) * 0.5;
+			ivec2 rtgi_half_size = (rtgi_full_size + ivec2(rtgi_scale - 1)) / rtgi_scale;
+			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5) / float(rtgi_scale);
 			ivec2 rtgi_base = ivec2(floor(rtgi_pos));
 			vec2 rtgi_fr = rtgi_pos - vec2(rtgi_base);
 			float rtgi_own_depth = -vertex.z;
@@ -2351,7 +2353,7 @@ void fragment_shader(in SceneData scene_data) {
 				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
 				// The full-res pixel the gather read its normal from (it clamps
 				// the same way for odd sizes).
-				ivec2 rtgi_fp = min(hp * 2, rtgi_full_size - ivec2(1));
+				ivec2 rtgi_fp = min(hp * rtgi_scale, rtgi_full_size - ivec2(1));
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
 				vec3 sn = nr_normal(texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0));

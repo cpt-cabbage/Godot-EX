@@ -1238,6 +1238,9 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		params.mirror_count = fill_mirror_planes(params.mirrors, &view_from_world, 2u);
 		params.mirror_order = mirror_order();
 		params.image_chain_count = params.mirror_count > 0 ? image_chain_count : 0;
+		// GODOT_STOCH_EXACT_MAX=<n> overrides the setting for an A/B.
+		static const int64_t exact_override = OS::get_singleton()->get_environment("GODOT_STOCH_EXACT_MAX").to_int();
+		params.exact_lights = exact_override > 0 ? uint32_t(exact_override) : MAX(p_quality.exact_lights, 1u);
 		for (uint32_t i = 0; i < IMAGE_CHAINS_MAX; i++) {
 			params.image_chains[i] = image_chain_codes[i];
 		}
@@ -1585,8 +1588,8 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
 	Size2i full_size = p_render_buffers->get_internal_size();
-	uint32_t depth_scale = p_quality.half_resolution ? 2 : 1;
-	Size2i size = p_quality.half_resolution ? Size2i((full_size.x + 1) / 2, (full_size.y + 1) / 2) : full_size;
+	uint32_t depth_scale = p_quality.half_resolution ? (p_quality.quarter_resolution ? 4 : 2) : 1;
+	Size2i size = Size2i((full_size.x + depth_scale - 1) / depth_scale, (full_size.y + depth_scale - 1) / depth_scale);
 
 	// The resolution setting is live: recreate everything on a size change.
 	if (p_render_buffers->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT)) {
@@ -1839,6 +1842,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT") || OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT");
 	if (tier_stats) {
 		params.flags |= 262144; // FLAG_TIER_STATS
+	}
+	// GODOT_GI_REQUESTS=0 (diagnostics): the card reads ask for no relight
+	// (the atomics' cost, and what the round robin alone converges to).
+	static const bool no_requests = OS::get_singleton()->get_environment("GODOT_GI_REQUESTS") == "0";
+	if (no_requests) {
+		params.flags |= 16777216; // FLAG_NO_REQUESTS
 	}
 	if (p_quality.specular) {
 		params.flags |= 2; // FLAG_SPECULAR
@@ -2848,7 +2857,7 @@ String Raytracing::get_state_scale_line() const {
 	}
 	if (surface_cache) {
 		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
-		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used);
+		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d period %d", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.period);
 	}
 	return line;
 }

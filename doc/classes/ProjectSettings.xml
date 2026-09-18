@@ -3394,6 +3394,9 @@
 		<member name="rendering/ray_tracing/raytraced_gi/quality/half_resolution" type="bool" setter="" getter="" default="true">
 			Gathers at half resolution, roughly four times cheaper; full resolution doubled the frame time at 1440p. Leave on.
 		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/quarter_resolution" type="bool" setter="" getter="" default="false">
+			With [member rendering/ray_tracing/raytraced_gi/quality/half_resolution], gathers at a quarter of the resolution each way: a sixteenth of the rays, the gather, its denoiser and the deferred hit shading all a quarter of their half-resolution cost, upsampled by the same depth- and normal-aware filter. The low-spec form of shipped ray-traced GI; indirect light is smooth, so the loss is at fine contact detail.
+		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel" type="int" setter="" getter="" default="1">
 			Indirect rays per pixel per frame. One plus temporal accumulation is the intended setting; more converge faster after a cut at a near-linear cost.
 		</member>
@@ -3449,6 +3452,9 @@
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/half_resolution" type="bool" setter="" getter="" default="true">
 			Traces and denoises at half resolution. The biggest performance lever of this pass (about a third of the cost) at some softening of shadow edges. Material detail is kept.
+		</member>
+		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights" type="int" setter="" getter="" default="512">
+			Up to this many lights reaching a pixel (its cluster cell's), the unshadowed direct term is summed exactly, every light evaluated every frame; past it a strided estimate over the cell, re-drawn every frame. The sampling pass costs a light evaluation per pixel per light within it: a level whose long-range lights overlap by the dozen pays for every one at the default, and reads noisier at a low value.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel" type="int" setter="" getter="" default="4">
 			Lights sampled and shadow-traced per pixel per frame. The main quality-versus-cost dial of this pass.
@@ -3520,8 +3526,11 @@
 		<member name="rendering/ray_tracing/surface_cache/quality/density_distance" type="float" setter="" getter="" default="12.0">
 			Beyond this distance in meters, cached resolution falls off with distance. Keeps large scenes within budget. [code]0.0[/code] keeps full resolution everywhere.
 		</member>
+		<member name="rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame" type="int" setter="" getter="" default="524288">
+			Cached texels re-lit per frame, spent on the surfaces rays landed on: every texel a ray reads is re-lit in turn, so a level with more visible surface converges more slowly rather than costing more. The cache lighting pass scales with this (the default is about 18 ms worth on an M4 at 1080p); higher follows moving and switching lights faster on large levels.
+		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame" type="int" setter="" getter="" default="64">
-			Instances re-lit per frame. Higher follows moving and switching lights faster; the cache lighting is one of the larger passes and scales with this.
+			Instances re-lit whole per frame in a round robin, whether or not rays reach them, with what [member rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame] leaves: keeps the lighting of surfaces seen only through bounces from going stale.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/max_card_size" type="int" setter="" getter="" default="128">
 			Largest cached surface in texels. Larger keeps big walls sharp at the cost of atlas space.

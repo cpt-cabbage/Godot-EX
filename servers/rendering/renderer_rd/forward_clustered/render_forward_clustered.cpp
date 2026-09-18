@@ -857,7 +857,8 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Bit 128 (experiment, GODOT_GI_NO_AO): the ambient term without the
 	// material's and the screen-space occlusion (section 33).
 	static const bool rt_gi_no_ao = OS::get_singleton()->get_environment("GODOT_GI_NO_AO") == "1";
-	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_half_res ? 2u : 1u) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u) | (rt_gi_no_ao ? 128u : 0u)) : 0;
+	// Bits 1|2: the gather's resolution, 1 full, 2 half, 3 quarter (the scene shader upsamples by 1 << (n - 1)).
+	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_quarter_res ? 3u : (use_rt_gi_half_res ? 2u : 1u)) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u) | (rt_gi_no_ao ? 128u : 0u)) : 0;
 	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
@@ -2286,6 +2287,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	}
 	use_rt_gi = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
 	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/half_resolution");
+	use_rt_gi_quarter_res = use_rt_gi_half_res && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/quarter_resolution"));
 	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel"));
 	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/enabled");
 	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/border_fade");
@@ -2334,12 +2336,14 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	}
 	surface_cache_settings.captures_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/captures_per_frame"));
 	surface_cache_settings.lighting_sets_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame"));
+	surface_cache_settings.lighting_texels_per_frame = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame"));
 	surface_cache_settings.temporal_frames = int(GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/temporal_frames"));
 	surface_cache_settings.shared_bounce_ray = GLOBAL_GET("rendering/ray_tracing/surface_cache/quality/shared_bounce_ray");
 	surface_cache_light_radius = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_radius");
 	surface_cache_settings.light_grid = GLOBAL_GET("rendering/ray_tracing/surface_cache/light_grid");
 
 	stochastic_quality.rays_per_pixel = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/rays_per_pixel"));
+	stochastic_quality.exact_lights = int(GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/quality/exact_lights"));
 	stochastic_quality.half_resolution = use_stochastic_half_res;
 	stochastic_quality.light_guiding = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/light_guiding");
 	stochastic_quality.screen_traces = GLOBAL_GET("rendering/ray_tracing/stochastic_direct_lighting/screen_space_traces");
@@ -2359,7 +2363,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 		_rt_state_out(vformat("RT STATE settings: shadows %s rays %d | stochastic %s half %s rays %d denoise %s tframes %d iter %d vthresh %.3f guiding %s straces %s tvol %s | gi %s half %s rays %d tframes %d iter %d vthresh %.3f spec %s dir %s so %s srad %s straces %s mirrors %s hit %d | cache %s mirror %s atlas %d texels/m %.1f caps %d sets %d tframes %d | sdfgi_rq %s",
 				use_raytraced_shadows ? "on" : "off", rt_shadow_rays,
 				use_stochastic_lighting ? "on" : "off", use_stochastic_half_res ? "on" : "off", stochastic_quality.rays_per_pixel, stochastic_quality.denoise ? "on" : "off", stochastic_quality.temporal_frames, stochastic_quality.spatial_iterations, stochastic_quality.variance_threshold, stochastic_quality.light_guiding ? "on" : "off", stochastic_quality.screen_traces ? "on" : "off", translucency_quality.enabled ? "on" : "off",
-				use_rt_gi ? "on" : "off", use_rt_gi_half_res ? "on" : "off", rt_gi_rays, rt_gi_temporal_frames, rt_gi_spatial_iterations, rt_gi_variance_threshold, use_rt_gi_specular ? "on" : "off", use_rt_gi_directional ? "on" : "off", use_rt_gi_specular_occlusion ? "on" : "off", use_rt_gi_screen_radiance ? "on" : "off", use_rt_gi_screen_traces ? "on" : "off", use_rt_gi_planar_mirrors ? "on" : "off", rt_gi_hit_shading,
+				use_rt_gi ? "on" : "off", use_rt_gi_quarter_res ? "quarter" : (use_rt_gi_half_res ? "on" : "off"), rt_gi_rays, rt_gi_temporal_frames, rt_gi_spatial_iterations, rt_gi_variance_threshold, use_rt_gi_specular ? "on" : "off", use_rt_gi_directional ? "on" : "off", use_rt_gi_specular_occlusion ? "on" : "off", use_rt_gi_screen_radiance ? "on" : "off", use_rt_gi_screen_traces ? "on" : "off", use_rt_gi_planar_mirrors ? "on" : "off", rt_gi_hit_shading,
 				use_surface_cache ? "on" : "off", use_surface_cache_mirror ? "on" : "off", int(surface_cache_settings.atlas_size), float(surface_cache_settings.texels_per_meter), int(surface_cache_settings.captures_per_frame), int(surface_cache_settings.lighting_sets_per_frame), int(surface_cache_settings.temporal_frames),
 				use_rt_sdfgi_probes ? "on" : "off"));
 	}
@@ -3213,6 +3217,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 				gi_quality.rays_per_pixel = rt_gi_rays;
 				gi_quality.half_resolution = use_rt_gi_half_res;
+				gi_quality.quarter_resolution = use_rt_gi_quarter_res;
 				gi_quality.screen_radiance = use_rt_gi_screen_radiance;
 				gi_quality.screen_radiance_diffuse = rt_diffuse_screen_radiance;
 				gi_quality.screen_radiance_border_fade = rt_gi_screen_radiance_border_fade;
@@ -3237,7 +3242,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					// widened fourfold for the cosine lobe it stands for.
 					const Projection &proj = p_render_data->scene_data->cam_projection;
 					float tan_half_fov = proj.columns[1][1] != 0.0f ? 1.0f / Math::abs(proj.columns[1][1]) : 1.0f;
-					float gather_height = float(MAX(rb->get_internal_size().y / (use_rt_gi_half_res ? 2 : 1), 1));
+					float gather_height = float(MAX(rb->get_internal_size().y / (use_rt_gi_quarter_res ? 4 : (use_rt_gi_half_res ? 2 : 1)), 1));
 					gi_quality.hit_cone_scale = 2.0f * tan_half_fov / gather_height * 4.0f;
 					gi_quality.emissive_exposure_normalization = 1.0f;
 					if (p_render_data->camera_attributes.is_valid()) {

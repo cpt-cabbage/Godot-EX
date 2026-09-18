@@ -104,7 +104,7 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	// chain's code packed as mirror_chains_at packs them (A | B << 3 |
 	// C << 6, MAX_MIRROR_PLANES ending it), four to a uvec4.
 	uint image_chain_count;
-	uint mirror_pad;
+	uint exact_lights; // The most lights a cell may hold for the analytic sum to be exact (was MAX_ANALYTIC_LIGHTS).
 	uvec4 image_chains[4];
 }
 params;
@@ -1243,7 +1243,7 @@ void main() {
 		uint discovery_budget = guide_miss ? MISS_DISCOVERY_CANDIDATES : MAX_DISCOVERY_CANDIDATES;
 		// Small enough to sum the analytic term exactly, so it stops being an
 		// estimate at all.
-		bool analytic_exact = cell_count <= MAX_ANALYTIC_LIGHTS;
+		bool analytic_exact = cell_count <= min(params.exact_lights, MAX_ANALYTIC_LIGHTS);
 		// Every light the analytic sum evaluates is a candidate for free: the
 		// reservoirs stream (see reservoir_update), so offering a light costs
 		// an update per reservoir and no storage, against the evaluation the

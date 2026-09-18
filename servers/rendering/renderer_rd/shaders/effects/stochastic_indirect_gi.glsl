@@ -126,6 +126,7 @@ params;
 #define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_SPEC_BUDGET 1048576u // Rough dielectrics skip the GGX ray: the cosine rays' mean radiance stands in for their reflection (GODOT_GI_SPEC_BUDGET).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
+#define FLAG_NO_REQUESTS 16777216u // Diagnostics (GODOT_GI_REQUESTS=0): the card reads ask for no relight.
 #define FLAG_MEMORY_EDGE 8388608u // Experiment (GODOT_GI_MEMORY_EDGE=1): settled pixels inside the border fade teach the screen memory too, at the fade's share of the rate.
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
@@ -285,8 +286,9 @@ layout(set = 0, binding = 19, std430) restrict readonly buffer CardSets {
 }
 card_sets;
 
-layout(set = 0, binding = 20, std430) restrict writeonly buffer CardRequests {
-	uint frame[];
+layout(set = 0, binding = 20, std430) restrict buffer CardRequests {
+	uint frame[SURFACE_CACHE_MAX_SETS]; // Per set: the frame of the last read.
+	uint tiles[]; // Per set, per card: the 16x16 tiles read (see surface_cache_inc.glsl).
 }
 card_requests;
 
@@ -1198,6 +1200,15 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	}
 	if (best_w <= 0.0) {
 		return false;
+	}
+	// The read is the request: the texel's tile is relit next frame.
+	if (!bool(params.flags & FLAG_NO_REQUESTS)) {
+		ivec2 dims = card_dims_packed(best_packed);
+		ivec2 texel = card_origin_packed(best_packed) + clamp(ivec2(best_uv * vec2(dims)), ivec2(0), dims - ivec2(1));
+		uint bit;
+		uint word = card_tile_word(inst.set, best_k, best_packed, texel, bit);
+		atomicOr(card_requests.tiles[word], bit);
+		card_requests.frame[inst.set] = params.surface_cache_frame;
 	}
 	// Bilinear inside the card, never across its border, at the mip the
 	// footprint covers (its texels are wider, so the border margin is too).

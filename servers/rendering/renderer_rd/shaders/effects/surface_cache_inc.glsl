@@ -6,6 +6,17 @@
 #define SURFACE_CACHE_CARDS 6u
 #define SURFACE_CACHE_SET_FLAG_CAPTURED 1u
 #define SURFACE_CACHE_SET_FLAG_RESET 2u
+#define SURFACE_CACHE_MAX_SETS 8192u
+
+// The relight requests. A read of a card texel asks for its 16x16 tile to be
+// relit (one bit per tile, per card, per set; a 256-texel card has 256
+// tiles = 8 words), and the prepare pass turns the set bits into the
+// lighting pass's work list. Relighting the tiles rays landed on instead of
+// every texel of every set a ray reached is what lets a level of a thousand
+// sets converge within the budget (plan section 77).
+#define SURFACE_CACHE_TILE 16u
+#define SURFACE_CACHE_TILE_WORDS_PER_CARD 8u
+#define SURFACE_CACHE_TILE_WORDS (SURFACE_CACHE_CARDS * SURFACE_CACHE_TILE_WORDS_PER_CARD)
 
 struct CardSet {
 	mat4 world_from_local;
@@ -18,7 +29,7 @@ struct CardSet {
 	vec3 world_aabb_size;
 	float pad1;
 	uint flags;
-	uint pad2;
+	uint captured_frame; // The frame of the cards' capture: a tile relit before it starts over.
 	uint pad3;
 	uint pad4;
 	uint cards[8]; // Per card: origin x (13 bits) | log2(width) - 2 (3 bits) | origin y << 16 (13 bits) | log2(height) - 2 << 29; six used.
@@ -56,6 +67,15 @@ ivec2 card_origin_packed(uint packed) {
 // A card's texels: width along u, height along v (each a power of two).
 ivec2 card_dims_packed(uint packed) {
 	return ivec2(4 << ((packed >> 13u) & 7u), 4 << ((packed >> 29u) & 7u));
+}
+
+// The request word and bit of the tile holding an atlas texel of a card.
+uint card_tile_word(uint p_set, uint p_card, uint p_packed, ivec2 p_texel, out uint r_bit) {
+	ivec2 rel = (p_texel - card_origin_packed(p_packed)) / int(SURFACE_CACHE_TILE);
+	int tiles_x = max(card_dims_packed(p_packed).x / int(SURFACE_CACHE_TILE), 1);
+	uint tile = uint(max(rel.y, 0) * tiles_x + max(rel.x, 0));
+	r_bit = 1u << (tile & 31u);
+	return p_set * SURFACE_CACHE_TILE_WORDS + p_card * SURFACE_CACHE_TILE_WORDS_PER_CARD + (tile >> 5u);
 }
 
 ivec2 card_origin(CardSet s, uint p_card) {

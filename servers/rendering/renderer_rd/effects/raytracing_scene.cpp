@@ -742,8 +742,35 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
+	// The instances in a fixed order. The cull hands them over in the order
+	// its threads finished, which differs from frame to frame, and the TLAS
+	// built from a differently ordered list breaks its ties differently: a
+	// ray at a face two kit pieces share came back from the other piece one
+	// relight in a hundred on the TPS bridge, which the cards' bounce
+	// gradient read as a surface moving and the GI history restarted on,
+	// everywhere, for good (section 77). GODOT_TLAS_UNSORTED=1 keeps the
+	// cull's order.
+	static const bool sort_instances = OS::get_singleton()->get_environment("GODOT_TLAS_UNSORTED") != "1";
+	thread_local LocalVector<RenderGeometryInstanceBase *> ordered;
+	ordered.clear();
+	ordered.reserve(p_instances.size());
 	for (uint64_t i = 0; i < p_instances.size(); i++) {
-		RenderGeometryInstanceBase *inst = static_cast<RenderGeometryInstanceBase *>(p_instances[i]);
+		ordered.push_back(static_cast<RenderGeometryInstanceBase *>(p_instances[i]));
+	}
+	if (sort_instances) {
+		struct ByBaseThenAddress {
+			bool operator()(RenderGeometryInstanceBase *a, RenderGeometryInstanceBase *b) const {
+				if (a->data->base.get_id() != b->data->base.get_id()) {
+					return a->data->base.get_id() < b->data->base.get_id();
+				}
+				return uintptr_t(a) < uintptr_t(b);
+			}
+		};
+		ordered.sort_custom<ByBaseThenAddress>();
+	}
+
+	for (uint64_t i = 0; i < ordered.size(); i++) {
+		RenderGeometryInstanceBase *inst = ordered[i];
 		const bool is_multimesh = inst->data->base_type == RSE::INSTANCE_MULTIMESH;
 		const bool is_skinned = !is_multimesh && inst->mesh_instance.is_valid();
 		const bool is_particles = inst->data->base_type == RSE::INSTANCE_PARTICLES;
@@ -860,7 +887,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			tlas_update_count++;
 		}
 		if (tlas_print_at > 0 && tlas_update_count == tlas_print_at) {
-			print_line(vformat("TLAS inst %d: casting 0x%x double 0x%x front 0x%x alpha 0x%x layers 0x%x det %.3f aabb %s", (int)i, casting_mask, double_sided, front_cull, alpha_tested, inst->layer_mask, inst->transform.basis.determinant(), inst->transformed_aabb));
+			print_line(vformat("TLAS inst %d: casting 0x%x double 0x%x front 0x%x alpha 0x%x layers 0x%x det %.3f aabb %s base %s %s", (int)i, casting_mask, double_sided, front_cull, alpha_tested, inst->layer_mask, inst->transform.basis.determinant(), inst->transformed_aabb, inst->data->base_type == RSE::INSTANCE_MULTIMESH ? "multimesh" : (inst->data->base_type == RSE::INSTANCE_PARTICLES ? "particles" : "mesh"), inst->mesh_instance.is_valid() ? "skinned" : ""));
 		}
 
 		for (const FacingClass &facing : classes) {

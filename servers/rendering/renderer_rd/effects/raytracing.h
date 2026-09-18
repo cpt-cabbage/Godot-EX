@@ -368,7 +368,7 @@ private:
 		uint32_t mirror_count;
 		uint32_t mirror_order;
 		uint32_t image_chain_count; // The image chains in the cluster (image_chain_codes), 0 without mirrors.
-		uint32_t mirror_pad;
+		uint32_t exact_lights; // The most lights a cluster cell may hold for its analytic sum to be exact; past it a strided estimate (stochastic_direct_lighting/quality/exact_lights).
 		uint32_t image_chains[16]; // The chains' codes, uvec4[4] in the shader (std140 packs a uint array by 16 bytes).
 	};
 	static_assert(sizeof(StochasticParamsUBO) == 752, "StochasticParamsUBO layout must match stochastic_direct_lighting.glsl.");
@@ -657,6 +657,7 @@ public:
 	// settings every frame so changes apply without a restart.
 	struct StochasticQuality {
 		uint32_t rays_per_pixel = 4; // Reservoir count, 1..MAX_RESERVOIRS (4).
+		uint32_t exact_lights = 512; // The most lights a cluster cell may hold for the analytic sum to be exact.
 		bool half_resolution = false;
 		bool light_guiding = true; // Visible light list sample guiding.
 		bool screen_traces = true; // Screen-space contact traces.
@@ -739,6 +740,7 @@ public:
 	struct GiQuality {
 		uint32_t rays_per_pixel = 1;
 		bool half_resolution = true;
+		bool quarter_resolution = false; // With half_resolution: a quarter each way (the low-spec form; Sousa ships it).
 		bool screen_radiance = true;
 		bool screen_radiance_diffuse = false; // The screen texture is the colour pass's diffuse target (no camera specular): the gather adds the surface's own specular energy from the G-buffer (FLAG_SRAD_FOLD).
 		float screen_radiance_border_fade = 0.08f; // uv width of the hand-back to the cache; 0 is a hard switch.
