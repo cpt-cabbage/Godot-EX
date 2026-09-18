@@ -1272,6 +1272,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.dynamic_motion = MAX(MAX(motion / MAX(dyn_motion, 1e-4f), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()), 0.0f);
 	params.dynamic_window = MAX(dyn_window, 1.0f);
 	params.dynamic_change = RendererRD::LightStorage::get_singleton()->get_card_dynamic_change();
+	// The most a moving light's direct term marks a texel for the GI screen
+	// history's restart (surface_cache_light.glsl accumulate): 0.125 is a
+	// restart to eight frames, the young fallback's threshold; 1 restores
+	// the uncapped mark, which under a light sweeping the level every frame
+	// (the TPS demo's forklifts) kept the whole screen at one frame.
+	static const float dyn_mark = OS::get_singleton()->get_environment("GODOT_CARD_DYN_MARK") == "" ? 1.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_DYN_MARK").to_float());
+	params.dynamic_mark = CLAMP(dyn_mark, 0.0f, 1.0f);
 	// A light joining the dynamic set (LightStorage): the static
 	// accumulation holds its bounce, and hands it over to the dynamic
 	// histories as they converge (surface_cache_light.glsl accumulate).

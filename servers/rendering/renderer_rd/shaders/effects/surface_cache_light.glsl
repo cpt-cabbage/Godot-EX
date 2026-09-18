@@ -111,7 +111,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
 	float dynamic_join; // On the frame a light joins the dynamic set (every set relit): the share of its bounce the static accumulation holds, which it sheds (see accumulate). 0 otherwise.
 	uint area_light_count; // The area lights (every one in the population: a few, each tested for range per texel).
-	float pad_join1;
+	float dynamic_mark; // The most a moving light's direct term may mark a texel for the screen (see accumulate); a change of intensity or colour is not capped.
 	float pad_join2;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
@@ -1475,7 +1475,6 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 			// The landing's radiance from this light's direct term alone.
 			vec3 l_dyn = albedo_p * c_p * weight;
 			float pdf_area = pdf_omega * cos_pl / (d_lp * d_lp);
-			change_total = max(change_total, hit_change_total - 0.25);
 			// The texel connected to the landing. The estimator of the
 			// irradiance over pi is radiance * geom / (pi * pdf_area); its
 			// balance-heuristic weight against the cosine rays (n_cosine of
@@ -1495,6 +1494,16 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 					float geom = cos_t * cos_pt / (d * d + 0.01);
 					dyn_sample += l_dyn * (geom / (M_PI * n_light * pdf_area + n_cosine * geom));
 					landed += share;
+					// The landing's change reaches this texel only through a
+					// connection, like the cosine ray's hit (accumulate weighs
+					// it by the dynamic sample's share). Carried from every
+					// landing whether or not it connected, two spotlights of
+					// the TPS demo's forklifts (50 m range, flying) handed
+					// the cone edge's full marks to every texel within their
+					// range each frame, and through the cosine hits to the
+					// rest of the level: the GI screen history restarted on
+					// 98% of the pixels every frame the level was played.
+					change_total = max(change_total, hit_change_total - 0.25);
 				}
 			}
 		}
@@ -1958,7 +1967,7 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 // third everywhere and the screen history at three frames (section 77).
 float mark_decay = 0.125;
 
-void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
+void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, float dyn_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
 	vec4 old = imageLoad(lighting_atlas, texel);
 	Change prev = change_load(texel);
 	// A fresh capture has nothing to compare with, and neither has a texel
@@ -1985,6 +1994,13 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		float share = (fresh || acc.a <= 0.0 || l_acc <= 1e-5) ? 1.0 : clamp(luminance(max(indirect_sample, vec3(0.0))) / l_acc, 0.0, 1.0);
 		bounce_change *= share;
 		bounce_change_total *= share;
+		// The light rays' landings (trace_dynamic) the same way, by the
+		// dynamic sample's luminance over the whole accumulation, static
+		// and dynamic: a texel the moving light's bounce barely reaches
+		// reads little of what its landings saw.
+		float l_all = l_acc + luminance(max(imageLoad(indirect_dyn_atlas, texel).rgb, vec3(0.0))) + luminance(max(imageLoad(indirect_dyn2_atlas, texel).rgb, vec3(0.0)));
+		float dyn_share = (fresh || acc.a <= 0.0 || l_all <= 1e-5) ? 1.0 : clamp(luminance(max(dyn_sample, vec3(0.0))) / l_all, 0.0, 1.0);
+		bounce_change_total = max(bounce_change_total, dyn_change_total * dyn_share);
 	}
 
 	// The radiance gradient: how much the deterministic part of this texel's
@@ -2015,6 +2031,20 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	float total_lum = luminance(unshadowed) + dyn_lum;
 	float prev_total_lum = luminance(prev.unshadowed) + dyn_old.a;
 	float dyn_change = fresh ? 0.0 : abs(dyn_lum - dyn_old.a) / max(max(dyn_lum, dyn_old.a), max(0.25 * max(total_lum, prev_total_lum), 1e-4));
+	// A moving light's mark is capped (params.dynamic_mark, 0.125: the
+	// screen restarts to eight frames at most, never to the young fallback).
+	// The gather adds a dynamic light's direct term at the hit analytically
+	// every frame, so what the mark buys is the screen's lag on the change,
+	// and a full restart every frame is the whole screen speckled: the TPS
+	// demo's forklift spotlights, flying at 14 m/s round a 68 m orbit,
+	// marked a third of the level's texels whole each frame and the GI
+	// history never passed one frame while the level was played (98% of
+	// the pixels young; the frame time doubled on the fallback, and the
+	// slower frame moved the light farther per frame). The flashlight's
+	// sweeps (5% a frame, section 19) sit under the cap and are unchanged.
+	// A light switching or changing colour (params.dynamic_change) is a
+	// step the screen should take whole, and is not capped.
+	dyn_change = min(dyn_change, params.dynamic_mark);
 	if (!fresh && dyn_lum > 0.05 * total_lum) {
 		dyn_change = max(dyn_change, params.dynamic_change);
 	}
@@ -2398,8 +2428,7 @@ void main() {
 		float dyn_change_total;
 		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
-		bounce_change_total = max(bounce_change_total, dyn_change_total);
-		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
+		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
 	}
 
@@ -2467,7 +2496,6 @@ void main() {
 	float dyn_change_total;
 	trace_dynamic(tracer_texel, t[tracer], float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 	dyn_sample += dyn_light;
-	bounce_change_total = max(bounce_change_total, dyn_change_total);
 	// The image lights' sum, computed at the quad's first texel and shared.
 	ImageCache images;
 	images.valid = false;
@@ -2479,6 +2507,6 @@ void main() {
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		Direct d;
 		shade_direct(set, t[k], seed_k, images, d);
-		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
+		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
 }

@@ -432,7 +432,8 @@ private:
 		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
 		float dynamic_join; // The share of a joining light's bounce the static accumulation holds, on the frame it joins (LightStorage; 0 otherwise).
 		uint32_t area_light_count;
-		float pad_join[2];
+		float dynamic_mark; // The most a moving light's direct term marks a texel for the screen's restart (GODOT_CARD_DYN_MARK, 0.125).
+		float pad_join;
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 		uint32_t mirror_count;
