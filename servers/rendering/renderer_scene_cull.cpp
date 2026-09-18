@@ -2393,6 +2393,61 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 	}
 }
 
+// The shadow transform of a local light without its shadow pass (see the
+// caller): the projection and view _light_instance_update_shadow would set
+// for each of its passes, and nothing else.
+void RendererSceneCull::_light_instance_set_shadow_transform_only(Instance *p_instance) {
+	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
+	Transform3D light_transform = p_instance->transform;
+	light_transform.orthonormalize(); // Scale does not count on lights.
+	const real_t radius = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_RANGE);
+	const real_t z_near = MIN(0.025f, radius);
+	switch (RSG::light_storage->light_get_type(p_instance->base)) {
+		case RSE::LIGHT_DIRECTIONAL: {
+			// Handled with the directional shadows.
+		} break;
+		case RSE::LIGHT_OMNI: {
+			RSE::LightOmniShadowMode shadow_mode = RSG::light_storage->light_omni_get_shadow_mode(p_instance->base);
+			if (shadow_mode == RSE::LIGHT_OMNI_SHADOW_DUAL_PARABOLOID || !RSG::light_storage->light_instances_can_render_shadow_cube()) {
+				for (int i = 0; i < 2; i++) {
+					RSG::light_storage->light_instance_set_shadow_transform(light->instance, Projection(), light_transform, radius, 0, i, 0);
+				}
+			} else {
+				Projection cm;
+				cm.set_perspective(90, 1, z_near, radius);
+				static const Vector3 view_normals[6] = {
+					Vector3(+1, 0, 0),
+					Vector3(-1, 0, 0),
+					Vector3(0, -1, 0),
+					Vector3(0, +1, 0),
+					Vector3(0, 0, +1),
+					Vector3(0, 0, -1)
+				};
+				static const Vector3 view_up[6] = {
+					Vector3(0, -1, 0),
+					Vector3(0, -1, 0),
+					Vector3(0, 0, -1),
+					Vector3(0, 0, +1),
+					Vector3(0, -1, 0),
+					Vector3(0, -1, 0)
+				};
+				for (int i = 0; i < 6; i++) {
+					Transform3D xform = light_transform * Transform3D().looking_at(view_normals[i], view_up[i]);
+					RSG::light_storage->light_instance_set_shadow_transform(light->instance, cm, xform, radius, 0, i, 0);
+				}
+			}
+		} break;
+		case RSE::LIGHT_SPOT: {
+			const real_t angle = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SPOT_ANGLE);
+			Projection cm;
+			cm.set_perspective(angle * 2.0, 1.0, z_near, radius);
+			RSG::light_storage->light_instance_set_shadow_transform(light->instance, cm, light_transform, radius, 0, 0, 0);
+		} break;
+		default: {
+		} break;
+	}
+}
+
 bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers) {
 	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
 
@@ -3654,6 +3709,23 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			// shadow (last frame's verdict) needs neither the caster culls
 			// nor the atlas passes for them; a frame it turns out unable to,
 			// the atlas holds last frame's maps rather than nothing.
+			//
+			// The light's shadow transform is still needed: the light
+			// buffer's shadow_matrix is built from it, and that matrix is
+			// what projects a point into the light's cookie (the projector
+			// rect in the decal atlas), in the scene shader and in every
+			// ray traced pass alike. It is only ever set by the atlas pass,
+			// so a light created while the ray tracer already owned the
+			// shadows (any scene loaded after the first, the game's own
+			// menu-to-level swap) kept the default: its cookie sampled the
+			// atlas's black border, and in the TPS demo every spotlight
+			// went dark on the player (2026-09-18). Set here, from the same
+			// numbers the atlas pass uses, once per dirty light.
+			if (light->is_shadow_dirty() && local_shadows_traced) {
+				_light_instance_set_shadow_transform_only(ins);
+				light->last_version++;
+				light->decrement_shadow_dirty();
+			}
 			if (light->is_shadow_dirty() && !local_shadows_traced) {
 				// Dirty shadows have no need to be drawn if
 				// the light volume doesn't intersect the camera frustum.
@@ -3758,6 +3830,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		// scenario, not just the frustum survivors: an occluder behind the
 		// camera still has to block rays toward the light.
 		rt_geometry_instances.clear();
+		bool rt_mesh_instances_dirty = false;
 		for (uint64_t i = 0; i < scenario->instance_data.size(); i++) {
 			const InstanceData &idata = scenario->instance_data[i];
 			uint32_t base_type = idata.flags & InstanceData::FLAG_BASE_TYPE_MASK;
@@ -3767,7 +3840,23 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			if (idata.flags & InstanceData::FLAG_VISIBILITY_DEPENDENCY_HIDDEN) {
 				continue;
 			}
+			// A skinned or blend-shaped instance outside the frustum is
+			// skinned by nobody once the ray tracer owns the shadows: the
+			// frustum cull above updates the visible ones and the shadow
+			// passes used to update their casters. Its BLAS was then built
+			// from a vertex buffer nothing had written -- a tree over
+			// garbage that its refits kept forever, which every ray in the
+			// scene crawled through (the TPS demo at 250 ms a frame after
+			// its menu, 2026-09-18: the robots at their spawn points behind
+			// the camera). Skin it before the structure is built from it.
+			if (idata.instance->mesh_instance.is_valid()) {
+				RSG::mesh_storage->mesh_instance_check_for_update(idata.instance->mesh_instance);
+				rt_mesh_instances_dirty = true;
+			}
 			rt_geometry_instances.push_back(idata.instance_geometry);
+		}
+		if (rt_mesh_instances_dirty) {
+			RSG::mesh_storage->update_mesh_instances();
 		}
 		scene_render->update_ray_tracing_scene(rt_geometry_instances, p_camera_data->main_transform.origin);
 	}
