@@ -135,7 +135,8 @@ params;
 #define FLAG_MEMORY_EDGE 8388608u // Experiment (GODOT_GI_MEMORY_EDGE=1): settled pixels inside the border fade teach the screen memory too, at the fade's share of the rate.
 #define FLAG_ABLATE_RAYS 33554432u // Diagnostics (GODOT_GI_ABLATE=rays): the bounce rays are not traced (every one misses to the sky).
 #define FLAG_ABLATE_SPEC 67108864u // Diagnostics (GODOT_GI_ABLATE=spec): no reflection ray; the diffuse mean stands in as under the budget.
-#define FLAG_ABLATE_CARDS 134217728u // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
+#define FLAG_ABLATE_CARDS 134217728u
+#define FLAG_SPEC_HALF_RATE 268435456u // The rough reflection ray on a checkerboard that alternates each frame; the resolve fills the rest from the traced neighbors (raytraced_gi/quality/half_rate_reflections). // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -1782,6 +1783,21 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	if (bool(params.flags & FLAG_SPEC_HALF_RATE)) {
+		// The half-rate reflection's threads, remapped: a ray costs its
+		// SIMD group the traversal whether one lane traces or all of them,
+		// so a checkerboard on the natural mapping (an 8x4 group holding
+		// half of each) saved nothing (measured: 8.2 -> 7.7 ms on the TPS
+		// bridge, inside the spread, against 3.5 for no reflection ray at
+		// all). The block's 32 traced pixels go to the first SIMD group of
+		// the 8x8 workgroup and the 32 skipped to the second, and the
+		// group that skips is idle for the whole ray.
+		uint l = gl_LocalInvocationIndex;
+		uint k = l & 31u;
+		ivec2 lp = ivec2(int((k & 3u) * 2u), int(k >> 2u));
+		lp.x += int((uint(lp.y) + (l >> 5u)) & 1u);
+		pixel = ivec2(gl_WorkGroupID.xy) * 8 + lp;
+	}
 	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
 		return;
 	}
@@ -1980,9 +1996,55 @@ void main() {
 		float f0_lum = luminance(gb_f0(texelFetch(gbuf_f0_texture, full_pixel, 0)));
 		spec_stand_in = f0_lum < params.cv_params.w;
 	}
+	// The half-rate form (FLAG_SPEC_HALF_RATE): a rough pixel traces its
+	// reflection ray on alternate frames, its four neighbors on the
+	// others, and the resolve pass reweights the neighbours' hits into
+	// this pixel's lobe (the same reuse the full resolve does, here only
+	// for the pixels without a ray: spec_ray stays zero to mark them). A
+	// mirror keeps its ray: no neighbour's sample is its image. The stand-in
+	// (the diffuse mean) was measured as the cheaper form first and is a
+	// bias, not a budget: a grazing lobe on the TPS demo's floor sees the
+	// dark far end of the ring, the hemisphere mean sees the lit ceiling,
+	// and the frame read 12% brighter.
+	// The checkerboard does not alternate by frame: it did first, and a
+	// pixel then toggled between its own sample and its neighbours' mean,
+	// two estimators that agree on a flat wall and not on a normal-mapped
+	// pipe or a highlight a pixel wide -- the machines' flicker at rest
+	// doubled and a strafe past the hall's pipes left a mottle where the
+	// two patterns met in the history. Fixed, a skipped pixel is always
+	// the mean of its four traced neighbors: a blurrier reflection on
+	// half the pixels, and a still one.
+	bool spec_skip = bool(params.flags & FLAG_SPEC_HALF_RATE) && !mirror && roughness > 0.2 && ((pixel.x + pixel.y) & 1) != 0;
+	if (spec_skip) {
+		// Only where a 4-neighbour is on this surface by the fill's own
+		// stops (a twentieth of the depth, the normal to a few degrees):
+		// a railing or a pipe a pixel wide at the quarter tier has none,
+		// and a fill with nothing to read is a black sample. Those trace.
+		bool has_neighbour = false;
+		for (int k = 0; k < 4 && !has_neighbour; k++) {
+			ivec2 sp = pixel + ivec2(k == 0 ? -1 : (k == 1 ? 1 : 0), k == 2 ? -1 : (k == 3 ? 1 : 0));
+			if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, params.screen_size))) {
+				continue;
+			}
+			ivec2 sfp = min(sp * int(params.depth_scale), params.full_screen_size - 1);
+			float sd = texelFetch(depth_texture, sfp, 0).r;
+			if (sd == 0.0) {
+				continue;
+			}
+			vec2 suv = (vec2(sfp) + 0.5) / vec2(params.full_screen_size);
+			vec4 sp4 = params.view_from_ndc * vec4(suv * 2.0 - 1.0, sd, 1.0);
+			float s_depth = -sp4.z / sp4.w;
+			if (abs(s_depth + view_pos.z) > 0.05 * max(-view_pos.z, 1.0)) {
+				continue;
+			}
+			vec3 sn = nr_normal(texelFetch(normal_roughness_texture, sfp, 0));
+			has_neighbour = pow(max(dot(view_normal, sn), 0.0), 32.0) > 1e-3;
+		}
+		spec_skip = has_neighbour;
+	}
 	if (spec_stand_in) {
 		reflection = irradiance;
-	} else if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror)) {
+	} else if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror) && !spec_skip) {
 		// GGX half-vector sampling around the mirror direction.
 		vec2 rnd = stbn_sample(pixel, 6u);
 		vec3 v = normalize(-(world_basis * view_pos));

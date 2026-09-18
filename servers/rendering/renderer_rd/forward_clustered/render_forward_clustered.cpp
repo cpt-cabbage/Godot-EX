@@ -860,6 +860,17 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// Bits 1|2: the gather's resolution, 1 full, 2 half, 3 quarter (the scene shader upsamples by 1 << (n - 1)).
 	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_quarter_res ? 3u : (use_rt_gi_half_res ? 2u : 1u)) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u) | (rt_gi_no_ao ? 128u : 0u)) : 0;
 	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
+	// GODOT_RT_OPAQUE_ABLATE=stoch,gi (profiling): the passes run, the
+	// opaque pass reads neither -- what its RT composites cost (the direct
+	// lights then shade through unrendered shadow maps, the GI through the
+	// probes: lower bounds of the stock loops, not stock itself).
+	static const String opaque_ablate = OS::get_singleton()->get_environment("GODOT_RT_OPAQUE_ABLATE");
+	if (opaque_ablate.contains("stoch")) {
+		scene_state.ubo.stochastic_direct_lights = 0;
+	}
+	if (opaque_ablate.contains("gi")) {
+		scene_state.ubo.rt_gi = 0;
+	}
 	// When the sun's shadow is ray traced, its shadow map is neither rendered
 	// nor sampled: the traced mask fully owns that light's shadow.
 	scene_state.ubo.rt_sun_shadow = (p_opaque_render_buffers && p_render_data->reflection_probe.is_null() && _get_rt_sun_base(p_render_data).is_valid()) ? 1 : 0;
@@ -2289,6 +2300,7 @@ void RenderForwardClustered::_update_ray_tracing_settings() {
 	use_rt_gi = supports_ray_query && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/enabled"));
 	use_rt_gi_half_res = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/half_resolution");
 	use_rt_gi_quarter_res = use_rt_gi_half_res && bool(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/quarter_resolution"));
+	use_rt_gi_half_rate_reflections = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/half_rate_reflections");
 	rt_gi_rays = int(GLOBAL_GET("rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel"));
 	use_rt_gi_screen_radiance = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/enabled");
 	rt_gi_screen_radiance_border_fade = GLOBAL_GET("rendering/ray_tracing/raytraced_gi/screen_radiance/border_fade");
@@ -3220,6 +3232,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				gi_quality.rays_per_pixel = rt_gi_rays;
 				gi_quality.half_resolution = use_rt_gi_half_res;
 				gi_quality.quarter_resolution = use_rt_gi_quarter_res;
+				gi_quality.half_rate_reflections = use_rt_gi_half_rate_reflections;
 				gi_quality.screen_radiance = use_rt_gi_screen_radiance;
 				gi_quality.screen_radiance_diffuse = rt_diffuse_screen_radiance;
 				gi_quality.screen_radiance_border_fade = rt_gi_screen_radiance_border_fade;

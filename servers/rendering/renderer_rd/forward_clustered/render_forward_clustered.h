@@ -882,6 +882,7 @@ private:
 	static bool _prepass_motion_enabled();
 	bool use_rt_gi_half_res = true;
 	bool use_rt_gi_quarter_res = false;
+	bool use_rt_gi_half_rate_reflections = false;
 	uint32_t rt_gi_rays = 1;
 	bool use_rt_gi_screen_radiance = true;
 	float rt_gi_screen_radiance_border_fade = 0.08f;

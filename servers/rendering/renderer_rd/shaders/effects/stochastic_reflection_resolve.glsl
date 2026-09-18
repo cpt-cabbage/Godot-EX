@@ -13,7 +13,7 @@
 // that turns the neighbourhood's hits into samples of this lobe
 // (Stachowiak 2015's ray reuse; the neighbour's own direction stood in
 // first and read worse than no resolve at all on a strafe past a lit wall,
-// a hit a metre away being a different direction from a pixel ten pixels
+// a hit a meter away being a different direction from a pixel ten pixels
 // over), with depth and normal stops so a different surface's rays stay
 // out. What the temporal pass then
 // accumulates -- and restarts to, under a lighting change -- is twenty-five
@@ -44,7 +44,7 @@ layout(push_constant, std430) uniform Params {
 	float rough_min; // Below this roughness the sample passes through (the mirror path).
 	float rough_full; // From this roughness the resolve replaces the sample whole.
 	float weight_cap; // The most a neighbour's density ratio may weigh.
-	float pad;
+	int fill; // 1: the half-rate form -- only a pixel without a ray of its own is resolved, from the neighbors that traced; the rest pass through.
 }
 params;
 
@@ -65,7 +65,6 @@ vec3 view_position(ivec2 pixel, float depth) {
 	vec4 p = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	return p.xyz / p.w;
 }
-
 
 // The density the gather draws its rough ray with: GGX over the half
 // vector (stochastic_indirect_gi.glsl), turned to a density over
@@ -93,11 +92,27 @@ void main() {
 	vec4 nr = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0);
 	float roughness = nr_roughness(nr);
 	vec4 own_ray = texelFetch(spec_ray, pixel, 0);
-	if (depth == 0.0 || roughness < params.rough_min || own_ray.z <= 0.0) {
-		imageStore(out_reflection, pixel, center);
+	// The half-rate fill: a pixel with a ray passes through, one without
+	// (a rough pixel the gather skipped this frame) takes the plain mean of
+	// the four neighbors on its surface (the depth and normal stops; the
+	// gather skipped it only because one exists). Their lobes are its own
+	// -- the same roughness, a view vector a pixel apart -- so the density
+	// ratio below has nothing to correct, and what it did was trim: a
+	// neighbour's hit a hand away is a different direction from here and
+	// weighed the bright near hits down (the filled set read 20% dimmer
+	// than the traced set on the TPS bridge). A mirror (at or below
+	// rough_min) traced its own ray and is never filled.
+	bool filling = params.fill != 0;
+	bool paint = params.fill == 2; // Diagnostics (GODOT_GI_SPEC_FILL_PAINT=1): why each pixel got what it got.
+	if (depth == 0.0 || (filling ? roughness <= params.rough_min : roughness < params.rough_min) || (own_ray.z <= 0.0) != filling) {
+		imageStore(out_reflection, pixel, paint ? (depth == 0.0 ? vec4(0.0) : (roughness <= params.rough_min ? vec4(1.0, 1.0, 0.0, 0.0) : vec4(0.0, 0.0, 1.0, 0.0))) : center);
 		return;
 	}
-	vec3 n = normalize(nr.xyz * 2.0 - 1.0);
+	// Decoded as the neighbours' are: the buffer went octahedral three days
+	// after this pass was written (4c106eb895) and the pixel's own normal
+	// stayed on the raw read, so every neighbor failed the normal stop and
+	// the pass was a pass-through until the half-rate fill found it.
+	vec3 n = nr_normal(nr);
 	vec3 pos = view_position(pixel, depth);
 	vec3 v = -normalize(pos);
 	float alpha = roughness * roughness;
@@ -106,6 +121,8 @@ void main() {
 	// The pixel's own sample first, at the weight its own density gives it (one).
 	vec3 sum = center.rgb;
 	float weight = 1.0;
+	vec4 plain_sum = vec4(0.0);
+	float plain_weight = 0.0;
 	for (int y = -params.radius; y <= params.radius; y++) {
 		for (int x = -params.radius; x <= params.radius; x++) {
 			if (x == 0 && y == 0) {
@@ -132,6 +149,11 @@ void main() {
 			if (w_normal <= 1e-3) {
 				continue;
 			}
+			if (filling) {
+				plain_sum += texelFetch(raw_reflection, sp, 0) * w_normal;
+				plain_weight += w_normal;
+				continue;
+			}
 			vec3 ray_dir = oct_decode(ray.xy);
 			// The neighbour's hit, seen from this pixel (a miss keeps the
 			// ray's direction: the sky is at infinity for both).
@@ -145,6 +167,10 @@ void main() {
 			sum += texelFetch(raw_reflection, sp, 0).rgb * w;
 			weight += w;
 		}
+	}
+	if (filling) {
+		imageStore(out_reflection, pixel, paint ? (plain_weight > 0.0 ? vec4(1.0, 0.0, 0.0, 0.0) : vec4(0.0, 1.0, 0.0, 0.0)) : (plain_weight > 0.0 ? plain_sum / plain_weight : center));
+		return;
 	}
 	vec3 resolved = sum / weight;
 	float blend = smoothstep(params.rough_min, params.rough_full, roughness);

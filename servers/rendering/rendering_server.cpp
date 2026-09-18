@@ -3826,6 +3826,7 @@ void RenderingServer::init() {
 	// 1440p (78 -> 158 ms on the interior test scene).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/half_resolution"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/quarter_resolution"), false);
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/ray_tracing/raytraced_gi/quality/half_rate_reflections"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel", PROPERTY_HINT_RANGE, "1,4,1"), 1);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/ray_tracing/raytraced_gi/quality/temporal_frames", PROPERTY_HINT_RANGE, "1,64,1"), 32);
 	// The gather's own spatial filter settings. It used to borrow the direct

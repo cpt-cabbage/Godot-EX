@@ -3397,6 +3397,9 @@
 		<member name="rendering/ray_tracing/raytraced_gi/quality/quarter_resolution" type="bool" setter="" getter="" default="false">
 			With [member rendering/ray_tracing/raytraced_gi/quality/half_resolution], gathers at a quarter of the resolution each way: a sixteenth of the rays, the gather, its denoiser and the deferred hit shading all a quarter of their half-resolution cost, upsampled by the same depth- and normal-aware filter. The low-spec form of shipped ray-traced GI; indirect light is smooth, so the loss is at fine contact detail.
 		</member>
+		<member name="rendering/ray_tracing/raytraced_gi/quality/half_rate_reflections" type="bool" setter="" getter="" default="false">
+			Traces the rough reflection ray on a fixed checkerboard of pixels and fills the rest from their traced neighbors (a depth- and normal-stopped mean). Mirror-smooth surfaces keep a ray per pixel. Measured on the TPS demo's bridge at the quarter tier: the gather 8.0 to 6.8 ms and the deferred hit shading 2.1 to 1.65, for a patchier highlight on glossy pipes and about twice the flicker in the frames after a camera stop (a one-sample hot hit becomes a five-pixel cross). A budget for a low tier, off by default.
+		</member>
 		<member name="rendering/ray_tracing/raytraced_gi/quality/rays_per_pixel" type="int" setter="" getter="" default="1">
 			Indirect rays per pixel per frame. One plus temporal accumulation is the intended setting; more converge faster after a cut at a near-linear cost.
 		</member>

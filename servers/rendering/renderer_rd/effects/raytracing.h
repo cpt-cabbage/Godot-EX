@@ -488,7 +488,7 @@ private:
 		float rough_min;
 		float rough_full;
 		float weight_cap;
-		float pad;
+		int32_t fill; // 1: only the pixels without a ray of their own are resolved, from the neighbors that traced (half_rate_reflections).
 	};
 
 	struct StochasticDenoisePushConstant {
@@ -776,6 +776,7 @@ public:
 		uint32_t rays_per_pixel = 1;
 		bool half_resolution = true;
 		bool quarter_resolution = false; // With half_resolution: a quarter each way (the low-spec form; Sousa ships it).
+		bool half_rate_reflections = false; // The rough reflection ray on a checkerboard, the rest filled from neighbors (raytraced_gi/quality/half_rate_reflections).
 		bool screen_radiance = true;
 		bool screen_radiance_diffuse = false; // The screen texture is the colour pass's diffuse target (no camera specular): the gather adds the surface's own specular energy from the G-buffer (FLAG_SRAD_FOLD).
 		float screen_radiance_border_fade = 0.08f; // uv width of the hand-back to the cache; 0 is a hard switch.

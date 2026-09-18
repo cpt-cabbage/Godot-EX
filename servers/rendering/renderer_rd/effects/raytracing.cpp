@@ -1992,6 +1992,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (gi_ablate.contains("cards")) {
 		params.flags |= 134217728u; // FLAG_ABLATE_CARDS
 	}
+	if (p_quality.half_rate_reflections && p_quality.specular) {
+		params.flags |= 268435456u; // FLAG_SPEC_HALF_RATE
+	}
 	params.screen_radiance_border_fade = p_quality.screen_radiance_border_fade;
 	// GODOT_GI_SRAD_CLAMP=<lum> overrides the project's absolute firefly
 	// ceiling on the screen term, GODOT_GI_SRAD_FLOOR=<lum> the allowance
@@ -2416,9 +2419,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_SPEC_RESOLVE=1 turns it on, GODOT_GI_SPEC_RESOLVE_RADIUS=
 	// <taps> (2: a 5x5), _MIN and _FULL the roughness it ramps in over (0.2
 	// .. 0.35), _CAP the most a neighbour's density ratio weighs (4).
+	// The half-rate form runs the same pass as a fill: only the pixels the
+	// gather skipped this frame are resolved, from the four neighbors that
+	// traced (radius 1), and a traced pixel passes through.
 	static const bool spec_resolve = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE") == "1";
+	const bool spec_fill = p_quality.half_rate_reflections && !spec_resolve;
 	RID temporal_reflection = raw_reflection;
-	if (spec_resolve && p_quality.specular) {
+	if ((spec_resolve || spec_fill) && p_quality.specular) {
 		static const int64_t resolve_radius = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS").to_int();
 		static const float resolve_min = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN") == "" ? 0.2f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN").to_float());
 		static const float resolve_full = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL") == "" ? 0.35f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL").to_float());
@@ -2432,10 +2439,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		resolve_push.screen_size[0] = size.x;
 		resolve_push.screen_size[1] = size.y;
 		resolve_push.depth_scale = (int32_t)depth_scale;
-		resolve_push.radius = (int32_t)CLAMP(resolve_radius, 1, 4);
+		resolve_push.radius = spec_fill ? 1 : (int32_t)CLAMP(resolve_radius, 1, 4);
 		resolve_push.rough_min = resolve_min;
 		resolve_push.rough_full = MAX(resolve_full, resolve_min + 1e-3f);
 		resolve_push.weight_cap = resolve_cap;
+		static const bool fill_paint = OS::get_singleton()->get_environment("GODOT_GI_SPEC_FILL_PAINT") == "1";
+		resolve_push.fill = spec_fill ? (fill_paint ? 2 : 1) : 0;
 		RID resolve_rid = reflection_resolve_shader.version_get_shader(reflection_resolve_shader_version, 0);
 		RD::Uniform r_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_reflection }));
 		RD::Uniform r_ray(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_spec_ray }));
