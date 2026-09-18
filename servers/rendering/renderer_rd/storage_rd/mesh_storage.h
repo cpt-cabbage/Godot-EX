@@ -201,6 +201,7 @@ private:
 		RID blend_weights_buffer;
 		List<MeshInstance *>::Element *I = nullptr; //used to erase itself
 		uint64_t skeleton_version = 0;
+		uint64_t deform_version = 0; // Counts the skinning/blend-shape dispatches over this instance (the ray tracing rebuilds its BLAS when it changes).
 		bool dirty = false;
 		bool weights_dirty = false;
 		SelfList<MeshInstance> weight_update_list;
@@ -660,6 +661,7 @@ public:
 	virtual void mesh_instance_set_skeleton(RID p_mesh_instance, RID p_skeleton) override;
 	// The version of the skeleton the instance is skinned with (0 without one): changes with its pose.
 	uint64_t mesh_instance_get_skeleton_version(RID p_mesh_instance) const;
+	uint64_t mesh_instance_get_deform_version(RID p_mesh_instance) const;
 	virtual void mesh_instance_set_blend_shape_weight(RID p_mesh_instance, int p_shape, float p_weight) override;
 	virtual void mesh_instance_check_for_update(RID p_mesh_instance) override;
 	virtual void mesh_instance_set_canvas_item_transform(RID p_mesh_instance, const Transform2D &p_transform) override;

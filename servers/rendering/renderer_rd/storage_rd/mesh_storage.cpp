@@ -380,7 +380,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	// renderers can build BLASes directly from mesh geometry. The ray-traced
 	// passes also read every surface buffer in compute: compressed positions
 	// are decoded for the BLAS build, and the hit shading unpacks positions,
-	// normals, tangents, uvs and colours into its geometry pool.
+	// normals, tangents, uvs and colors into its geometry pool.
 	const bool supports_ray_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 	BitField<RD::BufferCreationBits> as_input_flag = 0;
 	if (supports_ray_query) {
@@ -1072,6 +1072,11 @@ void MeshStorage::mesh_instance_free(RID p_rid) {
 	mesh_instance_owner.free(p_rid);
 }
 
+uint64_t MeshStorage::mesh_instance_get_deform_version(RID p_mesh_instance) const {
+	const MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
+	return mi != nullptr ? mi->deform_version : 0;
+}
+
 uint64_t MeshStorage::mesh_instance_get_skeleton_version(RID p_mesh_instance) const {
 	const MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
 	if (mi == nullptr || mi->skeleton.is_null()) {
@@ -1327,6 +1332,7 @@ void MeshStorage::update_mesh_instances() {
 		}
 
 		mi->dirty = false;
+		mi->deform_version++;
 		if (sk) {
 			mi->skeleton_version = sk->version;
 		}

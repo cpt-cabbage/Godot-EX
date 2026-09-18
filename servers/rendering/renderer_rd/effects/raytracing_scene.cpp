@@ -901,18 +901,28 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			}
 
 			MeshBlas *entry;
+			// Deformed geometry: its own BLAS over the skinned vertex buffers,
+			// rebuilt on the frames the skinning dispatch ran (recorded earlier
+			// in the cull, so the build reads this frame's positions). It was
+			// rebuilt every frame: the TPS demo's player and robots standing
+			// still cost 4.3 ms of builds a frame on the bridge (2026-09-18).
+			// GODOT_RT_SKINNED_REBUILD=1 restores the rebuild every frame.
+			static const bool skinned_rebuild_always = OS::get_singleton()->get_environment("GODOT_RT_SKINNED_REBUILD") == "1";
+			bool deformed = false;
 			if (is_skinned) {
-				// Deformed geometry: its own BLAS over the skinned vertex buffers,
-				// rebuilt every frame (the skinning dispatch is recorded earlier in
-				// the cull, so the build reads this frame's positions).
 				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
+				if (entry != nullptr) {
+					const uint64_t deform_version = mesh_storage->mesh_instance_get_deform_version(inst->mesh_instance);
+					deformed = skinned_rebuild_always || !entry->built || deform_version != entry->built_deform_version;
+					entry->built_deform_version = deform_version;
+				}
 			} else {
 				entry = _resolve_mesh_blas(mesh, surface_mask);
 			}
 			if (entry == nullptr || entry->blas.is_null()) {
 				continue;
 			}
-			if (is_skinned) {
+			if (deformed) {
 				for (const DecodeJob &job : entry->decode_jobs) {
 					_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
 				}
@@ -929,15 +939,15 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 				entry->built = true;
 			}
 
-			// The hit shading's geometry for this BLAS (once; every frame for
-			// a deforming one, whose pose the pool must follow), and the
+			// The hit shading's geometry for this BLAS (once; again when a
+			// deforming one moved, so the pool follows its pose), and the
 			// materials its geometries are drawn with this frame.
 			uint32_t material_base = SurfaceCache::INVALID_ID;
 			if (hit_shading) {
 				if (entry->geometry_base == HIT_INVALID) {
 					_build_hit_geometry(*entry, mesh, is_skinned ? inst->mesh_instance : RID());
 				}
-				if (entry->geometry_base != HIT_INVALID && (!entry->unpacked || is_skinned)) {
+				if (entry->geometry_base != HIT_INVALID && (!entry->unpacked || deformed)) {
 					_unpack_hit_geometry(*entry);
 				}
 				if (entry->geometry_base != HIT_INVALID) {

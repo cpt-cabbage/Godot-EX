@@ -177,6 +177,7 @@ private:
 		LocalVector<DecodeJob> decode_jobs; // Re-run per frame for deforming geometry.
 		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
 		bool built = false;
+		uint64_t built_deform_version = 0; // Skinned: the instance's deform version the BLAS and the hit pool were last built over.
 		// The hit shading's view of the BLAS: its geometries (the casting
 		// surfaces, in the BLAS's order) as records over the pools.
 		LocalVector<uint32_t> geometry_surfaces; // The surface index of each geometry.
@@ -194,7 +195,7 @@ private:
 	HashMap<RID, LocalVector<MeshBlas>> blas_cache;
 
 	// Skinned / blend-shaped instances: one BLAS per mesh instance over its
-	// deformed vertex buffers, rebuilt every frame.
+	// deformed vertex buffers, rebuilt on the frames the skinning ran.
 	HashMap<RID, MeshBlas> skinned_blas_cache;
 
 	RID tlas;
