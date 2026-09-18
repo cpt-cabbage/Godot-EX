@@ -118,6 +118,7 @@ params;
 #define FLAG_GUIDE_CELL 16u // A guided entry the pixel's cluster cell does not hold is dropped from the proposal (GODOT_STOCH_GUIDE_CELL=0 offers it as before).
 #define FLAG_GUIDE_PAINT 96u // Bits 5-6, GODOT_STOCH_GUIDE_PAINT=1|2|3: the diffuse ratio painted with the guided entries the cell lacks (1), holds (2), or zero (3).
 #define FLAG_GUIDE_PAINT_SHIFT 5u
+#define FLAG_NO_RAYS 128u // Diagnostics (GODOT_STOCH_ABLATE=rays): every shadow ray reports visible.
 
 // The froxel light grid built by clustered forward culling. Same layout as the
 // scene shader: per cell, per light type, max_cluster_element_count_div_32
@@ -786,6 +787,9 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 }
 
 bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
+	if ((params.flags & FLAG_NO_RAYS) != 0u) {
+		return true;
+	}
 	vec3 delta = world_target - world_origin;
 	float dist = length(delta);
 	if (dist < 1e-4) {

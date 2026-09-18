@@ -1306,6 +1306,12 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	static const bool guide_cell_off = OS::get_singleton()->get_environment("GODOT_STOCH_GUIDE_CELL") == "0";
 	static const uint32_t guide_paint = CLAMP(OS::get_singleton()->get_environment("GODOT_STOCH_GUIDE_PAINT").to_int(), 0, 3);
 	params.flags |= (guide_cell_off ? 0 : 16) | (guide_paint << 5); // FLAG_GUIDE_CELL, FLAG_GUIDE_PAINT
+	// GODOT_STOCH_ABLATE=rays (profiling): the shadow rays report visible, the
+	// rest of the pass as it is -- what the rays cost against the candidates.
+	static const bool ablate_rays = OS::get_singleton()->get_environment("GODOT_STOCH_ABLATE").contains("rays");
+	if (ablate_rays) {
+		params.flags |= 128; // FLAG_NO_RAYS
+	}
 	rd->buffer_update(rb_state->stochastic_params_ubos[p_view], 0, sizeof(StochasticParamsUBO), &params);
 
 	RID shader_rid = stochastic_shader.version_get_shader(stochastic_shader_version, 0);

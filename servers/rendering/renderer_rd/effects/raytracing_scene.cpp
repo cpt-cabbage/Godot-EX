@@ -576,7 +576,11 @@ bool RaytracingScene::_material_reflectance(RID p_material, float &r_f0, float &
 	float albedo_mean = (albedo.r + albedo.g + albedo.b) / 3.0f;
 	r_f0 = Math::lerp(0.16f * specular * specular, albedo_mean, metallic);
 	r_roughness = roughness;
-	return roughness <= 0.3f || r_f0 >= 0.3f;
+	// A mirror is a smooth surface, whatever its F0: a rough metal reflects
+	// a blur no image light describes. The F0 alternative made four 62 x 74 m
+	// rough metal panels of the TPS demo mirrors (F0 1.0, roughness 1.0),
+	// and their image lights cost the bridge 32 ms a frame (section 78).
+	return roughness <= 0.3f;
 }
 
 void RaytracingScene::_find_mirror_planes(const PagedArray<RenderGeometryInstance *> &p_instances, const Vector3 &p_camera_position) {
