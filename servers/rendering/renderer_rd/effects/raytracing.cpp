@@ -1874,7 +1874,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(304); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own, the control variate's and the fold's.
+		c.buffer = rd->storage_buffer_create(344); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own, the control variate's, the fold's and the card lookups' failures.
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -2347,7 +2347,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_spec_ray(RD::UNIFORM_TYPE_IMAGE, 5, Vector<RID>({ raw_spec_ray }));
 
 	if (calibrate || tier_stats) {
-		rd->buffer_clear(calibration.buffer, 0, 304);
+		rd->buffer_clear(calibration.buffer, 0, 344);
 	}
 	// The lighting-change votes (GODOT_GI_VOTES=1, plan section 45): a
 	// buffer of two counters per 8x8 tile, cleared every frame.
@@ -2388,7 +2388,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_TIER_PRINT=<frames> sets the interval (60 when unset or 0).
 	static const int64_t tier_interval = MAX(OS::get_singleton()->get_environment("GODOT_GI_TIER_PRINT").to_int(), int64_t(0));
 	if (tier_stats && (rb_state->frame_index % (tier_interval > 0 ? uint32_t(tier_interval) : 60u)) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 280);
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 320);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -3082,6 +3082,10 @@ bool Raytracing::get_translucency_volume_mapping(Ref<RenderSceneBuffersRD> p_ren
 }
 
 float Raytracing::last_tier_share[7] = {};
+float Raytracing::last_lookup_fail[7] = {};
+float Raytracing::last_young_share = 0.0f;
+// LOOKUP_FAIL_* in stochastic_indirect_gi.glsl.
+const char *Raytracing::lookup_fail_names[7] = { "no_record", "no_set", "uncaptured", "outside", "no_depth", "coarse", "tolerance" };
 uint32_t Raytracing::last_tier_rays = 0;
 uint32_t Raytracing::last_hit_appended = 0;
 uint32_t Raytracing::last_hit_slots = 0;
@@ -3098,6 +3102,12 @@ String Raytracing::get_state_scale_line() const {
 	for (int i = 0; i < 7; i++) {
 		line += vformat(" tier_%s %.1f", tiers[i], last_tier_share[i]);
 	}
+	// The card lookups that failed, as a share of the lookups, by the test
+	// they failed at: what the hit packets are made of.
+	for (int i = 0; i < 7; i++) {
+		line += vformat(" lookup_%s %.1f", lookup_fail_names[i], last_lookup_fail[i]);
+	}
+	line += vformat(" young_pixels_pct %.1f", last_young_share);
 	if (surface_cache) {
 		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
 		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels);
@@ -3164,6 +3174,13 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 		line += vformat("  %s %.1f%% (lum %.1f%%)", names[i], last_tier_share[i], l > 0.0 ? 100.0 * t[8 + i] / l : 0.0);
 	}
 	last_tier_rays = uint32_t(n);
+	if (p_data.size() >= 320) {
+		const uint32_t *lf = t + 68;
+		for (int i = 0; i < 7; i++) {
+			last_lookup_fail[i] = lf[7] > 0 ? float(100.0 * lf[i] / lf[7]) : 0.0f;
+		}
+		last_young_share = lf[9] > 0 ? float(100.0 * lf[8] / lf[9]) : 0.0f;
+	}
 	if (!OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT")) {
 		return; // The scale line carries the shares.
 	}
@@ -3196,6 +3213,18 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 			double k = 1.0 / 1024.0 / double(v[3]);
 			print_line(vformat("RT_GI_CV pixels %d  field %.4f  control %.4f  used %.4f  (control / field %.3f, used / field %.3f)", v[3], v[0] * k, v[1] * k, v[2] * k, v[0] > 0 ? double(v[1]) / double(v[0]) : 0.0, v[0] > 0 ? double(v[2]) / double(v[0]) : 0.0));
 		}
+	}
+	if (p_data.size() >= 320) {
+		// The card lookups that failed, by the furthest test any card of the
+		// set passed (LOOKUP_FAIL_* in the shader): the scale line carries
+		// the shares, this the counts.
+		const uint32_t *lf = t + 68;
+		String fail_line = vformat("RT_GI_LOOKUPS %d:", lf[7]);
+		for (int i = 0; i < 7; i++) {
+			fail_line += vformat("  %s %d (%.1f%%)", lookup_fail_names[i], lf[i], lf[7] > 0 ? 100.0 * lf[i] / lf[7] : 0.0);
+		}
+		fail_line += vformat("  | young pixels %d of %d (%.1f%%)", lf[8], lf[9], last_young_share);
+		print_line(fail_line);
 	}
 	if (p_data.size() >= 280) {
 		// The screen reads' fold (FLAG_SRAD_FOLD) by the hit pixel's metallic,

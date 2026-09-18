@@ -6,6 +6,8 @@
 
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_samplerless_texture_functions : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 // Ray-traced indirect lighting ("Lumen-lite" final gather).
 // Per pixel: cosine-sampled hemisphere rays traced against the scene BVH,
@@ -267,8 +269,23 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint fold_near_screen[4]; // Their diffuse target and card luminance sums, as above.
 	uint fold_near_card[4];
 	uint fold_near_spec[4]; // Of the near reads, the reflection rays'.
+	// Diagnostics (FLAG_TIER_STATS): why a card lookup failed, by the furthest
+	// test any of the set's cards passed (LOOKUP_FAIL_*), and in [7] the lookups.
+	uint lookup_fail[8];
+	// Diagnostics (FLAG_TIER_STATS): the pixels whose history is under
+	// FALLBACK_FRAMES (they trace the stand-in's primary ray), and the pixels.
+	uint young_pixels;
+	uint pixels;
 }
 calibration;
+
+#define LOOKUP_FAIL_NO_RECORD 0u // The hit's instance names no record, or the ablation.
+#define LOOKUP_FAIL_NO_SET 1u // The record has no card set.
+#define LOOKUP_FAIL_NOT_CAPTURED 2u // The set has no capture yet, or cards under 8 texels.
+#define LOOKUP_FAIL_OUTSIDE 3u // No facing card projects the hit inside its box.
+#define LOOKUP_FAIL_NO_DEPTH 4u // The card's texel holds no surface.
+#define LOOKUP_FAIL_COARSE 5u // The card is coarser than the limit.
+#define LOOKUP_FAIL_TOLERANCE 6u // The stored depth is off by more than the tolerance.
 
 #define SPEC_SRC_SCREEN 0u // The screen, whole.
 #define SPEC_SRC_PARTIAL 1u // The screen at the border fade or a young pixel's fade-in, the rest the card (and its memory).
@@ -1151,17 +1168,36 @@ vec3 memory_base(vec3 cache_radiance) {
 bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec3 r_radiance, out uint r_set) {
 	r_radiance = vec3(0.0);
 	r_set = SURFACE_CACHE_INVALID;
+	const bool fail_stats = bool(params.flags & FLAG_TIER_STATS);
+	if (fail_stats) {
+		// Every ray counts here: the group's lanes add up before one atomic
+		// (a million atomics on one word a frame at half resolution otherwise).
+		uint n = subgroupAdd(1u);
+		if (subgroupElect()) {
+			atomicAdd(calibration.lookup_fail[7], n);
+		}
+	}
 	if (p_instance_id == SURFACE_CACHE_INVALID || bool(params.flags & FLAG_ABLATE_CARDS)) {
+		if (fail_stats) {
+			atomicAdd(calibration.lookup_fail[LOOKUP_FAIL_NO_RECORD], 1u);
+		}
 		return false;
 	}
 	CardInstance inst = card_instances.data[p_instance_id];
 	if (inst.set == SURFACE_CACHE_INVALID) {
+		if (fail_stats) {
+			atomicAdd(calibration.lookup_fail[LOOKUP_FAIL_NO_SET], 1u);
+		}
 		return false;
 	}
 	CardSet s = card_sets.data[inst.set];
 	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
+		if (fail_stats) {
+			atomicAdd(calibration.lookup_fail[LOOKUP_FAIL_NOT_CAPTURED], 1u);
+		}
 		return false;
 	}
+	uint fail_stage = LOOKUP_FAIL_OUTSIDE;
 	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
 	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
 	float longest = max(max(s.aabb_size.x, s.aabb_size.y), s.aabb_size.z);
@@ -1188,9 +1224,11 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		ivec2 dims = card_dims_packed(packed);
 		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
 		float stored = texelFetch(card_depth_atlas, texel, 0).r;
+		fail_stage = max(fail_stage, LOOKUP_FAIL_NO_DEPTH);
 		if (stored <= 0.0) {
 			continue;
 		}
+		fail_stage = max(fail_stage, LOOKUP_FAIL_COARSE);
 		// Two texels of the card's own footprint, or a slice of the box.
 		// The box's longest extent over the card's longer edge, as when the
 		// cards were square: a card's own (shorter) texel made the tolerance
@@ -1213,6 +1251,7 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 			continue;
 		}
 		float tolerance = max(uintBitsToFloat(params.ray_params.z) * texel_world, uintBitsToFloat(params.ray_params.w) * longest);
+		fail_stage = max(fail_stage, LOOKUP_FAIL_TOLERANCE);
 		if (abs(stored - depth) > tolerance) {
 			continue;
 		}
@@ -1234,6 +1273,9 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		}
 	}
 	if (best_w <= 0.0) {
+		if (fail_stats) {
+			atomicAdd(calibration.lookup_fail[fail_stage], 1u);
+		}
 		return false;
 	}
 	// The read is the request: the texel's tile is relit next frame.
@@ -1706,11 +1748,13 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 							hit_packets.data[b + 8u] = floatBitsToUint(world_hit.z);
 							hit_packets.data[b + 9u] = floatBitsToUint(t_hit);
 							hit_results.data[uint(hit_pixel.y * params.screen_size.x + hit_pixel.x) * (params.ray_count + 1u) + hit_slot] = uvec4(0u, 0u, rt_hit_pack_dir(world_dir), RT_HIT_RESULT_PENDING);
-							// Nothing now; the resolve adds the material's answer.
-							trace_source = TIER_SRC_HIT_SHADED;
 							// The control variate: the cards' bounce ray reads the probes at a hit without a card.
 							ray_control = max(sdfgi_cache_radiance(rel_hit, world_dir), vec3(0.0));
 							ray_card = true;
+							// Nothing now; the resolve adds the material's answer. (Named
+							// after the probe read, which names its own tier: the deferred
+							// hits counted as "none" in the tier statistics until 2026-09-18.)
+							trace_source = TIER_SRC_HIT_SHADED;
 							return vec3(0.0);
 						} else {
 							atomicAdd(hit_counts.data[RT_HIT_COUNT_OVERFLOW], 1u);
@@ -1873,6 +1917,16 @@ void main() {
 	}
 	uint rays = clamp(prev_frames < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
 	pixel_rays = rays;
+	if (bool(params.flags & FLAG_TIER_STATS)) {
+		uint n = subgroupAdd(1u);
+		uint young = subgroupAdd(prev_frames < FALLBACK_FRAMES ? 1u : 0u);
+		if (subgroupElect()) {
+			atomicAdd(calibration.pixels, n);
+			if (young > 0u) {
+				atomicAdd(calibration.young_pixels, young);
+			}
+		}
+	}
 
 	vec3 irradiance = vec3(0.0);
 	// First moment of the incoming radiance and the near-field visibility,

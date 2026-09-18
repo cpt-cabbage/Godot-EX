@@ -681,6 +681,9 @@ private:
 	static void _hit_counts_readback(const Vector<uint8_t> &p_data); // RT_HIT_DEBUG=1 and GODOT_GI_TIER_PRINT print the frame's packet counts.
 	// The last readbacks, for the RT STATE scale line.
 	static float last_tier_share[7];
+	static float last_lookup_fail[7]; // The card lookups that failed, by reason, as a share of the lookups.
+	static const char *lookup_fail_names[7];
+	static float last_young_share; // The gather's pixels under FALLBACK_FRAMES of history, as a share.
 	static uint32_t last_tier_rays;
 	static uint32_t last_hit_appended;
 	static uint32_t last_hit_slots;
