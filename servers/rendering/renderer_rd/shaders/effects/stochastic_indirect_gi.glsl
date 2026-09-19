@@ -138,6 +138,8 @@ params;
 #define FLAG_ABLATE_RAYS 33554432u // Diagnostics (GODOT_GI_ABLATE=rays): the bounce rays are not traced (every one misses to the sky).
 #define FLAG_ABLATE_SPEC 67108864u // Diagnostics (GODOT_GI_ABLATE=spec): no reflection ray; the diffuse mean stands in as under the budget.
 #define FLAG_ABLATE_CARDS 134217728u
+#define FLAG_DYN_YOUNG_RAYS 1073741824u // With FLAG_DYN_SPLIT (GODOT_GI_DYN_SPLIT=2): the extra rays of a young pixel follow the younger of the two histories, not the static one alone.
+#define FLAG_DYN_SPLIT 536870912u // The moving lights' term apart (GODOT_GI_DYN_SPLIT, section 88): out_ambient_dyn carries it with its own change mark, the temporal pass accumulates it as a history of its own, and out_ambient's mark is the static lights' alone.
 #define FLAG_SPEC_HALF_RATE 268435456u // The rough reflection ray on a checkerboard that alternates each frame; the resolve fills the rest from the traced neighbors (raytraced_gi/quality/half_rate_reflections). // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
@@ -276,6 +278,8 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	// FALLBACK_FRAMES (they trace the stand-in's primary ray), and the pixels.
 	uint young_pixels;
 	uint pixels;
+	uint young_static; // Of them, the pixels whose static history is young (FLAG_DYN_SPLIT; the same count otherwise).
+	uint pad_young;
 }
 calibration;
 
@@ -327,6 +331,7 @@ layout(set = 0, binding = 23) uniform usampler2D card_change_atlas; // Packed ha
 // with its decay: an on-screen hit reads last frame's colour, so it inherits
 // that pixel's mark and a restart propagates through the screen bounces.
 layout(set = 0, binding = 24) uniform sampler2D prev_gi_history;
+layout(set = 0, binding = 43) uniform sampler2D prev_gi_history_dyn; // The moving lights' history (FLAG_DYN_SPLIT), for the mark its alpha carries.
 
 // Deferred hit shading (see rt_hit_inc.glsl): the material slot of every
 // instance geometry, the packets this pass appends for the hits it hands
@@ -370,6 +375,15 @@ float pixel_change = 0.0;
 // their luminance (FLAG_VOTES).
 float ray_change = 0.0;
 float vote_change = 0.0;
+// The moving lights' part of the current ray's radiance (FLAG_DYN_SPLIT):
+// their direct term at a card hit and the cards' bounce of it (the two
+// things a card cannot hold still while a light moves), which the temporal
+// pass accumulates apart from the rest so that a beam sweeping the level
+// restarts only its own history. Reset per ray; scaled by what the screen
+// took over (screen_radiance_boost); the mark it raises is the cards'
+// whole change, where the static history's is the static lights' alone.
+vec3 ray_dyn = vec3(0.0);
+float pixel_change_dyn = 0.0;
 float vote_weight = 0.0;
 
 // Set per pixel in main(): this pixel's hits contribute to the calibration.
@@ -394,6 +408,8 @@ bool boost_from_screen = false;
 #define SDFGI_OCT_SIZE 6
 
 layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_ambient;
+layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_ambient_dyn; // The moving lights' irradiance and its change mark (FLAG_DYN_SPLIT).
+layout(set = 1, binding = 7, rgba16f) uniform restrict writeonly image2D out_fallback_dyn; // The moving lights' share of the young pixel's stand-in (FLAG_DYN_SPLIT; see out_fallback).
 layout(set = 1, binding = 1, rgba16f) uniform restrict writeonly image2D out_reflection;
 // View depth of the shaded texel, for the half-resolution upsample.
 layout(set = 1, binding = 2, r16f) uniform restrict writeonly image2D out_view_depth;
@@ -455,6 +471,7 @@ layout(set = 0, binding = 35, std430) restrict readonly buffer DynamicLights {
 	uint pad1;
 	uint pad2;
 	vec4 weights[2];
+	vec4 prev_color[8]; // Each light's colour (energy in) last frame: what the screen's colour, a frame old, was lit with (see screen_radiance_boost).
 	LightData data[8];
 }
 dyn_lights;
@@ -496,8 +513,23 @@ vec3 card_dynamic_direct(vec3 world_pos, vec3 n) {
 	return sum;
 }
 
+// The same with each light as it was last frame (its colour and energy;
+// the position is this frame's), for what a frame-old screen colour holds.
+vec3 dyn_light_direct_color(uint i, vec3 world_pos, vec3 n, vec3 color);
+vec3 card_dynamic_direct_prev(vec3 world_pos, vec3 n) {
+	vec3 sum = vec3(0.0);
+	for (uint i = 0u; i < dyn_lights.count; i++) {
+		sum += dyn_light_direct_color(i, world_pos, n, dyn_lights.prev_color[i].rgb);
+	}
+	return sum;
+}
+
 // One dynamic light's unshadowed direct term at a point, times its weight.
 vec3 dyn_light_direct(uint i, vec3 world_pos, vec3 n) {
+	return dyn_light_direct_color(i, world_pos, n, dyn_lights.data[i].color);
+}
+
+vec3 dyn_light_direct_color(uint i, vec3 world_pos, vec3 n, vec3 p_color) {
 	{
 		LightData ld = dyn_lights.data[i];
 		vec3 rel = ld.position - world_pos;
@@ -514,7 +546,7 @@ vec3 dyn_light_direct(uint i, vec3 world_pos, vec3 n) {
 		if (geom <= 0.0) {
 			return vec3(0.0);
 		}
-		vec3 color = ld.color;
+		vec3 color = p_color;
 		// The projector texture, as the card lighting reads it
 		// (surface_cache_light.glsl projector_factor): a spot's cookie
 		// through the cards' world-space projector matrix, an omni's map
@@ -1008,6 +1040,31 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	// each other would otherwise hand the mark back and forth forever.
 	float hit_mark = textureLod(prev_gi_history, prev_uv, 0.0).a;
 	pixel_change = max(pixel_change, hit_mark - 0.25);
+	// The moving lights' part of the screen's colour (FLAG_DYN_SPLIT): their
+	// direct term on the hit pixel, estimated from the G-buffer's albedo and
+	// normal and the lights' current state (unshadowed: in their shadow it
+	// hands the moving history more than its due, which is bounded by the
+	// colour itself), and the hit pixel's own history of them. Landed whole
+	// in the static history, the lamp of rt_lab's colour case turned and
+	// the ceiling, lit by the floor through these reads, held the old
+	// colour for the static window (section 88). Each history's mark
+	// reaches this pixel through its own reads, weakened by the quarter.
+	vec3 dyn_screen = vec3(0.0);
+	if (bool(params.flags & FLAG_DYN_SPLIT)) {
+		vec4 hit_dyn = textureLod(prev_gi_history_dyn, prev_uv, 0.0);
+		pixel_change_dyn = max(pixel_change_dyn, hit_dyn.a - 0.25);
+		ivec2 gb_pixel = ivec2(uv * vec2(params.full_screen_size));
+		vec3 albedo_hit = gb_albedo(texelFetch(gbuf_albedo_texture, gb_pixel, 0));
+		dyn_screen = albedo_hit * max(hit_dyn.rgb, vec3(0.0)); // The history is irradiance; the screen has the albedo in.
+		if (dyn_lights.count > 0u) {
+			vec3 n_hit = normalize(mat3(params.world_from_view) * nr_normal(texelFetch(normal_roughness_texture, gb_pixel, 0)));
+			vec3 world_hit = params.world_from_view[3].xyz + mat3(params.world_from_view) * view_hit;
+			// The lights as they were last frame: the screen is a frame old
+			// (a lamp switched off this frame still lights it).
+			dyn_screen += albedo_hit * card_dynamic_direct_prev(world_hit, n_hit);
+		}
+		dyn_screen = min(dyn_screen, max(col, vec3(0.0)));
+	}
 	// The colour a young pixel shows is its own one-sample guess, spread by
 	// the wide kernels its youth gets; read back here it fed the pixels whose
 	// rays land on it, and after a camera flick the whole screen restarted
@@ -1023,6 +1080,9 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		// and the reflection restarts on its own (the smear cap, the
 		// mismatch test).
 		hit_frames = (params.memory_rate > 0.0 ? min(hit_meta.r, hit_meta.g) : hit_meta.r) * 64.0;
+		if (bool(params.flags & FLAG_DYN_SPLIT)) {
+			hit_frames = min(hit_frames, hit_meta.b * 64.0); // The younger of the pixel's two diffuse histories.
+		}
 		settled = smoothstep(0.0, params.screen_radiance_extra.x, hit_frames);
 		// A pixel young because the light on it changed (its history's
 		// change mark is live for eight frames after the restart) shows the
@@ -1115,6 +1175,7 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 			}
 			if (screen_share >= 0.999) {
 				boost_source = SPEC_SRC_SCREEN;
+				ray_dyn = dyn_screen;
 				return col;
 			}
 		}
@@ -1122,11 +1183,13 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 		if (screen_share > 0.0) {
 			boost_source = screen_share >= 0.999 ? SPEC_SRC_SCREEN : SPEC_SRC_PARTIAL;
 		}
+		ray_dyn = mix(ray_dyn, dyn_screen, screen_share);
 		return mix(base, col, screen_share);
 	}
 	if (screen_share > 0.0 && tier == CACHE_TIER_CARD) {
 		boost_source = screen_share >= 0.999 ? SPEC_SRC_SCREEN : SPEC_SRC_PARTIAL;
 	}
+	ray_dyn = mix(ray_dyn, dyn_screen, screen_share);
 	return mix(cache_radiance, col, screen_share);
 }
 
@@ -1340,14 +1403,32 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		card_basis(best_k, axis, u, v);
 		vec3 n_world = normalize(mat3(s.world_from_local) * (u * n_cam.x + v * n_cam.y + axis * n_cam.z));
 		float vis = texelFetch(card_static_atlas, tex0, 0).a;
-		r_radiance += albedo * card_dynamic_direct(p_world_hit, n_world) * vis;
+		vec3 dyn_direct = albedo * card_dynamic_direct(p_world_hit, n_world) * vis;
+		r_radiance += dyn_direct;
+		if (bool(params.flags & FLAG_DYN_SPLIT)) {
+			// The moving lights' part of what this read returns: their
+			// direct term above and the cards' bounce of them, which the
+			// lighting atlas holds summed with the rest (read here at the
+			// texel, the atlas at its level: the bounce is filtered over
+			// the card and reads nearly the same either way).
+			ray_dyn = min(dyn_direct + albedo * max(texelFetch(card_indirect_dyn_atlas, tex0, 0).rgb, vec3(0.0)), max(r_radiance, vec3(0.0)));
+		}
 	}
 	if (params.card_cone_tan < 0.0) {
 		// Diagnostics (GODOT_GI_CONE < 0): the level picked, as the radiance.
 		r_radiance = vec3(lod / 5.0, card_lookup_footprint, best_texel_world * 10.0);
 	}
-	float texel_change = float((texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y >> 16u) & 0xFFu) / 255.0;
-	pixel_change = max(pixel_change, texel_change);
+	uint change_packed = texelFetch(card_change_atlas, ivec2(atlas_texel), 0).y;
+	float texel_change = float((change_packed >> 16u) & 0xFFu) / 255.0;
+	if (bool(params.flags & FLAG_DYN_SPLIT)) {
+		// The static history takes the static lights' change (the byte the
+		// cards' own bounce accumulation restarts by), the moving lights'
+		// history the whole of it.
+		pixel_change = max(pixel_change, float((change_packed >> 24u) & 0xFFu) / 255.0);
+		pixel_change_dyn = max(pixel_change_dyn, texel_change);
+	} else {
+		pixel_change = max(pixel_change, texel_change);
+	}
 	ray_change = max(ray_change, texel_change);
 	card_atlas_texel = atlas_texel;
 	card_atlas_origin = card_origin_packed(best_packed);
@@ -1496,6 +1577,8 @@ void cv_control_screen(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, f
 		float t = rayQueryGetIntersectionTEXT(rq, true);
 		vec3 world_hit = origin + world_dir * t + params.world_from_view[3].xyz;
 		float change_before = pixel_change;
+		float change_dyn_before = pixel_change_dyn;
+		vec3 ray_dyn_before = ray_dyn;
 		card_lookup_footprint = t * abs(params.card_cone_tan);
 		vec3 card_radiance;
 		uint card_set;
@@ -1504,6 +1587,8 @@ void cv_control_screen(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, f
 			ray_control = max(card_radiance, vec3(0.0));
 		}
 		pixel_change = change_before;
+		pixel_change_dyn = change_dyn_before;
+		ray_dyn = ray_dyn_before;
 	}
 }
 
@@ -1850,6 +1935,10 @@ void main() {
 	float depth = texelFetch(depth_texture, full_pixel, 0).r;
 	if (depth == 0.0) {
 		imageStore(out_ambient, pixel, vec4(0.0));
+		if (bool(params.flags & FLAG_DYN_SPLIT)) {
+			imageStore(out_ambient_dyn, pixel, vec4(0.0));
+			imageStore(out_fallback_dyn, pixel, vec4(0.0));
+		}
 		imageStore(out_reflection, pixel, vec4(0.0));
 		imageStore(out_spec_ray, pixel, vec4(0.0));
 		imageStore(out_view_depth, pixel, vec4(0.0));
@@ -1906,29 +1995,47 @@ void main() {
 	// its reprojection, none off frame): a young pixel traces more rays
 	// (ray_params.y), and reads the cards' stand-in below.
 	float prev_frames = 0.0;
+	float prev_frames_static = 0.0;
 	{
 		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		if (prev_ndc.w > 0.0) {
 			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 			if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
-				prev_frames = textureLod(prev_gi_meta, prev_uv, 0.0).r * 64.0;
+				vec4 prev_meta = textureLod(prev_gi_meta, prev_uv, 0.0);
+				prev_frames = prev_meta.r * 64.0;
+				if (bool(params.flags & FLAG_DYN_SPLIT)) {
+					// The moving lights' history restarts under every sweep
+					// and its stand-in is the cards' own estimate of the
+					// same term: it wants the stand-in, not the extra rays
+					// (which cost the TPS demo's frame under its beams).
+					prev_frames_static = prev_frames;
+					prev_frames = min(prev_frames, prev_meta.b * 64.0);
+				}
 			}
 		}
 	}
-	uint rays = clamp(prev_frames < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
+	if (!bool(params.flags & FLAG_DYN_SPLIT) || bool(params.flags & FLAG_DYN_YOUNG_RAYS)) {
+		prev_frames_static = prev_frames;
+	}
+	uint rays = clamp(prev_frames_static < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
 	pixel_rays = rays;
 	if (bool(params.flags & FLAG_TIER_STATS)) {
 		uint n = subgroupAdd(1u);
 		uint young = subgroupAdd(prev_frames < FALLBACK_FRAMES ? 1u : 0u);
+		uint young_static = subgroupAdd(prev_frames_static < FALLBACK_FRAMES ? 1u : 0u);
 		if (subgroupElect()) {
 			atomicAdd(calibration.pixels, n);
 			if (young > 0u) {
 				atomicAdd(calibration.young_pixels, young);
 			}
+			if (young_static > 0u) {
+				atomicAdd(calibration.young_static, young_static);
+			}
 		}
 	}
 
 	vec3 irradiance = vec3(0.0);
+	vec3 irradiance_dyn = vec3(0.0); // The moving lights' part of it (FLAG_DYN_SPLIT).
 	// First moment of the incoming radiance and the near-field visibility,
 	// both free from the rays we already trace.
 	vec3 moment = vec3(0.0);
@@ -1947,11 +2054,13 @@ void main() {
 		hit_slot = r;
 		ray_card = false;
 		ray_change = 0.0;
+		ray_dyn = vec3(0.0);
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
 		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
 		irradiance += radiance;
+		irradiance_dyn += clamp(ray_dyn, vec3(0.0), radiance);
 		float ray_lum = luminance(radiance);
 		vote_change += ray_lum * ray_change;
 		vote_weight += ray_lum;
@@ -1964,6 +2073,7 @@ void main() {
 	}
 	float inv_rays = 1.0 / float(rays);
 	irradiance *= inv_rays;
+	irradiance_dyn *= inv_rays;
 	moment *= inv_rays;
 	visibility *= inv_rays;
 	if (mirror_on() && params.mirror_light.w > 0.0) {
@@ -2182,6 +2292,7 @@ void main() {
 	// instance is missing, which the G-buffer does not carry: one short
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
+	vec3 fallback_dyn = vec3(0.0);
 	if (bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF)) {
 		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & (FLAG_FALLBACK_ALL | FLAG_FALLBACK_EVERY)) || params.cv_params.x > 0.0) {
 			float view_len = length(rel_pos);
@@ -2194,6 +2305,7 @@ void main() {
 				uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
 				vec3 world_hit = params.world_from_view[3].xyz + eye_dir * rayQueryGetIntersectionTEXT(rq, true);
 				float change_before = pixel_change;
+				float change_dyn_before = pixel_change_dyn;
 				vec3 card_radiance;
 				uint card_set;
 				// Looked up along the surface's normal, not the eye ray: the
@@ -2233,23 +2345,35 @@ void main() {
 					vec2 t_min = vec2(card_atlas_origin) + 0.5;
 					vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
 					vec3 ind = vec3(0.0);
+					vec3 ind_dyn = vec3(0.0);
 					for (int dy = 0; dy < 4; dy++) {
 						for (int dx = 0; dx < 4; dx++) {
 							vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
 							vec2 uv = t / float(params.surface_cache_atlas_size);
 							uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
 							// The dynamic bounces come summed and filtered in the one atlas (parts 2 and 4 both select it).
-							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0)) + ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
+							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0));
+							ind_dyn += ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
 						}
 					}
 					ind /= 16.0;
+					ind_dyn /= 16.0;
+					// The moving lights' share apart (FLAG_DYN_SPLIT: the
+					// spatial pass fades each history's own share in);
+					// the stand-in itself is the sum, as before.
+					ind += ind_dyn;
 					fallback = vec4(max(ind, vec3(0.0)), min(relights, 64.0) / 64.0 * card_lookup_confidence);
+					fallback_dyn = max(ind_dyn, vec3(0.0));
 				}
 				pixel_change = change_before;
+				pixel_change_dyn = change_dyn_before;
 			}
 		}
 	}
 	imageStore(out_fallback, pixel, fallback);
+	if (bool(params.flags & FLAG_DYN_SPLIT)) {
+		imageStore(out_fallback_dyn, pixel, vec4(fallback_dyn, 0.0));
+	}
 
 	// The control variate (GODOT_GI_CV): the cards' field under the surface
 	// is the expectation of what the cards' bounce rays read from here, and
@@ -2290,6 +2414,15 @@ void main() {
 	if (params.mirror_params.x > 0.0 && standin_reads > 0.0) {
 		pixel_change = max(pixel_change, params.mirror_params.x * standin_youth / standin_reads);
 	}
-	imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
+	if (bool(params.flags & FLAG_DYN_SPLIT)) {
+		// The two histories' samples: the moving lights' part, and the rest
+		// (never negative: the image lights and the control variate above
+		// move the whole, the part is capped by it).
+		irradiance_dyn = clamp(irradiance_dyn, vec3(0.0), irradiance);
+		imageStore(out_ambient, pixel, vec4(irradiance - irradiance_dyn, clamp(pixel_change, 0.0, 1.0)));
+		imageStore(out_ambient_dyn, pixel, vec4(irradiance_dyn, clamp(pixel_change_dyn, 0.0, 1.0)));
+	} else {
+		imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
+	}
 	imageStore(out_directional, pixel, directional_out);
 }

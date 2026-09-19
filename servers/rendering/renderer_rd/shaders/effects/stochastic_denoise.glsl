@@ -25,6 +25,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_FALLBACK_ALL 32u // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 // Temporal (GI, diagnostics): the reflection history keeps its frames through
 // the named restart (GODOT_GI_SPEC_ABLATE=change,smear,mismatch).
+#define FLAG_DYN_YOUNG_RAYS 4194304u // Temporal (GI, with FLAG_DYN_SPLIT): the gather's extra rays followed the younger history (GODOT_GI_DYN_SPLIT=2), so the sample count does too.
+#define FLAG_DYN_SPLIT 2097152u // GI: the moving lights' term is a history of its own (GODOT_GI_DYN_SPLIT, section 88): the temporal pass accumulates in_dyn against history_dyn, restarted by its own mark, and hands the spatial pass the sum; the meta's b is its frame count.
 #define FLAG_SPEC_NO_CHANGE 64u
 #define FLAG_SPEC_NO_SMEAR 128u
 #define FLAG_SPEC_NO_MISMATCH 256u
@@ -188,6 +190,13 @@ layout(set = 0, binding = 16, std430) restrict readonly buffer ChangeVotes {
 }
 change_votes;
 layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_split;
+// The moving lights' term (FLAG_DYN_SPLIT): the gather's sample of it with
+// its change mark, its history, and the two outputs -- the history for
+// next frame and the sum of both histories for the spatial pass.
+layout(set = 0, binding = 17) uniform sampler2D in_dyn;
+layout(set = 0, binding = 18) uniform sampler2D history_dyn;
+layout(set = 1, binding = 7, rgba16f) uniform restrict writeonly image2D out_dyn;
+layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_sum;
 #endif
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
@@ -205,6 +214,8 @@ layout(set = 0, binding = 8) uniform sampler2D in_directional;
 layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
 // The temporal pass's split history (see there and the kernel decision).
 layout(set = 0, binding = 10) uniform sampler2D split_texture;
+// The moving lights' share of the fallback (FLAG_DYN_SPLIT; see store_result).
+layout(set = 0, binding = 11) uniform sampler2D fallback_dyn_texture;
 #endif
 
 // The spatial pass writes the final buffers, which stay packed on both paths:
@@ -416,6 +427,10 @@ void main() {
 #ifdef HAS_DIRECTIONAL
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
 		imageStore(out_split, pixel, vec4(0.0));
+		if ((params.flags & FLAG_DYN_SPLIT) != 0u) {
+			imageStore(out_dyn, pixel, vec4(0.0));
+			imageStore(out_sum, pixel, vec4(0.0));
+		}
 #endif
 		return;
 	}
@@ -450,6 +465,15 @@ void main() {
 	vec4 current_specular4 = texelFetch(in_specular, pixel, 0);
 	vec3 current_specular = current_specular4.rgb;
 #ifdef HAS_DIRECTIONAL
+	// The moving lights' term (FLAG_DYN_SPLIT): its own sample, mark,
+	// history and frame count (the meta's b, the direct pass's dominance,
+	// which the GI never had).
+	const bool dyn_split = (params.flags & FLAG_DYN_SPLIT) != 0u;
+	vec4 current_dyn4 = dyn_split ? texelFetch(in_dyn, pixel, 0) : vec4(0.0);
+	vec3 current_dyn = current_dyn4.rgb;
+	float change_age_dyn = current_dyn4.a;
+	vec3 result_dyn = current_dyn;
+	float frames_dyn = 1.0;
 	vec4 current_directional = texelFetch(in_directional, pixel, 0);
 	vec4 result_directional = current_directional;
 	// The reflection's virtual view depth (gather output alpha), and how much
@@ -681,6 +705,7 @@ void main() {
 		vec4 hist_dir = vec4(0.0);
 		vec4 hist_fb = vec4(0.0);
 		vec4 hist_split = vec4(0.0);
+		vec4 hist_dyn4 = vec4(0.0);
 #endif
 #ifdef DEPTH_HISTORY
 		if (history_usable) {
@@ -725,6 +750,9 @@ void main() {
 				hist_dir += texelFetch(history_directional, tp, 0) * w;
 				hist_fb += texelFetch(fallback_prev, tp, 0) * w;
 				hist_split += texelFetch(history_split, tp, 0) * w;
+				if (dyn_split) {
+					hist_dyn4 += texelFetch(history_dyn, tp, 0) * w;
+				}
 #endif
 				hist_weight += w;
 			}
@@ -742,6 +770,7 @@ void main() {
 				hist_dir *= inv_weight;
 				hist_fb *= inv_weight;
 				hist_split *= inv_weight;
+				hist_dyn4 *= inv_weight;
 #endif
 			}
 		}
@@ -755,6 +784,9 @@ void main() {
 			hist_dir = textureLod(history_directional, prev_uv, 0.0);
 			hist_fb = textureLod(fallback_prev, prev_uv, 0.0);
 			hist_split = textureLod(history_split, prev_uv, 0.0);
+			if (dyn_split) {
+				hist_dyn4 = textureLod(history_dyn, prev_uv, 0.0);
+			}
 #endif
 		}
 #endif
@@ -846,13 +878,23 @@ void main() {
 			// below weighs the sample by as many.
 			float hist_frames_d = hist_meta.r * 64.0 * confidence_d;
 #ifdef HAS_DIRECTIONAL
-			samples_d = hist_frames_d < 8.0 ? max(reprojection.young_rays, 1.0) : 1.0;
+			float young_frames_d = hist_frames_d;
+			if (dyn_split && (params.flags & FLAG_DYN_YOUNG_RAYS) != 0u) {
+				young_frames_d = min(hist_frames_d, hist_meta.b * 64.0 * confidence_d);
+			}
+			samples_d = young_frames_d < 8.0 ? max(reprojection.young_rays, 1.0) : 1.0;
 #endif
 			frames_d = min(hist_frames_d + samples_d, frames_cap);
 			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
+#ifdef HAS_DIRECTIONAL
+			if (dyn_split) {
+				frames_dyn = min(hist_meta.b * 64.0 * confidence_d + 1.0, frames_cap);
+			}
+#endif
 			if (borrowed) {
 				frames_d = min(frames_d, BORROW_FRAMES);
 #ifdef HAS_DIRECTIONAL
+				frames_dyn = min(frames_dyn, BORROW_FRAMES);
 				// The lighting is continuous across the frame edge; a
 				// mirror's image is not. A borrowed reflection on the game's
 				// mirror floor was the bottom row's image copied up every
@@ -933,6 +975,22 @@ void main() {
 			change_age = max(change_age, mark_hist);
 			bool changed = change_age > 0.02;
 			bool mark_new = reprojection.mark_age <= 0.0 || mark_now > mark_hist;
+			// The moving lights' history restarts by its own mark (the
+			// cards' whole change at the rays' hits), the same way; the
+			// static history's mark, the static lights' alone, is what a
+			// beam sweeping the level leaves untouched (section 88). The
+			// reflection, one history for both, restarts by the larger.
+			vec3 hist_dyn = max(hist_dyn4.rgb, vec3(0.0));
+			float change_age_s = change_age;
+			if (dyn_split) {
+				float mark_hist_dyn = hist_dyn4.a - 0.125;
+				bool mark_new_dyn = reprojection.mark_age <= 0.0 || change_age_dyn > mark_hist_dyn;
+				change_age_dyn = max(change_age_dyn, mark_hist_dyn);
+				if (change_age_dyn > 0.02 && mark_new_dyn) {
+					frames_dyn = min(frames_dyn, max(1.0, 1.0 / change_age_dyn));
+				}
+				change_age_s = max(change_age, change_age_dyn);
+			}
 			float field_change = 0.0;
 			if (mod_on && reprojection.mod_motion > 0.0) {
 				vec4 fb_now = texelFetch(fallback_current, pixel, 0);
@@ -1000,12 +1058,12 @@ void main() {
 				keep = max(keep, mix(1.0, explained_keep, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
 				frames_d = min(frames_d, keep);
 			}
-			if (changed) {
+			if (change_age_s > 0.02) {
 				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
 					// The reflection is one GGX sample per pixel with no
 					// stand-in for its young frames (the diffuse has the
 					// cards'), so it may not be restarted below a floor.
-					float keep_s = max(max(1.0, 1.0 / change_age), params.spec_restart_min);
+					float keep_s = max(max(1.0, 1.0 / change_age_s), params.spec_restart_min);
 					// A rough lobe's history fix (reprojection.spec_fix > 0):
 					// the changed fraction of the history is replaced by the
 					// raw 5x5 resolve rather than by the pixel's one sample --
@@ -1018,7 +1076,7 @@ void main() {
 					// sample: the resolve would blur its image.
 					float lobe = smoothstep(0.15, 0.4, nr_rough);
 					if (reprojection.spec_fix > 0.0 && lobe > 0.0) {
-						hist_s = mix(hist_s, mean_s, change_age * lobe);
+						hist_s = mix(hist_s, mean_s, change_age_s * lobe);
 						keep_s = max(keep_s, mix(1.0, reprojection.spec_fix, lobe));
 					}
 					frames_s = min(frames_s, keep_s);
@@ -1078,16 +1136,26 @@ void main() {
 			float lum_s = weight_lum(current_specular);
 			result_diffuse = mix(hist_d, current_diffuse, alpha_d);
 			result_specular = mix(hist_s, current_specular, alpha_s);
+			// The sum's derived quantities (the moments, the directional
+			// moment) follow the younger of the two diffuse histories: a
+			// restart of either is a restart of the sum's estimate.
+			float alpha_m = alpha_d;
 #ifdef HAS_DIRECTIONAL
+			if (dyn_split) {
+				float alpha_dyn = min(max(1.0 / frames_dyn, params.blend_alpha), 1.0);
+				result_dyn = mix(hist_dyn, current_dyn, alpha_dyn);
+				alpha_m = max(alpha_d, alpha_dyn);
+				lum_d = weight_lum(current_diffuse + current_dyn);
+			}
 			// The moment is stored unnormalized precisely so this blend is a
 			// linear average: with one ray per pixel a single frame's moment
 			// is a delta and useless on its own, but its running mean over
 			// frames_d frames is the estimate we want. It must use the same
 			// alpha as the diffuse signal it is paired with, or the ratio
 			// between them stops being bounded.
-			result_directional = mix(hist_dir, current_directional, alpha_d);
+			result_directional = mix(hist_dir, current_directional, alpha_m);
 #endif
-			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_d),
+			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_m),
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
 #ifdef HAS_DIRECTIONAL
 			// The split history: this frame's sample joins one half, at
@@ -1108,6 +1176,11 @@ void main() {
 			}
 #endif
 			dominance = mix(hist_meta.b, dominance, alpha_d);
+#ifdef HAS_DIRECTIONAL
+			if (dyn_split) {
+				dominance = frames_dyn / 64.0; // The meta's b carries the moving lights' frame count.
+			}
+#endif
 			// A usable history clears the disocclusion mark over a few frames.
 			// A borrowed one is still young enough to want the widened kernel
 			// for a couple of frames, but not the full reset.
@@ -1122,6 +1195,12 @@ void main() {
 	if (reveal == 1.0) {
 		float lum_d = weight_lum(current_diffuse);
 		float lum_s = weight_lum(current_specular);
+#ifdef HAS_DIRECTIONAL
+		if (dyn_split) {
+			lum_d = weight_lum(current_diffuse + current_dyn);
+			dominance = 1.0 / 64.0;
+		}
+#endif
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
 #ifdef HAS_DIRECTIONAL
 		// Both halves start from the one sample: they agree, but a revealed
@@ -1142,6 +1221,12 @@ void main() {
 		result_specular = vec3(0.0);
 		frames_s = 0.0;
 	}
+#ifdef HAS_DIRECTIONAL
+	if (any(isnan(result_dyn)) || any(isinf(result_dyn))) {
+		result_dyn = vec3(0.0);
+		dominance = 0.0;
+	}
+#endif
 	if (any(isnan(moments)) || any(isinf(moments))) {
 		moments = vec4(0.0);
 	}
@@ -1168,6 +1253,13 @@ void main() {
 		result_diffuse = paint_why == 1 ? vec3(1.0, 0.0, 0.0) : (paint_why == 2 ? vec3(1.0, 1.0, 0.0) : (paint_why == 3 ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0)));
 	}
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, clamp(change_age, 0.0, 1.0)));
+	if (dyn_split) {
+		imageStore(out_dyn, pixel, vec4(result_dyn, clamp(change_age_dyn, 0.0, 1.0)));
+		// The sum's alpha: the moving lights' luminance, which the spatial
+		// iterations filter along with the sum (its share of the filtered
+		// value is what the stand-in replaces; see store_result).
+		imageStore(out_sum, pixel, vec4(result_diffuse + result_dyn, luminance(result_dyn)));
+	}
 #else
 	imageStore(out_diffuse, pixel, vec4(result_diffuse, 0.0));
 #endif
@@ -1220,7 +1312,16 @@ void main() {
 // through the screen radiance the next gather reads, at a bounce's weight),
 // so the fade costs the convergence nothing; measured on
 // rt_lab/temporal_suite.sh game_fixed_flick (14 degrees a frame).
-void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, float p_fallback_weight) {
+// Under FLAG_DYN_SPLIT the two histories fade in on their own (p_fallback_weight
+// the static one's youth, p_fallback_weight_dyn the moving lights'): each
+// takes its own share of the filtered value (p_dyn_lum the moving lights'
+// luminance in it, filtered with it) for its own share of the stand-in, so
+// a beam sweeping the level replaces its own term with the cards' estimate
+// of that term and leaves the converged rest as the screen has it. The share
+// is the screen's, not the cards': apportioned by the cards' split, half of
+// a one-sample spike of the moving lights' term survived the fade (the
+// colour case's hot pixels x32, section 88).
+void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, float p_fallback_weight, float p_fallback_weight_dyn, float p_dyn_lum) {
 	float spec_fresnel_weight = 0.0;
 	if ((params.flags & FLAG_MODULATE_ANALYTIC) != 0u) {
 		d *= texelFetch(analytic_diffuse, pixel, 0).rgb;
@@ -1232,15 +1333,29 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, flo
 	if ((params.flags & FLAG_FALLBACK_ALL) != 0u) {
 		vec4 fb = texelFetch(fallback_texture, pixel, 0);
 		d = fb.a > 0.0 ? fb.rgb : vec3(0.0);
-	} else if (p_fallback_weight > 0.0) {
+	} else if (p_fallback_weight > 0.0 || p_fallback_weight_dyn > 0.0) {
 		vec4 fb = texelFetch(fallback_texture, pixel, 0);
 		// The card's own accumulation counts too: a texel relit once is no
 		// better than the pixel's sample.
-		float w = p_fallback_weight * clamp(fb.a * 64.0 / max(params.fallback_ramp, 1.0), 0.0, 1.0);
-		d = mix(d, fb.rgb, w);
+		float trust = clamp(fb.a * 64.0 / max(params.fallback_ramp, 1.0), 0.0, 1.0);
+		if ((params.flags & FLAG_DYN_SPLIT) != 0u) {
+			vec3 fb_dyn = max(texelFetch(fallback_dyn_texture, pixel, 0).rgb, vec3(0.0));
+			vec3 fb_static = max(fb.rgb - fb_dyn, vec3(0.0));
+			float share = clamp(p_dyn_lum / max(luminance(d), 1e-6), 0.0, 1.0);
+			float w_s = p_fallback_weight * trust;
+			float w_d = p_fallback_weight_dyn * trust;
+			d = d * (1.0 - w_s * (1.0 - share) - w_d * share) + w_s * fb_static + w_d * fb_dyn;
+		} else {
+			d = mix(d, fb.rgb, p_fallback_weight * trust);
+		}
 	}
 #endif
+#if defined(FILTER_DIRECTIONAL) && defined(SPATIAL_HDR_OUT)
+	// The moving lights' luminance rides along to the next iteration (FLAG_DYN_SPLIT; 0 otherwise, as before).
+	imageStore(out_diffuse, pixel, vec4(d, (params.flags & FLAG_DYN_SPLIT) != 0u ? p_dyn_lum : 0.0));
+#else
 	imageStore(out_diffuse, pixel, vec4(d, 0.0));
+#endif
 	imageStore(out_specular, pixel, vec4(s, spec_fresnel_weight));
 #if defined(FILTER_DIRECTIONAL) && defined(SPATIAL_HDR_OUT)
 	// Intermediate iteration: carry the moment through unchanged, the last one
@@ -1283,7 +1398,7 @@ void main() {
 
 	// Denoiser disabled (sentinel threshold): pass the input through.
 	if (params.variance_threshold >= 1e5) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0, 0.0);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, 1.0, 0.0, 0.0, center_d4.a);
 #ifdef MOMENTS_OUTPUT
 		imageStore(out_moments, pixel, texelFetch(moments_texture, pixel, 0));
 #endif
@@ -1309,6 +1424,16 @@ void main() {
 	float frames_d = meta.r * 64.0;
 	float frames_s = meta.g * 64.0;
 	float dominance = meta.b;
+	// The moving lights' history (FLAG_DYN_SPLIT): the kernel and the
+	// directional ramp follow the younger of the two diffuse histories (the
+	// sum's variance restarted with either), the stand-in each one's own.
+	float frames_d_static = frames_d;
+	float frames_dyn = frames_d;
+	if ((params.flags & FLAG_DYN_SPLIT) != 0u) {
+		frames_dyn = meta.b * 64.0;
+		frames_d = min(frames_d, frames_dyn);
+		dominance = 0.0;
+	}
 	// Only a true disocclusion (history rejected, not merely clipped) widens
 	// the kernel and drops the luminance stop below; the variance estimate is
 	// meaningless there. A signal whose accumulation is still young (reset by
@@ -1325,8 +1450,12 @@ void main() {
 #ifdef FILTER_DIRECTIONAL
 	float youth = clamp(1.0 - (frames_d - 1.0) / (YOUNG_FRAMES - 1.0), 0.0, 1.0);
 	young_d = young_d || youth > 0.0;
+	float youth_static = clamp(1.0 - (frames_d_static - 1.0) / (YOUNG_FRAMES - 1.0), 0.0, 1.0);
+	float youth_dyn = clamp(1.0 - (frames_dyn - 1.0) / (YOUNG_FRAMES - 1.0), 0.0, 1.0);
 #else
 	float youth = 0.0;
+	float youth_static = 0.0;
+	float youth_dyn = 0.0;
 #endif
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
 	bool filter_s = newly_revealed || (young_s && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u) || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
@@ -1389,7 +1518,7 @@ void main() {
 			// colour: black young, red skipped, green halved, blue filtered
 			// as before; the reflection channel black.
 			vec3 paint = frames_d < YOUNG_FRAMES ? vec3(0.0) : (rel_mean_d < reprojection.split_skip ? vec3(1.0, 0.0, 0.0) : (rel_mean_d < reprojection.split_threshold ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0)));
-			store_result(pixel, paint, vec3(0.0), center_dir, 1.0, 0.0);
+			store_result(pixel, paint, vec3(0.0), center_dir, 1.0, 0.0, 0.0, 0.0);
 			return;
 		}
 	}
@@ -1397,9 +1526,10 @@ void main() {
 	// Ramp the directional term in over the first frames of accumulation.
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	// And the cards' stand-in out (GI only; see store_result).
-	float fallback_weight = youth;
+	float fallback_weight = youth_static;
+	float fallback_weight_dyn = youth_dyn;
 	if (!filter_d && !filter_s) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight, fallback_weight_dyn, center_d4.a);
 #ifdef MOMENTS_OUTPUT
 		// Nothing was filtered: the moments this pixel hands to the next
 		// iteration are still the ones that describe its signal.
@@ -1476,7 +1606,7 @@ void main() {
 		stride_s = max(1, stride_s >> 1);
 	}
 	if (!filter_d && !filter_s) {
-		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight);
+		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight, fallback_weight_dyn, center_d4.a);
 #ifdef MOMENTS_OUTPUT
 		imageStore(out_moments, pixel, moments);
 #endif
@@ -1491,6 +1621,7 @@ void main() {
 	mat2 rot = mat2(vec2(cos(angle), -sin(angle)), vec2(sin(angle), cos(angle)));
 
 	vec3 sum_d = center_d4.rgb;
+	float sum_da = center_d4.a; // The moving lights' luminance (FLAG_DYN_SPLIT), filtered with the sum.
 	vec3 sum_s = center_s4.rgb;
 	vec4 sum_dir = center_dir;
 	float weight_d = 1.0;
@@ -1542,7 +1673,8 @@ void main() {
 				continue;
 			}
 
-			vec3 d = texelFetch(in_diffuse, sp, 0).rgb;
+			vec4 d4 = texelFetch(in_diffuse, sp, 0);
+			vec3 d = d4.rgb;
 			vec3 s = texelFetch(in_specular, sp_s, 0).rgb;
 
 			float wd = w_spatial;
@@ -1562,6 +1694,7 @@ void main() {
 #endif
 
 			sum_d += d * wd;
+			sum_da += d4.a * wd;
 			sum_s += s * ws;
 			weight_d += wd;
 			weight_s += ws;
@@ -1602,7 +1735,7 @@ void main() {
 
 	store_result(pixel, filter_d ? sum_d / weight_d : center_d4.rgb,
 			filter_s ? sum_s / weight_s : center_s4.rgb,
-			filter_d ? sum_dir / weight_d : center_dir, dir_confidence, fallback_weight);
+			filter_d ? sum_dir / weight_d : center_dir, dir_confidence, fallback_weight, fallback_weight_dyn, filter_d ? sum_da / weight_d : center_d4.a);
 }
 
 #endif

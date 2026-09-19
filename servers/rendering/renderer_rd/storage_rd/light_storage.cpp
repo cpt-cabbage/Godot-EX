@@ -981,6 +981,7 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 	card_dynamic_lights.clear();
 	card_dynamic_light_data.clear();
 	card_dynamic_weights.clear();
+	card_dynamic_prev_colors.clear();
 	card_dynamic_projector_tables.clear();
 	card_dynamic_projector_mask = 0;
 	card_dynamic_motion = 0.0f;
@@ -1021,6 +1022,10 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 		// Dynamic: changed since last seen (a light seen for the first time
 		// is not a change), and within the hold.
 		CardLightTrack &track = card_light_tracks[p_lights[i]];
+		// Last frame's card copy of the colour, if the light was in the
+		// dynamic set then (the gather's screen reads are a frame old).
+		const bool world_seen = track.world_seen;
+		track.world_seen = false;
 		bool changed = false;
 		float motion = 0.0f;
 		if (track.seen) {
@@ -1111,6 +1116,10 @@ void LightStorage::update_card_light_buffers(const RID *p_lights, uint32_t p_lig
 			LightData world;
 			_fill_card_light_data(world, light->type, light, light_instance, Transform3D(), distance, p_camera_attributes);
 			world.pad = light->type == RSE::LIGHT_SPOT ? 1.0f : 0.0f;
+			const Color world_color(world.color[0], world.color[1], world.color[2]);
+			card_dynamic_prev_colors.push_back(world_seen ? track.world_color : world_color);
+			track.world_color = world_color;
+			track.world_seen = true;
 			// A spot's cookie as a sampling table for the light rays.
 			const uint32_t entry = card_dynamic_light_data.size();
 			card_dynamic_light_data.push_back(world);

@@ -116,6 +116,14 @@
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
+// The moving lights' term as a history of its own (GODOT_GI_DYN_SPLIT, plan
+// section 88): the gather's sample of it, its two histories, the sum the
+// spatial pass filters, and the moving lights' share of the stand-in.
+#define RB_RT_GI_RAW_DYN SNAME("raw_dyn")
+#define RB_RT_GI_HIST_DYN_0 SNAME("hist_dyn_0")
+#define RB_RT_GI_HIST_DYN_1 SNAME("hist_dyn_1")
+#define RB_RT_GI_TEMPORAL_SUM SNAME("temporal_sum")
+#define RB_RT_GI_FALLBACK_DYN SNAME("fallback_dyn")
 
 // Per-viewport temporal state, attached to the render buffers rather than held
 // on the (single, renderer-wide) Raytracing object.
@@ -308,6 +316,8 @@ private:
 		DENOISE_FLAG_BORROW_SPEC = 524288, // Temporal (GI, experiment, GODOT_GI_BORROW_SPEC=1): the frame-edge borrow serves a mirror's reflection too.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
+		DENOISE_FLAG_DYN_YOUNG_RAYS = 4194304, // Temporal (GI, GODOT_GI_DYN_SPLIT=2): the young pixel's sample count follows the younger history, as the gather's rays do.
+		DENOISE_FLAG_DYN_SPLIT = 2097152, // GI (GODOT_GI_DYN_SPLIT): the moving lights' term is a history of its own; the temporal pass accumulates it apart and hands the spatial pass the sum, the spatial pass fades each history's share of the stand-in in on its own.
 	};
 
 	// The viewport currently being rendered, selected by advance_frame(). Every
@@ -683,7 +693,8 @@ private:
 	static float last_tier_share[7];
 	static float last_lookup_fail[7]; // The card lookups that failed, by reason, as a share of the lookups.
 	static const char *lookup_fail_names[7];
-	static float last_young_share; // The gather's pixels under FALLBACK_FRAMES of history, as a share.
+	static float last_young_share;
+	static float last_young_static_share; // The gather's pixels under FALLBACK_FRAMES of history, as a share.
 	static uint32_t last_tier_rays;
 	static uint32_t last_hit_appended;
 	static uint32_t last_hit_slots;

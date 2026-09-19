@@ -1240,8 +1240,12 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (dynamic_enabled && p_inputs.light_radius > 0.0f) {
 		const LocalVector<RendererRD::LightStorage::LightData> &data = RendererRD::LightStorage::get_singleton()->get_card_dynamic_light_data();
 		const LocalVector<float> &weights = RendererRD::LightStorage::get_singleton()->get_card_dynamic_weights();
+		const LocalVector<Color> &prev_colors = RendererRD::LightStorage::get_singleton()->get_card_dynamic_prev_colors();
 		for (uint32_t i = 0; i < data.size() && dyn.count < 8; i++) {
 			dyn.weights[dyn.count] = weights[i];
+			for (int ch = 0; ch < 3; ch++) {
+				dyn.prev_color[dyn.count][ch] = prev_colors[i][ch];
+			}
 			dyn.data[dyn.count++] = data[i];
 		}
 		// The spots' cookie tables (pad[0]: bit i set where slot i has one).

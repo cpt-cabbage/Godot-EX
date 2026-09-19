@@ -277,6 +277,7 @@ layout(set = 0, binding = 27, std430) restrict readonly buffer DynamicLights {
 	uint pad1;
 	uint pad2;
 	vec4 weights[2];
+	vec4 prev_color[8]; // Each light's colour last frame (the gather reads it; the cards do not).
 	LightData data[8];
 }
 dyn_lights;

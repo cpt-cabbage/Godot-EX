@@ -449,6 +449,7 @@ private:
 		uint32_t count;
 		uint32_t pad[3];
 		float weights[8];
+		float prev_color[8][4]; // Each light's colour last frame (LightStorage::get_card_dynamic_prev_colors), for the gather's screen reads.
 		LightStorage::LightData data[8];
 	};
 

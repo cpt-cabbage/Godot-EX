@@ -229,11 +229,14 @@ private:
 		uint64_t last_change = 0;
 		bool seen = false;
 		bool dynamic = false; // Weight above zero last frame.
+		Color world_color; // The card copy's colour (energy in) the last frame the light was in the dynamic set.
+		bool world_seen = false; // Whether world_color is last frame's.
 	};
 	HashMap<RID, CardLightTrack> card_light_tracks;
 	LocalVector<uint32_t> card_dynamic_lights;
 	LocalVector<LightData> card_dynamic_light_data; // The same lights in world space, pad 1 for a spot (the cards' DynamicLights buffer).
 	LocalVector<float> card_dynamic_weights; // Per entry: 1 within the hold, fading to 0 over GODOT_CARD_DYN_FADE frames after it.
+	LocalVector<Color> card_dynamic_prev_colors; // Per entry: the card copy's colour last frame (this frame's for a light that just joined), for the gather's frame-old screen reads.
 	// A spot's projector as a sampling table for the cards' light rays
 	// (surface_cache_light.glsl trace_dynamic): 16x16 cells of the cookie's
 	// linear luminance over the projector's frame, as the marginal CDF over
@@ -908,6 +911,7 @@ public:
 	bool card_lights_are_valid() const { return card_lights_valid; }
 	const LocalVector<uint32_t> &get_card_dynamic_lights() const { return card_dynamic_lights; }
 	const LocalVector<float> &get_card_dynamic_weights() const { return card_dynamic_weights; }
+	const LocalVector<Color> &get_card_dynamic_prev_colors() const { return card_dynamic_prev_colors; }
 	const LocalVector<LightData> &get_card_dynamic_light_data() const { return card_dynamic_light_data; }
 	const LocalVector<float> &get_card_dynamic_projector_tables() const { return card_dynamic_projector_tables; }
 	uint32_t get_card_dynamic_projector_mask() const { return card_dynamic_projector_mask; }
