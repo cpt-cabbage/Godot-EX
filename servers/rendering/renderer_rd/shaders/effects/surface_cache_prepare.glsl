@@ -30,22 +30,29 @@ sets;
 
 layout(set = 0, binding = 1, std430) restrict buffer Requests {
 	uint frame[SURFACE_CACHE_MAX_SETS];
-	uint tiles[]; // Per set, per card: the 16x16 tiles read (surface_cache_inc.glsl).
+	uint tiles[]; // Per level, per set, per card: the 16x16 tiles read through that mip (surface_cache_inc.glsl).
 }
 requests;
 
 // Bit 31 of a list entry: the set is due in full (every block), else only
-// its requested tiles. An item is entry | card << 16 | block << 19.
+// its requested tiles. An item is card_item_pack (surface_cache_inc.glsl).
+// The budget is in cost units, eighths of a full tile: a level-0 item is
+// 32, an item at any coarser level 16 (64 representatives, one ray and
+// one direct term each, against 64 quads of four), so a level-2 item
+// covers four tiles for half of one, a level-3 item sixteen.
 #define ACTIVE_FULL 0x80000000u
 layout(set = 0, binding = 2, std430) restrict buffer Active {
 	uint count;
 	uint rr_count;
-	uint item_count;
-	uint pending; // The requested blocks this frame, their turn or not.
+	uint item_count; // The requested tiles' items (mode 0), contiguous from 0.
+	uint pending; // The requested tiles this frame, their turn or not, in cost units at the level they asked.
 	uint period; // Frames between two relights of a requested tile (from last frame's pending over the cap).
-	uint item_count_full; // The whole-set pass's items (mode 1), counted apart; the cull pass folds them into item_count.
-	uint pending_young; // Of the pending, the tiles listed ahead of the turns (young, or never relit).
-	uint pad;
+	uint item_count_full; // The whole-set pass's items (mode 1), contiguous after item_count; the cull pass folds them into item_count.
+	uint pending_young; // Of the pending, the cost listed ahead of the turns (young, or never relit).
+	uint item_cost; // The cost the requested items charged (dropped ones included), against three quarters of the cap.
+	uint item_cost_full; // The whole-set items', against the rest.
+	uint items_lod[4]; // Items by level (the scale line).
+	uint pad[3];
 	uint list[SURFACE_CACHE_MAX_SETS];
 	uint items[];
 }
@@ -105,6 +112,7 @@ layout(set = 0, binding = 8, std430) restrict buffer Relit {
 	uint tile_prev[TILE_STAMPS];
 	uint tile_last[TILE_STAMPS];
 	uint tile_age[TILE_STAMPS]; // The tile's relight count after its last relight (the lighting pass's minimum over the tile; reset as the tile is listed).
+	uint tile_lod[TILE_STAMPS]; // The level of the tile's last relight (low four bits) and of the one before (the next four): the lighting pass re-traces the previous ray only when the levels agree.
 }
 relit;
 
@@ -116,11 +124,15 @@ layout(push_constant, std430) uniform Push {
 	uint round_robin_period;
 	uint omni_light_count;
 	uint spot_light_count;
-	uint max_items; // The work list's cap: 16x16 (or 8x8, flag bit 1) blocks lit this frame.
+	uint max_items; // The work list's cap: 16x16 (or 8x8, flag bit 1) blocks lit this frame, in cost units of an eighth of a block (see Active).
 	uint idle_divisor; // Settled cards under static lights: only one set in this many is due each frame (1: all).
 	uint flags; // 1: blocks are 8x8 (the bounce ray per texel), else 16x16 (shared per quad); 2: hashed turns alone; 4: turns by age alone.
 	uint young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: the turns alone).
 	uint young_period; // Frames between two relights of a young tile (1: every frame).
+	uint full_lod; // The level the whole-set relights (fresh captures, the round robin) are listed at.
+	uint lod_costs; // Per level, a byte: the cost of one tile relit at that level, in eighths of a full tile (32, 16, 4, 1).
+	uint max_item_count; // The work list's length.
+	uint lod_hold; // Listings in a row a tile must ask coarser before it is relit coarser (1: at once).
 }
 push;
 
@@ -128,6 +140,16 @@ push;
 // robin's whole sets (mode 1, listed after them) always get the rest.
 uint requests_cap() {
 	return max(push.max_items * 3u / 4u, 1u);
+}
+
+uint tile_cost(uint lod) {
+	return (push.lod_costs >> (lod * 8u)) & 0xFFu;
+}
+
+// An item's cost: a full tile at level 0, half of one at any coarser level
+// (the workgroup is full either way; see Active).
+uint item_cost(uint lod) {
+	return lod == 0u ? tile_cost(0u) : tile_cost(1u);
 }
 
 #ifdef MODE_SELECT
@@ -197,34 +219,37 @@ void main() {
 
 // Whether the item made the list: past the cap it is dropped, and a
 // dropped block is not relit, so its tile keeps its stamps and its request.
-// The two passes count apart: the requested tiles' pass counted its dropped
-// items too, so when they overran their three quarters the whole-set pass
-// began past the cap and dropped everything, and the lighting dispatch,
-// sized by the count, ran the slots between the cap and the count on
-// whatever items an earlier frame had left there -- tiles relit without a
-// listing, so their stamps named a relight that was not the record's, and
-// the bounce gradient re-traced another frame's ray: about 300 false
-// restarts a frame on the TPS bridge at rest, spreading into a third of
-// the screen's history (2026-09-18). The whole-set pass's items go after
-// the requested ones actually stored (a compare-and-swap cap on one
-// counter did the same for +0.35 ms of contention).
-bool emit_item(uint entry, uint card, uint block) {
+// The cost is charged first and the index taken only for an item that
+// fits, so the indices are contiguous and the whole-set pass's items
+// (mode 1) follow the requested ones exactly. (The earlier form counted
+// the dropped items in item_count: when the requests overran their three
+// quarters the whole-set pass began past the cap and dropped everything,
+// and the lighting dispatch, sized by the count, ran the slots between
+// the cap and the count on whatever items an earlier frame had left
+// there -- tiles relit without a listing, whose stamps named a relight
+// that was not the record's, so the bounce gradient re-traced another
+// frame's ray: about 300 false restarts a frame on the TPS bridge at
+// rest, 2026-09-18.)
+bool emit_item(uint entry, uint lod, uint card, uint block) {
+	uint cost = item_cost(lod);
 	uint item;
 	if (push.mode == 0u) {
-		uint idx = atomicAdd(active_sets.item_count, 1u);
-		if (idx >= requests_cap()) {
+		if (atomicAdd(active_sets.item_cost, cost) + cost > requests_cap()) {
 			return false;
 		}
-		item = idx;
+		item = atomicAdd(active_sets.item_count, 1u);
 	} else {
-		uint base = min(active_sets.item_count, requests_cap());
-		uint idx = atomicAdd(active_sets.item_count_full, 1u);
-		if (base + idx >= push.max_items) {
+		uint full_cap = push.max_items - min(active_sets.item_cost, requests_cap());
+		if (atomicAdd(active_sets.item_cost_full, cost) + cost > full_cap) {
 			return false;
 		}
-		item = base + idx;
+		item = active_sets.item_count + atomicAdd(active_sets.item_count_full, 1u);
 	}
-	active_sets.items[item] = entry | (card << 16u) | (block << 19u);
+	if (item >= push.max_item_count) {
+		return false;
+	}
+	active_sets.items[item] = card_item_pack(entry, lod, card, block);
+	atomicAdd(active_sets.items_lod[lod], 1u);
 	return true;
 }
 
@@ -236,7 +261,7 @@ uint tile_stamp_index(uint packed, uvec2 block, uint tile) {
 // The tile's stamps promoted for the relight being listed (once a frame:
 // with 8x8 blocks the four of a tile are listed by one thread, but a set
 // due in full lists them from four threads, whence the guard).
-void stamp_tile(uint idx) {
+void stamp_tile(uint idx, uint lod, bool asked_coarser) {
 	uint last = relit.tile_last[idx];
 	if (last != push.frame) {
 		relit.tile_prev[idx] = last;
@@ -245,6 +270,27 @@ void stamp_tile(uint idx) {
 		// minimum over the tile; a block the pass leaves untouched (an
 		// uncaptured edge) reads as converged, never as young.
 		relit.tile_age[idx] = 64u;
+		// This relight's level, the previous one's, and the streak of
+		// listings whose request was coarser than the level relit (the hold
+		// against alternation, see the tiles pass).
+		uint held = relit.tile_lod[idx];
+		uint streak = asked_coarser ? min(((held >> 8u) & 0xFu) + 1u, 15u) : 0u;
+		relit.tile_lod[idx] = ((held & 0xFu) << 4u) | lod | (streak << 8u);
+	}
+}
+
+// Every tile an item at (top-left tile tc, level lod) covers is stamped
+// with this relight: the item relights them all (the whole-set pass, whose
+// tiles asked nothing).
+void stamp_item(uint packed, uvec2 tc, uint lod, uvec2 n, uint tile) {
+	uint r = card_item_tiles(lod);
+	for (uint dy = 0u; dy < r; dy++) {
+		for (uint dx = 0u; dx < r; dx++) {
+			uvec2 c = tc + uvec2(dx, dy);
+			if (c.x < n.x && c.y < n.y) {
+				stamp_tile(tile_stamp_index(packed, c, tile), lod, false);
+			}
+		}
 	}
 }
 
@@ -261,6 +307,14 @@ void stamp_tile(uint idx) {
 // seen. Without the turns every read relit its tile every frame and the
 // reads' closure (the bounce rays request what they land on) relit 440 of
 // the TPS bridge's sets a frame: 94 ms (section 77).
+//
+// A tile is relit at the finest level any read asked it in (its plane;
+// section 92): a far read's tile is relit as one representative texel per
+// cell, a near read's at full density, and a region of 2x2 or 4x4 tiles
+// whose reads were all coarse goes as one item. The finest read decides,
+// so a contact's bounce never blurs -- what that leaves to the coarse
+// relights on a level is about a fifth of the requested texels (the near
+// reads pin most tiles), and the round robin's whole sets (full_lod).
 void main() {
 	uint entry = gl_WorkGroupID.x;
 	uint count = min(active_sets.count, SURFACE_CACHE_MAX_SETS);
@@ -273,22 +327,33 @@ void main() {
 	if (full != (push.mode == 1u)) {
 		return;
 	}
-	uint tile = (push.flags & 1u) != 0u ? 8u : 16u;
+	bool small_blocks = (push.flags & 1u) != 0u;
+	uint tile = small_blocks ? 8u : 16u;
 	uint period = max(active_sets.period, 1u) * push.idle_divisor;
 	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
 		uint packed = sets.data[set].cards[k];
 		ivec2 dims = card_dims_packed(packed);
 		uvec2 n = max(uvec2(dims) / tile, uvec2(1u));
+		// The coarse levels need the 16x16 quad layout (the representatives
+		// are eight by eight at a stride); with 8x8 blocks everything is
+		// level 0.
+		uint card_max = small_blocks ? 0u : card_max_lod(dims);
 		if (full) {
-			uint blocks = n.x * n.y;
-			for (uint b = gl_LocalInvocationID.x; b < blocks; b += 64u) {
-				if (emit_item(entry, k, b)) {
-					stamp_tile(tile_stamp_index(packed, uvec2(b % n.x, b / n.x), tile));
+			uint lod = min(push.full_lod, card_max);
+			uint r = card_item_tiles(lod);
+			uvec2 nr = (n + r - 1u) / r;
+			uint regions = nr.x * nr.y;
+			for (uint b = gl_LocalInvocationID.x; b < regions; b += 64u) {
+				uvec2 tc = uvec2(b % nr.x, b / nr.x) * r;
+				if (emit_item(entry, lod, k, tc.y * n.x + tc.x)) {
+					stamp_item(packed, tc, lod, n, tile);
 				}
 			}
 			// The requests the full relight covers are spent.
 			if (gl_LocalInvocationID.x < SURFACE_CACHE_TILE_WORDS_PER_CARD) {
-				requests.tiles[set * SURFACE_CACHE_TILE_WORDS + k * SURFACE_CACHE_TILE_WORDS_PER_CARD + gl_LocalInvocationID.x] = 0u;
+				for (uint plane = 0u; plane < SURFACE_CACHE_LOD_PLANES; plane++) {
+					requests.tiles[plane * SURFACE_CACHE_PLANE_WORDS + set * SURFACE_CACHE_TILE_WORDS + k * SURFACE_CACHE_TILE_WORDS_PER_CARD + gl_LocalInvocationID.x] = 0u;
+				}
 			}
 			continue;
 		}
@@ -296,77 +361,224 @@ void main() {
 			continue;
 		}
 		uint word = set * SURFACE_CACHE_TILE_WORDS + k * SURFACE_CACHE_TILE_WORDS_PER_CARD + gl_LocalInvocationID.x;
-		uint bits = requests.tiles[word];
+		uint planes[SURFACE_CACHE_LOD_PLANES];
+		uint bits = 0u;
+		for (uint plane = 0u; plane < SURFACE_CACHE_LOD_PLANES; plane++) {
+			planes[plane] = requests.tiles[plane * SURFACE_CACHE_PLANE_WORDS + word];
+			bits |= planes[plane];
+		}
 		if (bits == 0u) {
 			continue;
 		}
-		atomicAdd(active_sets.pending, uint(bitCount(bits)));
-		uint kept = 0u;
 		uvec2 n_req = max(uvec2(dims) / SURFACE_CACHE_TILE, uvec2(1u));
-		while (bits != 0u) {
-			uint t = uint(findLSB(bits)) + gl_LocalInvocationID.x * 32u;
-			bits &= bits - 1u;
-			uvec2 tc = uvec2(t % n_req.x, t / n_req.x);
-			uint stamp = tile_stamp_index(packed, tc, SURFACE_CACHE_TILE);
-			uint last = relit.tile_last[stamp];
-			// Due: never relit (a surface seen for the first time goes at
-			// once), young (under young_relights relights since its capture
-			// or its last light change) and young_period frames since its
-			// last relight, or its hashed turn (one frame in `period`, at
-			// random, the period over the mature tiles alone). The young
-			// tile just seen goes on at its own short period through its
-			// first relights whatever the budget, and a light change
-			// restarts the count so the changed tiles come first the same
-			// way. Every frame was measured first (tag young262): the
-			// restarting tiles at rest then read a fresh one-sample relight
-			// every frame and the machines' flicker doubled, and on the
-			// hall strafe the young filled the cap, the mature tiles'
-			// period climbed, and their bounce, which reads the newly lit
-			// tiles, went stale -- the frame darker and the stop's worst
-			// tile +75%. Turns by age alone (listed once
-			// the last relight is `period` old) were measured: the relights
-			// fall into bursts, every tile's mark lands in the same frame,
-			// and the screen history sat at five frames where the hashed
-			// turns keep it at thirty-two (section 77). GODOT_CARD_TURNS=hash
-			// keeps the turns alone, GODOT_CARD_TURNS=age the age alone.
-			bool turn = period <= 1u || ((set * 7u + k * 13u + t * 31u + push.frame) % period) == 0u;
-			bool young = last == 0u || (push.young_relights > 0u && relit.tile_age[stamp] < push.young_relights && push.frame - last >= max(push.young_period, 1u));
-			if (young) {
-				atomicAdd(active_sets.pending_young, 1u);
+		uint word_first = gl_LocalInvocationID.x * 32u;
+		// The level each requested tile asked at (the finest plane), clamped
+		// to the card's, then held against its last relight's level: a tile
+		// goes finer the moment a read asks (a contact seen for the first
+		// time), but coarser only after `lod_hold` listings in a row asked
+		// coarser -- the rays are random, and a tile with a near read every
+		// other turn would otherwise alternate between its own texels and
+		// its representative's, a flicker at the turn period on whatever
+		// reads it (measured before the hold: 50-100 tiles a frame
+		// alternating on the bridge at rest). The region a coarse tile would
+		// join takes the finest level over its tiles, and a region that
+		// would be finer than level 2 falls back to items per tile at level
+		// 1: nothing coarse is splatted over a tile someone reads finely. A
+		// region's tiles are in this thread's word for the levels allowed (a
+		// 32-tile word is two rows of a 256-card, four of a 128: a 2x2 at an
+		// even row always fits; a 4x4 needs four rows, so level 3 is level 2
+		// on 256-cards).
+		uint req_lod[32]; // Per tile of the word: the level asked (unused for tiles without a request).
+		uint eff_lod[32]; // The level after the hold.
+		uint fine_bits = 0u; // Tiles held or asked finer than level 2.
+		uint cost_pending = 0u;
+		{
+			uint finer = 0u;
+			uint level_bits[SURFACE_CACHE_LOD_PLANES];
+			for (uint plane = 0u; plane < SURFACE_CACHE_LOD_PLANES; plane++) {
+				level_bits[plane] = planes[plane] & ~finer;
+				finer |= planes[plane];
 			}
-			bool due;
-			if ((push.flags & 2u) != 0u) {
-				due = turn;
-			} else if ((push.flags & 4u) != 0u) {
-				due = last == 0u || push.frame - last >= period;
-			} else {
-				due = young || turn;
+			uint b = bits;
+			while (b != 0u) {
+				uint i = uint(findLSB(b));
+				b &= b - 1u;
+				uint tb = 1u << i;
+				uint lod = 0u;
+				for (uint plane = 0u; plane < SURFACE_CACHE_LOD_PLANES; plane++) {
+					if ((level_bits[plane] & tb) != 0u) {
+						lod = plane;
+						break;
+					}
+				}
+				lod = min(lod, card_max);
+				req_lod[i] = lod;
+				uint t = i + word_first;
+				uint stamp = tile_stamp_index(packed, uvec2(t % n_req.x, t / n_req.x), SURFACE_CACHE_TILE);
+				uint held = relit.tile_lod[stamp];
+				uint last_lod = held & 0xFu;
+				uint streak = (held >> 8u) & 0xFu;
+				if (relit.tile_last[stamp] != 0u && lod > last_lod && streak + 1u < push.lod_hold) {
+					lod = last_lod;
+				}
+				eff_lod[i] = lod;
+				cost_pending += tile_cost(lod);
+				if (lod < 2u) {
+					fine_bits |= tb;
+				}
+			}
+		}
+		uint cost_young = 0u;
+		uint done = 0u; // Tiles a region item already covered.
+		uint b = bits;
+		while (b != 0u) {
+			uint i = uint(findLSB(b));
+			uint t = i + word_first;
+			uint tb = 1u << i;
+			b &= b - 1u;
+			if ((done & tb) != 0u) {
+				continue;
+			}
+			uint lod = eff_lod[i];
+			uvec2 tc = uvec2(t % n_req.x, t / n_req.x);
+			// The region: shrink the level until its tiles sit in this word
+			// and none asks finer than 2.
+			uvec2 rc = tc;
+			uint r = 1u;
+			uint region_mask = tb;
+			while (lod >= 2u) {
+				r = card_item_tiles(lod);
+				rc = tc & ~(r - 1u);
+				uint first = rc.y * n_req.x + rc.x;
+				uint last = min(rc.y + r - 1u, n_req.y - 1u) * n_req.x + min(rc.x + r - 1u, n_req.x - 1u);
+				bool fits = first >= word_first && last < word_first + 32u;
+				uint mask = 0u;
+				if (fits) {
+					for (uint dy = 0u; dy < r; dy++) {
+						for (uint dx = 0u; dx < r; dx++) {
+							uvec2 c = rc + uvec2(dx, dy);
+							if (c.x < n_req.x && c.y < n_req.y) {
+								mask |= 1u << ((c.y * n_req.x + c.x) & 31u);
+							}
+						}
+					}
+				}
+				if (fits && (mask & (fine_bits | done)) == 0u) {
+					// The region's level: the finest over its requested tiles
+					// (a finer one shrinks the region, and the loop sizes it
+					// again -- an item stamped over tiles it does not relight
+					// leaves them with the wrong previous frame, and the next
+					// real relight re-traces the wrong ray).
+					uint region_lod = lod;
+					uint m = mask & bits;
+					while (m != 0u) {
+						uint j = uint(findLSB(m));
+						m &= m - 1u;
+						region_lod = min(region_lod, eff_lod[j]);
+					}
+					if (region_lod == lod) {
+						region_mask = mask;
+						break;
+					}
+					lod = region_lod;
+				} else {
+					lod--;
+				}
+				r = 1u;
+				rc = tc;
+				region_mask = tb;
+			}
+			if (r == 1u) {
+				lod = min(lod, 1u); // A per-tile item is at most level 1.
+			}
+			// Due: never relit (a surface seen for the first time goes at
+			// once), asked finer than its last relight (a surface the round
+			// robin warmed coarse, or one the camera came near), young (under
+			// young_relights relights since its capture or its last light
+			// change) and young_period frames since its last relight, or its
+			// hashed turn (one frame in `period`, at random, the period over
+			// the mature tiles alone). A region goes when any of its tiles is
+			// due. Every frame was measured first (tag young262): the
+			// restarting tiles at rest then read a fresh one-sample relight
+			// every frame and the machines' flicker doubled, and on the hall
+			// strafe the young filled the cap, the mature tiles' period
+			// climbed, and their bounce, which reads the newly lit tiles,
+			// went stale -- the frame darker and the stop's worst tile +75%.
+			// Turns by age alone (listed once the last relight is `period`
+			// old) were measured: the relights fall into bursts, every
+			// tile's mark lands in the same frame, and the screen history sat
+			// at five frames where the hashed turns keep it at thirty-two
+			// (section 77). GODOT_CARD_TURNS=hash keeps the turns alone,
+			// GODOT_CARD_TURNS=age the age alone.
+			bool due = false;
+			bool young_any = false;
+			uint m = region_mask & bits;
+			while (m != 0u) {
+				uint j = uint(findLSB(m));
+				uint u = j + word_first;
+				m &= m - 1u;
+				uvec2 uc = uvec2(u % n_req.x, u / n_req.x);
+				uint stamp = tile_stamp_index(packed, uc, SURFACE_CACHE_TILE);
+				uint last = relit.tile_last[stamp];
+				bool turn = period <= 1u || ((set * 7u + k * 13u + u * 31u + push.frame) % period) == 0u;
+				bool finer = last != 0u && lod < (relit.tile_lod[stamp] & 0xFu);
+				bool young = last == 0u || finer || (push.young_relights > 0u && relit.tile_age[stamp] < push.young_relights && push.frame - last >= max(push.young_period, 1u));
+				young_any = young_any || young;
+				if ((push.flags & 2u) != 0u) {
+					due = due || turn;
+				} else if ((push.flags & 4u) != 0u) {
+					due = due || last == 0u || push.frame - last >= period;
+				} else {
+					due = due || young || turn;
+				}
+			}
+			if (young_any) {
+				cost_young += item_cost(lod);
 			}
 			if (!due) {
-				kept |= 1u << (t & 31u); // Not its turn: the request waits.
-				continue;
+				continue; // Not its turn: the request waits (kept below).
 			}
 			bool listed = false;
 			if (tile == SURFACE_CACHE_TILE) {
-				listed = emit_item(entry, k, tc.y * n.x + tc.x);
+				listed = emit_item(entry, lod, k, rc.y * n.x + rc.x);
 			} else {
 				// A 16-texel tile is four 8-texel blocks (fewer at a card's edge).
 				for (uint dy = 0u; dy < 2u; dy++) {
 					for (uint dx = 0u; dx < 2u; dx++) {
 						uvec2 bc = tc * 2u + uvec2(dx, dy);
 						if (bc.x < n.x && bc.y < n.y) {
-							listed = emit_item(entry, k, bc.y * n.x + bc.x) || listed;
+							listed = emit_item(entry, 0u, k, bc.y * n.x + bc.x) || listed;
 						}
 					}
 				}
 			}
 			if (listed) {
-				stamp_tile(stamp);
-			} else {
-				kept |= 1u << (t & 31u); // Dropped past the cap: asked again next frame.
+				// Every covered tile stamped at the item's level, its streak
+				// of coarser requests counted (a tile relit without asking,
+				// or asking no coarser, starts over).
+				uint mm = region_mask;
+				while (mm != 0u) {
+					uint j = uint(findLSB(mm));
+					mm &= mm - 1u;
+					uint u = j + word_first;
+					uint stamp = tile_stamp_index(packed, uvec2(u % n_req.x, u / n_req.x), SURFACE_CACHE_TILE);
+					bool asked_coarser = (bits & (1u << j)) != 0u && req_lod[j] > lod;
+					stamp_tile(stamp, lod, asked_coarser);
+				}
+				done |= region_mask;
 			}
 		}
-		requests.tiles[word] = kept;
+
+		// Dropped past the cap, or not its turn: asked again next frame, in
+		// the planes it asked in.
+		uint kept = bits & ~done;
+		for (uint plane = 0u; plane < SURFACE_CACHE_LOD_PLANES; plane++) {
+			requests.tiles[plane * SURFACE_CACHE_PLANE_WORDS + word] = planes[plane] & kept;
+		}
+		atomicAdd(active_sets.pending, cost_pending);
+		if (cost_young > 0u) {
+			atomicAdd(active_sets.pending_young, cost_young);
+		}
 	}
 }
 
@@ -379,13 +591,14 @@ void main() {
 	uint entry = gl_WorkGroupID.x;
 	uint count = min(active_sets.count, SURFACE_CACHE_MAX_SETS);
 	if (entry == 0u && gl_LocalInvocationID.x == 0u) {
-		uint items = min(min(active_sets.item_count, requests_cap()) + active_sets.item_count_full, push.max_items);
+		uint items = min(active_sets.item_count + active_sets.item_count_full, push.max_item_count);
 		active_sets.item_count = items;
 		dispatch_args.x = items;
 		dispatch_args.y = 1u;
 		dispatch_args.z = 1u;
 		// Next frame's turn period: the requests pending now over their cap,
-		// the young ones (listed every frame) taken out of both.
+		// the young ones (listed every frame) taken out of both (all in
+		// cost units).
 		uint young = min(active_sets.pending_young, active_sets.pending);
 		uint cap = max(requests_cap() - min(active_sets.pending_young, requests_cap() - 1u), 1u);
 		active_sets.period = clamp((active_sets.pending - young + cap - 1u) / cap, 1u, 64u);

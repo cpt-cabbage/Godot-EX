@@ -294,10 +294,16 @@ private:
 	// surface_cache_inc.glsl). A read is a request; the prepare pass turns
 	// the bits into the lighting pass's work list (section 77).
 	static constexpr uint32_t TILE_WORDS_PER_SET = CARDS_PER_SET * ((MAX_CARD_EDGE / 16) * (MAX_CARD_EDGE / 16) / 32);
+	// The tile bits come in planes, one per mip the read went through (0, 1,
+	// 2, 3 and coarser; SURFACE_CACHE_LOD_PLANES in the inc), plane-major:
+	// a tile is relit at the finest level it was asked in (section 92).
+	static constexpr uint32_t LOD_PLANES = 4;
 	RID requests_buffer;
 	// count, rr_count, item_count, pending, period, item_count_full,
-	// pending_young, pad, the active set list (MAX_SETS), then the work items
-	// (MAX_ITEMS): entry | card << 16 | block << 19.
+	// pending_young, item_cost, item_cost_full, items_lod[4], pad[3], the
+	// active set list (MAX_SETS), then the work items (MAX_ITEMS):
+	// card_item_pack in surface_cache_inc.glsl.
+	static constexpr uint32_t ACTIVE_HEADER = 16;
 	static constexpr uint32_t MAX_ITEMS = 65536;
 	RID active_buffer;
 	// The relight stamps: per set the relight before the last and the last
@@ -311,9 +317,11 @@ private:
 	// at a fixed row stride. A third array per block: the tile's relight
 	// count after its last relight (the bounce accumulation's, which a
 	// light change restarts), by which the prepare pass lists the young
-	// tiles every frame ahead of the turns.
+	// tiles every frame ahead of the turns. A fourth: the level of the
+	// tile's last two relights (section 92).
 	static constexpr uint32_t TILE_STAMP_STRIDE = 8192 / 8;
 	static constexpr uint32_t TILE_STAMPS = TILE_STAMP_STRIDE * TILE_STAMP_STRIDE;
+	static constexpr uint32_t TILE_STAMP_ARRAYS = 4;
 	RID dyn_stats_buffer; // Diagnostics (GODOT_CARD_ABLATE=stats): 16 counters of the dynamic rays' fate.
 	RID dynamic_lights_buffer; // DynamicLightsBuffer, uploaded every lighting update.
 	RID projector_tables_buffer; // The dynamic spots' cookie sampling tables (LightStorage::ProjectorTable), 8 slots.
@@ -355,6 +363,7 @@ private:
 	static uint32_t last_pending;
 	static uint32_t last_pending_young;
 	static uint32_t last_period;
+	static uint32_t last_items_lod[4];
 	static void _items_readback(const Vector<uint8_t> &p_data);
 	static bool _settled();
 	RID set_lights_buffer; // Per active slot: count + MAX_LIGHTS_PER_SET indices.
@@ -409,6 +418,10 @@ private:
 		uint32_t flags; // 1: 8x8 blocks (a bounce ray per texel), else 16x16 (shared per quad).
 		uint32_t young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: turns alone).
 		uint32_t young_period; // Frames between two relights of a young tile.
+		uint32_t full_lod; // The level the whole-set relights (fresh captures, the round robin) are listed at (GODOT_CARD_FULL_LOD, 2).
+		uint32_t lod_costs; // Per level, a byte: one tile relit at that level in eighths of a full tile (GODOT_CARD_LOD_COST; 32, 16, 4, 1).
+		uint32_t max_item_count; // The work list's length (MAX_ITEMS).
+		uint32_t lod_hold; // Listings in a row a tile must ask coarser before it is relit coarser (GODOT_CARD_LOD_HOLD, 15; 1: at once).
 	};
 
 	struct LightParamsUBO {
@@ -439,7 +452,7 @@ private:
 		float dynamic_join; // The share of a joining light's bounce the static accumulation holds, on the frame it joins (LightStorage; 0 otherwise).
 		uint32_t area_light_count;
 		float dynamic_mark; // The most a moving light's direct term marks a texel for the screen's restart (GODOT_CARD_DYN_MARK, 0.125).
-		float pad_join;
+		uint32_t lod_rays; // Per level, a byte: the cosine rays a representative texel traces per relight (GODOT_CARD_LOD_RAYS; a cell of sixteen texels traced four rays a relight as quads, one representative traces one unless this says more).
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 		uint32_t mirror_count;
@@ -565,11 +578,20 @@ public:
 		uint32_t pending_blocks = 0; // Requested blocks that frame, and the turn period they set.
 		uint32_t pending_young = 0; // Of them, the young (or never relit) ones, listed ahead of the turns.
 		uint32_t period = 0;
+		uint32_t items_lod[4] = {}; // The work list's items by the level they were relit at (section 92).
 		float density_scale = 1.0f;
 		uint32_t read_sets = 0; // Sets a ray read within the last round-robin period (as last read back), and their share of the allocated texels.
 		float read_texels = 0.0f;
 	};
 	ScaleStats get_scale_stats() const;
+	// The relight-at-read-mip knobs (plan section 92), shared with the gather
+	// that makes the requests: GODOT_CARD_RELIGHT_LOD is the coarsest level a
+	// read may request its tile at (3; 0: every tile at full density, the
+	// form before), GODOT_CARD_LOD_BIAS the levels finer than the read's own
+	// it asks for.
+	static uint32_t request_lod_max();
+	static int32_t request_lod_bias();
+	static uint32_t request_lod_sample(); // GODOT_CARD_LOD_SAMPLE: one read in this many asks at its own level, the rest at the coarsest plane (1: every read).
 	uint32_t get_instance_record_count() const { return instance_records.size(); }
 	bool is_ready() const { return sets_buffer.is_valid() && instances_buffer.is_valid(); }
 

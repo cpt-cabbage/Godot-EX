@@ -17,6 +17,39 @@
 #define SURFACE_CACHE_TILE 16u
 #define SURFACE_CACHE_TILE_WORDS_PER_CARD 8u
 #define SURFACE_CACHE_TILE_WORDS (SURFACE_CACHE_CARDS * SURFACE_CACHE_TILE_WORDS_PER_CARD)
+// A request names the mip the read went through: one plane of tile bits per
+// level (0, 1, 2, 3 and coarser), plane-major, so a tile asked for from far
+// away can be relit at that level -- one texel standing for a 2^L cell --
+// instead of at full density (plan section 92). The finest plane a tile is
+// asked in is the level it is relit at.
+#define SURFACE_CACHE_LOD_PLANES 4u
+#define SURFACE_CACHE_PLANE_WORDS (SURFACE_CACHE_MAX_SETS * SURFACE_CACHE_TILE_WORDS)
+
+// A work item of the lighting pass: the active list entry (13 bits), the
+// level the item is relit at (3), the card (3) and the index of the item's
+// top-left 16x16 tile (13). At level 0 the item is that tile; at level L
+// >= 1 the workgroup lights 8x8 representative texels at a stride of 2^L,
+// each standing for its cell, so the item covers 8 << L texels square: one
+// tile at level 1, 2x2 tiles at level 2, 4x4 at level 3.
+#define SURFACE_CACHE_ITEM_ENTRY_MASK 0x1FFFu
+#define SURFACE_CACHE_ITEM_LOD_SHIFT 13u
+#define SURFACE_CACHE_ITEM_CARD_SHIFT 16u
+#define SURFACE_CACHE_ITEM_BLOCK_SHIFT 19u
+uint card_item_pack(uint entry, uint lod, uint card, uint block) {
+	return (entry & SURFACE_CACHE_ITEM_ENTRY_MASK) | (lod << SURFACE_CACHE_ITEM_LOD_SHIFT) | (card << SURFACE_CACHE_ITEM_CARD_SHIFT) | (block << SURFACE_CACHE_ITEM_BLOCK_SHIFT);
+}
+// Tiles along an edge of an item at a level (1, 1, 2, 4).
+uint card_item_tiles(uint lod) {
+	return 1u << (max(lod, 1u) - 1u);
+}
+// The coarsest level a card can be relit at: its shorter edge over eight
+// (an 8-texel card at level 1 is 4x4 representatives; the gather's reads
+// stop a level finer, at a quarter of the card, so a request never asks
+// for more than this).
+uint card_max_lod(ivec2 dims) {
+	int d = min(dims.x, dims.y);
+	return d >= 64 ? 3u : (d >= 32 ? 2u : (d >= 16 ? 1u : (d >= 8 ? 1u : 0u)));
+}
 
 struct CardSet {
 	mat4 world_from_local;

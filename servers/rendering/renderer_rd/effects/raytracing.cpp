@@ -1995,7 +1995,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	while (rb_state->rt_gi_calibration.size() <= p_view) {
 		RenderBuffersRT::RtGiCalibration c;
-		c.buffer = rd->storage_buffer_create(344); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own, the control variate's, the fold's and the card lookups' failures.
+		c.buffer = rd->storage_buffer_create(360); // The sums, then the tier statistics (GODOT_GI_TIER_PRINT), then the reflection rays' own, the control variate's, the fold's, the card lookups' failures and the reads' request levels.
 		c.state.instantiate();
 		rb_state->rt_gi_calibration.push_back(c);
 	}
@@ -2309,6 +2309,11 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// mismatch (texels) against the facing; 0 is the facing alone.
 	static const float card_pick_weight = OS::get_singleton()->get_environment("GODOT_GI_CARD_PICK").to_float();
 	params.card_pick_weight = card_pick_weight;
+	// The mip a hit's request is relit at (surface_cache_prepare.glsl):
+	// the read's own footprint level, capped by GODOT_CARD_RELIGHT_LOD.
+	params.card_request_lod = use_cards ? SurfaceCache::request_lod_max() : 0u;
+	params.card_request_bias = SurfaceCache::request_lod_bias();
+	params.card_request_sample = SurfaceCache::request_lod_sample();
 	// Diagnostics: GODOT_GI_FALLBACK_PARTS=n shows only some of the cards'
 	// bounce histories in the fallback (1 the static, 2 the dynamic lights'
 	// first bounce, 4 their later bounces; 0 all).
@@ -2502,7 +2507,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_fallback_dyn(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ dyn_split ? raw_fallback_dyn : rt_gi_dummy_image }));
 
 	if (calibrate || tier_stats) {
-		rd->buffer_clear(calibration.buffer, 0, 344);
+		rd->buffer_clear(calibration.buffer, 0, 360);
 	}
 	// The lighting-change votes (GODOT_GI_VOTES=1, plan section 45): a
 	// buffer of two counters per 8x8 tile, cleared every frame.
@@ -2543,7 +2548,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_TIER_PRINT=<frames> sets the interval (60 when unset or 0).
 	static const int64_t tier_interval = MAX(OS::get_singleton()->get_environment("GODOT_GI_TIER_PRINT").to_int(), int64_t(0));
 	if (tier_stats && (rb_state->frame_index % (tier_interval > 0 ? uint32_t(tier_interval) : 60u)) == 0) {
-		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 320);
+		rd->buffer_get_data_async(calibration.buffer, callable_mp_static(&Raytracing::_tier_stats_readback), 24, 336);
 	}
 
 	// Denoise with the same temporal + spatial chain as the direct lighting,
@@ -3301,7 +3306,7 @@ String Raytracing::get_state_scale_line() const {
 	line += vformat(" young_pixels_pct %.1f young_static_pct %.1f", last_young_share, last_young_static_share);
 	if (surface_cache) {
 		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
-		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d pending_young %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.pending_young, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels);
+		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d pending_young %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f items_lod0 %d items_lod1 %d items_lod2 %d items_lod3 %d", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.pending_young, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels, st.items_lod[0], st.items_lod[1], st.items_lod[2], st.items_lod[3]);
 	}
 	return line;
 }
@@ -3416,6 +3421,13 @@ void Raytracing::_tier_stats_readback(const Vector<uint8_t> &p_data) {
 			fail_line += vformat("  %s %d (%.1f%%)", lookup_fail_names[i], lf[i], lf[7] > 0 ? 100.0 * lf[i] / lf[7] : 0.0);
 		}
 		fail_line += vformat("  | young pixels %d of %d (%.1f%%), static history young %d", lf[8], lf[9], last_young_share, lf[10]);
+		if (p_data.size() >= 336) {
+			// The card reads by the mip they read through (the level their
+			// request asks the relight at, section 92).
+			const uint32_t *rl = t + 80;
+			uint32_t rn = rl[0] + rl[1] + rl[2] + rl[3];
+			fail_line += vformat("  | reads by level %d / %d / %d / %d (%.1f / %.1f / %.1f / %.1f%%)", rl[0], rl[1], rl[2], rl[3], rn > 0 ? 100.0 * rl[0] / rn : 0.0, rn > 0 ? 100.0 * rl[1] / rn : 0.0, rn > 0 ? 100.0 * rl[2] / rn : 0.0, rn > 0 ? 100.0 * rl[3] / rn : 0.0);
+		}
 		print_line(fail_line);
 	}
 	if (p_data.size() >= 280) {

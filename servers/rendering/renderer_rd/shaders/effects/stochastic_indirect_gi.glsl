@@ -108,6 +108,20 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	// The card pick's weight on the depth mismatch, in texels (0: the card
 	// facing the ray most squarely; see surface_cache_lookup).
 	float card_pick_weight;
+	// The coarsest mip a read requests its tile's relight at (3; 0: every
+	// request at full density, the form before section 92), and the
+	// levels finer than the read's own the request is shifted (a quality
+	// dial, GODOT_CARD_LOD_BIAS; negative asks coarser).
+	uint card_request_lod;
+	int card_request_bias;
+	// One read in this many asks at its own level; the rest ask at the
+	// coarsest plane, which says only that the tile was read. So a finer
+	// plane bit means about this many reads at that level over the tile's
+	// turn, and a few near rays among many far ones do not hold a whole
+	// tile at full density (GODOT_CARD_LOD_SAMPLE; 1: every read asks at
+	// its level, the finest wins).
+	uint card_request_sample;
+	uint pad_request1;
 }
 params;
 
@@ -281,6 +295,7 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint pixels;
 	uint young_static; // Of them, the pixels whose static history is young (FLAG_DYN_SPLIT; the same count otherwise).
 	uint pad_young;
+	uint request_lod[4]; // Diagnostics (FLAG_TIER_STATS): the card reads by the level they requested their relight at.
 }
 calibration;
 
@@ -1343,15 +1358,6 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		}
 		return false;
 	}
-	// The read is the request: the texel's tile is relit next frame.
-	if (!bool(params.flags & FLAG_NO_REQUESTS)) {
-		ivec2 dims = card_dims_packed(best_packed);
-		ivec2 texel = card_origin_packed(best_packed) + clamp(ivec2(best_uv * vec2(dims)), ivec2(0), dims - ivec2(1));
-		uint bit;
-		uint word = card_tile_word(inst.set, best_k, best_packed, texel, bit);
-		atomicOr(card_requests.tiles[word], bit);
-		card_requests.frame[inst.set] = params.surface_cache_frame;
-	}
 	// Bilinear inside the card, never across its border, at the mip the
 	// footprint covers (its texels are wider, so the border margin is too).
 	vec2 best_dims = vec2(card_dims_packed(best_packed));
@@ -1360,6 +1366,26 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	float max_lod = max(min(CARD_LIGHTING_MIPS - 1.0, log2(min(best_dims.x, best_dims.y)) - 2.0), 0.0);
 	if (card_lookup_footprint > 0.0) {
 		lod = clamp(log2(max(card_lookup_footprint / best_texel_world, 1.0)), 0.0, max_lod);
+	}
+	// The read is the request: the texel's tile is relit next frame, at the
+	// level the footprint read it through (the youth level below is the
+	// read's own smoothing, not the resolution the ray wants). A far read
+	// then costs the cards a sixteenth of the tile, or less.
+	if (!bool(params.flags & FLAG_NO_REQUESTS)) {
+		ivec2 dims = ivec2(best_dims);
+		ivec2 texel = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), dims - ivec2(1));
+		uint bit;
+		uint word = card_tile_word(inst.set, best_k, best_packed, texel, bit);
+		uint max_plane = min(params.card_request_lod, SURFACE_CACHE_LOD_PLANES - 1u);
+		uint plane = uint(clamp(int(lod) - params.card_request_bias, 0, int(max_plane)));
+		if (plane < max_plane && params.card_request_sample > 1u && (pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame_index + gl_GlobalInvocationID.x * 7919u + gl_GlobalInvocationID.y * 104729u))) % params.card_request_sample) != 0u) {
+			plane = max_plane;
+		}
+		atomicOr(card_requests.tiles[plane * SURFACE_CACHE_PLANE_WORDS + word], bit);
+		card_requests.frame[inst.set] = params.surface_cache_frame;
+		if (fail_stats) {
+			atomicAdd(calibration.request_lod[min(uint(lod), 3u)], 1u);
+		}
 	}
 	// A young texel is read through a coarser level. The bounce a texel
 	// accumulates restarts when the light on it changes (the temporal

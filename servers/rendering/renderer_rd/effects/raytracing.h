@@ -461,7 +461,12 @@ private:
 		uint32_t mirror_order;
 		float card_coarse_limit; // Cards with a texel wider than this (meters) are not read by the gather, their hits go to hit shading (GODOT_GI_CARD_COARSE; 0 off).
 		float card_pick_weight; // The card pick's weight on the depth mismatch in texels against the facing (GODOT_GI_CARD_PICK; 0 picks by facing alone).
+		uint32_t card_request_lod; // The coarsest mip a hit requests its card tile's relight at (SurfaceCache::request_lod_max; 0: full density).
+		int32_t card_request_bias; // Levels finer than the read's own the request is shifted (SurfaceCache::request_lod_bias; negative asks coarser).
+		uint32_t card_request_sample; // One read in this many asks at its own level, the rest at the coarsest (SurfaceCache::request_lod_sample).
+		uint32_t pad_request;
 	};
+	static_assert(sizeof(RtGiParamsUBO) % 16 == 0, "RtGiParamsUBO must end on a 16-byte boundary (std140).");
 
 	// The surface cache the gather shades hits from, when enabled (owned here;
 	// the renderer drives its captures through the material pass).

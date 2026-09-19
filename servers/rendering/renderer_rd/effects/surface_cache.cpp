@@ -98,12 +98,12 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 		mip_pipeline = rd->compute_pipeline_create(mip_shader.version_get_shader(mip_shader_version, 0));
 	}
 
-	requests_buffer = rd->storage_buffer_create(MAX_SETS * (1 + TILE_WORDS_PER_SET) * sizeof(uint32_t));
-	rd->buffer_clear(requests_buffer, 0, MAX_SETS * (1 + TILE_WORDS_PER_SET) * sizeof(uint32_t));
-	active_buffer = rd->storage_buffer_create((8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
-	rd->buffer_clear(active_buffer, 0, (8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
-	relit_buffer = rd->storage_buffer_create((MAX_SETS * 2 + TILE_STAMPS * 3) * sizeof(uint32_t));
-	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * 3) * sizeof(uint32_t));
+	requests_buffer = rd->storage_buffer_create(MAX_SETS * (1 + LOD_PLANES * TILE_WORDS_PER_SET) * sizeof(uint32_t));
+	rd->buffer_clear(requests_buffer, 0, MAX_SETS * (1 + LOD_PLANES * TILE_WORDS_PER_SET) * sizeof(uint32_t));
+	active_buffer = rd->storage_buffer_create((ACTIVE_HEADER + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
+	rd->buffer_clear(active_buffer, 0, (ACTIVE_HEADER + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
+	relit_buffer = rd->storage_buffer_create((MAX_SETS * 2 + TILE_STAMPS * TILE_STAMP_ARRAYS) * sizeof(uint32_t));
+	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * TILE_STAMP_ARRAYS) * sizeof(uint32_t));
 	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	converge_buffer = rd->storage_buffer_create(20 * sizeof(uint32_t));
@@ -1226,6 +1226,15 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// accumulation is under eight relights (a restart, a fresh capture).
 	static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS") == "" ? 3 : OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS").to_int();
 	params.young_rays = uint32_t(CLAMP(young_rays, 0, 15));
+	// GODOT_CARD_LOD_RAYS=<l0>,<l1>,<l2>,<l3>: the cosine rays a texel
+	// relit at each level traces per relight (section 92; level 0 is the
+	// quad's one ray whatever this says).
+	static const Vector<String> lod_rays_env = OS::get_singleton()->get_environment("GODOT_CARD_LOD_RAYS").split(",");
+	params.lod_rays = 0;
+	for (int i = 0; i < 4; i++) {
+		uint32_t r = i < lod_rays_env.size() && !lod_rays_env[i].is_empty() ? uint32_t(CLAMP(lod_rays_env[i].to_int(), 1, 16)) : 1u;
+		params.lod_rays |= r << (8 * i);
+	}
 	// The dynamic lights (LightStorage::get_card_dynamic_lights: the lights
 	// that moved or changed lately), whose bounce the cards estimate from
 	// the light rather than by the cosine rays (surface_cache_light.glsl
@@ -1351,7 +1360,29 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	push.frame = p_inputs.frame;
 	push.budget = budget;
 	push.idle_divisor = idle ? idle_divisor : 1u;
-	push.max_items = MIN(items_override > 0 ? uint32_t(items_override) : blocks_per_frame, MAX_ITEMS);
+	// The cap in cost units: eighths of a full tile, a level-0 item 32 and
+	// a coarser one 16 (GODOT_CARD_LOD_COST=<l0>,<l1>,<l2>,<l3> the cost of
+	// one tile at each level, section 92); GODOT_CARD_FULL_LOD the level
+	// the whole-set relights (fresh captures, the round robin) go at: 2,
+	// one texel in sixteen, the bridge's cards 7.3 -> 6.4 ms for a first
+	// relight the requests refine within their turn (0 restores the full
+	// density).
+	static const Vector<String> lod_cost_env = OS::get_singleton()->get_environment("GODOT_CARD_LOD_COST").split(",");
+	const uint32_t lod_cost_default[4] = { 32, 16, 4, 1 };
+	push.lod_costs = 0;
+	for (int i = 0; i < 4; i++) {
+		uint32_t c = i < lod_cost_env.size() && !lod_cost_env[i].is_empty() ? uint32_t(CLAMP(lod_cost_env[i].to_int(), 1, 255)) : lod_cost_default[i];
+		push.lod_costs |= c << (8 * i);
+	}
+	static const String full_lod_env = OS::get_singleton()->get_environment("GODOT_CARD_FULL_LOD");
+	push.full_lod = uint32_t(CLAMP(full_lod_env.is_empty() ? int64_t(2) : full_lod_env.to_int(), int64_t(0), int64_t(LOD_PLANES - 1)));
+	push.max_items = MIN(items_override > 0 ? uint32_t(items_override) : blocks_per_frame, MAX_ITEMS) * (push.lod_costs & 0xFF);
+	push.max_item_count = MAX_ITEMS;
+	// GODOT_CARD_LOD_HOLD=<listings>: a tile is relit coarser only after
+	// this many listings in a row asked coarser (the rays are random; a
+	// tile with a near read every other turn would otherwise alternate).
+	static const int64_t lod_hold_env = OS::get_singleton()->get_environment("GODOT_CARD_LOD_HOLD").to_int();
+	push.lod_hold = lod_hold_env > 0 ? uint32_t(MIN(lod_hold_env, int64_t(15))) : 15u;
 	push.flags = settings.shared_bounce_ray ? 0u : 1u;
 	// GODOT_CARD_TURNS=hash|age: the requested tiles take hashed turns alone
 	// (one in `period` frames at random) or turns by age alone (listed once
@@ -1385,7 +1416,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	push.spot_light_count = p_inputs.spot_light_count;
 
 	rd->buffer_clear(active_buffer, 0, 4 * sizeof(uint32_t));
-	rd->buffer_clear(active_buffer, 5 * sizeof(uint32_t), 2 * sizeof(uint32_t)); // item_count_full, pending_young; the period between them persists.
+	rd->buffer_clear(active_buffer, 5 * sizeof(uint32_t), (ACTIVE_HEADER - 5) * sizeof(uint32_t)); // item_count_full and the counters after it; the period before them persists.
 
 	RID prepare_rid_select = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_SELECT);
 	RID prepare_rid_tiles = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_TILES);
@@ -1436,11 +1467,14 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// What a card's texels are worth is what this measures (plan section 82).
 	static const bool read_print = OS::get_singleton()->has_environment("GODOT_CARD_READ_PRINT");
 	if (read_print && p_inputs.frame % 60 == 45 && !sets.is_empty()) {
-		Vector<uint8_t> data = rd->buffer_get_data(requests_buffer, MAX_SETS * sizeof(uint32_t), sets.size() * TILE_WORDS_PER_SET * sizeof(uint32_t));
+		Vector<uint8_t> data = rd->buffer_get_data(requests_buffer, MAX_SETS * sizeof(uint32_t), LOD_PLANES * MAX_SETS * TILE_WORDS_PER_SET * sizeof(uint32_t));
 		const uint32_t *w = reinterpret_cast<const uint32_t *>(data.ptr());
 		const uint32_t words_per_card = TILE_WORDS_PER_SET / CARDS_PER_SET;
+		const uint32_t plane_words = MAX_SETS * TILE_WORDS_PER_SET;
 		uint64_t held[16] = {};
 		uint64_t asked[16] = {};
+		uint64_t asked_lod[LOD_PLANES] = {}; // Tiles by the finest level they were asked at, and their texels.
+		uint64_t asked_lod_texels[LOD_PLANES] = {};
 		uint32_t sets_asked = 0;
 		for (uint32_t i = 0; i < sets.size(); i++) {
 			const CardSet &set = sets[i];
@@ -1456,11 +1490,22 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 				uint32_t tiles = MAX(uint32_t(set.dims[k].x) / 16u, 1u) * MAX(uint32_t(set.dims[k].y) / 16u, 1u);
 				held[cls] += tiles;
 				uint32_t n = 0;
+				const uint32_t tile_texels = MIN(uint32_t(set.dims[k].x), 16u) * MIN(uint32_t(set.dims[k].y), 16u);
+				uint32_t card_max_level = 0;
+				while ((8u << card_max_level) < uint32_t(MIN(set.dims[k].x, set.dims[k].y)) && card_max_level < LOD_PLANES - 1) {
+					card_max_level++;
+				}
 				for (uint32_t j = 0; j < words_per_card; j++) {
-					uint32_t v = w[i * TILE_WORDS_PER_SET + k * words_per_card + j];
-					while (v) {
-						n++;
-						v &= v - 1;
+					uint32_t finer = 0;
+					for (uint32_t plane = 0; plane < LOD_PLANES; plane++) {
+						uint32_t v = w[plane * plane_words + i * TILE_WORDS_PER_SET + k * words_per_card + j] & ~finer;
+						finer |= v;
+						while (v) {
+							n++;
+							asked_lod[MIN(plane, card_max_level)]++;
+							asked_lod_texels[MIN(plane, card_max_level)] += tile_texels;
+							v &= v - 1;
+						}
 					}
 				}
 				asked[cls] += MIN(n, tiles);
@@ -1479,6 +1524,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 			ta += asked[c];
 		}
 		line += vformat(" | all %d/%d (%.1f%%)", ta, th, th > 0 ? 100.0 * double(ta) / double(th) : 0.0);
+		line += vformat(" | by level: %d / %d / %d / %d tiles, %dk / %dk / %dk / %dk texels", asked_lod[0], asked_lod[1], asked_lod[2], asked_lod[3], asked_lod_texels[0] / 1000, asked_lod_texels[1] / 1000, asked_lod_texels[2] / 1000, asked_lod_texels[3] / 1000);
 		print_line(line);
 	}
 
@@ -1612,7 +1658,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// The work list's size, for the RT STATE scale line (GODOT_RT_STATE_PRINT).
 	static const bool state_print_items = OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT");
 	if (state_print_items && p_inputs.frame % 60 == 30) {
-		rd->buffer_get_data_async(active_buffer, callable_mp_static(&SurfaceCache::_items_readback), 0, 12 * sizeof(uint32_t));
+		rd->buffer_get_data_async(active_buffer, callable_mp_static(&SurfaceCache::_items_readback), 0, ACTIVE_HEADER * sizeof(uint32_t));
 	}
 	if ((params.debug & 4096) != 0 && p_inputs.frame % 10 == 0) {
 		print_line(vformat("Surface cache: %d sets captured, budget %d per frame, round robin %d, idle divisor %d; lights: %d omni, %d spot, %d area, %d mirrors", sets.size(), budget, push.round_robin_period, push.idle_divisor, params.omni_light_count, params.spot_light_count, params.area_light_count, params.mirror_count));
@@ -1759,9 +1805,10 @@ uint32_t SurfaceCache::last_items = 0;
 uint32_t SurfaceCache::last_pending = 0;
 uint32_t SurfaceCache::last_pending_young = 0;
 uint32_t SurfaceCache::last_period = 0;
+uint32_t SurfaceCache::last_items_lod[4] = {};
 
 void SurfaceCache::_items_readback(const Vector<uint8_t> &p_data) {
-	if (p_data.size() < 32) {
+	if (p_data.size() < int64_t(ACTIVE_HEADER * sizeof(uint32_t))) {
 		return;
 	}
 	const uint32_t *v = reinterpret_cast<const uint32_t *>(p_data.ptr());
@@ -1770,6 +1817,25 @@ void SurfaceCache::_items_readback(const Vector<uint8_t> &p_data) {
 	last_pending = v[3];
 	last_period = v[4];
 	last_pending_young = v[6];
+	for (int i = 0; i < 4; i++) {
+		last_items_lod[i] = v[9 + i];
+	}
+}
+
+uint32_t SurfaceCache::request_lod_max() {
+	static const String env = OS::get_singleton()->get_environment("GODOT_CARD_RELIGHT_LOD");
+	static const int64_t v = env.is_empty() ? int64_t(LOD_PLANES - 1) : env.to_int();
+	return uint32_t(CLAMP(v, 0, int64_t(LOD_PLANES - 1)));
+}
+
+int32_t SurfaceCache::request_lod_bias() {
+	static const int64_t v = OS::get_singleton()->get_environment("GODOT_CARD_LOD_BIAS").to_int();
+	return int32_t(CLAMP(v, -int64_t(LOD_PLANES - 1), int64_t(LOD_PLANES - 1)));
+}
+
+uint32_t SurfaceCache::request_lod_sample() {
+	static const int64_t v = OS::get_singleton()->get_environment("GODOT_CARD_LOD_SAMPLE").to_int();
+	return uint32_t(CLAMP(v, 1, 256));
 }
 
 SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
@@ -1779,6 +1845,9 @@ SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	st.pending_blocks = last_pending;
 	st.pending_young = last_pending_young;
 	st.period = last_period;
+	for (int i = 0; i < 4; i++) {
+		st.items_lod[i] = last_items_lod[i];
+	}
 	st.density_scale = density_scale;
 	double texels = 0.0;
 	double read_texels = 0.0;

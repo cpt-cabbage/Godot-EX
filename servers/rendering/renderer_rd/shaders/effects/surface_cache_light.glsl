@@ -49,7 +49,11 @@ layout(set = 0, binding = 2, std430) restrict readonly buffer Active {
 	uint pending;
 	uint period;
 	uint item_count_full;
-	uint pad[2];
+	uint pending_young;
+	uint item_cost;
+	uint item_cost_full;
+	uint items_lod[4];
+	uint pad[3];
 	uint list[SURFACE_CACHE_MAX_SETS];
 	uint items[];
 }
@@ -113,7 +117,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_join; // On the frame a light joins the dynamic set (every set relit): the share of its bounce the static accumulation holds, which it sheds (see accumulate). 0 otherwise.
 	uint area_light_count; // The area lights (every one in the population: a few, each tested for range per texel).
 	float dynamic_mark; // The most a moving light's direct term may mark a texel for the screen (see accumulate); a change of intensity or colour is not capped.
-	float pad_join2;
+	uint lod_rays; // Per level, a byte: the cosine rays a representative traces per relight (see main).
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 	uint mirror_count;
@@ -259,8 +263,42 @@ layout(set = 0, binding = 23, std430) restrict buffer Relit {
 	uint tile_prev[TILE_STAMPS]; // Per 8x8 atlas block (a tile's first): the relight before this one (the prepare pass promotes as it lists the tile).
 	uint tile_last[TILE_STAMPS];
 	uint tile_age[TILE_STAMPS]; // The tile's relight count after this relight, the minimum over its texels (the prepare pass lists the young every frame).
+	uint tile_lod[TILE_STAMPS]; // The level of this relight (low four bits) and of the one before (the next four), set by the prepare pass.
 }
 relit;
+
+// A relight at a coarse level (plan section 92): the thread's texel stands
+// for its cell of splat_side texels square, and everything accumulate
+// stores for it is written over the cell's captured texels, so every
+// reader of the level-0 atlases (the gather's depth test and youth read,
+// the hit shader, the translucency froxels, this pass's own bounce reads
+// and filters) sees a complete, if blocky, card. The reads accumulate
+// makes are the representative's own. splat_mask marks the captured
+// texels of the cell, row-major, found once per thread.
+ivec2 splat_origin = ivec2(0);
+int splat_side = 1;
+uvec2 splat_mask = uvec2(0u);
+// The tile's previous relight was at another level: the stored terms this
+// relight would compare against are another texel's (the representative's,
+// or this texel's own where the last relight was finer), so nothing is
+// read as a change and the previous ray is not re-traced; the
+// accumulations carry on from what the cell holds.
+bool level_changed = false;
+#define SPLAT_STORE(img, texel, value) \
+	{ \
+		if (splat_side == 1) { \
+			imageStore(img, texel, value); \
+		} else { \
+			for (int sy = 0; sy < splat_side; sy++) { \
+				for (int sx = 0; sx < splat_side; sx++) { \
+					uint bi = uint(sy * splat_side + sx); \
+					if (((bi < 32u ? splat_mask.x >> bi : splat_mask.y >> (bi - 32u)) & 1u) != 0u) { \
+						imageStore(img, splat_origin + ivec2(sx, sy), value); \
+					} \
+				} \
+			} \
+		} \
+	}
 
 // The dynamic lights' bounce (see trace_dynamic), its own history: rgb the
 // accumulated term, a the luminance of the dynamic lights' direct term at
@@ -495,7 +533,7 @@ Change change_load(ivec2 texel) {
 
 void change_store(ivec2 texel, Change c) {
 	uint y = (packHalf2x16(vec2(c.unshadowed.b, 0.0)) & 0xFFFFu) | (uint(clamp(c.change, 0.0, 1.0) * 255.0 + 0.5) << 16u) | (uint(clamp(c.change_static, 0.0, 1.0) * 255.0 + 0.5) << 24u);
-	imageStore(change_atlas, texel, uvec4(packHalf2x16(c.unshadowed.rg), y, packHalf2x16(vec2(c.geom, c.vis)), (packHalf2x16(vec2(c.bounce_t, 0.0)) & 0xFFFFu) | (c.bounce_set << 16u)));
+	SPLAT_STORE(change_atlas, texel, uvec4(packHalf2x16(c.unshadowed.rg), y, packHalf2x16(vec2(c.geom, c.vis)), (packHalf2x16(vec2(c.bounce_t, 0.0)) & 0xFFFFu) | (c.bounce_set << 16u)));
 }
 
 // The static lights' change (the bounce accumulation's restart), and the
@@ -1981,7 +2019,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	if (fresh) {
 		// The screen's memory of this texel (the gather's) is of whatever
 		// the atlas page held before.
-		imageStore(screen_atlas, texel, vec4(0.0));
+		SPLAT_STORE(screen_atlas, texel, vec4(0.0));
 	}
 	// The change the ray's hit carried, weighted by what the hit is worth
 	// here: the sample's luminance over the accumulation's. A wall lit by a
@@ -2026,14 +2064,14 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	vec3 delta = abs(unshadowed - prev.unshadowed);
 	float lum_floor = 0.25 * max(luminance(unshadowed), luminance(prev.unshadowed));
 	vec3 rel = delta / max(max(unshadowed, prev.unshadowed), vec3(max(lum_floor, 1e-4)));
-	float change = fresh ? 0.0 : max(max(rel.r, rel.g), rel.b);
+	float change = (fresh || level_changed) ? 0.0 : max(max(rel.r, rel.g), rel.b);
 	// The whole lighting's change, for the GI gather's screen history: the
 	// static change, and the dynamic lights' direct term here against the
 	// last relight's (by luminance, floored at a quarter of the whole), and
 	// what the rays carried from their hits.
 	float total_lum = luminance(unshadowed) + dyn_lum;
 	float prev_total_lum = luminance(prev.unshadowed) + dyn_old.a;
-	float dyn_change = fresh ? 0.0 : abs(dyn_lum - dyn_old.a) / max(max(dyn_lum, dyn_old.a), max(0.25 * max(total_lum, prev_total_lum), 1e-4));
+	float dyn_change = (fresh || level_changed) ? 0.0 : abs(dyn_lum - dyn_old.a) / max(max(dyn_lum, dyn_old.a), max(0.25 * max(total_lum, prev_total_lum), 1e-4));
 	// A moving light's mark is capped (params.dynamic_mark, 0.125: the
 	// screen restarts to eight frames at most, never to the young fallback).
 	// The gather adds a dynamic light's direct term at the hit analytically
@@ -2098,7 +2136,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// Floored where no light to speak of reaches the texel: the stored sum
 	// is a half, and below a thousandth its rounding alone read as a move
 	// (a few hundred texels a frame at rest restarting their ratio).
-	float geom_change = fresh ? 0.0 : abs(d.local_geom - prev.geom) / max(max(d.local_geom, prev.geom), 1e-3);
+	float geom_change = (fresh || level_changed) ? 0.0 : abs(d.local_geom - prev.geom) / max(max(d.local_geom, prev.geom), 1e-3);
 	if ((params.flags & 4096u) != 0u && geom_change > 0.02) {
 		atomicAdd(converge.change_src[CHANGE_SRC_GEOM], 1u);
 	}
@@ -2283,12 +2321,12 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn2 = vec3(0.0);
 		dyn_frames = 0.0;
 	}
-	imageStore(indirect_dyn_atlas, texel, vec4(dyn, dyn_lum));
-	imageStore(indirect_dyn2_atlas, texel, vec4(dyn2, dyn_frames / 64.0));
+	SPLAT_STORE(indirect_dyn_atlas, texel, vec4(dyn, dyn_lum));
+	SPLAT_STORE(indirect_dyn2_atlas, texel, vec4(dyn2, dyn_frames / 64.0));
 	// The accumulation less the joining light's share of the dynamic
 	// histories (see the hand-over above); the readers add the histories.
 	vec3 indirect_stored = max(indirect - join * (dyn + dyn2), vec3(0.0));
-	imageStore(indirect_atlas, texel, vec4(indirect_stored, ind_pack(min(ind_frames + 1.0, 64.0), join)));
+	SPLAT_STORE(indirect_atlas, texel, vec4(indirect_stored, ind_pack(min(ind_frames + 1.0, 64.0), join)));
 	// What the readers take for the bounces: the accumulations filtered
 	// over the card (the accumulations themselves stay raw above).
 	vec3 ind_read;
@@ -2307,8 +2345,8 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		ind_read = t.n_world * 0.5 + 0.5;
 		dyn_read = vec3(0.0);
 	}
-	imageStore(indirect_filtered_atlas, texel, vec4(ind_read, ind_read_age / 64.0));
-	imageStore(indirect_dyn_filtered_atlas, texel, vec4(dyn_read, dyn_read_age / 64.0));
+	SPLAT_STORE(indirect_filtered_atlas, texel, vec4(ind_read, ind_read_age / 64.0));
+	SPLAT_STORE(indirect_dyn_filtered_atlas, texel, vec4(dyn_read, dyn_read_age / 64.0));
 
 	// The radiance the rays read: without the dynamic lights' direct term,
 	// which every reader adds from the lights' current state (the gather at
@@ -2337,9 +2375,13 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 			atomicAdd(dyn_stats.count[31], 1u);
 		}
 	}
-	imageStore(static_atlas, texel, vec4(static_radiance, vis_dyn));
-	imageStore(lighting_atlas, texel, vec4(radiance, frames / 64.0));
+	SPLAT_STORE(static_atlas, texel, vec4(static_radiance, vis_dyn));
+	SPLAT_STORE(lighting_atlas, texel, vec4(radiance, frames / 64.0));
 	mip_dirty.tiles[uint(texel.y >> 5) * (params.atlas_size >> 5u) + uint(texel.x >> 5)] = 1u;
+	if (splat_side > 1) {
+		ivec2 far_corner = splat_origin + ivec2(splat_side - 1);
+		mip_dirty.tiles[uint(far_corner.y >> 5) * (params.atlas_size >> 5u) + uint(far_corner.x >> 5)] = 1u;
+	}
 }
 
 // The tile's relight count for the prepare pass's young-first listing: the
@@ -2349,6 +2391,11 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 // which the prepare pass set to the top as it listed the tile).
 void record_tile_age(ivec2 p_tile_texel, ivec2 p_texel) {
 	uint age = uint(imageLoad(indirect_atlas, p_texel).a * 64.0);
+	if (splat_side >= 4) {
+		// A coarse item spans several tiles: each lane records its own.
+		atomicMin(relit.tile_age[uint(p_tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(p_tile_texel.x >> 3)], age);
+		return;
+	}
 	age = subgroupMin(age);
 	if (subgroupElect()) {
 		atomicMin(relit.tile_age[uint(p_tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(p_tile_texel.x >> 3)], age);
@@ -2363,7 +2410,8 @@ void main() {
 		return;
 	}
 	uint item = active_sets.items[gl_WorkGroupID.x];
-	uint entry = item & 0xFFFFu;
+	uint entry = item & SURFACE_CACHE_ITEM_ENTRY_MASK;
+	uint lod = (item >> SURFACE_CACHE_ITEM_LOD_SHIFT) & 7u;
 	uint set = active_sets.list[entry] & 0x7FFFFFFFu;
 	CardSet s = sets.data[set];
 	// The workgroup tiles 8x8 texels, so a set under eight an edge cannot
@@ -2380,8 +2428,8 @@ void main() {
 	// cards' block counts.
 	bool quad_mode = bool(params.flags & FLAG_SHARED_BOUNCE_RAY);
 	uint tile = quad_mode ? 16u : 8u;
-	uint card = (item >> 16u) & 7u;
-	uint block = item >> 19u;
+	uint card = (item >> SURFACE_CACHE_ITEM_CARD_SHIFT) & 7u;
+	uint block = item >> SURFACE_CACHE_ITEM_BLOCK_SHIFT;
 	uint card_packed = sets.data[set].cards[card];
 	ivec2 dims = card_dims_packed(card_packed);
 	uvec2 n = max(uvec2(dims) / tile, uvec2(1u));
@@ -2391,6 +2439,103 @@ void main() {
 	set_state.state[set * 2u] = 1u;
 	ivec2 block_origin = ivec2(int(block % n.x), int(block / n.x)) * int(tile);
 	ivec2 origin_texel = card_origin_packed(card_packed);
+	if (lod > 0u && quad_mode) {
+		// A coarse relight (plan section 92): the item covers 8 << lod texels
+		// square from its top-left tile, and each thread lights one
+		// representative texel at the center of its cell of 2^lod, with its
+		// own bounce ray and direct term, and stores the result over the
+		// cell (SPLAT_STORE). One texel for a cell of four, sixteen or
+		// sixty-four: what a tile read only from far away costs, since its
+		// readers average the cell through the mip chain anyway. The
+		// representative's own history accumulates at its texel and is
+		// copied over the cell, so a later relight at a finer level starts
+		// every texel from it, and a coarser one replaces the cell's
+		// histories with it.
+		int stride = 1 << lod;
+		ivec2 cell_in_card = block_origin + ivec2(gl_LocalInvocationID.xy) * stride;
+		if (any(greaterThanEqual(cell_in_card, dims))) {
+			return;
+		}
+		// The captured texels of the cell, and the representative: the
+		// center, or the first captured one when the center is empty.
+		splat_side = stride;
+		splat_origin = origin_texel + cell_in_card;
+		splat_mask = uvec2(0u);
+		int center = (stride * stride + stride) / 2; // (stride / 2, stride / 2), row-major.
+		int rep = -1;
+		for (int i = 0; i < stride * stride; i++) {
+			ivec2 c = splat_origin + ivec2(i % stride, i / stride);
+			if (texelFetch(depth_atlas, c, 0).r > 0.0) {
+				if (i < 32) {
+					splat_mask.x |= 1u << uint(i);
+				} else {
+					splat_mask.y |= 1u << uint(i - 32);
+				}
+				if (rep < 0 || i == center) {
+					rep = i;
+				}
+			}
+		}
+		if (rep < 0) {
+			return;
+		}
+		ivec2 texel_in_card = cell_in_card + ivec2(rep % stride, rep / stride);
+		ivec2 texel = origin_texel + texel_in_card;
+		Texel t;
+		if (!read_texel(s, card, dims, texel_in_card, texel, t)) {
+			return;
+		}
+		set_state.state[set * 2u + 1u] = 1u;
+		// The stamps of the representative's own tile (the item spans up to
+		// sixteen, each stamped by the prepare pass as it listed the item),
+		// and the previous relight's ray re-traced only when that relight
+		// was at this level: at another level the ray left another texel.
+		ivec2 tile_texel = origin_texel + (texel_in_card & ~15);
+		uint stamp = uint(tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(tile_texel.x >> 3);
+		uint prev_frame = relit.tile_prev[stamp];
+		uint prev_lod = (relit.tile_lod[stamp] >> 4u) & 0xFu;
+		bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || prev_frame == 0u || prev_frame <= s.captured_frame;
+		level_changed = !reset && prev_lod != lod;
+		bool have_prev = !reset && !level_changed && prev_frame != 0u && prev_frame < params.frame;
+		relit.frame[set * 2u + 1u] = params.frame;
+		mark_decay = 0.125 * float(clamp(have_prev ? params.frame - prev_frame : 1u, 1u, 8u));
+		gradient_gap = have_prev ? params.frame - prev_frame : 0u;
+		ivec2 card_min = origin_texel;
+		ivec2 card_max = origin_texel + dims - ivec2(1);
+		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
+		uint bounce_seed = pcg_hash(seed ^ 0x9E3779B9u);
+		uint prev_seed = pcg_hash(pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(prev_frame))) ^ 0x9E3779B9u);
+		Direct d;
+		ImageCache images;
+		images.valid = false;
+		shade_direct(set, t, seed, images, d);
+		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, prev_seed, have_prev));
+		vec3 indirect_sample;
+		float bounce_change;
+		float bounce_change_total;
+		uint bounce_set;
+		float bounce_t;
+		bool young_dynamic = texel_young_dynamic(texel);
+		// The cell's rays: a cell of 2^lod texels square traced a ray per
+		// quad as tiles; its one representative traces what lod_rays says
+		// (one at every level: the far reads average the cells through the
+		// mip chain, and the relights come round oftener within the same
+		// budget; measured against the cell's four, section 92).
+		uint n_cosine = max(cosine_rays(texel_young(texel), young_dynamic), max((params.lod_rays >> (lod * 8u)) & 0xFFu, 1u));
+		float n_light = light_rays(young_dynamic);
+		vec3 dyn_sample;
+		vec3 dyn2_sample;
+		trace_bounce(t, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+		trace_bounce_young(n_cosine, n_light, t, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+		vec3 dyn_light;
+		float dyn_landed;
+		float dyn_change_total;
+		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+		dyn_sample += dyn_light;
+		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
+		record_tile_age(tile_texel, texel);
+		return;
+	}
 	// The tile's relight before this one, whose bounce ray the gradient
 	// re-traces (the tile's own stamp: the tiles take turns, and a set's
 	// stamp named a frame most of its tiles were not relit on, so the
@@ -2399,11 +2544,15 @@ void main() {
 	// since, a reset whether or not the flag's one upload reached this
 	// frame (the select pass keeps a fresh set urgent until it is relit).
 	ivec2 tile_texel = origin_texel + block_origin;
-	uint prev_frame = relit.tile_prev[uint(tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(tile_texel.x >> 3)];
+	uint tile_stamp = uint(tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(tile_texel.x >> 3);
+	uint prev_frame = relit.tile_prev[tile_stamp];
 	bool reset = (s.flags & SURFACE_CACHE_SET_FLAG_RESET) != 0u || prev_frame == 0u || prev_frame <= s.captured_frame;
+	// The previous relight at a coarser level: its stored terms are the
+	// representatives' (see level_changed).
+	level_changed = !reset && ((relit.tile_lod[tile_stamp] >> 4u) & 0xFu) != 0u;
 	ivec2 card_min = origin_texel;
 	ivec2 card_max = origin_texel + dims - ivec2(1);
-	bool have_prev = !reset && prev_frame != 0u && prev_frame < params.frame;
+	bool have_prev = !reset && !level_changed && prev_frame != 0u && prev_frame < params.frame;
 	relit.frame[set * 2u + 1u] = params.frame;
 	mark_decay = 0.125 * float(clamp(have_prev ? params.frame - prev_frame : 1u, 1u, 8u));
 	gradient_gap = have_prev ? params.frame - prev_frame : 0u;
