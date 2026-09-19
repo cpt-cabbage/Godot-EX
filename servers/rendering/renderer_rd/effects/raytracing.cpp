@@ -695,6 +695,10 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		{ "gi_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_AMBIENT },
 		{ "gi_raw_dyn", RB_SCOPE_RT_GI, RB_RT_GI_RAW_DYN },
 		{ "gi_sum", RB_SCOPE_RT_GI, RB_RT_GI_TEMPORAL_SUM },
+		// This frame's GI temporal history and meta (r the static history's frames / 64, g the reflection's, b the moving lights', a the reveal age).
+		{ "gi_hist", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_AMBIENT_0 : RB_RT_GI_HIST_AMBIENT_1 },
+		{ "gi_hist_dyn", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_DYN_0 : RB_RT_GI_HIST_DYN_1 },
+		{ "gi_meta", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_META_0 : RB_RT_GI_META_1 },
 		{ "spec", RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION },
 		{ "spec_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION },
 		{ "spec_resolved", RB_SCOPE_RT_GI, RB_RT_GI_RESOLVED_REFLECTION },
