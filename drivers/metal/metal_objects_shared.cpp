@@ -30,6 +30,8 @@
 
 #include "metal_objects_shared.h"
 
+#include "core/io/file_access.h"
+#include "core/os/os.h"
 #include "drivers/metal/rendering_device_driver_metal.h"
 
 #include <os/signpost.h>
@@ -891,6 +893,18 @@ MDImmediateLibrary::MDImmediateLibrary(ShaderCacheEntry *p_entry,
 		_error = error;
 		if (error) {
 			ERR_PRINT(vformat(U"Error compiling shader %s: %s", p_entry->name.get_data(), error->localizedDescription()->utf8String()));
+#ifdef DEV_ENABLED
+			// GODOT_MSL_DUMP=<dir>: the source that failed, for the line and
+			// column the error names (the conversion's own dump runs only
+			// when a shader is converted, not when it is loaded from the cache).
+			static const String dump_dir = OS::get_singleton()->get_environment("GODOT_MSL_DUMP");
+			if (!dump_dir.is_empty() && get_original_source() != nullptr) {
+				Ref<FileAccess> f = FileAccess::open(dump_dir.path_join(vformat("%s.%s.error.metal", String(p_entry->name.get_data()).replace_char(':', '_'), SHADER_STAGE_NAMES[p_entry->stage])), FileAccess::WRITE);
+				if (f.is_valid()) {
+					f->store_string(String::utf8(get_original_source()->utf8String()));
+				}
+			}
+#endif
 		}
 
 		std::lock_guard<std::mutex> lock(_cv_mutex);
