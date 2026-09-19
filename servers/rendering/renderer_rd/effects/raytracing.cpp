@@ -2111,9 +2111,29 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	const float tol_fraction = card_tol.size() >= 2 ? float(card_tol[1]) : 0.02f;
 	memcpy(&params.ray_params[2], &tol_texels, sizeof(float));
 	memcpy(&params.ray_params[3], &tol_fraction, sizeof(float));
+	// GODOT_GI_SPEC_SHARE=<roughness>: pixels at or above it trace no
+	// reflection ray; their diffuse ray stands as a sample of the lobe at
+	// the cosine density and the resolve pass reweights the
+	// neighbourhood's rays into the lobe (FLAG_SPEC_SHARE; the resolve
+	// runs in its shared form, see process_rt_gi). "1" is 0.5. Off by
+	// default; exclusive with the budget, whose stand-in is a bias.
+	// A second value, GODOT_GI_SPEC_SHARE=<roughness>,<min n.v>: the view
+	// cosine below which a pixel keeps its GGX ray (0: none does).
+	static const String spec_share_env = OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE");
+	static const Vector<double> spec_share_v = spec_share_env == "1" ? Vector<double>({ 0.5 }) : spec_share_env.split_floats(",");
+	static const float spec_share = spec_share_v.size() >= 1 ? float(spec_share_v[0]) : 0.0f;
+	static const float spec_share_ndv = spec_share_v.size() >= 2 ? float(spec_share_v[1]) : 0.0f;
+	const bool use_spec_share = spec_share > 0.0f && !use_spec_budget && p_quality.specular;
+	if (use_spec_share) {
+		params.cv_params[2] = spec_share;
+		params.cv_params[3] = spec_share_ndv;
+	}
 	params.flags = 0;
 	if (use_spec_budget) {
 		params.flags |= 1048576; // FLAG_SPEC_BUDGET
+	}
+	if (use_spec_share) {
+		params.flags |= 2147483648u; // FLAG_SPEC_SHARE
 	}
 	// GODOT_GI_ABLATE=rays,spec,cards (profiling): what the gather costs
 	// without its bounce rays (a zero-length query, so the kernel keeps its
@@ -2578,9 +2598,24 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// gather skipped this frame are resolved, from the four neighbors that
 	// traced (radius 1), and a traced pixel passes through.
 	static const bool spec_resolve = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE") == "1";
-	const bool spec_fill = p_quality.half_rate_reflections && !spec_resolve;
+	// The shared form (GODOT_GI_SPEC_SHARE, see the gather's flags): the
+	// resolve runs over the pixels whose reflection sample is their
+	// diffuse ray, reweighting it and the neighbourhood's rays into the
+	// lobe; a pixel that traced its own GGX ray passes through as without
+	// the resolve. GODOT_GI_SPEC_SHARE_CAP=<ratio> is the most any ray
+	// weighs (16: a cosine ray under a lobe of roughness 0.5 peaks near
+	// that); _RADIUS the taps each way (2).
+	static const bool spec_shared = !OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE").is_empty() && OS::get_singleton()->get_environment("GODOT_GI_SPEC_BUDGET").is_empty();
+	const bool spec_fill = p_quality.half_rate_reflections && !spec_resolve && !spec_shared;
 	RID temporal_reflection = raw_reflection;
-	if ((spec_resolve || spec_fill) && p_quality.specular) {
+	// The denoisers' guide (section 83), built here so the resolve's taps
+	// read it too: its depth and normal stops at twenty-five taps were the
+	// strided full-resolution fetches that cost the spatial passes a cache
+	// line a tap (0.75 ms at the quarter tier for the shared form).
+	RID guide_depth = depth;
+	RID guide_nr = p_normal_roughness;
+	const bool guided = _denoise_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness, guide_depth, guide_nr);
+	if ((spec_resolve || spec_fill || spec_shared) && p_quality.specular) {
 		static const int64_t resolve_radius = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_RADIUS").to_int();
 		static const float resolve_min = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN") == "" ? 0.2f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_MIN").to_float());
 		static const float resolve_full = OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL") == "" ? 0.35f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_RESOLVE_FULL").to_float());
@@ -2593,18 +2628,20 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		}
 		resolve_push.screen_size[0] = size.x;
 		resolve_push.screen_size[1] = size.y;
-		resolve_push.depth_scale = (int32_t)depth_scale;
-		resolve_push.radius = spec_fill ? 1 : (int32_t)CLAMP(resolve_radius, 1, 4);
+		resolve_push.depth_scale = guided ? 1 : (int32_t)depth_scale;
+		static const int64_t share_radius = OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE_RADIUS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE_RADIUS").to_int();
+		static const float share_cap = OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE_CAP") == "" ? 16.0f : float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_SHARE_CAP").to_float());
+		resolve_push.radius = spec_fill ? 1 : (int32_t)CLAMP(spec_shared && !spec_resolve ? share_radius : resolve_radius, 1, 4);
 		resolve_push.rough_min = resolve_min;
 		resolve_push.rough_full = MAX(resolve_full, resolve_min + 1e-3f);
-		resolve_push.weight_cap = resolve_cap;
+		resolve_push.weight_cap = spec_shared && !spec_resolve ? share_cap : resolve_cap;
 		static const bool fill_paint = OS::get_singleton()->get_environment("GODOT_GI_SPEC_FILL_PAINT") == "1";
-		resolve_push.fill = spec_fill ? (fill_paint ? 2 : 1) : 0;
+		resolve_push.fill = spec_fill ? (fill_paint ? 2 : 1) : (spec_shared && !spec_resolve ? 3 : 0);
 		RID resolve_rid = reflection_resolve_shader.version_get_shader(reflection_resolve_shader_version, 0);
 		RD::Uniform r_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_reflection }));
 		RD::Uniform r_ray(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_spec_ray }));
-		RD::Uniform r_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, depth }));
-		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, p_normal_roughness }));
+		RD::Uniform r_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, guide_depth }));
+		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, guide_nr }));
 		RD::Uniform r_out(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ resolved_reflection }));
 		RENDER_TIMESTAMP("RT GI Reflection Resolve");
 		rd->draw_command_begin_label("RT GI Reflection Resolve");
@@ -2748,9 +2785,6 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// intermediate iterations use the variant that writes it, leaves the
 	// directional moment un-renormalized, and carries the filtered moments on.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
-	RID guide_depth = depth;
-	RID guide_nr = p_normal_roughness;
-	const bool guided = _denoise_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness, guide_depth, guide_nr);
 	denoise_push_constant.depth_scale = guided ? 1 : (int32_t)depth_scale;
 	RID scratch_a[2] = { raw_ambient, hist_read_a };
 	RID scratch_r[2] = { raw_reflection, hist_read_r };
@@ -3267,7 +3301,7 @@ String Raytracing::get_state_scale_line() const {
 	line += vformat(" young_pixels_pct %.1f young_static_pct %.1f", last_young_share, last_young_static_share);
 	if (surface_cache) {
 		SurfaceCache::ScaleStats st = surface_cache->get_scale_stats();
-		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels);
+		line += vformat(" sets %d sets_captured %d sets_shrunk %d sets_noroom %d atlas_pages %d/%d atlas_texels_pct %.1f relit_sets %d relit_blocks %d pending_blocks %d pending_young %d period %d density_scale %.3f read_sets %d read_texels_pct %.1f", st.sets, st.captured, st.shrunk, st.no_room, st.pages_used, st.pages, 100.0f * st.texels_used, st.active_sets, st.relit_blocks, st.pending_blocks, st.pending_young, st.period, st.density_scale, st.read_sets, 100.0f * st.read_texels);
 	}
 	return line;
 }

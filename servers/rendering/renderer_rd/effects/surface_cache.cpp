@@ -102,8 +102,8 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	rd->buffer_clear(requests_buffer, 0, MAX_SETS * (1 + TILE_WORDS_PER_SET) * sizeof(uint32_t));
 	active_buffer = rd->storage_buffer_create((8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
 	rd->buffer_clear(active_buffer, 0, (8 + MAX_SETS + MAX_ITEMS) * sizeof(uint32_t));
-	relit_buffer = rd->storage_buffer_create((MAX_SETS * 2 + TILE_STAMPS * 2) * sizeof(uint32_t));
-	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * 2) * sizeof(uint32_t));
+	relit_buffer = rd->storage_buffer_create((MAX_SETS * 2 + TILE_STAMPS * 3) * sizeof(uint32_t));
+	rd->buffer_clear(relit_buffer, 0, (MAX_SETS * 2 + TILE_STAMPS * 3) * sizeof(uint32_t));
 	dyn_stats_buffer = rd->storage_buffer_create(32 * sizeof(uint32_t));
 	rd->buffer_clear(dyn_stats_buffer, 0, 32 * sizeof(uint32_t));
 	converge_buffer = rd->storage_buffer_create(20 * sizeof(uint32_t));
@@ -1367,11 +1367,25 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// every captured set every frame, within the budget).
 	static const uint32_t rr_override = OS::get_singleton()->get_environment("GODOT_CARD_RR").to_int();
 	push.round_robin_period = full_relight ? 1u : MAX(rr_override > 0 ? rr_override : settings.round_robin_period, 1u);
+	// The young tiles first: a requested tile under GODOT_CARD_YOUNG=<relights>
+	// (the bounce accumulation's count, restarted by a light change) is
+	// listed every <period> frames (the second value, 2), and the hashed
+	// turns share what the cap has left among the converged ones. A tile a
+	// ray reads for the first time was already listed at once; this
+	// carries it through its first relights at its own rate, so a surface
+	// entering the frame converges in about as many frames whatever the
+	// budget, and the budget's dial moves the converged tiles' refresh
+	// rate alone (unset: the turns alone, as before).
+	static const Vector<String> young_env = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG").split(",");
+	static const uint32_t young_relights = young_env[0].is_empty() ? 0u : uint32_t(CLAMP(young_env[0].to_int(), 0, 64));
+	static const uint32_t young_period = young_env.size() > 1 ? uint32_t(CLAMP(young_env[1].to_int(), 1, 64)) : 2u;
+	push.young_relights = young_relights;
+	push.young_period = young_period;
 	push.omni_light_count = p_inputs.omni_light_count;
 	push.spot_light_count = p_inputs.spot_light_count;
 
 	rd->buffer_clear(active_buffer, 0, 4 * sizeof(uint32_t));
-	rd->buffer_clear(active_buffer, 5 * sizeof(uint32_t), sizeof(uint32_t)); // item_count_full; the period between them persists.
+	rd->buffer_clear(active_buffer, 5 * sizeof(uint32_t), 2 * sizeof(uint32_t)); // item_count_full, pending_young; the period between them persists.
 
 	RID prepare_rid_select = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_SELECT);
 	RID prepare_rid_tiles = prepare_shader.version_get_shader(prepare_shader_version, PREPARE_VARIANT_TILES);
@@ -1743,6 +1757,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 uint32_t SurfaceCache::last_active_sets = 0;
 uint32_t SurfaceCache::last_items = 0;
 uint32_t SurfaceCache::last_pending = 0;
+uint32_t SurfaceCache::last_pending_young = 0;
 uint32_t SurfaceCache::last_period = 0;
 
 void SurfaceCache::_items_readback(const Vector<uint8_t> &p_data) {
@@ -1754,6 +1769,7 @@ void SurfaceCache::_items_readback(const Vector<uint8_t> &p_data) {
 	last_items = v[2];
 	last_pending = v[3];
 	last_period = v[4];
+	last_pending_young = v[6];
 }
 
 SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
@@ -1761,6 +1777,7 @@ SurfaceCache::ScaleStats SurfaceCache::get_scale_stats() const {
 	st.active_sets = last_active_sets;
 	st.relit_blocks = last_items;
 	st.pending_blocks = last_pending;
+	st.pending_young = last_pending_young;
 	st.period = last_period;
 	st.density_scale = density_scale;
 	double texels = 0.0;

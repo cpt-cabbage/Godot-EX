@@ -44,7 +44,8 @@ layout(set = 0, binding = 2, std430) restrict buffer Active {
 	uint pending; // The requested blocks this frame, their turn or not.
 	uint period; // Frames between two relights of a requested tile (from last frame's pending over the cap).
 	uint item_count_full; // The whole-set pass's items (mode 1), counted apart; the cull pass folds them into item_count.
-	uint pad[2];
+	uint pending_young; // Of the pending, the tiles listed ahead of the turns (young, or never relit).
+	uint pad;
 	uint list[SURFACE_CACHE_MAX_SETS];
 	uint items[];
 }
@@ -103,6 +104,7 @@ layout(set = 0, binding = 8, std430) restrict buffer Relit {
 	uint frame[SURFACE_CACHE_MAX_SETS * 2u];
 	uint tile_prev[TILE_STAMPS];
 	uint tile_last[TILE_STAMPS];
+	uint tile_age[TILE_STAMPS]; // The tile's relight count after its last relight (the lighting pass's minimum over the tile; reset as the tile is listed).
 }
 relit;
 
@@ -117,6 +119,8 @@ layout(push_constant, std430) uniform Push {
 	uint max_items; // The work list's cap: 16x16 (or 8x8, flag bit 1) blocks lit this frame.
 	uint idle_divisor; // Settled cards under static lights: only one set in this many is due each frame (1: all).
 	uint flags; // 1: blocks are 8x8 (the bounce ray per texel), else 16x16 (shared per quad); 2: hashed turns alone; 4: turns by age alone.
+	uint young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: the turns alone).
+	uint young_period; // Frames between two relights of a young tile (1: every frame).
 }
 push;
 
@@ -237,6 +241,10 @@ void stamp_tile(uint idx) {
 	if (last != push.frame) {
 		relit.tile_prev[idx] = last;
 		relit.tile_last[idx] = push.frame;
+		// The relight count starts from the top for the lighting pass's
+		// minimum over the tile; a block the pass leaves untouched (an
+		// uncaptured edge) reads as converged, never as young.
+		relit.tile_age[idx] = 64u;
 	}
 }
 
@@ -302,21 +310,37 @@ void main() {
 			uint stamp = tile_stamp_index(packed, tc, SURFACE_CACHE_TILE);
 			uint last = relit.tile_last[stamp];
 			// Due: never relit (a surface seen for the first time goes at
-			// once), or its hashed turn (one frame in `period`, at random).
-			// Turns by age alone (listed once the
-			// last relight is `period` old) were measured: the relights fall
-			// into bursts, every tile's mark lands in the same frame, and the
-			// screen history sat at five frames where the hashed turns keep
-			// it at thirty-two (section 77). GODOT_CARD_TURNS=hash keeps
-			// the turns alone, GODOT_CARD_TURNS=age the age alone.
+			// once), young (under young_relights relights since its capture
+			// or its last light change) and young_period frames since its
+			// last relight, or its hashed turn (one frame in `period`, at
+			// random, the period over the mature tiles alone). The young
+			// tile just seen goes on at its own short period through its
+			// first relights whatever the budget, and a light change
+			// restarts the count so the changed tiles come first the same
+			// way. Every frame was measured first (tag young262): the
+			// restarting tiles at rest then read a fresh one-sample relight
+			// every frame and the machines' flicker doubled, and on the
+			// hall strafe the young filled the cap, the mature tiles'
+			// period climbed, and their bounce, which reads the newly lit
+			// tiles, went stale -- the frame darker and the stop's worst
+			// tile +75%. Turns by age alone (listed once
+			// the last relight is `period` old) were measured: the relights
+			// fall into bursts, every tile's mark lands in the same frame,
+			// and the screen history sat at five frames where the hashed
+			// turns keep it at thirty-two (section 77). GODOT_CARD_TURNS=hash
+			// keeps the turns alone, GODOT_CARD_TURNS=age the age alone.
 			bool turn = period <= 1u || ((set * 7u + k * 13u + t * 31u + push.frame) % period) == 0u;
+			bool young = last == 0u || (push.young_relights > 0u && relit.tile_age[stamp] < push.young_relights && push.frame - last >= max(push.young_period, 1u));
+			if (young) {
+				atomicAdd(active_sets.pending_young, 1u);
+			}
 			bool due;
 			if ((push.flags & 2u) != 0u) {
 				due = turn;
 			} else if ((push.flags & 4u) != 0u) {
 				due = last == 0u || push.frame - last >= period;
 			} else {
-				due = last == 0u || turn;
+				due = young || turn;
 			}
 			if (!due) {
 				kept |= 1u << (t & 31u); // Not its turn: the request waits.
@@ -360,8 +384,11 @@ void main() {
 		dispatch_args.x = items;
 		dispatch_args.y = 1u;
 		dispatch_args.z = 1u;
-		// Next frame's turn period: the requests pending now over their cap.
-		active_sets.period = clamp((active_sets.pending + requests_cap() - 1u) / requests_cap(), 1u, 64u);
+		// Next frame's turn period: the requests pending now over their cap,
+		// the young ones (listed every frame) taken out of both.
+		uint young = min(active_sets.pending_young, active_sets.pending);
+		uint cap = max(requests_cap() - min(active_sets.pending_young, requests_cap() - 1u), 1u);
+		active_sets.period = clamp((active_sets.pending - young + cap - 1u) / cap, 1u, 64u);
 	}
 	if (gl_LocalInvocationID.x == 0u) {
 		found_count = 0u;

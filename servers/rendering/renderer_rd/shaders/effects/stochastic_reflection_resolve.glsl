@@ -29,7 +29,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // rgb the ray's radiance, a the virtual view depth (kept as the pixel's own).
 layout(set = 0, binding = 0) uniform sampler2D raw_reflection;
 // xy the ray's direction in view space (octahedral), z its sampling
-// density (0: no rough ray), w the hit distance (1e4 and above: a miss).
+// density (0: no rough ray; negated: the pixel's diffuse ray at the cosine
+// density, standing in for a reflection ray -- the gather's shared form),
+// w the hit distance (1e4 and above: a miss).
 layout(set = 0, binding = 1) uniform sampler2D spec_ray;
 layout(set = 0, binding = 2) uniform sampler2D depth_texture;
 layout(set = 0, binding = 3) uniform sampler2D normal_roughness_texture;
@@ -44,7 +46,7 @@ layout(push_constant, std430) uniform Params {
 	float rough_min; // Below this roughness the sample passes through (the mirror path).
 	float rough_full; // From this roughness the resolve replaces the sample whole.
 	float weight_cap; // The most a neighbour's density ratio may weigh.
-	int fill; // 1: the half-rate form -- only a pixel without a ray of its own is resolved, from the neighbors that traced; the rest pass through.
+	int fill; // 1: the half-rate form -- only a pixel without a ray of its own is resolved, from the neighbors that traced; the rest pass through. 3: the shared form -- only a pixel whose own ray is its diffuse ray is resolved, that ray and the neighbours' reweighted into its lobe; the rest pass through.
 }
 params;
 
@@ -102,9 +104,14 @@ void main() {
 	// weighed the bright near hits down (the filled set read 20% dimmer
 	// than the traced set on the TPS bridge). A mirror (at or below
 	// rough_min) traced its own ray and is never filled.
-	bool filling = params.fill != 0;
+	bool sharing = params.fill == 3;
+	bool filling = params.fill != 0 && !sharing;
 	bool paint = params.fill == 2; // Diagnostics (GODOT_GI_SPEC_FILL_PAINT=1): why each pixel got what it got.
-	if (depth == 0.0 || (filling ? roughness <= params.rough_min : roughness < params.rough_min) || (own_ray.z <= 0.0) != filling) {
+	// The shared form resolves the pixels whose own ray is their diffuse
+	// ray (the density negated) and passes the rest through, GGX ray or
+	// none; the fill resolves the pixels without a ray from those with.
+	bool skip = sharing ? own_ray.z >= 0.0 : ((own_ray.z == 0.0) != filling);
+	if (depth == 0.0 || (filling ? roughness <= params.rough_min : roughness < params.rough_min) || skip) {
 		imageStore(out_reflection, pixel, paint ? (depth == 0.0 ? vec4(0.0) : (roughness <= params.rough_min ? vec4(1.0, 1.0, 0.0, 0.0) : vec4(0.0, 0.0, 1.0, 0.0))) : center);
 		return;
 	}
@@ -118,9 +125,16 @@ void main() {
 	float alpha = roughness * roughness;
 	float view_depth = -pos.z;
 
-	// The pixel's own sample first, at the weight its own density gives it (one).
+	// The pixel's own sample first, at the weight its own density gives it:
+	// one for a GGX ray; for its diffuse ray, the lobe's density at the
+	// direction over the cosine density, as for any neighbour's.
 	vec3 sum = center.rgb;
 	float weight = 1.0;
+	if (own_ray.z < 0.0) {
+		vec3 own_dir = oct_decode(own_ray.xy);
+		weight = min(ggx_dir_pdf(n, v, own_dir, alpha) / -own_ray.z, params.weight_cap);
+		sum = center.rgb * weight;
+	}
 	vec4 plain_sum = vec4(0.0);
 	float plain_weight = 0.0;
 	for (int y = -params.radius; y <= params.radius; y++) {
@@ -137,9 +151,10 @@ void main() {
 				continue;
 			}
 			vec4 ray = texelFetch(spec_ray, sp, 0);
-			if (ray.z <= 0.0) {
+			if (ray.z == 0.0) {
 				continue;
 			}
+			ray.z = abs(ray.z); // A diffuse ray's density, negated to mark it, weighs the same way.
 			vec3 spos = view_position(sp, sd);
 			if (abs(-spos.z - view_depth) > 0.05 * max(view_depth, 1.0)) {
 				continue;
@@ -172,7 +187,14 @@ void main() {
 		imageStore(out_reflection, pixel, paint ? (plain_weight > 0.0 ? vec4(1.0, 0.0, 0.0, 0.0) : vec4(0.0, 1.0, 0.0, 0.0)) : (plain_weight > 0.0 ? plain_sum / plain_weight : center));
 		return;
 	}
+	if (weight <= 0.0) {
+		// Not one ray of the neighbourhood lies in the lobe (a shared ray
+		// at a grazing view, nothing traced nearby): the pixel's own sample
+		// rather than nothing.
+		imageStore(out_reflection, pixel, center);
+		return;
+	}
 	vec3 resolved = sum / weight;
-	float blend = smoothstep(params.rough_min, params.rough_full, roughness);
+	float blend = sharing ? 1.0 : smoothstep(params.rough_min, params.rough_full, roughness);
 	imageStore(out_reflection, pixel, vec4(mix(center.rgb, resolved, blend), center.a));
 }

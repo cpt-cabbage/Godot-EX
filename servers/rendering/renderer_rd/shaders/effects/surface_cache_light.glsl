@@ -5,6 +5,7 @@
 #VERSION_DEFINES
 
 #extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_samplerless_texture_functions : enable
 
@@ -257,6 +258,7 @@ layout(set = 0, binding = 23, std430) restrict buffer Relit {
 	uint frame[SURFACE_CACHE_MAX_SETS * 2u];
 	uint tile_prev[TILE_STAMPS]; // Per 8x8 atlas block (a tile's first): the relight before this one (the prepare pass promotes as it lists the tile).
 	uint tile_last[TILE_STAMPS];
+	uint tile_age[TILE_STAMPS]; // The tile's relight count after this relight, the minimum over its texels (the prepare pass lists the young every frame).
 }
 relit;
 
@@ -2340,6 +2342,19 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	mip_dirty.tiles[uint(texel.y >> 5) * (params.atlas_size >> 5u) + uint(texel.x >> 5)] = 1u;
 }
 
+// The tile's relight count for the prepare pass's young-first listing: the
+// bounce accumulation's count the texel just stored (restarted by a light
+// change, so a changed tile reads young again), the minimum over the tile
+// (the group's lanes first, one atomic per SIMD group on the tile's stamp,
+// which the prepare pass set to the top as it listed the tile).
+void record_tile_age(ivec2 p_tile_texel, ivec2 p_texel) {
+	uint age = uint(imageLoad(indirect_atlas, p_texel).a * 64.0);
+	age = subgroupMin(age);
+	if (subgroupElect()) {
+		atomicMin(relit.tile_age[uint(p_tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(p_tile_texel.x >> 3)], age);
+	}
+}
+
 void main() {
 	// One workgroup per work item the prepare pass listed: the block of a
 	// card of an active set (a requested tile, or every block of a set due
@@ -2430,6 +2445,7 @@ void main() {
 		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
+		record_tile_age(origin_texel + (block_origin & ~15), texel);
 		return;
 	}
 
@@ -2510,4 +2526,5 @@ void main() {
 		shade_direct(set, t[k], seed_k, images, d);
 		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
+	record_tile_age(tile_texel, tracer_texel);
 }

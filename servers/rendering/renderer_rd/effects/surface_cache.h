@@ -295,9 +295,9 @@ private:
 	// the bits into the lighting pass's work list (section 77).
 	static constexpr uint32_t TILE_WORDS_PER_SET = CARDS_PER_SET * ((MAX_CARD_EDGE / 16) * (MAX_CARD_EDGE / 16) / 32);
 	RID requests_buffer;
-	// count, rr_count, item_count, pending, period, item_count_full, pad[2],
-	// the active set list (MAX_SETS), then the work items (MAX_ITEMS): entry |
-	// card << 16 | block << 19.
+	// count, rr_count, item_count, pending, period, item_count_full,
+	// pending_young, pad, the active set list (MAX_SETS), then the work items
+	// (MAX_ITEMS): entry | card << 16 | block << 19.
 	static constexpr uint32_t MAX_ITEMS = 65536;
 	RID active_buffer;
 	// The relight stamps: per set the relight before the last and the last
@@ -308,7 +308,10 @@ private:
 	// Blocks of the smallest card, so two cards never share a stamp (four
 	// 8-texel cards fill one 16-texel tile, and a stamp per tile handed a
 	// card its neighbour's frame), of the largest atlas the settings allow,
-	// at a fixed row stride.
+	// at a fixed row stride. A third array per block: the tile's relight
+	// count after its last relight (the bounce accumulation's, which a
+	// light change restarts), by which the prepare pass lists the young
+	// tiles every frame ahead of the turns.
 	static constexpr uint32_t TILE_STAMP_STRIDE = 8192 / 8;
 	static constexpr uint32_t TILE_STAMPS = TILE_STAMP_STRIDE * TILE_STAMP_STRIDE;
 	RID dyn_stats_buffer; // Diagnostics (GODOT_CARD_ABLATE=stats): 16 counters of the dynamic rays' fate.
@@ -350,6 +353,7 @@ private:
 	static uint32_t last_active_sets;
 	static uint32_t last_items;
 	static uint32_t last_pending;
+	static uint32_t last_pending_young;
 	static uint32_t last_period;
 	static void _items_readback(const Vector<uint8_t> &p_data);
 	static bool _settled();
@@ -403,6 +407,8 @@ private:
 		uint32_t max_items; // The lighting work list's cap: blocks lit this frame.
 		uint32_t idle_divisor; // Settled cards under static lights relight one set in this many (1: every due set).
 		uint32_t flags; // 1: 8x8 blocks (a bounce ray per texel), else 16x16 (shared per quad).
+		uint32_t young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: turns alone).
+		uint32_t young_period; // Frames between two relights of a young tile.
 	};
 
 	struct LightParamsUBO {
@@ -557,6 +563,7 @@ public:
 		uint32_t active_sets = 0; // Sets in the last work list read back, and its blocks.
 		uint32_t relit_blocks = 0;
 		uint32_t pending_blocks = 0; // Requested blocks that frame, and the turn period they set.
+		uint32_t pending_young = 0; // Of them, the young (or never relit) ones, listed ahead of the turns.
 		uint32_t period = 0;
 		float density_scale = 1.0f;
 		uint32_t read_sets = 0; // Sets a ray read within the last round-robin period (as last read back), and their share of the allocated texels.

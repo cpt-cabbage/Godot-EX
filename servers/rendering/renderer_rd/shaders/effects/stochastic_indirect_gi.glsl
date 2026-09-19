@@ -140,6 +140,7 @@ params;
 #define FLAG_ABLATE_CARDS 134217728u
 #define FLAG_DYN_YOUNG_RAYS 1073741824u // With FLAG_DYN_SPLIT (GODOT_GI_DYN_SPLIT=2): the extra rays of a young pixel follow the younger of the two histories, not the static one alone.
 #define FLAG_DYN_SPLIT 536870912u // The moving lights' term apart (GODOT_GI_DYN_SPLIT, section 88): out_ambient_dyn carries it with its own change mark, the temporal pass accumulates it as a history of its own, and out_ambient's mark is the static lights' alone.
+#define FLAG_SPEC_SHARE 2147483648u // A rough pixel (roughness at or above cv_params.z) traces no reflection ray: its diffuse ray stands as a sample of the lobe, at the cosine density, and the resolve reweights the neighbourhood's diffuse rays into the lobe (GODOT_GI_SPEC_SHARE; see the reflection below).
 #define FLAG_SPEC_HALF_RATE 268435456u // The rough reflection ray on a checkerboard that alternates each frame; the resolve fills the rest from the traced neighbors (raytraced_gi/quality/half_rate_reflections). // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
@@ -364,6 +365,7 @@ hit_results;
 ivec2 hit_pixel = ivec2(0);
 uint hit_slot = 0u;
 bool hit_specular = false;
+bool hit_shared = false; // The diffuse ray being traced stands in for the reflection ray too (FLAG_SPEC_SHARE): its deferred hit is flagged for both.
 bool hit_mirror = false;
 uint pixel_rays = 1u; // The diffuse rays this pixel traces (ray_params), for the deferred hits' packets.
 
@@ -1820,7 +1822,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 						uint idx = atomicAdd(hit_counts.data[RT_HIT_COUNT_TOTAL], 1u);
 						if (idx < params.hit_capacity) {
 							atomicAdd(hit_counts.data[slot], 1u);
-							uint flags = (rayQueryGetIntersectionFrontFaceEXT(rq, true) ? RT_HIT_PACKET_FRONT_FACE : 0u) | (hit_specular ? RT_HIT_PACKET_MIRROR : 0u);
+							uint flags = (rayQueryGetIntersectionFrontFaceEXT(rq, true) ? RT_HIT_PACKET_FRONT_FACE : 0u) | (hit_specular ? RT_HIT_PACKET_MIRROR : 0u) | (hit_shared ? RT_HIT_PACKET_SHARED : 0u);
 							uint b = idx * RT_HIT_PACKET_WORDS;
 							hit_packets.data[b] = rt_hit_pack_pixel(hit_pixel, hit_slot, flags);
 							hit_packets.data[b + 1u] = instance_id;
@@ -2046,12 +2048,32 @@ void main() {
 	// The control variate's sum: what the cards' bounce rays would have
 	// read in each ray's direction (see ray_control).
 	vec3 control = vec3(0.0);
+	// The first diffuse ray, kept for the shared reflection (FLAG_SPEC_SHARE):
+	// its direction in view space, its radiance, its hit distance and the
+	// cosine density it was drawn with (after the fold, as the GGX ray's
+	// density is taken).
+	vec3 share_view_dir = vec3(0.0);
+	vec3 share_radiance = vec3(0.0);
+	float share_t = 0.0;
+	float share_pdf = 0.0;
+	// Decided before the rays so the first ray's deferred hit can be
+	// flagged for the reflection too (the same test as spec_share below).
+	// Only where the view is steep enough (n.v at or above cv_params.w) for
+	// the cosine sampler to cover the lobe: at a grazing view the lobe's
+	// mass sits near the horizon, where a cosine ray almost never goes, and
+	// the neighbourhood's twenty-five rays hold none of it -- the
+	// normalized weights then fall back on the up-going rays that see the
+	// lit ceiling, and the TPS bridge's floor read 8% bright (the stand-in's
+	// failure in a milder form). Those pixels keep their GGX ray.
+	float share_ndv = dot(world_normal, normalize(-(world_basis * view_pos)));
+	bool spec_share = bool(params.flags & FLAG_SPEC_SHARE) && !(bool(params.flags & FLAG_MIRROR) && roughness <= 0.2) && roughness >= params.cv_params.z && share_ndv >= params.cv_params.w && !bool(params.flags & FLAG_ABLATE_SPEC);
 	for (uint r = 0u; r < rays; r++) {
 		vec2 rnd = stbn_sample(pixel, r);
 		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
 		vec3 view_dir = transpose(world_basis) * dir;
 		float t_hit;
 		hit_slot = r;
+		hit_shared = spec_share && r == 0u;
 		ray_card = false;
 		ray_change = 0.0;
 		ray_dyn = vec3(0.0);
@@ -2059,6 +2081,13 @@ void main() {
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
 		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
+		hit_shared = false;
+		if (r == 0u) {
+			share_view_dir = view_dir;
+			share_radiance = radiance;
+			share_t = t_hit;
+			share_pdf = max(dot(dir, world_normal), 0.0) / M_PI;
+		}
 		irradiance += radiance;
 		irradiance_dyn += clamp(ray_dyn, vec3(0.0), radiance);
 		float ray_lum = luminance(radiance);
@@ -2206,7 +2235,29 @@ void main() {
 		}
 		spec_skip = has_neighbour;
 	}
-	if (spec_stand_in) {
+	// The shared form (FLAG_SPEC_SHARE): a pixel rough enough that its GGX
+	// lobe is a few times the cosine lobe's width traces no reflection ray
+	// and hands the resolve its diffuse ray instead -- a sample of the
+	// hemisphere at a known density, which the resolve turns into a sample
+	// of the lobe by the same density ratio it applies to the neighbours'
+	// GGX rays (Stachowiak's reuse; the density stored negated marks it as
+	// the cosine ray's). Unlike the budget's stand-in above this is an
+	// estimator of the lobe, not of the hemisphere: a grazing lobe on the
+	// TPS demo's floor sees the dark far end of the ring through the rays
+	// that went that way, weighted up, and not the lit ceiling's mean. The
+	// price is variance, which the resolve's twenty-five taps and the
+	// temporal pass carry, and which grows as the lobe narrows: the
+	// threshold is where a ray per pixel is bought back for it.
+	spec_share = spec_share && !mirror && !spec_stand_in;
+	if (spec_share) {
+		reflection = share_radiance;
+		spec_ray = vec4(octahedron_encode(share_view_dir), -max(share_pdf, 1e-6), min(share_t, 1e4));
+		float view_len = max(length(view_pos), 1e-4);
+		float curvature = surface_curvature(full_pixel, view_pos, geo_view_normal);
+		float t_image = min(share_t, 1e4);
+		t_image /= (1.0 + 2.0 * curvature * t_image);
+		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
+	} else if (spec_stand_in) {
 		reflection = irradiance;
 	} else if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror) && !spec_skip) {
 		// GGX half-vector sampling around the mirror direction.

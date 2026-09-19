@@ -498,7 +498,7 @@ private:
 		float rough_min;
 		float rough_full;
 		float weight_cap;
-		int32_t fill; // 1: only the pixels without a ray of their own are resolved, from the neighbors that traced (half_rate_reflections).
+		int32_t fill; // 1: only the pixels without a ray of their own are resolved, from the neighbors that traced (half_rate_reflections); 3: only the pixels whose ray is their diffuse ray (GODOT_GI_SPEC_SHARE).
 	};
 
 	struct StochasticDenoisePushConstant {
