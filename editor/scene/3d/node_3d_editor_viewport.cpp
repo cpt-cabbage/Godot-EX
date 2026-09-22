@@ -2553,13 +2553,20 @@ void Node3DEditorViewport::_sinput(const Ref<InputEvent> &p_event) {
 				} else {
 					if (ruler->is_inside_tree()) {
 						EditorNode::get_singleton()->get_scene_root()->remove_child(ruler);
+						collision_reposition = false;
+
 						ruler_start_point->set_visible(false);
 						ruler_end_point->set_visible(false);
 						ruler_label->set_visible(false);
 						ruler_label_x->set_visible(false);
 						ruler_label_y->set_visible(false);
 						ruler_label_z->set_visible(false);
-						collision_reposition = false;
+
+						geometry->clear_surfaces();
+						geometry_xray->clear_surfaces();
+						triangle_mesh->clear_surfaces();
+						triangle_mesh_xray->clear_surfaces();
+
 						break;
 					}
 
@@ -2916,6 +2923,12 @@ void Node3DEditorViewport::_sinput(const Ref<InputEvent> &p_event) {
 		if (ED_IS_SHORTCUT("spatial_editor/focus_selection", event_mod)) {
 			_menu_option(VIEW_CENTER_TO_SELECTION);
 			times_focused_consecutively += 1;
+			follow_mode_uses_aabb = false;
+		}
+		if (ED_IS_SHORTCUT("spatial_editor/focus_aabb", event_mod)) {
+			_menu_option(VIEW_CENTER_TO_AABB);
+			times_focused_consecutively += 1;
+			follow_mode_uses_aabb = true;
 		}
 		if (ED_IS_SHORTCUT("spatial_editor/align_transform_with_view", event_mod)) {
 			_menu_option(VIEW_ALIGN_TRANSFORM_WITH_VIEW);
@@ -3291,7 +3304,7 @@ void Node3DEditorViewport::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_PROCESS: {
-			if (ruler->is_inside_tree()) {
+			if (ruler->is_inside_tree() && ruler_start_point->is_visible()) {
 				Vector3 start_pos = ruler_start_point->get_global_position();
 				Vector3 end_pos = ruler_end_point->get_global_position();
 
@@ -3324,103 +3337,91 @@ void Node3DEditorViewport::_notification(int p_what) {
 				bool show_components = Input::get_singleton()->is_key_pressed(Key::SHIFT);
 
 				if (show_components) {
-					Ref<ImmediateMesh> triangle_mesh = ruler_triangle_lines->get_mesh();
-					Ref<ImmediateMesh> triangle_mesh_xray = ruler_triangle_lines_xray->get_mesh();
-
-					if (triangle_mesh.is_valid() && triangle_mesh_xray.is_valid()) {
-						Vector3 delta = end_pos - start_pos;
-						delta = delta.abs();
-						const real_t threshold = 0.001;
-						if (delta.x < threshold) {
-							delta.x = 0.0;
-						}
-						if (delta.y < threshold) {
-							delta.y = 0.0;
-						}
-						if (delta.z < threshold) {
-							delta.z = 0.0;
-						}
-
-						Vector3 corner_point;
-						Color first_line_color;
-						Color second_line_color;
-
-						Color axis_x_color = get_theme_color(SNAME("axis_x_color"), EditorStringName(Editor));
-						Color axis_y_color = get_theme_color(SNAME("axis_y_color"), EditorStringName(Editor));
-						Color axis_z_color = get_theme_color(SNAME("axis_z_color"), EditorStringName(Editor));
-
-						if (delta.x > 0.0 && delta.y > 0.0 && delta.z == 0.0) {
-							// XY plane
-							corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
-							first_line_color = axis_x_color;
-							second_line_color = axis_y_color;
-						} else if (delta.x > 0.0 && delta.z > 0.0 && delta.y == 0.0) {
-							// XZ plane
-							corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
-							first_line_color = axis_x_color;
-							second_line_color = axis_z_color;
-						} else if (delta.y > 0.0 && delta.z > 0.0 && delta.x == 0.0) {
-							// YZ plane
-							corner_point = Vector3(start_pos.x, start_pos.y, end_pos.z);
-							first_line_color = axis_z_color;
-							second_line_color = axis_y_color;
-						} else if (delta.x > 0.0 && delta.y > 0.0 && delta.z > 0.0) {
-							// All three axes
-							corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
-							first_line_color = axis_x_color;
-							second_line_color = axis_y_color;
-						} else {
-							corner_point = end_pos;
-							first_line_color = axis_x_color;
-							second_line_color = axis_x_color;
-						}
-
-						triangle_mesh->clear_surfaces();
-						triangle_mesh->surface_begin(Mesh::PRIMITIVE_LINES);
-
-						Vector3 triangle_camera_dir = (camera->get_transform().origin - center).normalized();
-						real_t triangle_offset_distance = 0.01;
-
-						triangle_mesh->surface_set_color(first_line_color);
-						triangle_mesh->surface_add_vertex(start_pos + triangle_camera_dir * triangle_offset_distance);
-						triangle_mesh->surface_set_color(first_line_color);
-						triangle_mesh->surface_add_vertex(corner_point + triangle_camera_dir * triangle_offset_distance);
-						triangle_mesh->surface_set_color(second_line_color);
-						triangle_mesh->surface_add_vertex(corner_point + triangle_camera_dir * triangle_offset_distance);
-						triangle_mesh->surface_set_color(second_line_color);
-						triangle_mesh->surface_add_vertex(end_pos + triangle_camera_dir * triangle_offset_distance);
-
-						triangle_mesh->surface_end();
-
-						Color first_line_color_xray = first_line_color;
-						Color second_line_color_xray = second_line_color;
-						first_line_color_xray.a = 0.15;
-						second_line_color_xray.a = 0.15;
-
-						triangle_mesh_xray->clear_surfaces();
-						triangle_mesh_xray->surface_begin(Mesh::PRIMITIVE_LINES);
-
-						triangle_mesh_xray->surface_set_color(first_line_color_xray);
-						triangle_mesh_xray->surface_add_vertex(start_pos);
-						triangle_mesh_xray->surface_set_color(first_line_color_xray);
-						triangle_mesh_xray->surface_add_vertex(corner_point);
-						triangle_mesh_xray->surface_set_color(second_line_color_xray);
-						triangle_mesh_xray->surface_add_vertex(corner_point);
-						triangle_mesh_xray->surface_set_color(second_line_color_xray);
-						triangle_mesh_xray->surface_add_vertex(end_pos);
-
-						triangle_mesh_xray->surface_end();
+					Vector3 delta = end_pos - start_pos;
+					delta = delta.abs();
+					const real_t threshold = 0.001;
+					if (delta.x < threshold) {
+						delta.x = 0.0;
 					}
+					if (delta.y < threshold) {
+						delta.y = 0.0;
+					}
+					if (delta.z < threshold) {
+						delta.z = 0.0;
+					}
+
+					Vector3 corner_point;
+					Color first_line_color;
+					Color second_line_color;
+
+					Color axis_x_color = get_theme_color(SNAME("axis_x_color"), EditorStringName(Editor));
+					Color axis_y_color = get_theme_color(SNAME("axis_y_color"), EditorStringName(Editor));
+					Color axis_z_color = get_theme_color(SNAME("axis_z_color"), EditorStringName(Editor));
+
+					if (delta.x > 0.0 && delta.y > 0.0 && delta.z == 0.0) {
+						// XY plane
+						corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
+						first_line_color = axis_x_color;
+						second_line_color = axis_y_color;
+					} else if (delta.x > 0.0 && delta.z > 0.0 && delta.y == 0.0) {
+						// XZ plane
+						corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
+						first_line_color = axis_x_color;
+						second_line_color = axis_z_color;
+					} else if (delta.y > 0.0 && delta.z > 0.0 && delta.x == 0.0) {
+						// YZ plane
+						corner_point = Vector3(start_pos.x, start_pos.y, end_pos.z);
+						first_line_color = axis_z_color;
+						second_line_color = axis_y_color;
+					} else if (delta.x > 0.0 && delta.y > 0.0 && delta.z > 0.0) {
+						// All three axes
+						corner_point = Vector3(end_pos.x, start_pos.y, start_pos.z);
+						first_line_color = axis_x_color;
+						second_line_color = axis_y_color;
+					} else {
+						corner_point = end_pos;
+						first_line_color = axis_x_color;
+						second_line_color = axis_x_color;
+					}
+
+					triangle_mesh->clear_surfaces();
+					triangle_mesh->surface_begin(Mesh::PRIMITIVE_LINES);
+
+					Vector3 triangle_camera_dir = (camera->get_transform().origin - center).normalized();
+					real_t triangle_offset_distance = 0.01;
+
+					triangle_mesh->surface_set_color(first_line_color);
+					triangle_mesh->surface_add_vertex(start_pos + triangle_camera_dir * triangle_offset_distance);
+					triangle_mesh->surface_set_color(first_line_color);
+					triangle_mesh->surface_add_vertex(corner_point + triangle_camera_dir * triangle_offset_distance);
+					triangle_mesh->surface_set_color(second_line_color);
+					triangle_mesh->surface_add_vertex(corner_point + triangle_camera_dir * triangle_offset_distance);
+					triangle_mesh->surface_set_color(second_line_color);
+					triangle_mesh->surface_add_vertex(end_pos + triangle_camera_dir * triangle_offset_distance);
+
+					triangle_mesh->surface_end();
+
+					Color first_line_color_xray = first_line_color;
+					Color second_line_color_xray = second_line_color;
+					first_line_color_xray.a = 0.15;
+					second_line_color_xray.a = 0.15;
+
+					triangle_mesh_xray->clear_surfaces();
+					triangle_mesh_xray->surface_begin(Mesh::PRIMITIVE_LINES);
+
+					triangle_mesh_xray->surface_set_color(first_line_color_xray);
+					triangle_mesh_xray->surface_add_vertex(start_pos);
+					triangle_mesh_xray->surface_set_color(first_line_color_xray);
+					triangle_mesh_xray->surface_add_vertex(corner_point);
+					triangle_mesh_xray->surface_set_color(second_line_color_xray);
+					triangle_mesh_xray->surface_add_vertex(corner_point);
+					triangle_mesh_xray->surface_set_color(second_line_color_xray);
+					triangle_mesh_xray->surface_add_vertex(end_pos);
+
+					triangle_mesh_xray->surface_end();
 				} else {
-					Ref<ImmediateMesh> triangle_mesh = ruler_triangle_lines->get_mesh();
-					Ref<ImmediateMesh> triangle_mesh_xray = ruler_triangle_lines_xray->get_mesh();
-
-					if (triangle_mesh.is_valid()) {
-						triangle_mesh->clear_surfaces();
-					}
-					if (triangle_mesh_xray.is_valid()) {
-						triangle_mesh_xray->clear_surfaces();
-					}
+					triangle_mesh->clear_surfaces();
+					triangle_mesh_xray->clear_surfaces();
 				}
 
 				if (show_components) {
@@ -3594,7 +3595,11 @@ void Node3DEditorViewport::_notification(int p_what) {
 					follow_mode->set_text(vformat(TTR("Following %s"), focused_node->get_name()));
 					follow_mode->set_button_icon(get_editor_theme_icon(focused_node->get_class()));
 					follow_mode->show();
-					focus_selection();
+					if (follow_mode_uses_aabb) {
+						focus_aabb();
+					} else {
+						focus_selection();
+					}
 				} else {
 					_disable_follow_mode();
 				}
@@ -4404,6 +4409,10 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 		} break;
 		case VIEW_CENTER_TO_SELECTION: {
 			focus_selection();
+
+		} break;
+		case VIEW_CENTER_TO_AABB: {
+			focus_aabb();
 
 		} break;
 		case VIEW_ALIGN_TRANSFORM_WITH_VIEW: {
@@ -5435,6 +5444,66 @@ void Node3DEditorViewport::focus_selection() {
 	view_3d_controller->cursor.pos_z = center.z;
 }
 
+void Node3DEditorViewport::focus_aabb() {
+	Vector3 center;
+	AABB combined_aabb;
+	bool aabb_valid = false;
+	float required_distance = 0.0f;
+
+	const List<Node *> &selection = editor_selection->get_top_selected_node_list();
+	if (selection.is_empty()) {
+		return;
+	}
+
+	focused_node_id = selection.front()->get()->get_instance_id();
+
+	LocalVector<Node *> stack;
+	stack.reserve(selection.size());
+	for (Node *node : selection) {
+		stack.push_back(node);
+	}
+
+	while (!stack.is_empty()) {
+		Node *node = stack[stack.size() - 1];
+		stack.resize(stack.size() - 1);
+
+		VisualInstance3D *vi = Object::cast_to<VisualInstance3D>(node);
+		if (vi) {
+			AABB local_aabb = vi->get_aabb();
+			if (local_aabb.has_volume()) {
+				AABB global_aabb = vi->get_global_transform().xform(local_aabb);
+				if (!aabb_valid) {
+					combined_aabb = global_aabb;
+					aabb_valid = true;
+				} else {
+					combined_aabb = combined_aabb.merge(global_aabb);
+				}
+			}
+		}
+
+		for (Node *child : node->iterate_children()) {
+			stack.push_back(child);
+		}
+	}
+
+	if (aabb_valid) {
+		center = combined_aabb.get_center();
+
+		float aabb_radius = combined_aabb.get_size().length() * 0.5f;
+		float fov_rad = Math::deg_to_rad(get_fov());
+		required_distance = aabb_radius / Math::tan(fov_rad * 0.5f);
+		required_distance *= 1.2f;
+		required_distance = CLAMP(required_distance, get_znear() * 2.0f, get_zfar() * 0.8f);
+
+		view_3d_controller->cursor.pos_x = center.x;
+		view_3d_controller->cursor.pos_y = center.y;
+		view_3d_controller->cursor.pos_z = center.z;
+		view_3d_controller->cursor.distance = required_distance;
+	} else {
+		focus_selection();
+	}
+}
+
 void Node3DEditorViewport::assign_pending_data_pointers(Node3D *p_preview_node, AABB *p_preview_bounds, AcceptDialog *p_accept) {
 	preview_node = p_preview_node;
 	preview_bounds = p_preview_bounds;
@@ -6172,7 +6241,7 @@ bool Node3DEditorViewport::can_drop_data_fw(const Point2 &p_point, const Variant
 		}
 	}
 
-	String title = TTRN("Can't drop the file...", "Can't drop the files...", files.size());
+	String title = TPL(files.size(), TTR("Can't drop the file..."), TTR("Can't drop the files..."));
 	if (!error_message.is_empty()) {
 		_show_tooltip(title, error_message);
 		return false;
@@ -6194,18 +6263,9 @@ bool Node3DEditorViewport::can_drop_data_fw(const Point2 &p_point, const Variant
 	preview_node->hide();
 
 	String desc = "[ul]" +
-			TTRN("[b]Default:[/b] Add as sibling of selected node (except when root is selected).",
-					"[b]Default:[/b] Add as siblings of selected node (except when root is selected).",
-					files.size()) +
-			"\n" +
-			TTRN("[b]Hold Shift:[/b] Add as child of selected node.",
-					"[b]Hold Shift:[/b] Add as children of selected node.",
-					files.size()) +
-			"\n" +
-			vformat(TTRN("[b]Hold %s:[/b] Add as child of root node.",
-							"[b]Hold %s:[/b] Add as children of root node.",
-							files.size()),
-					keycode_get_string((Key)KeyModifierMask::ALT));
+			TPL(files.size(), TTR("[b]Default:[/b] Add as sibling of selected node (except when root is selected)."), TTR("[b]Default:[/b] Add as siblings of selected node (except when root is selected).")) + "\n" +
+			TPL(files.size(), TTR("[b]Hold Shift:[/b] Add as child of selected node."), TTR("[b]Hold Shift:[/b] Add as children of selected node.")) + "\n" +
+			vformat(TPL(files.size(), TTR("[b]Hold %s:[/b] Add as child of root node."), TTR("[b]Hold %s:[/b] Add as children of root node.")), keycode_get_string((Key)KeyModifierMask::ALT));
 
 	if (files.size() > 1) {
 		title = TTR("Dropping multiple files...");
@@ -7041,6 +7101,7 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 	view_display_menu->get_popup()->add_separator();
 	view_display_menu->get_popup()->add_shortcut(ED_GET_SHORTCUT("spatial_editor/focus_origin"), VIEW_CENTER_TO_ORIGIN);
 	view_display_menu->get_popup()->add_shortcut(ED_GET_SHORTCUT("spatial_editor/focus_selection"), VIEW_CENTER_TO_SELECTION);
+	view_display_menu->get_popup()->add_shortcut(ED_GET_SHORTCUT("spatial_editor/focus_aabb"), VIEW_CENTER_TO_AABB);
 	view_display_menu->get_popup()->set_item_tooltip(-1, TTR("Press Focus Selection twice to start following the selection as it moves. Press it yet another time to stop following the selection."));
 	view_display_menu->get_popup()->add_shortcut(ED_GET_SHORTCUT("spatial_editor/align_transform_with_view"), VIEW_ALIGN_TRANSFORM_WITH_VIEW);
 	view_display_menu->get_popup()->add_shortcut(ED_GET_SHORTCUT("spatial_editor/align_rotation_with_view"), VIEW_ALIGN_ROTATION_WITH_VIEW);
@@ -7259,15 +7320,13 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 	ruler_material_xray->set_transparency(BaseMaterial3D::TRANSPARENCY_ALPHA);
 	ruler_material_xray->set_render_priority(BaseMaterial3D::RENDER_PRIORITY_MAX);
 
-	geometry.instantiate();
-
-	geometry_xray.instantiate();
-
 	ruler_line = memnew(MeshInstance3D);
+	geometry.instantiate();
 	ruler_line->set_mesh(geometry);
 	ruler_line->set_material_override(ruler_material);
 
 	ruler_line_xray = memnew(MeshInstance3D);
+	geometry_xray.instantiate();
 	ruler_line_xray->set_mesh(geometry_xray);
 	ruler_line_xray->set_material_override(ruler_material_xray);
 
@@ -7288,13 +7347,11 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 	ruler_triangle_material_xray->set_flag(BaseMaterial3D::FLAG_ALBEDO_FROM_VERTEX_COLOR, true);
 
 	ruler_triangle_lines = memnew(MeshInstance3D);
-	Ref<ImmediateMesh> triangle_mesh;
 	triangle_mesh.instantiate();
 	ruler_triangle_lines->set_mesh(triangle_mesh);
 	ruler_triangle_lines->set_material_override(ruler_triangle_material);
 
 	ruler_triangle_lines_xray = memnew(MeshInstance3D);
-	Ref<ImmediateMesh> triangle_mesh_xray;
 	triangle_mesh_xray.instantiate();
 	ruler_triangle_lines_xray->set_mesh(triangle_mesh_xray);
 	ruler_triangle_lines_xray->set_material_override(ruler_triangle_material_xray);

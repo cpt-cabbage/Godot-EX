@@ -157,6 +157,7 @@ class Node3DEditorViewport : public Control {
 		VIEW_REAR,
 		VIEW_CENTER_TO_ORIGIN,
 		VIEW_CENTER_TO_SELECTION,
+		VIEW_CENTER_TO_AABB,
 		VIEW_ALIGN_TRANSFORM_WITH_VIEW,
 		VIEW_ALIGN_ROTATION_WITH_VIEW,
 		VIEW_PERSPECTIVE,
@@ -235,6 +236,8 @@ private:
 	Node3D *ruler_end_point = nullptr;
 	Ref<ImmediateMesh> geometry;
 	Ref<ImmediateMesh> geometry_xray;
+	Ref<ImmediateMesh> triangle_mesh;
+	Ref<ImmediateMesh> triangle_mesh_xray;
 	MeshInstance3D *ruler_line = nullptr;
 	MeshInstance3D *ruler_line_xray = nullptr;
 	Label *ruler_label = nullptr;
@@ -474,6 +477,7 @@ private:
 	bool previewing_camera = false;
 	bool previewing_cinema = false;
 	int times_focused_consecutively = 0;
+	bool follow_mode_uses_aabb = false;
 	bool pilot_preview_enabled = false;
 
 	bool pilot_undo_session_active = false;
@@ -567,6 +571,7 @@ public:
 	Point2 point_to_screen(const Vector3 &p_point);
 
 	void focus_selection();
+	void focus_aabb();
 
 	void assign_pending_data_pointers(
 			Node3D *p_preview_node,
