@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_blur.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_composite_upsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_denoise_guide.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
@@ -123,6 +124,8 @@
 // Per-viewport temporal state, attached to the render buffers rather than held
 // on the (single, renderer-wide) Raytracing object.
 #define RB_SCOPE_RT_STATE SNAME("rb_rt_state")
+// The composites' full-resolution upsample (composite_upsample()).
+#define RB_SCOPE_RT_COMPOSITE SNAME("rb_rt_composite")
 // This frame's motion vectors, written by the prepass for the temporal passes
 // (render_forward_clustered.cpp PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).
 #define RB_RT_VELOCITY SNAME("velocity")
@@ -167,6 +170,10 @@ public:
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 	uint32_t denoise_guide_frame[2][4] = {}; // Per view (up to two) and scale (1, 2, 4, 8 as index 0..3): the frame the guide was produced.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
+	// The frame the composites' full-resolution upsample ran, and which
+	// signals it wrote (COMPOSITE_UPSAMPLE_*).
+	uint32_t composite_frame = 0;
+	uint32_t composite_signals = 0;
 
 	// The translucency lighting volume (see process_translucency_volume):
 	// its ping-ponged textures and what last frame's mapping was, for the
@@ -570,6 +577,24 @@ private:
 	};
 	bool _denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness);
 
+	// The composites' upsample (rt_composite_upsample.glsl, composite_upsample()):
+	// variant 1 carries the image lights.
+	RtCompositeUpsampleShaderRD composite_upsample_shader;
+	RID composite_upsample_shader_version;
+	RID composite_upsample_pipeline[2];
+	struct CompositeUpsamplePushConstant {
+		float view_from_ndc[16];
+		int32_t full_size[2];
+		int32_t stochastic_scale;
+		int32_t gi_scale;
+		float view_from_world[4]; // A quaternion.
+		float luminance_weights[3];
+		float directionality;
+		uint32_t flags;
+		uint32_t pad[3];
+	};
+	static_assert(sizeof(CompositeUpsamplePushConstant) == 128);
+
 	RtHitBinShaderRD hit_bin_shader;
 	RID hit_bin_shader_version;
 	enum HitBinVariant {
@@ -893,6 +918,26 @@ public:
 	// striding the full-resolution buffer (2.3 ms of the TPS bridge's
 	// opaque pass at 1080p).
 	RID get_denoise_guide_normal(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_scale) const;
+
+	// The opaque pass's RT composites upsampled at full resolution in one
+	// compute pass (rt_composite_upsample.glsl), so the scene shader reads a
+	// texel per signal instead of weighing four taps of each (plan section
+	// 98). Call after the frame's last RT pass for the view, with the scales
+	// of the signals this frame produced (0: not produced, or at full
+	// resolution, which needs no upsample). Returns the signals written.
+	enum {
+		COMPOSITE_UPSAMPLE_STOCHASTIC = 1,
+		COMPOSITE_UPSAMPLE_STOCHASTIC_IMAGES = 2,
+		COMPOSITE_UPSAMPLE_GI = 4,
+	};
+	// The GI's re-basing runs there too (p_gi_directional, rt_gi bit 3; its
+	// visibility for the specular occlusion with p_gi_occlusion, bit 4).
+	uint32_t composite_upsample(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, RID p_normal_roughness, uint32_t p_stochastic_scale, bool p_stochastic_images, uint32_t p_gi_scale, bool p_gi_directional, bool p_gi_occlusion, float p_gi_directionality);
+	// What composite_upsample() wrote this frame (0 if it did not run), and
+	// its textures: 0 the packed texel, 1 the visibility, 2-3 the image
+	// lights' (see the shader).
+	uint32_t get_composite_signals(Ref<RenderSceneBuffersRD> p_render_buffers) const;
+	RID get_composite_texture(Ref<RenderSceneBuffersRD> p_render_buffers, int p_index) const;
 
 	// The temporal passes' own velocity buffer, written by the prepass with
 	// this frame's motion vectors (the colour pass's is a frame stale for

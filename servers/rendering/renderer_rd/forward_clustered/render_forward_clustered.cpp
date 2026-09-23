@@ -895,6 +895,21 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			scene_state.ubo.rt_gi |= 512u;
 		}
 	}
+	// The composites' full-resolution upsample ran this frame for the
+	// signals the pass reads (bit 7 / bit 10; the bindings at 59-64): the
+	// fragment reads one texel a signal. The image lights' two only when
+	// it wrote them for a frame that has them.
+	if (raytracing != nullptr && p_opaque_render_buffers && p_render_data->render_buffers.is_valid()) {
+		const uint32_t signals = raytracing->get_composite_signals(p_render_data->render_buffers);
+		const uint32_t stochastic = scene_state.ubo.stochastic_direct_lights;
+		const bool images = (stochastic & 8u) == 0u;
+		if ((stochastic & 3u) >= 2u && (signals & RendererRD::Raytracing::COMPOSITE_UPSAMPLE_STOCHASTIC) && images == bool(signals & RendererRD::Raytracing::COMPOSITE_UPSAMPLE_STOCHASTIC_IMAGES)) {
+			scene_state.ubo.stochastic_direct_lights |= 128u;
+		}
+		if ((scene_state.ubo.rt_gi & 3u) >= 2u && (signals & RendererRD::Raytracing::COMPOSITE_UPSAMPLE_GI)) {
+			scene_state.ubo.rt_gi |= 1024u;
+		}
+	}
 	if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT") && p_opaque_render_buffers) {
 		static uint32_t last_words[2] = { UINT32_MAX, UINT32_MAX };
 		if (last_words[0] != scene_state.ubo.stochastic_direct_lights || last_words[1] != scene_state.ubo.rt_gi) {
@@ -3377,6 +3392,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 							rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), rb_data->get_gbuf_f0(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_near, scene_data->z_far, gi_quality);
 				}
 			}
+			// The opaque pass's composites upsampled at full resolution, one
+			// texel a signal for the scene shader (plan section 98); one view
+			// and no MSAA, where the prepass pixel is the opaque fragment.
+			// GODOT_RT_COMPOSITE_UPSAMPLE=0 keeps the per-fragment upsample,
+			// as do the opaque pass's ablations of it.
+			static const bool composite_upsample_off = OS::get_singleton()->get_environment("GODOT_RT_COMPOSITE_UPSAMPLE") == "0";
+			static const String composite_ablate = OS::get_singleton()->get_environment("GODOT_RT_OPAQUE_ABLATE");
+			if (!composite_upsample_off && !composite_ablate.contains("slow") && !composite_ablate.contains("normal") && !composite_ablate.contains("paint") && rb->get_view_count() == 1 && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED) {
+				RenderSceneDataRD *upsample_scene_data = p_render_data->scene_data;
+				const uint32_t stochastic_scale = (run_stochastic && use_stochastic_half_res) ? (use_stochastic_quarter_res ? 4 : 2) : 0;
+				const uint32_t gi_scale = (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid() && use_rt_gi_half_res) ? (use_rt_gi_quarter_res ? 4 : 2) : 0;
+				raytracing->composite_upsample(rb, 0, upsample_scene_data->get_view_projection(0).inverse(), upsample_scene_data->get_cam_transform(), rb_data->get_normal_roughness(0), stochastic_scale, raytracing->get_image_chain_count() != 0, gi_scale,
+						use_rt_gi_directional, use_rt_gi_specular_occlusion, rt_gi_directionality);
+			}
 			RD::get_singleton()->draw_command_end_label();
 			_request_ray_tracing_convergence(p_render_data, rb_data.ptr());
 			// The per-pass buffers of this frame to disk, when a harness asked
@@ -5268,6 +5297,19 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		const StringName &name = i == 0 ? RB_RT_GI_AMBIENT : (i == 1 ? RB_RT_GI_REFLECTION : (i == 2 ? gi_depth_name : RB_RT_GI_DIRECTIONAL));
 		RID buffer = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_GI, name) ? rb->get_texture(RB_SCOPE_RT_GI, name) : RID();
 		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
+	for (uint32_t i = 0; i < 4; i++) {
+		// The composites' full-resolution upsample (Raytracing::composite_upsample):
+		// the packed texel (unsigned, declared 2D in both layouts: multiview
+		// never reads it), the visibility and the image lights' two.
+		RD::Uniform u;
+		u.binding = 59 + i;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID buffer = (rb.is_valid() && raytracing != nullptr) ? raytracing->get_composite_texture(rb, i) : RID();
+		RID texture = buffer.is_valid() ? buffer : texture_storage->texture_rd_get_default(i == 0 ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_UINT : (is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK));
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}

@@ -1999,6 +1999,14 @@ void fragment_shader(in SceneData scene_data) {
 	vec3 rt_gi_bent_normal = normal;
 	float rt_gi_visibility = 1.0;
 	bool rt_gi_occlusion_valid = false;
+	// The composites' full-resolution upsample (rt_composite_upsample.glsl):
+	// one texel for both, read once: the GI's ambient, re-based onto this
+	// pixel's normal, and its reflection as six halves in x-z, the direct
+	// ratios as two in w.
+	uvec4 rt_composite = uvec4(0u);
+	if (((implementation_data.stochastic_direct_lights & 128u) | (implementation_data.rt_gi & 1024u)) != 0u) {
+		rt_composite = texelFetch(usampler2D(composite_packed, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0);
+	}
 	// The traced reflection is held back until the specular occlusion term
 	// has run: a ray that hits the nearby wall already returns the wall, so
 	// occluding it again by the same geometry darkens it twice. Only the
@@ -2322,6 +2330,13 @@ void fragment_shader(in SceneData scene_data) {
 		// reconstruction re-bases onto this fragment's normal.
 		vec3 rt_gi_gather_normal = rt_gi_face;
 		bool rt_gi_valid = false;
+		// The re-basing already ran in the full-resolution upsample.
+		bool rt_gi_rebased = false;
+#ifdef BENT_NORMAL_MAP_USED
+		const bool rt_gi_bent = true;
+#else
+		const bool rt_gi_bent = false;
+#endif
 		if ((implementation_data.rt_gi & 3u) == 1u) {
 #ifdef USE_MULTIVIEW
 			rt_gi_ambient = textureLod(sampler2DArray(rt_gi_ambient_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).rgb;
@@ -2332,6 +2347,30 @@ void fragment_shader(in SceneData scene_data) {
 			rt_gi_reflection = textureLod(sampler2D(rt_gi_reflection_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).rgb;
 			rt_gi_directional = textureLod(sampler2D(rt_gi_directional_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0);
 #endif
+			rt_gi_valid = true;
+		} else if ((implementation_data.rt_gi & 1024u) != 0u && !rt_gi_bent) {
+			// The upsample below and the re-basing after it, run at full
+			// resolution in compute against the prepass's depth and normal
+			// (rt_composite_upsample.glsl). The prepass has no bent normal, so
+			// a material with a bent normal map keeps the loop.
+			vec2 rtgi_up_y = unpackHalf2x16(rt_composite.y);
+			rt_gi_ambient = vec3(unpackHalf2x16(rt_composite.x), rtgi_up_y.x);
+			rt_gi_reflection = vec3(rtgi_up_y.y, unpackHalf2x16(rt_composite.z));
+			rt_gi_rebased = true;
+			if ((implementation_data.rt_gi & 16u) != 0u) {
+				// Negative where the moment gave no direction (the re-basing
+				// did not run, so the occlusion keeps its heuristic).
+#ifdef USE_MULTIVIEW
+				float rtgi_up_visibility = texelFetch(sampler2DArray(composite_visibility, SAMPLER_NEAREST_CLAMP), ivec3(ivec2(gl_FragCoord.xy), int(ViewIndex)), 0).r;
+#else
+				float rtgi_up_visibility = texelFetch(sampler2D(composite_visibility, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0).r;
+#endif
+				if (rtgi_up_visibility >= 0.0) {
+					rt_gi_bent_normal = normal;
+					rt_gi_visibility = rtgi_up_visibility;
+					rt_gi_occlusion_valid = true;
+				}
+			}
 			rt_gi_valid = true;
 		} else {
 			// Half resolution: the same depth-aware upsample the stochastic
@@ -2499,7 +2538,7 @@ void fragment_shader(in SceneData scene_data) {
 		}
 		if (rt_gi_valid) {
 			ambient_light = rt_gi_ambient;
-			if (bool(implementation_data.rt_gi & 8u)) {
+			if (bool(implementation_data.rt_gi & 8u) && !rt_gi_rebased) {
 				// Re-base the gathered irradiance onto this fragment's own
 				// normal. The gather integrates a cosine lobe around the
 				// half-resolution normal, so a normal-mapped surface gets one
@@ -3715,7 +3754,30 @@ void fragment_shader(in SceneData scene_data) {
 		// thin features take the loop.
 		bool stochastic_fast = false;
 		vec2 stochastic_guv = vec2(0.0);
-		if (stochastic_guide && stochastic_normal_test) {
+		// Bit 7: the loop below ran at full resolution in compute, against
+		// the prepass's depth and normal (rt_composite_upsample.glsl), and
+		// this fragment reads its pixel's result: the ratios (one scalar
+		// each, in the texel read with the GI's), and the image lights'
+		// terms where there are any.
+		bool stochastic_upsampled = (implementation_data.stochastic_direct_lights & 128u) != 0u && !tv_active;
+		if (stochastic_upsampled) {
+			vec2 up_ratios = unpackHalf2x16(rt_composite.w);
+			if (read_images) {
+				ivec2 up_pixel = ivec2(gl_FragCoord.xy);
+#ifdef USE_MULTIVIEW
+				vec4 up_image_0 = texelFetch(sampler2DArray(composite_image_diffuse, SAMPLER_NEAREST_CLAMP), ivec3(up_pixel, int(ViewIndex)), 0);
+				up_image_specular = vec4(texelFetch(sampler2DArray(composite_image_specular, SAMPLER_NEAREST_CLAMP), ivec3(up_pixel, int(ViewIndex)), 0).rgb, up_image_0.a);
+#else
+				vec4 up_image_0 = texelFetch(sampler2D(composite_image_diffuse, SAMPLER_NEAREST_CLAMP), up_pixel, 0);
+				up_image_specular = vec4(texelFetch(sampler2D(composite_image_specular, SAMPLER_NEAREST_CLAMP), up_pixel, 0).rgb, up_image_0.a);
+#endif
+				up_image_diffuse = up_image_0.rgb;
+			}
+			up_diffuse = vec3(up_ratios.x);
+			up_specular = vec4(vec3(up_ratios.y), 0.0);
+			up_weight = 1.0;
+		}
+		if (!stochastic_upsampled && stochastic_guide && stochastic_normal_test) {
 			vec2 gsize = vec2(half_size);
 			vec2 corner = (vec2(base) + 1.0) / gsize;
 #ifdef USE_MULTIVIEW
@@ -3783,7 +3845,7 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 			up_weight = 1.0;
 		}
-		for (int i = 0; i < 4 && !stochastic_fast; i++) {
+		for (int i = 0; i < 4 && !stochastic_fast && !stochastic_upsampled; i++) {
 			ivec2 off = ivec2(i & 1, i >> 1);
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
 			// The full-res pixel the sampling pass lit texel hp at (it clamps

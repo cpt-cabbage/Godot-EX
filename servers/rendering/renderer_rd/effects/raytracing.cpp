@@ -174,6 +174,17 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 		denoise_guide_pipeline = RD::get_singleton()->compute_pipeline_create(denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 0));
 	}
 
+	{
+		Vector<String> upsample_modes;
+		upsample_modes.push_back("");
+		upsample_modes.push_back("\n#define USE_IMAGES\n");
+		composite_upsample_shader.initialize(upsample_modes);
+		composite_upsample_shader_version = composite_upsample_shader.version_create();
+		for (int i = 0; i < 2; i++) {
+			composite_upsample_pipeline[i] = RD::get_singleton()->compute_pipeline_create(composite_upsample_shader.version_get_shader(composite_upsample_shader_version, i));
+		}
+	}
+
 	Vector<String> light_list_modes;
 	light_list_modes.push_back("");
 	light_list_shader.initialize(light_list_modes);
@@ -273,6 +284,7 @@ Raytracing::~Raytracing() {
 	}
 	hit_bin_shader.version_free(hit_bin_shader_version);
 	denoise_guide_shader.version_free(denoise_guide_shader_version);
+	composite_upsample_shader.version_free(composite_upsample_shader_version);
 	translucency_shader.version_free(translucency_shader_version);
 	RD::get_singleton()->free_rid(sampler);
 	RD::get_singleton()->free_rid(stbn_texture);
@@ -1174,6 +1186,157 @@ bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint
 	rd->compute_list_end();
 	rd->draw_command_end_label();
 	return true;
+}
+
+static const StringName &_composite_texture_name(int p_index) {
+	static const StringName names[4] = { SNAME("composite_packed"), SNAME("composite_visibility"), SNAME("composite_image_diffuse"), SNAME("composite_image_specular") };
+	return names[p_index];
+}
+
+uint32_t Raytracing::composite_upsample(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, RID p_normal_roughness, uint32_t p_stochastic_scale, bool p_stochastic_images, uint32_t p_gi_scale, bool p_gi_directional, bool p_gi_occlusion, float p_gi_directionality) {
+	ERR_FAIL_NULL_V(rb_state, 0);
+	rb_state->composite_signals = 0;
+	if (p_view != 0 || p_normal_roughness.is_null() || (p_stochastic_scale <= 1 && p_gi_scale <= 1)) {
+		return 0;
+	}
+	RD *rd = RD::get_singleton();
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+	const Size2i full_size = p_render_buffers->get_internal_size();
+
+	// Created cleared (the scene shader only reads pixels this wrote, but
+	// a texture is never left uninitialized), recreated on a size change.
+	if (p_render_buffers->has_texture(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(0))) {
+		RD::TextureFormat tf = p_render_buffers->get_texture_format(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(0));
+		if (tf.width != uint32_t(full_size.x) || tf.height != uint32_t(full_size.y)) {
+			p_render_buffers->clear_context(RB_SCOPE_RT_COMPOSITE);
+		}
+	}
+	// The image lights' two only once a frame has image lights (16 MB each
+	// at 1080p).
+	for (int i = 0; i < 4; i++) {
+		if (i > 1 && !p_stochastic_images) {
+			continue;
+		}
+		if (!p_render_buffers->has_texture(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(i))) {
+			_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_COMPOSITE, _composite_texture_name(i), i == 0 ? RD::DATA_FORMAT_R32G32B32A32_UINT : (i == 1 ? RD::DATA_FORMAT_R16_SFLOAT : RD::DATA_FORMAT_R16G16B16A16_SFLOAT),
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, full_size);
+		}
+	}
+
+	CompositeUpsamplePushConstant pc = {};
+	for (int col = 0; col < 4; col++) {
+		for (int row = 0; row < 4; row++) {
+			pc.view_from_ndc[col * 4 + row] = p_view_from_ndc.columns[col][row];
+		}
+	}
+	pc.full_size[0] = full_size.x;
+	pc.full_size[1] = full_size.y;
+	pc.stochastic_scale = int32_t(MAX(p_stochastic_scale, 1u));
+	pc.gi_scale = int32_t(MAX(p_gi_scale, 1u));
+	// The scene shader rotates the world-space moment by
+	// transpose(mat3(inv_view_matrix)): the camera basis transposed.
+	const Quaternion view_from_world = p_world_from_view.basis.orthonormalized().transposed().get_quaternion();
+	pc.view_from_world[0] = view_from_world.x;
+	pc.view_from_world[1] = view_from_world.y;
+	pc.view_from_world[2] = view_from_world.z;
+	pc.view_from_world[3] = view_from_world.w;
+	const Vector3 luminance = ColorManagement::get_luminance_weights();
+	pc.luminance_weights[0] = luminance.x;
+	pc.luminance_weights[1] = luminance.y;
+	pc.luminance_weights[2] = luminance.z;
+	pc.directionality = p_gi_directionality;
+
+	RID black = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+	RID stochastic[6] = { black, black, black, black, black, black }; // diffuse, specular, image diffuse, image specular, depth, normal
+	RID gi[5] = { black, black, black, black, black }; // ambient, reflection, directional, depth, normal
+	uint32_t signals = 0;
+	const bool parity = rb_state->history_parity;
+	if (p_stochastic_scale > 1 && p_render_buffers->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE)) {
+		signals |= COMPOSITE_UPSAMPLE_STOCHASTIC;
+		pc.flags |= 1u;
+		stochastic[0] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE, p_view, 0);
+		stochastic[1] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR, p_view, 0);
+		if (p_stochastic_images) {
+			signals |= COMPOSITE_UPSAMPLE_STOCHASTIC_IMAGES;
+			pc.flags |= 2u;
+			stochastic[2] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_DIFFUSE, p_view, 0);
+			stochastic[3] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_IMAGE_SPECULAR, p_view, 0);
+		}
+		// The view depth the sampling pass wrote this frame (the other
+		// slot is last frame's, for the history test).
+		stochastic[4] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, parity ? RB_RT_STOCHASTIC_VIEW_DEPTH_0 : RB_RT_STOCHASTIC_VIEW_DEPTH_1, p_view, 0);
+		RID guide = get_denoise_guide_normal(p_render_buffers, p_stochastic_scale);
+		if (guide.is_valid()) {
+			pc.flags |= 4u;
+		}
+		stochastic[5] = guide.is_valid() ? guide : p_normal_roughness;
+	}
+	if (p_gi_scale > 1 && p_render_buffers->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT)) {
+		signals |= COMPOSITE_UPSAMPLE_GI;
+		pc.flags |= 8u;
+		gi[0] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_AMBIENT, p_view, 0);
+		gi[1] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION, p_view, 0);
+		gi[2] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_DIRECTIONAL, p_view, 0);
+		gi[3] = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, parity ? RB_RT_GI_VIEW_DEPTH_0 : RB_RT_GI_VIEW_DEPTH_1, p_view, 0);
+		RID guide = get_denoise_guide_normal(p_render_buffers, p_gi_scale);
+		if (guide.is_valid()) {
+			pc.flags |= 16u;
+		}
+		gi[4] = guide.is_valid() ? guide : p_normal_roughness;
+		pc.flags |= (p_gi_directional ? 32u : 0u) | (p_gi_occlusion ? 64u : 0u);
+	}
+	if (signals == 0) {
+		return 0;
+	}
+
+	const int variant = (signals & COMPOSITE_UPSAMPLE_STOCHASTIC_IMAGES) ? 1 : 0;
+	RID shader_rid = composite_upsample_shader.version_get_shader(composite_upsample_shader_version, variant);
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	thread_local LocalVector<RD::Uniform> inputs;
+	inputs.clear();
+	inputs.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_render_buffers->get_depth_texture(p_view) })));
+	inputs.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, p_normal_roughness })));
+	for (int i = 0; i < 6; i++) {
+		inputs.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2 + i, Vector<RID>({ sampler, stochastic[i] })));
+	}
+	for (int i = 0; i < 5; i++) {
+		inputs.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8 + i, Vector<RID>({ sampler, gi[i] })));
+	}
+	thread_local LocalVector<RD::Uniform> outputs;
+	outputs.clear();
+	for (int i = 0; i < (variant ? 4 : 2); i++) {
+		outputs.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, i, Vector<RID>({ p_render_buffers->get_texture_slice(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(i), p_view, 0) })));
+	}
+
+	RENDER_TIMESTAMP("RT Composite Upsample");
+	rd->draw_command_begin_label("RT Composite Upsample");
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, composite_upsample_pipeline[variant]);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache_vec(shader_rid, 0, inputs), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache_vec(shader_rid, 1, outputs), 1);
+	rd->compute_list_set_push_constant(list, &pc, sizeof(CompositeUpsamplePushConstant));
+	rd->compute_list_dispatch_threads(list, full_size.x, full_size.y, 1);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+
+	rb_state->composite_frame = rb_state->frame_index;
+	rb_state->composite_signals = signals;
+	return signals;
+}
+
+uint32_t Raytracing::get_composite_signals(Ref<RenderSceneBuffersRD> p_render_buffers) const {
+	if (rb_state == nullptr || p_render_buffers.is_null() || rb_state->composite_frame != rb_state->frame_index || rb_state->frame_index == 0) {
+		return 0;
+	}
+	return rb_state->composite_signals;
+}
+
+RID Raytracing::get_composite_texture(Ref<RenderSceneBuffersRD> p_render_buffers, int p_index) const {
+	ERR_FAIL_INDEX_V(p_index, 4, RID());
+	if (p_render_buffers.is_null() || !p_render_buffers->has_texture(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(p_index))) {
+		return RID();
+	}
+	return p_render_buffers->get_texture(RB_SCOPE_RT_COMPOSITE, _composite_texture_name(p_index));
 }
 
 void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_gbuf_albedo, RID p_gbuf_f0, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
