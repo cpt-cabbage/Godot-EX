@@ -108,7 +108,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float grid_cell;
 	uint grid_n;
 	uint grid_cap;
-	float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (see accumulate).
+	float pad_bounce_floor;
 	uint young_rays; // Extra bounce rays for a texel whose accumulation is young (see trace_bounce_young).
 	uint dynamic_rays; // Light rays per dynamic light per texel per relight (see trace_dynamic).
 	float dynamic_motion; // How far the dynamic lights moved this frame, over the distance that refreshes their bounce whole (0 at rest, 1 and above a full refresh): caps the dynamic histories' length at its inverse (see accumulate).
@@ -116,7 +116,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	float dynamic_change; // How much the dynamic lights' intensity or colour changed this frame, relative (a hue turning at constant luminance is a change the luminance below cannot see).
 	float dynamic_join; // On the frame a light joins the dynamic set (every set relit): the share of its bounce the static accumulation holds, which it sheds (see accumulate). 0 otherwise.
 	uint area_light_count; // The area lights (every one in the population: a few, each tested for range per texel).
-	float dynamic_mark; // The most a moving light's direct term may mark a texel for the screen (see accumulate); a change of intensity or colour is not capped.
+	float pad_dynamic_mark;
 	uint lod_rays; // Per level, a byte: the cosine rays a representative traces per relight (see main).
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	MirrorPlane mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
@@ -136,7 +136,6 @@ params;
 #define FLAG_DYN_FILTER 128u // The static and the dynamic bounce histories filtered over the card at every age (filter_bounces; GODOT_CARD_DYN_FILTER=0 clears it).
 #define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
 #define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights.
-#define FLAG_BOUNCE_REQUESTS 8192u // The bounce rays' landings ask to be relit (GODOT_CARD_BOUNCE_REQUESTS=1; see card_requests).
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -262,7 +261,6 @@ layout(set = 0, binding = 23, std430) restrict buffer Relit {
 	uint frame[SURFACE_CACHE_MAX_SETS * 2u];
 	uint tile_prev[TILE_STAMPS]; // Per 8x8 atlas block (a tile's first): the relight before this one (the prepare pass promotes as it lists the tile).
 	uint tile_last[TILE_STAMPS];
-	uint tile_age[TILE_STAMPS]; // The tile's relight count after this relight, the minimum over its texels (the prepare pass lists the young every frame).
 	uint tile_lod[TILE_STAMPS]; // The level of this relight (low four bits) and of the one before (the next four), set by the prepare pass.
 }
 relit;
@@ -363,9 +361,6 @@ layout(set = 0, binding = 33, rgba16f) uniform restrict image2D indirect_dyn_fil
 // the readers (the gather's fallback and youth, the hit shader), the
 // accumulation itself staying raw in indirect_atlas. Alpha: its relights.
 layout(set = 0, binding = 34, rgba16f) uniform restrict image2D indirect_filtered_atlas;
-// The gather's screen memory of each texel (stochastic_indirect_gi.glsl
-// screen_radiance_boost); only zeroed here, on a fresh capture.
-layout(set = 0, binding = 36, rgba16f) uniform restrict writeonly image2D screen_atlas;
 // The atlas tiles written this relight (32 texels square), for the mip
 // chain to rebuild only those (surface_cache.cpp update_lighting).
 layout(set = 0, binding = 37, std430) restrict writeonly buffer MipDirty {
@@ -802,12 +797,6 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	r_change_total = change_load_total(best_texel);
 	r_albedo = card_diffuse_albedo(best_texel, p_world_hit);
 	r_texel = best_texel;
-	if ((params.flags & FLAG_BOUNCE_REQUESTS) != 0u) {
-		uint bit;
-		uint word = card_tile_word(inst.set, best_k, sets.data[inst.set].cards[best_k], best_texel, bit);
-		atomicOr(card_requests.tiles[word], bit);
-		card_requests.frame[inst.set] = params.frame;
-	}
 	// The captured normal, as read_texel decodes it: the dynamic bounce needs
 	// the surface's orientation at the hit for its geometry terms.
 	vec3 n_cam = normalize(texelFetch(normal_atlas, best_texel, 0).rgb * 2.0 - 1.0);
@@ -2016,11 +2005,6 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	// reset flag is raised on the frame its record is built, which is not
 	// always the frame it is first lit.
 	bool fresh = reset || old.a <= 0.0;
-	if (fresh) {
-		// The screen's memory of this texel (the gather's) is of whatever
-		// the atlas page held before.
-		SPLAT_STORE(screen_atlas, texel, vec4(0.0));
-	}
 	// The change the ray's hit carried, weighted by what the hit is worth
 	// here: the sample's luminance over the accumulation's. A wall lit by a
 	// panel reads the panel's change whole (the sample is the accumulation);
@@ -2072,20 +2056,12 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	float total_lum = luminance(unshadowed) + dyn_lum;
 	float prev_total_lum = luminance(prev.unshadowed) + dyn_old.a;
 	float dyn_change = (fresh || level_changed) ? 0.0 : abs(dyn_lum - dyn_old.a) / max(max(dyn_lum, dyn_old.a), max(0.25 * max(total_lum, prev_total_lum), 1e-4));
-	// A moving light's mark is capped (params.dynamic_mark, 0.125: the
-	// screen restarts to eight frames at most, never to the young fallback).
-	// The gather adds a dynamic light's direct term at the hit analytically
-	// every frame, so what the mark buys is the screen's lag on the change,
-	// and a full restart every frame is the whole screen speckled: the TPS
-	// demo's forklift spotlights, flying at 14 m/s round a 68 m orbit,
-	// marked a third of the level's texels whole each frame and the GI
-	// history never passed one frame while the level was played (98% of
-	// the pixels young; the frame time doubled on the fallback, and the
-	// slower frame moved the light farther per frame). The flashlight's
-	// sweeps (5% a frame, section 19) sit under the cap and are unchanged.
+	// A cap on a moving light's mark was measured (section 86): the TPS
+	// demo's forklift beams kept the screen at one frame uncapped, but the
+	// cap is the screen's lag on the change; uncapped since the moving
+	// lights' term became a screen history of its own (section 88).
 	// A light switching or changing colour (params.dynamic_change) is a
-	// step the screen should take whole, and is not capped.
-	dyn_change = min(dyn_change, params.dynamic_mark);
+	// step the screen should take whole.
 	if (!fresh && dyn_lum > 0.05 * total_lum) {
 		dyn_change = max(dyn_change, params.dynamic_change);
 	}
@@ -2214,7 +2190,7 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn2 = mix(max(dyn2_old.rgb, vec3(0.0)), dyn2_sample, dyn_alpha);
 		dyn_frames = min(dyn_frames + 1.0, 64.0);
 	}
-	float keep_ind = (change > 0.02 && (params.debug & 32u) == 0u) ? max(params.bounce_floor, 1.0 / change) : 64.0;
+	float keep_ind = (change > 0.02 && (params.debug & 32u) == 0u) ? max(1.0, 1.0 / change) : 64.0;
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
 	// The hand-over of a light joining the dynamic set (params.dynamic_join,
 	// the frame every set is relit). Until it moved, the light was one of
@@ -2384,24 +2360,6 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	}
 }
 
-// The tile's relight count for the prepare pass's young-first listing: the
-// bounce accumulation's count the texel just stored (restarted by a light
-// change, so a changed tile reads young again), the minimum over the tile
-// (the group's lanes first, one atomic per SIMD group on the tile's stamp,
-// which the prepare pass set to the top as it listed the tile).
-void record_tile_age(ivec2 p_tile_texel, ivec2 p_texel) {
-	uint age = uint(imageLoad(indirect_atlas, p_texel).a * 64.0);
-	if (splat_side >= 4) {
-		// A coarse item spans several tiles: each lane records its own.
-		atomicMin(relit.tile_age[uint(p_tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(p_tile_texel.x >> 3)], age);
-		return;
-	}
-	age = subgroupMin(age);
-	if (subgroupElect()) {
-		atomicMin(relit.tile_age[uint(p_tile_texel.y >> 3) * TILE_STAMP_STRIDE + uint(p_tile_texel.x >> 3)], age);
-	}
-}
-
 void main() {
 	// One workgroup per work item the prepare pass listed: the block of a
 	// card of an active set (a requested tile, or every block of a set due
@@ -2533,7 +2491,6 @@ void main() {
 		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
-		record_tile_age(tile_texel, texel);
 		return;
 	}
 	// The tile's relight before this one, whose bounce ray the gradient
@@ -2594,7 +2551,6 @@ void main() {
 		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
-		record_tile_age(origin_texel + (block_origin & ~15), texel);
 		return;
 	}
 
@@ -2675,5 +2631,4 @@ void main() {
 		shade_direct(set, t[k], seed_k, images, d);
 		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
-	record_tile_age(tile_texel, tracer_texel);
 }

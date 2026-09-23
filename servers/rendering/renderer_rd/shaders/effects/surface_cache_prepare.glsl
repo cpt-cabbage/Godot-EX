@@ -111,7 +111,6 @@ layout(set = 0, binding = 8, std430) restrict buffer Relit {
 	uint frame[SURFACE_CACHE_MAX_SETS * 2u];
 	uint tile_prev[TILE_STAMPS];
 	uint tile_last[TILE_STAMPS];
-	uint tile_age[TILE_STAMPS]; // The tile's relight count after its last relight (the lighting pass's minimum over the tile; reset as the tile is listed).
 	uint tile_lod[TILE_STAMPS]; // The level of the tile's last relight (low four bits) and of the one before (the next four): the lighting pass re-traces the previous ray only when the levels agree.
 }
 relit;
@@ -127,8 +126,8 @@ layout(push_constant, std430) uniform Push {
 	uint max_items; // The work list's cap: 16x16 (or 8x8, flag bit 1) blocks lit this frame, in cost units of an eighth of a block (see Active).
 	uint idle_divisor; // Settled cards under static lights: only one set in this many is due each frame (1: all).
 	uint flags; // 1: blocks are 8x8 (the bounce ray per texel), else 16x16 (shared per quad); 2: hashed turns alone; 4: turns by age alone.
-	uint young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: the turns alone).
-	uint young_period; // Frames between two relights of a young tile (1: every frame).
+	uint pad_young0;
+	uint pad_young1;
 	uint full_lod; // The level the whole-set relights (fresh captures, the round robin) are listed at.
 	uint lod_costs; // Per level, a byte: the cost of one tile relit at that level, in eighths of a full tile (32, 16, 4, 1).
 	uint max_item_count; // The work list's length.
@@ -266,10 +265,6 @@ void stamp_tile(uint idx, uint lod, bool asked_coarser) {
 	if (last != push.frame) {
 		relit.tile_prev[idx] = last;
 		relit.tile_last[idx] = push.frame;
-		// The relight count starts from the top for the lighting pass's
-		// minimum over the tile; a block the pass leaves untouched (an
-		// uncaptured edge) reads as converged, never as young.
-		relit.tile_age[idx] = 64u;
 		// This relight's level, the previous one's, and the streak of
 		// listings whose request was coarser than the level relit (the hold
 		// against alternation, see the tiles pass).
@@ -493,17 +488,14 @@ void main() {
 			}
 			// Due: never relit (a surface seen for the first time goes at
 			// once), asked finer than its last relight (a surface the round
-			// robin warmed coarse, or one the camera came near), young (under
-			// young_relights relights since its capture or its last light
-			// change) and young_period frames since its last relight, or its
-			// hashed turn (one frame in `period`, at random, the period over
-			// the mature tiles alone). A region goes when any of its tiles is
-			// due. Every frame was measured first (tag young262): the
-			// restarting tiles at rest then read a fresh one-sample relight
-			// every frame and the machines' flicker doubled, and on the hall
-			// strafe the young filled the cap, the mature tiles' period
-			// climbed, and their bounce, which reads the newly lit tiles,
-			// went stale -- the frame darker and the stop's worst tile +75%.
+			// robin warmed coarse, or one the camera came near), or its
+			// hashed turn (one frame in `period`, at random). A region goes
+			// when any of its tiles is due. Listing the young tiles (under a
+			// few relights since a capture or a light change) on a short
+			// period of their own was measured (section 90): at rest their
+			// one-sample relights doubled the machines' flicker, and on the
+			// hall strafe they filled the cap and the mature tiles went
+			// stale.
 			// Turns by age alone (listed once the last relight is `period`
 			// old) were measured: the relights fall into bursts, every
 			// tile's mark lands in the same frame, and the screen history sat
@@ -522,7 +514,7 @@ void main() {
 				uint last = relit.tile_last[stamp];
 				bool turn = period <= 1u || ((set * 7u + k * 13u + u * 31u + push.frame) % period) == 0u;
 				bool finer = last != 0u && lod < (relit.tile_lod[stamp] & 0xFu);
-				bool young = last == 0u || finer || (push.young_relights > 0u && relit.tile_age[stamp] < push.young_relights && push.frame - last >= max(push.young_period, 1u));
+				bool young = last == 0u || finer;
 				young_any = young_any || young;
 				if ((push.flags & 2u) != 0u) {
 					due = due || turn;

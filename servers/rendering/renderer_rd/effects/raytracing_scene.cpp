@@ -760,26 +760,22 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 	// ray at a face two kit pieces share came back from the other piece one
 	// relight in a hundred on the TPS bridge, which the cards' bounce
 	// gradient read as a surface moving and the GI history restarted on,
-	// everywhere, for good (section 77). GODOT_TLAS_UNSORTED=1 keeps the
-	// cull's order.
-	static const bool sort_instances = OS::get_singleton()->get_environment("GODOT_TLAS_UNSORTED") != "1";
+	// everywhere, for good (section 77).
 	thread_local LocalVector<RenderGeometryInstanceBase *> ordered;
 	ordered.clear();
 	ordered.reserve(p_instances.size());
 	for (uint64_t i = 0; i < p_instances.size(); i++) {
 		ordered.push_back(static_cast<RenderGeometryInstanceBase *>(p_instances[i]));
 	}
-	if (sort_instances) {
-		struct ByBaseThenAddress {
-			bool operator()(RenderGeometryInstanceBase *a, RenderGeometryInstanceBase *b) const {
-				if (a->data->base.get_id() != b->data->base.get_id()) {
-					return a->data->base.get_id() < b->data->base.get_id();
-				}
-				return uintptr_t(a) < uintptr_t(b);
+	struct ByBaseThenAddress {
+		bool operator()(RenderGeometryInstanceBase *a, RenderGeometryInstanceBase *b) const {
+			if (a->data->base.get_id() != b->data->base.get_id()) {
+				return a->data->base.get_id() < b->data->base.get_id();
 			}
-		};
-		ordered.sort_custom<ByBaseThenAddress>();
-	}
+			return uintptr_t(a) < uintptr_t(b);
+		}
+	};
+	ordered.sort_custom<ByBaseThenAddress>();
 
 	for (uint64_t i = 0; i < ordered.size(); i++) {
 		RenderGeometryInstanceBase *inst = ordered[i];
@@ -848,11 +844,9 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 		// sub-instance), and every sub-instance's record maps the world into
 		// that space, so a hit on any of them reads the shared cards. Coarse
 		// for a field, right for a room's worth of chairs; before this the
-		// sub-instances had no cards at all (GODOT_CARD_NO_MULTIMESH=1 keeps
-		// that, for the comparison).
-		static const bool no_multimesh_cards = OS::get_singleton()->get_environment("GODOT_CARD_NO_MULTIMESH") == "1";
+		// sub-instances had no cards at all.
 		uint32_t card_set = SurfaceCache::INVALID_ID;
-		if (p_surface_cache != nullptr && !(is_multimesh && no_multimesh_cards)) {
+		if (p_surface_cache != nullptr) {
 			card_set = p_surface_cache->add_instance(inst, is_skinned, is_skinned ? mesh_storage->mesh_instance_get_skeleton_version(inst->mesh_instance) : 0);
 		}
 
@@ -914,14 +908,12 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			// in the cull, so the build reads this frame's positions). It was
 			// rebuilt every frame: the TPS demo's player and robots standing
 			// still cost 4.3 ms of builds a frame on the bridge (2026-09-18).
-			// GODOT_RT_SKINNED_REBUILD=1 restores the rebuild every frame.
-			static const bool skinned_rebuild_always = OS::get_singleton()->get_environment("GODOT_RT_SKINNED_REBUILD") == "1";
 			bool deformed = false;
 			if (is_skinned) {
 				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
 				if (entry != nullptr) {
 					const uint64_t deform_version = mesh_storage->mesh_instance_get_deform_version(inst->mesh_instance);
-					deformed = skinned_rebuild_always || !entry->built || deform_version != entry->built_deform_version;
+					deformed = !entry->built || deform_version != entry->built_deform_version;
 					entry->built_deform_version = deform_version;
 				}
 			} else {

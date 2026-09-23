@@ -357,7 +357,7 @@ struct ImplementationData {
 	uint stochastic_direct_lights; // Nonzero: omni/spot lights are shaded by the stochastic pass (bits 0-1: 1 full resolution, 2 half resolution composited here against the per-pixel analytic term, 3 half resolution modulated at half resolution and upsampled; bit 2: the half forms at a quarter each way).
 
 	uint rt_sun_shadow; // Nonzero: the first directional light's shadow is ray traced (shadow map skipped).
-	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers. Bits 0-1 the resolution (1 full, 2 half), 4 the reflection buffer is populated, 8 directional, 16 specular occlusion from the bent normal, 32 reflection probe refit, 64 the mirror path (every roughness traced, SSR skipped), 128 no AO (GODOT_GI_NO_AO); see RenderForwardClustered::_setup_environment.
+	uint rt_gi; // Nonzero: indirect lighting comes from the ray-traced GI buffers. Bits 0-1 the resolution (1 full, 2 half), 4 the reflection buffer is populated, 8 directional, 16 specular occlusion from the bent normal, 32 reflection probe refit, 64 the mirror path (every roughness traced, SSR skipped); see RenderForwardClustered::_setup_environment.
 	float rt_gi_directionality; // Scales how far the directional term re-bases irradiance onto the fragment normal.
 	uint local_shadow_maps; // Zero: no omni/spot/area shadow map was rendered this frame (the stochastic pass owns those shadows), so the analytic paths must not sample the atlas.
 

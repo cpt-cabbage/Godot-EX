@@ -39,14 +39,12 @@ struct HitGeometry {
 #define RT_HIT_PACKET_WORDS 10u
 #define RT_HIT_PACKET_FRONT_FACE 1u
 #define RT_HIT_PACKET_MIRROR 2u // The specular ray's hit (mirror or GGX): its radiance goes to the reflection.
-#define RT_HIT_PACKET_SHARED 4u // The diffuse ray standing in for the reflection ray (the gather's shared form): its radiance goes to both.
 
 // A pixel's result slots, a uvec4 each: xy the radiance (half4), z the ray
 // direction (octahedral), w the flags.
 #define RT_HIT_RESULT_PENDING 1u
 #define RT_HIT_RESULT_DONE 2u
 #define RT_HIT_RESULT_MIRROR 4u
-#define RT_HIT_RESULT_SHARED 8u // A diffuse hit the reflection takes too (RT_HIT_PACKET_SHARED).
 // Bits 8-9: the pixel's diffuse rays - 1 (a young pixel traces more; the
 // resolve divides its deferred hits by the count the pixel used).
 #define RT_HIT_RESULT_RAYS_SHIFT 8u

@@ -153,15 +153,6 @@ void main() {
 			irradiance += radiance * inv_rays;
 			moment += luminance(radiance) * rt_hit_unpack_dir(r.z) * inv_rays;
 			any_diffuse = true;
-			// The diffuse ray that stands in for the reflection ray (the
-			// gather's shared form): the reflection's one sample is this
-			// ray's, whole. Without it a deferred hit left the reflection
-			// black -- most of every ray while the cards are young, and
-			// every surface a strafe reveals (the first A/B, tag share1).
-			if ((r.w & RT_HIT_RESULT_SHARED) != 0u) {
-				reflection += radiance;
-				any_mirror = true;
-			}
 		}
 	}
 	if (any_diffuse) {

@@ -198,8 +198,6 @@ void SurfaceCache::_create_atlases() {
 	rd->texture_clear(indirect_filtered_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	static_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(static_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
-	screen_atlas = rd->texture_create(tf, RD::TextureView());
-	rd->texture_clear(screen_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
 	tf.format = RD::DATA_FORMAT_R32G32B32A32_UINT; // Six packed halves; see the shader.
 	change_atlas = rd->texture_create(tf, RD::TextureView());
 	rd->texture_clear(change_atlas, Color(0, 0, 0, 0), 0, 1, 0, 1);
@@ -258,7 +256,7 @@ void SurfaceCache::_free_atlases() {
 			rid = RID();
 		}
 	}
-	for (RID *rid : { &mip_dirty_buffer, &albedo_atlas, &normal_atlas, &specular_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &screen_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
+	for (RID *rid : { &mip_dirty_buffer, &albedo_atlas, &normal_atlas, &specular_atlas, &emission_atlas, &depth_atlas, &lighting_atlas, &indirect_atlas, &indirect_dyn_atlas, &indirect_dyn2_atlas, &indirect_dyn_filtered_atlas, &indirect_filtered_atlas, &static_atlas, &change_atlas, &scratch_framebuffer, &scratch_albedo, &scratch_normal, &scratch_orm, &scratch_emission, &scratch_depth_out, &scratch_depth }) {
 		if (rid->is_valid()) {
 			rd->free_rid(*rid);
 			*rid = RID();
@@ -1114,9 +1112,8 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.camera_origin[2] = p_inputs.world_from_view.origin.z;
 	// The radius within which the round robin relights sets four times as
 	// often (surface_cache_prepare.glsl): the cards' light radius, what a
-	// turn of the camera can bring into view. GODOT_CARD_NEAR=<m> overrides.
-	static const float near_override = OS::get_singleton()->get_environment("GODOT_CARD_NEAR").to_float();
-	params.camera_origin[3] = near_override > 0.0f ? near_override : MAX(p_inputs.light_radius, 16.0f);
+	// turn of the camera can bring into view.
+	params.camera_origin[3] = MAX(p_inputs.light_radius, 16.0f);
 	params.omni_light_count = p_inputs.omni_light_count;
 	params.spot_light_count = p_inputs.spot_light_count;
 	params.directional_light_count = p_inputs.directional_light_count;
@@ -1218,10 +1215,6 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// stats buffer and printed every sixty frames (debug bit 8192).
 	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
 	params.debug = ablate | (tier_stats ? 8192 : 0);
-	// GODOT_CARD_BOUNCE_FLOOR=<relights>: the fewest relights a lighting
-	// change restarts a texel's bounce accumulation to (1 is a full restart).
-	static const float bounce_floor = OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR") == "" ? 1.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_FLOOR").to_float());
-	params.bounce_floor = MAX(bounce_floor, 1.0f);
 	// GODOT_CARD_YOUNG_RAYS=<n>: extra bounce rays for a texel whose
 	// accumulation is under eight relights (a restart, a fresh capture).
 	static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS") == "" ? 3 : OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS").to_int();
@@ -1238,15 +1231,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// The dynamic lights (LightStorage::get_card_dynamic_lights: the lights
 	// that moved or changed lately), whose bounce the cards estimate from
 	// the light rather than by the cosine rays (surface_cache_light.glsl
-	// trace_dynamic). GODOT_CARD_DYNAMIC=0 leaves every light static (the
-	// bounce as before); GODOT_CARD_DYN_RAYS=n light rays per dynamic light
+	// trace_dynamic). GODOT_CARD_DYN_RAYS=n light rays per dynamic light
 	// per texel per relight (2); GODOT_CARD_DYN_WINDOW=n the most relights
 	// the dynamic histories accumulate (64).
-	static const bool dynamic_enabled = OS::get_singleton()->get_environment("GODOT_CARD_DYNAMIC") != "0";
 	static const int64_t dyn_rays = OS::get_singleton()->get_environment("GODOT_CARD_DYN_RAYS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_CARD_DYN_RAYS").to_int();
 	static const float dyn_window = OS::get_singleton()->get_environment("GODOT_CARD_DYN_WINDOW") == "" ? 64.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_DYN_WINDOW").to_float());
 	DynamicLightsBuffer dyn = {};
-	if (dynamic_enabled && p_inputs.light_radius > 0.0f) {
+	if (p_inputs.light_radius > 0.0f) {
 		const LocalVector<RendererRD::LightStorage::LightData> &data = RendererRD::LightStorage::get_singleton()->get_card_dynamic_light_data();
 		const LocalVector<float> &weights = RendererRD::LightStorage::get_singleton()->get_card_dynamic_weights();
 		const LocalVector<Color> &prev_colors = RendererRD::LightStorage::get_singleton()->get_card_dynamic_prev_colors();
@@ -1285,20 +1276,10 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	params.dynamic_motion = MAX(MAX(motion / MAX(dyn_motion, 1e-4f), RendererRD::LightStorage::get_singleton()->get_card_dynamic_change()), 0.0f);
 	params.dynamic_window = MAX(dyn_window, 1.0f);
 	params.dynamic_change = RendererRD::LightStorage::get_singleton()->get_card_dynamic_change();
-	// The most a moving light's direct term marks a texel for the GI screen
-	// history's restart (surface_cache_light.glsl accumulate): 0.125 is a
-	// restart to eight frames, the young fallback's threshold; 1 restores
-	// the uncapped mark, which under a light sweeping the level every frame
-	// (the TPS demo's forklifts) kept the whole screen at one frame.
-	static const float dyn_mark = OS::get_singleton()->get_environment("GODOT_CARD_DYN_MARK") == "" ? 1.0f : float(OS::get_singleton()->get_environment("GODOT_CARD_DYN_MARK").to_float());
-	params.dynamic_mark = CLAMP(dyn_mark, 0.0f, 1.0f);
 	// A light joining the dynamic set (LightStorage): the static
 	// accumulation holds its bounce, and hands it over to the dynamic
 	// histories as they converge (surface_cache_light.glsl accumulate).
-	// GODOT_CARD_JOIN=off leaves the accumulation to forget it over its
-	// window, with the bounce counted twice meanwhile.
-	static const bool join_off = OS::get_singleton()->get_environment("GODOT_CARD_JOIN") == "off";
-	params.dynamic_join = (dynamic_enabled && full_relight && !join_off) ? RendererRD::LightStorage::get_singleton()->get_card_dynamic_join() : 0.0f;
+	params.dynamic_join = (full_relight) ? RendererRD::LightStorage::get_singleton()->get_card_dynamic_join() : 0.0f;
 	params.dynamic_rays = uint32_t(CLAMP(params.dynamic_motion >= 0.5f ? dyn_rays : dyn_rays_rest, 0, 8));
 	// The young texels' extra cosine rays while the dynamic histories are
 	// young too (a light moved or changed within the last eight relights),
@@ -1320,14 +1301,6 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// and the idle relight budget below both read it.
 	const bool count_convergence = true;
 	params.flags |= 4096;
-	// GODOT_CARD_BOUNCE_REQUESTS=1: the bounce rays' landings request their
-	// relight too (measured on the TPS bridge: the pending set grows to the
-	// reachable level, 20k blocks, and the screen's surfaces converge no
-	// faster than the rest; off).
-	static const bool bounce_requests = OS::get_singleton()->get_environment("GODOT_CARD_BOUNCE_REQUESTS") == "1";
-	if (bounce_requests) {
-		params.flags |= 8192;
-	}
 	rd->buffer_clear(converge_buffer, 0, 20 * sizeof(uint32_t));
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
@@ -1398,20 +1371,6 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// every captured set every frame, within the budget).
 	static const uint32_t rr_override = OS::get_singleton()->get_environment("GODOT_CARD_RR").to_int();
 	push.round_robin_period = full_relight ? 1u : MAX(rr_override > 0 ? rr_override : settings.round_robin_period, 1u);
-	// The young tiles first: a requested tile under GODOT_CARD_YOUNG=<relights>
-	// (the bounce accumulation's count, restarted by a light change) is
-	// listed every <period> frames (the second value, 2), and the hashed
-	// turns share what the cap has left among the converged ones. A tile a
-	// ray reads for the first time was already listed at once; this
-	// carries it through its first relights at its own rate, so a surface
-	// entering the frame converges in about as many frames whatever the
-	// budget, and the budget's dial moves the converged tiles' refresh
-	// rate alone (unset: the turns alone, as before).
-	static const Vector<String> young_env = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG").split(",");
-	static const uint32_t young_relights = young_env[0].is_empty() ? 0u : uint32_t(CLAMP(young_env[0].to_int(), 0, 64));
-	static const uint32_t young_period = young_env.size() > 1 ? uint32_t(CLAMP(young_env[1].to_int(), 1, 64)) : 2u;
-	push.young_relights = young_relights;
-	push.young_period = young_period;
 	push.omni_light_count = p_inputs.omni_light_count;
 	push.spot_light_count = p_inputs.spot_light_count;
 
@@ -1609,7 +1568,6 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_indirect_dyn_filtered(RD::UNIFORM_TYPE_IMAGE, 33, Vector<RID>({ indirect_dyn_filtered_atlas }));
 	RD::Uniform l_indirect_filtered(RD::UNIFORM_TYPE_IMAGE, 34, Vector<RID>({ indirect_filtered_atlas }));
 	RD::Uniform l_converge(RD::UNIFORM_TYPE_STORAGE_BUFFER, 35, Vector<RID>({ converge_buffer }));
-	RD::Uniform l_screen(RD::UNIFORM_TYPE_IMAGE, 36, Vector<RID>({ screen_atlas }));
 	RD::Uniform l_mip_dirty(RD::UNIFORM_TYPE_STORAGE_BUFFER, 37, Vector<RID>({ mip_dirty_buffer }));
 	RD::Uniform l_set_state(RD::UNIFORM_TYPE_STORAGE_BUFFER, 38, Vector<RID>({ set_state_buffer }));
 	RD::Uniform l_specular(RD::UNIFORM_TYPE_TEXTURE, 39, Vector<RID>({ specular_atlas }));
@@ -1618,7 +1576,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	rd->draw_command_begin_label("Surface Cache Lighting");
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_screen, l_mip_dirty, l_set_state, l_specular), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
 	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -1779,7 +1737,6 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 				{ "indirect", indirect_atlas, Image::FORMAT_RGBAH },
 				{ "indirect_filtered", indirect_filtered_atlas, Image::FORMAT_RGBAH },
 				{ "static", static_atlas, Image::FORMAT_RGBAH },
-				{ "screen", screen_atlas, Image::FORMAT_RGBAH },
 				{ "albedo", albedo_atlas, Image::FORMAT_RGBA8 },
 				{ "specular", specular_atlas, Image::FORMAT_RGBA8 },
 				{ "change", change_atlas, Image::FORMAT_RGBA8 }, // Raw: four uints a texel (change_store in the shader).

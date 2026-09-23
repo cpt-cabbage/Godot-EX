@@ -846,10 +846,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// and only on frames the pass actually dispatched (no lights or a not yet
 	// ready TLAS otherwise leave last frame's lighting frozen in the buffers).
 	// 0 off, 1 full resolution, 2 half resolution composited as the denoised
-	// ratios times this shader's own per-pixel analytic term, 3 half
-	// resolution modulated at half resolution and upsampled (the first form,
-	// GODOT_RT_HALF_ANALYTIC=0; see the shader's composite).
-	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? ((RendererRD::Raytracing::half_res_pixel_analytic() ? 2 : 3) | (use_stochastic_quarter_res ? 4 : 0)) : 1) : 0;
+	// ratios times this shader's own per-pixel analytic term (| 4 at the
+	// quarter tier).
+	scene_state.ubo.stochastic_direct_lights = (use_stochastic_lighting && stochastic_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? (use_stochastic_half_res ? (2u | (use_stochastic_quarter_res ? 4u : 0u)) : 1u) : 0;
 	// Same validity rule for the ray-traced GI buffers. Bits 0-1: resolution
 	// mode (1 full, 2 half with the depth-aware upsample); bit 2: the traced
 	// reflection buffer is populated (otherwise the composite must not blend
@@ -858,11 +857,8 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// the traced bent normal; bit 5: re-fit reflection probes to the frame's
 	// irradiance; bit 6 (64): the surface cache's mirror path is on, so the
 	// traced reflection covers every roughness and SSR is skipped.
-	// Bit 128 (experiment, GODOT_GI_NO_AO): the ambient term without the
-	// material's and the screen-space occlusion (section 33).
-	static const bool rt_gi_no_ao = OS::get_singleton()->get_environment("GODOT_GI_NO_AO") == "1";
 	// Bits 1|2: the gather's resolution, 1 full, 2 half, 3 quarter (the scene shader upsamples by 1 << (n - 1)).
-	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_quarter_res ? 3u : (use_rt_gi_half_res ? 2u : 1u)) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u) | (rt_gi_no_ao ? 128u : 0u)) : 0;
+	scene_state.ubo.rt_gi = (use_rt_gi && rt_gi_traced_this_frame && p_opaque_render_buffers && p_render_data->reflection_probe.is_null()) ? ((use_rt_gi_quarter_res ? 3u : (use_rt_gi_half_res ? 2u : 1u)) | (use_rt_gi_specular ? 4u : 0u) | (use_rt_gi_directional ? 8u : 0u) | (use_rt_gi_specular_occlusion ? 16u : 0u) | (use_rt_gi_probe_refit ? 32u : 0u) | ((use_surface_cache && use_surface_cache_mirror && use_rt_gi_specular) ? 64u : 0u)) : 0;
 	scene_state.ubo.rt_gi_directionality = rt_gi_directionality;
 	// GODOT_RT_OPAQUE_ABLATE=stoch,gi (profiling): the passes run, the
 	// opaque pass reads neither -- what its RT composites cost (the direct

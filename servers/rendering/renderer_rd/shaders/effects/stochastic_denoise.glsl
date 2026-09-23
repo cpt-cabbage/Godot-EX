@@ -25,23 +25,14 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_FALLBACK_ALL 32u // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 // Temporal (GI, diagnostics): the reflection history keeps its frames through
 // the named restart (GODOT_GI_SPEC_ABLATE=change,smear,mismatch).
-#define FLAG_DYN_YOUNG_RAYS 4194304u // Temporal (GI, with FLAG_DYN_SPLIT): the gather's extra rays followed the younger history (GODOT_GI_DYN_SPLIT=2), so the sample count does too.
 #define FLAG_DYN_SPLIT 2097152u // GI: the moving lights' term is a history of its own (GODOT_GI_DYN_SPLIT, section 88): the temporal pass accumulates in_dyn against history_dyn, restarted by its own mark, and hands the spatial pass the sum; the meta's b is its frame count.
 #define FLAG_SPEC_NO_CHANGE 64u
 #define FLAG_SPEC_NO_SMEAR 128u
 #define FLAG_SPEC_NO_MISMATCH 256u
 #define FLAG_SPEC_PAINT 512u // Diagnostics (GODOT_GI_SPEC_ABLATE=paint): the reflection's frame count as a colour.
 #define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
-#define FLAG_LUMA_COMPRESS 2048u // Experiment (GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance (see weight_lum).
-#define FLAG_MOD_PAINT 4096u // Diagnostics (GODOT_GI_MOD_PAINT): the card correction as a colour (red its change, green the field's confidence, blue the mark).
-#define FLAG_NO_LUM_STOP 8192u // Experiment (GODOT_GI_LUMSTOP=0): the spatial pass's luminance stop off for settled pixels too.
-#define FLAG_VOTES 32768u // Temporal (GI): the change mark is the tile's luminance-weighted vote (change_votes), bilinear over the tiles, not the pixel's own largest hit.
-#define FLAG_FIREFLY_PAINT 16384u // Diagnostics (GODOT_GI_FIREFLY_PAINT=1): the temporal pass paints the samples the firefly test scaled.
 #define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
 #define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
-#define FLAG_BORROW_SPEC 524288u // Experiment (GODOT_GI_BORROW_SPEC=1): a borrowed history serves the reflection on a mirror too (the form before section 59).
-#define FLAG_MIRROR_YOUNG 16u // Experiment (GODOT_GI_MIRROR_YOUNG=1, set on the first iteration only): a young mirror pixel's reflection is filtered at stride 1.
-#define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel rather than at the history's (the form before the flick fix).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
@@ -171,25 +162,6 @@ layout(set = 1, binding = 2, rgba16f) uniform restrict writeonly image2D out_mom
 layout(set = 1, binding = 3, rgba8) uniform restrict writeonly image2D out_meta;
 #ifdef HAS_DIRECTIONAL
 layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_directional;
-// The cards' bounce irradiance under the surface, this frame's and last
-// frame's (the gather's fallback output: rgb, and in a its relights / 64
-// times the lookup's confidence, 0 without a card). The card correction
-// replaces the changed fraction of the history by it (see that block).
-layout(set = 0, binding = 13) uniform sampler2D fallback_current;
-layout(set = 0, binding = 14) uniform sampler2D fallback_prev;
-// The split history (GODOT_GI_SPLIT, see the spatial pass): the luminance
-// mean of the even frames' samples and of the odd frames', for the diffuse
-// (xy) and the reflection (zw). Two independent estimates of the same
-// mean: their disagreement is the error of the accumulated value itself,
-// which the moments (the samples' variance) never reach.
-layout(set = 0, binding = 15) uniform sampler2D history_split;
-// The gather's lighting-change votes per 8x8 tile (FLAG_VOTES; see
-// stochastic_indirect_gi.glsl change_votes): weighted change, weight.
-layout(set = 0, binding = 16, std430) restrict readonly buffer ChangeVotes {
-	uint data[];
-}
-change_votes;
-layout(set = 1, binding = 6, rgba16f) uniform restrict writeonly image2D out_split;
 // The moving lights' term (FLAG_DYN_SPLIT): the gather's sample of it with
 // its change mark, its history, and the two outputs -- the history for
 // next frame and the sum of both histories for the spatial pass.
@@ -212,8 +184,6 @@ layout(set = 0, binding = 8) uniform sampler2D in_directional;
 // under the surface (rgb) and its relight count (a, / 64); see out_fallback
 // there.
 layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
-// The temporal pass's split history (see there and the kernel decision).
-layout(set = 0, binding = 10) uniform sampler2D split_texture;
 // The moving lights' share of the fallback (FLAG_DYN_SPLIT; see store_result).
 layout(set = 0, binding = 11) uniform sampler2D fallback_dyn_texture;
 #endif
@@ -232,59 +202,26 @@ layout(set = 1, binding = 3, rgba16f) uniform restrict writeonly image2D out_mom
 #endif
 #endif
 
-#if defined(MODE_TEMPORAL) || defined(FILTER_DIRECTIONAL)
+#ifdef MODE_TEMPORAL
 // The previous frame pair's reprojection (previous NDC -> the frame before).
 // The velocity buffer is one frame stale (written by the previous color pass),
 // so this is the camera-only motion it was rendered with: static pixels match
-// it and only genuinely moving objects deviate. The GI's spatial pass binds
-// the same buffer for the split-history parameters (it reads nothing else).
+// it and only genuinely moving objects deviate.
 layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	mat4 prev_reproject;
-	// Temporal (GI): the card correction's strength (0 off, 1 the field's
-	// whole change), the frames a corrected history is shortened to, the
-	// dynamic lights' motion this frame and the dead band (see the
-	// lighting-change block). GODOT_GI_MOD, GODOT_GI_MOD_FLOOR,
-	// GODOT_GI_MOD_DEAD. In the UBO: push constants are capped at 128 bytes.
-	float mod_strength;
-	float mod_floor;
-	float mod_motion; // The dynamic lights' motion this frame (0: none, the field's change is not a lighting change).
-	float mod_dead; // The field's dead band: a relative change under it is taken for the cards' own relight noise (GODOT_GI_MOD_DEAD).
 	// Temporal (GI): the frames a rough reflection's history restarted by
 	// the change mark is worth once the raw 5x5 resolve has stood in for
 	// the changed part (0: the raw sample stands in, as before). GODOT_GI_SPEC_FIX.
+	// In the UBO: push constants are capped at 128 bytes.
 	float spec_fix;
 	float borrow_band; // How far outside the frame (UV) a history may lie and still borrow the edge's (GODOT_GI_BORROW; 0 never borrows).
 	float young_rays; // The gather's diffuse rays for a pixel whose history is under 8 frames: that frame's sample counts for as many.
-	float frame_parity; // 0 or 1: which half of the split history this frame's sample joins.
-	// The split history (GODOT_GI_SPLIT): 0 off, 1 the pixel's own halves,
-	// 2 the 3x3 neighbourhood's; the relative variance of the mean under
-	// which a settled pixel's kernel is halved (GODOT_GI_SPLIT_THRESH), and
-	// under which it is not filtered at all (GODOT_GI_SPLIT_SKIP).
-	float split_mode;
-	float split_threshold;
-	float split_skip;
-	// The luminance stop's width (GODOT_GI_SPLIT_SIGMA): 0 the samples'
-	// standard deviation (SVGF), 1 the mean's from the moments over the
-	// frames, 2 the mean's from the split history; times split_sigma_k.
-	float split_sigma_mode;
-	float split_sigma_k;
-	float split_spec; // Whether the reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: the reflection is filtered as before).
-	// Temporal (GI): the firefly test's bound in neighbourhood deviations
-	// (GODOT_GI_FIREFLY; 0 off) and the roughness from which the reflection
-	// takes it too (GODOT_GI_FIREFLY_ROUGH).
-	float firefly_k;
-	float firefly_rough;
-	float mark_age; // Temporal (GI): 1 restarts the history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
-	// Temporal (GI): the card correction's delta form (GODOT_GI_MOD_DELTA=1):
-	// the history is carried by the field's change, hist + (field_now -
-	// field_prev), instead of the changed fraction being replaced by the
-	// field, and is not shortened for it (see the lighting-change block).
-	float mod_delta;
+	float pad0;
 	// Half the previous frame's TAA jitter minus this frame's, in NDC: the
 	// motion vectors are unjittered (the scene shader subtracts both
 	// frames' jitters) where this pass's pixels sit in the jittered image,
 	// so a history predicted by uv + velocity lands here short of that
-	// (FLAG_VELOCITY_CURRENT). The block is 144 bytes; the C++ struct
+	// (FLAG_VELOCITY_CURRENT). The block is 96 bytes; the C++ struct
 	// carries the same.
 	vec2 jitter_delta;
 }
@@ -327,22 +264,6 @@ params;
 
 float luminance(vec3 c) {
 	return dot(c, vec3(params.luma_r, params.luma_g, params.luma_b));
-}
-
-// The luminance the filter weights are measured in. FLAG_LUMA_COMPRESS
-// (GODOT_GI_LUMA_COMPRESS, an experiment) compresses it as l / (1 + l): the
-// accumulation itself stays linear (a compressed mean would darken), but the
-// moments, the variance-driven kernel width and the luminance stop then
-// weigh a bright sample by roughly what the display transform will show of
-// it, instead of letting one hot hit own its neighbourhood's variance.
-// Measured 2026-09-09 in the game project (ACEScg, the ACES SDR view; the
-// metric reads the tonemapped captures): the static flashlight, the combo
-// motion and the flashlight yaw all within run noise of linear (err 0.0034
-// vs 0.0035 at rest, 0.0074 vs 0.0074 at combo's stop + 8, flash 0.0162 vs
-// 0.0189). Off by default; kept as the knob to retest with.
-float weight_lum(vec3 c) {
-	float l = luminance(c);
-	return (params.flags & FLAG_LUMA_COMPRESS) != 0u ? l / (1.0 + l) : l;
 }
 
 // Depth buffer value -> view-space distance. Comparing raw buffer depths
@@ -426,7 +347,6 @@ void main() {
 		imageStore(out_meta, pixel, vec4(0.0));
 #ifdef HAS_DIRECTIONAL
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
-		imageStore(out_split, pixel, vec4(0.0));
 		if ((params.flags & FLAG_DYN_SPLIT) != 0u) {
 			imageStore(out_dyn, pixel, vec4(0.0));
 			imageStore(out_sum, pixel, vec4(0.0));
@@ -438,30 +358,6 @@ void main() {
 	vec4 current_diffuse4 = texelFetch(in_diffuse, pixel, 0);
 	vec3 current_diffuse = current_diffuse4.rgb;
 	float change_age = current_diffuse4.a; // GI only; see the restart below.
-#if defined(MODE_TEMPORAL) && defined(HAS_DIRECTIONAL)
-	if ((params.flags & FLAG_VOTES) != 0u) {
-		// The tile vote (plan section 45): the change over the tile's rays
-		// weighted by what they brought, read bilinearly over the four
-		// tiles about the pixel so tile edges do not show.
-		int tiles_x = (params.screen_size.x + 7) / 8;
-		int tiles_y = (params.screen_size.y + 7) / 8;
-		vec2 tc = (vec2(pixel) + 0.5) / 8.0 - 0.5;
-		ivec2 t0 = ivec2(floor(tc));
-		vec2 fr = tc - vec2(t0);
-		float wc = 0.0;
-		float ww = 0.0;
-		for (int j = 0; j < 2; j++) {
-			for (int i = 0; i < 2; i++) {
-				ivec2 tt = clamp(t0 + ivec2(i, j), ivec2(0), ivec2(tiles_x - 1, tiles_y - 1));
-				float bw = (i == 0 ? 1.0 - fr.x : fr.x) * (j == 0 ? 1.0 - fr.y : fr.y);
-				uint idx = uint(tt.y * tiles_x + tt.x) * 2u;
-				wc += bw * float(change_votes.data[idx]);
-				ww += bw * float(change_votes.data[idx + 1u]);
-			}
-		}
-		change_age = ww > 0.0 ? clamp(wc / ww, 0.0, 1.0) : 0.0;
-	}
-#endif
 	vec4 current_specular4 = texelFetch(in_specular, pixel, 0);
 	vec3 current_specular = current_specular4.rgb;
 #ifdef HAS_DIRECTIONAL
@@ -490,11 +386,6 @@ void main() {
 	vec3 m2_d = vec3(0.0);
 	vec3 m2_s = vec3(0.0);
 	float count = 0.0;
-#ifdef HAS_DIRECTIONAL
-	// The neighbours' luminance without the center (the firefly test below).
-	vec2 nl_d = vec2(0.0); // sum, sum of squares
-	vec2 nl_s = vec2(0.0);
-#endif
 	for (int y = -2; y <= 2; y++) {
 		for (int x = -2; x <= 2; x++) {
 			ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
@@ -505,54 +396,12 @@ void main() {
 			m2_d += d * d;
 			m2_s += s * s;
 			count += 1.0;
-#ifdef HAS_DIRECTIONAL
-			if (reprojection.firefly_k > 0.0 && (x != 0 || y != 0)) {
-				float ld = weight_lum(d);
-				float ls = weight_lum(s);
-				nl_d += vec2(ld, ld * ld);
-				nl_s += vec2(ls, ls * ls);
-			}
-#endif
 		}
 	}
 	mean_d /= count;
 	mean_s /= count;
 	vec3 stddev_d = sqrt(max(m2_d / count - mean_d * mean_d, vec3(0.0)));
 	vec3 stddev_s = sqrt(max(m2_s / count - mean_s * mean_s, vec3(0.0)));
-#ifdef HAS_DIRECTIONAL
-	// The firefly test (GODOT_GI_FIREFLY=<k>, plan item A4(c)): a raw sample
-	// whose luminance stands more than k deviations above its 24 neighbours'
-	// mean is scaled down to that bound before it enters the history (its
-	// colour and its share of the directional moment kept), where it would
-	// otherwise sit for the whole temporal window and be spread a stride
-	// further by every spatial iteration. The diffuse, and the reflection
-	// only on rough surfaces (a mirror's bright image is not an outlier).
-	bool firefly_hit = false;
-	if (reprojection.firefly_k > 0.0) {
-		float n = count - 1.0;
-		float mean_n = nl_d.x / n;
-		float std_n = sqrt(max(nl_d.y / n - mean_n * mean_n, 0.0));
-		float bound = mean_n + reprojection.firefly_k * std_n;
-		float l = weight_lum(current_diffuse);
-		if (l > bound && l > 1e-6) {
-			float f = bound / l;
-			current_diffuse *= f;
-			current_directional.xyz *= f;
-			result_directional = current_directional;
-			firefly_hit = true;
-		}
-		if (nr_rough >= reprojection.firefly_rough) {
-			mean_n = nl_s.x / n;
-			std_n = sqrt(max(nl_s.y / n - mean_n * mean_n, 0.0));
-			bound = mean_n + reprojection.firefly_k * std_n;
-			l = weight_lum(current_specular);
-			if (l > bound && l > 1e-6) {
-				current_specular *= bound / l;
-				firefly_hit = true;
-			}
-		}
-	}
-#endif
 
 	// Dense bounded signals (the visibility ratios) also clamp the CURRENT
 	// sample into the neighborhood ellipsoid: a pixel whose reservoirs keep
@@ -571,18 +420,9 @@ void main() {
 	vec3 result_diffuse = current_diffuse;
 	vec3 result_specular = current_specular;
 	vec4 moments = vec4(0.0);
-#ifdef HAS_DIRECTIONAL
-	vec4 split = vec4(0.0);
-#endif
 	float frames_d = 1.0;
 	float samples_d = 1.0; // Samples this frame's diffuse carries (the gather's young rays).
 	float frames_s = 1.0;
-#ifdef HAS_DIRECTIONAL
-	// The card correction (GI, see the lighting-change block).
-	const bool mod_on = reprojection.mod_strength > 0.0;
-	float paint_change = 0.0; // Diagnostics (FLAG_MOD_PAINT).
-	float paint_field = 0.0;
-#endif
 	// Disocclusion mark for the spatial pass; set until a usable history
 	// proves the pixel is not freshly revealed.
 	float reveal = 1.0;
@@ -613,8 +453,7 @@ void main() {
 		// moving object (section 59, every pixel cyan under =why). Read at
 		// prev_uv the field is the one the matrix predicts for static geometry
 		// at any speed, and a moving object at a static camera reads as before
-		// (prev_uv is uv). GODOT_GI_OBJECTS=pixel reads at the current pixel
-		// as before.
+		// (prev_uv is uv).
 		// A moving object's shift beyond the camera's, carried to the
 		// reflection's reprojection below (the reflector took its image
 		// along).
@@ -633,8 +472,8 @@ void main() {
 			vec2 predicted = uv + velocity + reprojection.jitter_delta;
 			object_delta = predicted - prev_uv;
 			prev_uv = predicted;
-		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
-			ivec2 velocity_pixel = (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u ? pixel * params.depth_scale : ivec2(prev_uv * vec2(params.screen_size * params.depth_scale));
+		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && velocity_in_frame) {
+			ivec2 velocity_pixel = ivec2(prev_uv * vec2(params.screen_size * params.depth_scale));
 			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			// Under FSR2 the pixels no geometry wrote carry a (-1, -1)
@@ -703,8 +542,6 @@ void main() {
 		vec4 hist_meta = vec4(0.0);
 #ifdef HAS_DIRECTIONAL
 		vec4 hist_dir = vec4(0.0);
-		vec4 hist_fb = vec4(0.0);
-		vec4 hist_split = vec4(0.0);
 		vec4 hist_dyn4 = vec4(0.0);
 #endif
 #ifdef DEPTH_HISTORY
@@ -748,8 +585,6 @@ void main() {
 				hist_meta += texelFetch(history_meta, tp, 0) * w;
 #ifdef HAS_DIRECTIONAL
 				hist_dir += texelFetch(history_directional, tp, 0) * w;
-				hist_fb += texelFetch(fallback_prev, tp, 0) * w;
-				hist_split += texelFetch(history_split, tp, 0) * w;
 				if (dyn_split) {
 					hist_dyn4 += texelFetch(history_dyn, tp, 0) * w;
 				}
@@ -768,8 +603,6 @@ void main() {
 				hist_meta *= inv_weight;
 #ifdef HAS_DIRECTIONAL
 				hist_dir *= inv_weight;
-				hist_fb *= inv_weight;
-				hist_split *= inv_weight;
 				hist_dyn4 *= inv_weight;
 #endif
 			}
@@ -782,8 +615,6 @@ void main() {
 			hist_meta = textureLod(history_meta, prev_uv, 0.0);
 #ifdef HAS_DIRECTIONAL
 			hist_dir = textureLod(history_directional, prev_uv, 0.0);
-			hist_fb = textureLod(fallback_prev, prev_uv, 0.0);
-			hist_split = textureLod(history_split, prev_uv, 0.0);
 			if (dyn_split) {
 				hist_dyn4 = textureLod(history_dyn, prev_uv, 0.0);
 			}
@@ -878,11 +709,7 @@ void main() {
 			// below weighs the sample by as many.
 			float hist_frames_d = hist_meta.r * 64.0 * confidence_d;
 #ifdef HAS_DIRECTIONAL
-			float young_frames_d = hist_frames_d;
-			if (dyn_split && (params.flags & FLAG_DYN_YOUNG_RAYS) != 0u) {
-				young_frames_d = min(hist_frames_d, hist_meta.b * 64.0 * confidence_d);
-			}
-			samples_d = young_frames_d < 8.0 ? max(reprojection.young_rays, 1.0) : 1.0;
+			samples_d = hist_frames_d < 8.0 ? max(reprojection.young_rays, 1.0) : 1.0;
 #endif
 			frames_d = min(hist_frames_d + samples_d, frames_cap);
 			frames_s = min(hist_meta.g * 64.0 * confidence_s + 1.0, frames_cap);
@@ -904,7 +731,7 @@ void main() {
 				// (section 59). A mirror takes its own sample instead; a
 				// rough lobe's blur is as continuous as the lighting and
 				// keeps the borrow.
-				frames_s = min(frames_s, (params.flags & FLAG_BORROW_SPEC) != 0u ? BORROW_FRAMES : mix(BORROW_FRAMES, 1.0, virtual_weight));
+				frames_s = min(frames_s, mix(BORROW_FRAMES, 1.0, virtual_weight));
 #else
 				frames_s = min(frames_s, BORROW_FRAMES);
 #endif
@@ -920,61 +747,29 @@ void main() {
 			// alpha over eight frames, where the gather's on-screen hits read
 			// it, so a change propagates through the screen bounces.
 			//
-			// Measured and not kept: an
-			// accumulated drift in place of the decaying max, restarting to
-			// 1 / sqrt(c) under a steady change. It followed the slow ones
-			// closer (the game project's flashlight, a cycling hue) and made
-			// a fast flicker worse, an oscillation's swings counting as
-			// distance travelled.
+			// Measured and not kept: an accumulated drift in place of the
+			// decaying max, restarting to 1 / sqrt(c) under a steady change.
+			// It followed the slow ones closer (the game project's
+			// flashlight, a cycling hue) and made a fast flicker worse, an
+			// oscillation's swings counting as distance travelled. Nor a
+			// correction of the history by the cards' field under the
+			// surface, in its mix and its delta form (sections 27 and 67),
+			// removed 2026-09-22.
 			//
-			// With the card correction (reprojection.mod_strength > 0): the
-			// restart above took a pixel
-			// to one raw sample wherever a ray of its had landed on a changed
-			// card, at different pixels every frame under a moving
-			// flashlight, and the spatial pass widened its kernel on each --
-			// the grain that followed every move -- while the pixels no ray
-			// marked kept their history and lagged. The cards' bounce field
-			// under the surface (the gather's fallback, read for every pixel
-			// when this is on) estimates the same irradiance with the direct
-			// term exact every relight and a moving light's bounce in
-			// histories of its own, so where that field changed since last
-			// frame, while a light moves, the changed fraction of the history
-			// is replaced by the field (the history fix of the denoisers,
-			// with the world cache as the fix) and the history is shortened
-			// to mod_floor frames, so the pixel's own samples refine it from
-			// a smooth start instead of a raw one. The change is measured
-			// between consecutive frames of the field (the relights arrive on
-			// their own cadence, and a jump is seen exactly once), above a
-			// dead band for the cards' own relight noise, and only while a
-			// dynamic light moves: at rest the field's convergence is not a
-			// lighting change. Measured on the game flick it reads as the
-			// restart alone (stop 0.0704 against 0.0694) and on rt_lab's
-			// sweep identical, so it is off by default: the mark covers nine
-			// pixels in ten under the flashlight, and the flick's error on
-			// the glossy walls is the reflection's (below), not this
-			// history's. Measured and not kept before it: a fast history
-			// clamped to its neighbourhood (NRD's form; one ray per pixel
-			// over four frames spreads wider than the lag it should catch)
-			// and a multiplicative ratio of the field (biased above one on a
-			// noisy pair, it doubled the frame within a hundred frames
-			// ungated, and gated by the mark it lost the jumps the mark
-			// missed).
-			// The mark decays an eighth a frame in the history, and the
-			// restart below is to 1 / mark frames every frame it lasts, so a
-			// full mark restarts the history to 1, 1.14, 1.33, 1.6, 2, 2.67,
-			// 4, 8 frames at +0..+7 -- four frames of restart for one
-			// change (GODOT_GI_MARK_AGE=0). With mark_age the cap applies
-			// only where this frame's own mark exceeds the decayed one (a
-			// new change, or a larger one); the decayed mark is still
-			// carried out for the gather's propagation and the reflection's
-			// fix, which read the age, not the restart. The game flick's
-			// error after the stop 5-12% lower at every capture, its
-			// flicker level (section 58).
+			// The mark decays an eighth a frame in the history. Restarting to
+			// 1 / mark frames every frame it lasts gave four frames of
+			// restart for one change (1, 1.14, 1.33, 1.6, 2, 2.67, 4, 8 at
+			// +0..+7); the cap applies only where this frame's own mark
+			// exceeds the decayed one (a new change, or a larger one), and
+			// the decayed mark is still carried out for the gather's
+			// propagation and the reflection's fix, which read the age, not
+			// the restart. The game flick's error after the stop 5-12% lower
+			// at every capture, its flicker level (section 58).
 			float mark_now = change_age;
 			float mark_hist = hist_d4.a - 0.125;
 			change_age = max(change_age, mark_hist);
 			bool changed = change_age > 0.02;
-			bool mark_new = reprojection.mark_age <= 0.0 || mark_now > mark_hist;
+			bool mark_new = mark_now > mark_hist;
 			// The moving lights' history restarts by its own mark (the
 			// cards' whole change at the rays' hits), the same way; the
 			// static history's mark, the static lights' alone, is what a
@@ -984,79 +779,15 @@ void main() {
 			float change_age_s = change_age;
 			if (dyn_split) {
 				float mark_hist_dyn = hist_dyn4.a - 0.125;
-				bool mark_new_dyn = reprojection.mark_age <= 0.0 || change_age_dyn > mark_hist_dyn;
+				bool mark_new_dyn = change_age_dyn > mark_hist_dyn;
 				change_age_dyn = max(change_age_dyn, mark_hist_dyn);
 				if (change_age_dyn > 0.02 && mark_new_dyn) {
 					frames_dyn = min(frames_dyn, max(1.0, 1.0 / change_age_dyn));
 				}
 				change_age_s = max(change_age, change_age_dyn);
 			}
-			float field_change = 0.0;
-			if (mod_on && reprojection.mod_motion > 0.0) {
-				vec4 fb_now = texelFetch(fallback_current, pixel, 0);
-				paint_field = fb_now.a;
-				if (fb_now.a > 0.0 && hist_fb.a > 0.0) {
-					float l_now = luminance(fb_now.rgb);
-					float l_prev = luminance(hist_fb.rgb);
-					vec3 d = abs(fb_now.rgb - hist_fb.rgb);
-					float rel = max(d.r, max(d.g, d.b)) / max(max(l_now, l_prev), 1e-4);
-					const bool delta_form = reprojection.mod_delta > 0.0;
-					// The delta form (GODOT_GI_MOD_DELTA=1, section 67): the
-					// mix above hands the history the field's *level*, which
-					// is the cards' diffuse-only one -- 8-12% under the
-					// screen's on the ceiling of pose E and 37-41% under it on
-					// the right-hand furniture (section 56 B), so a corrected
-					// pixel reads as the base and climbs back from there.
-					// Carrying the history by the field's change instead,
-					// hist + (field_now - field_prev), keeps the screen's own
-					// level (the specular, the textures, the emissives, the
-					// screen bounces) and moves it by what the cards say the
-					// light did; the frame count is kept, so the samples keep
-					// refining the shifted history rather than restarting it.
-					// The gate ramps over the dead band (dead to twice it)
-					// rather than to the whole range: a jump is applied whole
-					// once it is a jump at all, since the shift is unbiased
-					// either way and a partial one leaves the rest to the mark.
-					// Measured on the game flick (three runs each, section 67):
-					// worse at the stop and through +8 in every run (stop
-					// 0.0280-0.0297 against 0.0256-0.0274, hot pixels 46-49
-					// against 38-43 per thousand, twice the default's at +2),
-					// inside the spread from +16 on, the flicker level. The
-					// field's change is only the cards' part of the screen's
-					// (the screen term's quarter of the furniture's light
-					// moves with the beam too, and the relights add their
-					// noise), and a history carried without a restart keeps
-					// that remainder for the window. Off.
-					field_change = delta_form
-							? clamp((rel - reprojection.mod_dead) / max(reprojection.mod_dead, 1e-4), 0.0, 1.0) * reprojection.mod_strength
-							: clamp((rel - reprojection.mod_dead) / (1.0 - reprojection.mod_dead), 0.0, 1.0) * reprojection.mod_strength;
-					paint_change = field_change;
-					if (field_change > 0.0) {
-						vec3 fixed_d = delta_form
-								? max(hist_d + (fb_now.rgb - hist_fb.rgb) * field_change, vec3(0.0))
-								: mix(hist_d, fb_now.rgb, field_change);
-						float l_hist = luminance(hist_d);
-						float lr = l_hist > 1e-6 ? luminance(fixed_d) / l_hist : 1.0;
-						hist_d = fixed_d;
-						// The directional moment and the luminance moments
-						// follow the history they describe.
-						hist_dir.xyz *= lr;
-						hist_moments.x *= lr;
-						hist_moments.y *= lr * lr;
-						if (!delta_form) {
-							frames_d = min(frames_d, reprojection.mod_floor);
-						}
-					}
-				}
-			}
 			if (changed && mark_new) {
-				float keep = max(1.0, 1.0 / change_age);
-				// The field's correction accounts for the mark's change in
-				// proportion; what it explains is not restarted (the delta
-				// form keeps the whole count for it).
-				float explained_keep = reprojection.mod_delta > 0.0 ? max(frames_d, reprojection.mod_floor) : reprojection.mod_floor;
-				keep = max(keep, mix(1.0, explained_keep, clamp(field_change / max(change_age, 1e-3), 0.0, 1.0)));
-				frames_d = min(frames_d, keep);
+				frames_d = min(frames_d, max(1.0, 1.0 / change_age));
 			}
 			if (change_age_s > 0.02) {
 				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
@@ -1132,8 +863,8 @@ void main() {
 			}
 #endif
 
-			float lum_d = weight_lum(current_diffuse);
-			float lum_s = weight_lum(current_specular);
+			float lum_d = luminance(current_diffuse);
+			float lum_s = luminance(current_specular);
 			result_diffuse = mix(hist_d, current_diffuse, alpha_d);
 			result_specular = mix(hist_s, current_specular, alpha_s);
 			// The sum's derived quantities (the moments, the directional
@@ -1145,7 +876,7 @@ void main() {
 				float alpha_dyn = min(max(1.0 / frames_dyn, params.blend_alpha), 1.0);
 				result_dyn = mix(hist_dyn, current_dyn, alpha_dyn);
 				alpha_m = max(alpha_d, alpha_dyn);
-				lum_d = weight_lum(current_diffuse + current_dyn);
+				lum_d = luminance(current_diffuse + current_dyn);
 			}
 			// The moment is stored unnormalized precisely so this blend is a
 			// linear average: with one ray per pixel a single frame's moment
@@ -1157,24 +888,6 @@ void main() {
 #endif
 			moments = vec4(mix(hist_moments.xy, vec2(lum_d, lum_d * lum_d), alpha_m),
 					mix(hist_moments.zw, vec2(lum_s, lum_s * lum_s), alpha_s));
-#ifdef HAS_DIRECTIONAL
-			// The split history: this frame's sample joins one half, at
-			// twice the blend (each half sees every other frame, so its
-			// window is half the mean's). A restart reaches the other half
-			// a frame later (its alpha is then 1 too), so the halves
-			// disagree for a frame or two after every restart, which the
-			// spatial pass reads as "not settled": the right verdict.
-			split = hist_split;
-			float alpha_hd = min(2.0 * alpha_d, 1.0);
-			float alpha_hs = min(2.0 * alpha_s, 1.0);
-			if (reprojection.frame_parity < 0.5) {
-				split.x = mix(hist_split.x, lum_d, alpha_hd);
-				split.z = mix(hist_split.z, lum_s, alpha_hs);
-			} else {
-				split.y = mix(hist_split.y, lum_d, alpha_hd);
-				split.w = mix(hist_split.w, lum_s, alpha_hs);
-			}
-#endif
 			dominance = mix(hist_meta.b, dominance, alpha_d);
 #ifdef HAS_DIRECTIONAL
 			if (dyn_split) {
@@ -1193,20 +906,15 @@ void main() {
 		}
 	}
 	if (reveal == 1.0) {
-		float lum_d = weight_lum(current_diffuse);
-		float lum_s = weight_lum(current_specular);
+		float lum_d = luminance(current_diffuse);
+		float lum_s = luminance(current_specular);
 #ifdef HAS_DIRECTIONAL
 		if (dyn_split) {
-			lum_d = weight_lum(current_diffuse + current_dyn);
+			lum_d = luminance(current_diffuse + current_dyn);
 			dominance = 1.0 / 64.0;
 		}
 #endif
 		moments = vec4(lum_d, lum_d * lum_d, lum_s, lum_s * lum_s);
-#ifdef HAS_DIRECTIONAL
-		// Both halves start from the one sample: they agree, but a revealed
-		// pixel is young for longer than the spatial pass consults them.
-		split = vec4(lum_d, lum_d, lum_s, lum_s);
-#endif
 	}
 
 	// The history never holds a non-finite value: it would keep it for the
@@ -1231,20 +939,8 @@ void main() {
 		moments = vec4(0.0);
 	}
 #ifdef HAS_DIRECTIONAL
-	if (any(isnan(split)) || any(isinf(split))) {
-		split = vec4(0.0);
-	}
-	imageStore(out_split, pixel, split);
 	if (any(isnan(result_directional)) || any(isinf(result_directional))) {
 		result_directional = vec4(0.0, 0.0, 0.0, 1.0);
-	}
-	if ((params.flags & FLAG_MOD_PAINT) != 0u) {
-		result_diffuse = vec3(paint_change, paint_field, clamp(change_age, 0.0, 1.0));
-	}
-	if ((params.flags & FLAG_FIREFLY_PAINT) != 0u) {
-		// Diagnostics: red where this frame's sample was scaled down.
-		result_diffuse = firefly_hit ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
-		result_specular = vec3(0.0);
 	}
 	if ((params.flags & FLAG_SPEC_PAINT_WHY) != 0u && paint_why != 0) {
 		// The diffuse takes the reflection's paint (below) for the four
@@ -1440,7 +1136,6 @@ void main() {
 	// history clipping) also has no usable variance yet, so it filters
 	// unconditionally at normal stride until a few frames have accumulated.
 	bool newly_revealed = meta.a > 1.0 - 2.5 * REVEAL_STEP;
-	bool no_lum_stop = (params.flags & FLAG_NO_LUM_STOP) != 0u;
 	bool young_d = frames_d < 4.0;
 	bool young_s = frames_s < 4.0;
 	// A young GI pixel's hit-distance term is one or two rays' worth: it
@@ -1463,66 +1158,6 @@ void main() {
 		filter_d = false;
 		filter_s = false;
 	}
-	// The split history (GODOT_GI_SPLIT): the moments' variance is that of
-	// the samples, which a one-ray GI signal never brings under the
-	// threshold above, so a settled pixel is filtered at the full stride for
-	// ever. The even and odd frames' means are two independent estimates of
-	// the accumulated value; (a - b)^2 / 4 is one draw of its error, and a
-	// settled pixel whose halves agree needs less of its neighbors: half
-	// the stride under split_threshold, none under split_skip. A single
-	// draw reads low a quarter of the time, so mode 2 averages the 3x3
-	// neighbourhood's draws. Young histories (both halves a few samples)
-	// keep the verdicts above.
-	bool split_tight_d = false;
-	bool split_tight_s = false;
-#ifdef FILTER_DIRECTIONAL
-	// The mean's variance from the split history (-1: not read).
-	float var_mean_d = -1.0;
-	float var_mean_s = -1.0;
-	if ((reprojection.split_mode > 0.5 || reprojection.split_sigma_mode > 1.5) && !newly_revealed) {
-		float sq_d = 0.0;
-		float sq_s = 0.0;
-		float n = 0.0;
-		int radius = reprojection.split_mode > 1.5 || reprojection.split_sigma_mode > 1.5 ? 1 : 0;
-		for (int y = -radius; y <= radius; y++) {
-			for (int x = -radius; x <= radius; x++) {
-				ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
-				vec4 sh = texelFetch(split_texture, sp, 0);
-				float dd = sh.x - sh.y;
-				float ds = sh.z - sh.w;
-				sq_d += dd * dd;
-				sq_s += ds * ds;
-				n += 1.0;
-			}
-		}
-		var_mean_d = 0.25 * sq_d / n;
-		var_mean_s = 0.25 * sq_s / n;
-		float rel_mean_d = var_mean_d / max(moments.x * moments.x, 1e-6);
-		float rel_mean_s = var_mean_s / max(moments.z * moments.z, 1e-6);
-		if (frames_d >= YOUNG_FRAMES && reprojection.split_mode > 0.5) {
-			if (rel_mean_d < reprojection.split_skip) {
-				filter_d = false;
-			} else if (rel_mean_d < reprojection.split_threshold) {
-				split_tight_d = true;
-			}
-		}
-		if (frames_s >= YOUNG_FRAMES && reprojection.split_mode > 0.5 && reprojection.split_spec > 0.5) {
-			if (rel_mean_s < reprojection.split_skip) {
-				filter_s = false;
-			} else if (rel_mean_s < reprojection.split_threshold) {
-				split_tight_s = true;
-			}
-		}
-		if (reprojection.split_mode > 2.5) {
-			// Diagnostics (GODOT_GI_SPLIT=3): the diffuse verdict as a
-			// colour: black young, red skipped, green halved, blue filtered
-			// as before; the reflection channel black.
-			vec3 paint = frames_d < YOUNG_FRAMES ? vec3(0.0) : (rel_mean_d < reprojection.split_skip ? vec3(1.0, 0.0, 0.0) : (rel_mean_d < reprojection.split_threshold ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0)));
-			store_result(pixel, paint, vec3(0.0), center_dir, 1.0, 0.0, 0.0, 0.0);
-			return;
-		}
-	}
-#endif
 	// Ramp the directional term in over the first frames of accumulation.
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	// And the cards' stand-in out (GI only; see store_result).
@@ -1548,24 +1183,6 @@ void main() {
 	vec3 center_normal = nr_normal(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
-#ifdef FILTER_DIRECTIONAL
-	// GODOT_GI_SPLIT_SIGMA: the luminance stop measured against the error
-	// of the accumulated mean (from the moments over the frames, or the
-	// split history's disagreement) rather than the samples' spread, which
-	// a settled one-ray signal exceeds only at a real edge. Young pixels
-	// keep the samples' (their stop is off anyway).
-	if (reprojection.split_sigma_mode > 0.5) {
-		bool from_split = reprojection.split_sigma_mode > 1.5 && var_mean_d >= 0.0;
-		float vm_d = from_split ? var_mean_d : var_d / max(frames_d, 1.0);
-		float vm_s = from_split ? var_mean_s : var_s / max(frames_s, 1.0);
-		if (frames_d >= YOUNG_FRAMES) {
-			sigma_d = reprojection.split_sigma_k * sqrt(vm_d) + 1e-4;
-		}
-		if (frames_s >= YOUNG_FRAMES) {
-			sigma_s = reprojection.split_sigma_k * sqrt(vm_s) + 1e-4;
-		}
-	}
-#endif
 
 	// Newly revealed pixels have no usable variance estimate yet, so widen the
 	// kernel and ignore the luminance stopping function for a few frames.
@@ -1584,26 +1201,14 @@ void main() {
 		float r = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
 		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
 		if (spec_scale < 0.25) {
-			// A mirror's image is never filtered once it has a history. Its
-			// first frames are one shaded sample each (the entering band of a
-			// slow turn over the mirror floor, since section 59 stopped the
-			// frame-edge borrow copying an image there), so with
-			// GODOT_GI_MIRROR_YOUNG the first iteration alone filters a young
-			// mirror pixel at stride 1: the image blurs by a pixel or two for
-			// under four frames, the shading noise averages.
-			filter_s = (params.flags & FLAG_MIRROR_YOUNG) != 0u && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u && (young_s || newly_revealed);
+			// A mirror's image is never filtered. Filtering a young mirror
+			// pixel at stride 1 on the first iteration was measured without
+			// gain on the slow floor-yaw's entering band (section 64).
+			filter_s = false;
 			stride_s = 1;
 		} else {
 			stride_s = max(1, int(round(float(stride_s) * spec_scale)));
 		}
-	}
-	// The split history's verdict (above): a settled pixel whose halves
-	// agree reaches half as far.
-	if (split_tight_d) {
-		stride = max(1, stride >> 1);
-	}
-	if (split_tight_s) {
-		stride_s = max(1, stride_s >> 1);
 	}
 	if (!filter_d && !filter_s) {
 		store_result(pixel, center_d4.rgb, center_s4.rgb, center_dir, dir_confidence, fallback_weight, fallback_weight_dyn, center_d4.a);
@@ -1679,11 +1284,11 @@ void main() {
 
 			float wd = w_spatial;
 			float ws = w_spatial_s;
-			if (!newly_revealed && !young_d && !no_lum_stop) {
-				wd *= exp(-abs(weight_lum(d) - moments.x) / sigma_d);
+			if (!newly_revealed && !young_d) {
+				wd *= exp(-abs(luminance(d) - moments.x) / sigma_d);
 			}
-			if (!newly_revealed && !young_s && !no_lum_stop) {
-				ws *= exp(-abs(weight_lum(s) - moments.z) / sigma_s);
+			if (!newly_revealed && !young_s) {
+				ws *= exp(-abs(luminance(s) - moments.z) / sigma_s);
 			}
 #ifdef FILTER_DIRECTIONAL
 			// Neighbors whose rays travelled a very different distance are

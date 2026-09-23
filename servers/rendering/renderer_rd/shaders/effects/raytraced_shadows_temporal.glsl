@@ -20,11 +20,9 @@ layout(set = 0, binding = 3) uniform sampler2D velocity_texture;
 // frame stale) velocity buffer was rendered with.
 layout(set = 0, binding = 4, std140) uniform ReprojectUBO {
 	mat4 prev_reproject;
-	// The GI denoiser's block (stochastic_denoise.glsl), shared: its card
-	// correction and filter parameters are not read here.
-	vec4 gi_params[4];
-	float mark_age;
-	float mod_delta;
+	// The GI denoiser's block (stochastic_denoise.glsl), shared: its GI
+	// parameters are not read here.
+	vec4 gi_params;
 	vec2 jitter_delta; // Half the previous frame's TAA jitter minus this frame's, NDC (FLAG_VELOCITY_CURRENT).
 }
 reprojection;
@@ -33,7 +31,6 @@ layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D dest_mask;
 layout(set = 1, binding = 1, rg8) uniform restrict writeonly image2D dest_history;
 
 #define FLAG_HAS_VELOCITY 1u
-#define FLAG_OBJECTS_AT_PIXEL 8u // Experiment (GODOT_GI_OBJECTS=pixel): the velocity read at the current pixel, the form before the flick fix.
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 // Frame-edge history borrowing (see the reprojection block); the band is
 // fixed here where the stochastic denoiser's comes from GODOT_GI_BORROW,
@@ -107,8 +104,8 @@ void main() {
 			// history at uv + velocity, the camera's and the object's motion
 			// together, no classification.
 			prev_uv = uv + texelFetch(velocity_texture, pixel, 0).xy + reprojection.jitter_delta;
-		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (velocity_in_frame || (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u)) {
-			ivec2 velocity_pixel = (params.flags & FLAG_OBJECTS_AT_PIXEL) != 0u ? pixel : ivec2(prev_uv * vec2(params.screen_size));
+		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && velocity_in_frame) {
+			ivec2 velocity_pixel = ivec2(prev_uv * vec2(params.screen_size));
 			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			if (velocity != vec2(0.0) && prevprev_ndc.w > 0.0) {

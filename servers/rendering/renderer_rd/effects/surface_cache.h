@@ -175,7 +175,6 @@ private:
 	RID indirect_dyn_filtered_atlas; // RGBA16F, both dynamic bounces summed and filtered over the card (surface_cache_light.glsl filter_bounces); alpha the age the readers should take it for. What the readers read.
 	RID indirect_filtered_atlas; // RGBA16F, the static bounce accumulation filtered the same way; alpha its relights, 64ths. What the readers read in place of indirect_atlas.
 	RID static_atlas; // RGBA16F, the static lights' radiance alone, for the static cosine rays (surface_cache_light.glsl static_atlas).
-	RID screen_atlas; // RGBA16F, the screen's memory: what the rendered screen showed over the card's radiance at each texel, as the gather's hits last read it settled (stochastic_indirect_gi.glsl screen_radiance_boost); alpha the writes / 64. Zeroed by the lighting pass on a fresh capture.
 	RID indirect_atlas; // RGBA16F, incoming indirect radiance (one card ray per 2x2 quad per relight, young texels four, accumulated).
 	// RGBA32UI (change_store): three halves of the unshadowed direct
 	// radiance at the last relight, two bytes of its relative change since
@@ -314,14 +313,11 @@ private:
 	// Blocks of the smallest card, so two cards never share a stamp (four
 	// 8-texel cards fill one 16-texel tile, and a stamp per tile handed a
 	// card its neighbour's frame), of the largest atlas the settings allow,
-	// at a fixed row stride. A third array per block: the tile's relight
-	// count after its last relight (the bounce accumulation's, which a
-	// light change restarts), by which the prepare pass lists the young
-	// tiles every frame ahead of the turns. A fourth: the level of the
-	// tile's last two relights (section 92).
+	// at a fixed row stride. A third: the level of the tile's last two
+	// relights (section 92).
 	static constexpr uint32_t TILE_STAMP_STRIDE = 8192 / 8;
 	static constexpr uint32_t TILE_STAMPS = TILE_STAMP_STRIDE * TILE_STAMP_STRIDE;
-	static constexpr uint32_t TILE_STAMP_ARRAYS = 4;
+	static constexpr uint32_t TILE_STAMP_ARRAYS = 3;
 	RID dyn_stats_buffer; // Diagnostics (GODOT_CARD_ABLATE=stats): 16 counters of the dynamic rays' fate.
 	RID dynamic_lights_buffer; // DynamicLightsBuffer, uploaded every lighting update.
 	RID projector_tables_buffer; // The dynamic spots' cookie sampling tables (LightStorage::ProjectorTable), 8 slots.
@@ -416,8 +412,7 @@ private:
 		uint32_t max_items; // The lighting work list's cap: blocks lit this frame.
 		uint32_t idle_divisor; // Settled cards under static lights relight one set in this many (1: every due set).
 		uint32_t flags; // 1: 8x8 blocks (a bounce ray per texel), else 16x16 (shared per quad).
-		uint32_t young_relights; // A requested tile under this many relights is listed on young_period, ahead of the turns (0: turns alone).
-		uint32_t young_period; // Frames between two relights of a young tile.
+		uint32_t pad_young[2];
 		uint32_t full_lod; // The level the whole-set relights (fresh captures, the round robin) are listed at (GODOT_CARD_FULL_LOD, 2).
 		uint32_t lod_costs; // Per level, a byte: one tile relit at that level in eighths of a full tile (GODOT_CARD_LOD_COST; 32, 16, 4, 1).
 		uint32_t max_item_count; // The work list's length (MAX_ITEMS).
@@ -443,7 +438,7 @@ private:
 		float grid_cell;
 		uint32_t grid_n;
 		uint32_t grid_cap;
-		float bounce_floor; // The fewest relights a change restarts the bounce accumulation to (GODOT_CARD_BOUNCE_FLOOR).
+		float pad_bounce_floor;
 		uint32_t young_rays; // Extra bounce rays for a texel whose accumulation is under eight relights (GODOT_CARD_YOUNG_RAYS).
 		uint32_t dynamic_rays; // Light rays per dynamic light per texel per relight (GODOT_CARD_DYN_RAYS).
 		float dynamic_motion; // The dynamic lights' motion this frame over GODOT_CARD_DYN_MOTION, or their relative intensity/colour change if larger (0 at rest, 1 a full refresh).
@@ -451,7 +446,7 @@ private:
 		float dynamic_change; // The dynamic lights' relative change of intensity or colour this frame (LightStorage).
 		float dynamic_join; // The share of a joining light's bounce the static accumulation holds, on the frame it joins (LightStorage; 0 otherwise).
 		uint32_t area_light_count;
-		float dynamic_mark; // The most a moving light's direct term marks a texel for the screen's restart (GODOT_CARD_DYN_MARK, 0.125).
+		float pad_dynamic_mark;
 		uint32_t lod_rays; // Per level, a byte: the cosine rays a representative texel traces per relight (GODOT_CARD_LOD_RAYS; a cell of sixteen texels traced four rays a relight as quads, one representative traces one unless this says more).
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
@@ -545,7 +540,6 @@ public:
 	RID get_dynamic_lights_buffer() const { return dynamic_lights_buffer; }
 	RID get_static_atlas() const { return static_atlas; }
 	RID get_specular_atlas() const { return specular_atlas; }
-	RID get_screen_atlas() const { return screen_atlas; }
 	uint32_t get_dynamic_light_count() const { return dynamic_light_count; }
 	// The world light grid as the last update_lighting left it (the hit
 	// shading reads it the way the card lighting does).

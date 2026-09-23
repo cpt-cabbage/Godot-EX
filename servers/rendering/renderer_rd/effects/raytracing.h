@@ -96,10 +96,6 @@
 #define RB_RT_GI_MOMENTS_0 SNAME("moments_0")
 #define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
 #define RB_RT_GI_MOMENTS_SCRATCH SNAME("moments_scratch")
-// The split history (GODOT_GI_SPLIT): the even and odd frames' luminance
-// means, ping-ponged with the moments.
-#define RB_RT_GI_SPLIT_0 SNAME("split_0")
-#define RB_RT_GI_SPLIT_1 SNAME("split_1")
 #define RB_RT_GI_META_0 SNAME("meta_0")
 #define RB_RT_GI_META_1 SNAME("meta_1")
 // Ping-ponged: the previous frame's copy validates history reprojection.
@@ -108,10 +104,9 @@
 // xyz: luminance-weighted mean incoming direction, w: short-range visibility.
 #define RB_RT_GI_DIRECTIONAL SNAME("directional")
 #define RB_RT_GI_RAW_DIRECTIONAL SNAME("raw_directional")
-// A young pixel's card bounce stand-in (rgb) and its confidence (a), ping-ponged: the temporal pass modulates the history by the change between the two.
-#define RB_RT_GI_FALLBACK_0 SNAME("gi_fallback_0")
-#define RB_RT_GI_FALLBACK_1 SNAME("gi_fallback_1")
-// The rough reflection ray's direction and density (the gather), and the reflection resolved over the neighbourhood's rays (the resolve pass; the temporal pass accumulates it only under GODOT_GI_SPEC_RESOLVE=1, the raw reflection otherwise).
+// A young pixel's card bounce stand-in (rgb) and its confidence (a).
+#define RB_RT_GI_FALLBACK SNAME("gi_fallback")
+// The rough reflection ray's direction and density (the gather), and the reflection the half-rate fill resolved over the neighbors that traced (the resolve pass).
 #define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
@@ -172,8 +167,6 @@ public:
 	LocalVector<RID> stochastic_params_ubos; // Per view.
 	uint32_t denoise_guide_frame[2][4] = {}; // Per view (up to two) and scale (1, 2, 4, 8 as index 0..3): the frame the guide was produced.
 	LocalVector<RID> rt_gi_params_ubos; // Per view.
-	LocalVector<RID> rt_gi_votes_buffers; // Per view: the gather's lighting-change votes per 8x8 tile (GODOT_GI_VOTES).
-	LocalVector<uint32_t> rt_gi_votes_tiles; // Per view: the tiles the buffer holds.
 
 	// The translucency lighting volume (see process_translucency_volume):
 	// its ping-ponged textures and what last frame's mapping was, for the
@@ -298,25 +291,16 @@ private:
 		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
 		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
-		DENOISE_FLAG_OBJECTS_AT_PIXEL = 8, // Temporal (experiment, GODOT_GI_OBJECTS=pixel): the moving-object test reads the velocity at the current pixel, not at the history's.
-		DENOISE_FLAG_MIRROR_YOUNG = 16, // Spatial (GI, experiment, GODOT_GI_MIRROR_YOUNG=1): the first iteration filters a young mirror pixel's reflection at stride 1.
 		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
 		DENOISE_FLAG_SPEC_NO_SMEAR = 128, // ... nor capped by the parallax smear.
 		DENOISE_FLAG_SPEC_NO_MISMATCH = 256, // ... nor restarted by the virtual depth mismatch.
 		DENOISE_FLAG_SPEC_PAINT = 512, // Temporal (GI, diagnostics): the reflection's frame count as a colour.
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
-		DENOISE_FLAG_LUMA_COMPRESS = 2048, // GI (experiment, GODOT_GI_LUMA_COMPRESS): the filter weights measure a compressed luminance.
-		DENOISE_FLAG_MOD_PAINT = 4096, // Temporal (GI, diagnostics, GODOT_GI_MOD_PAINT): the card correction as a colour.
-		DENOISE_FLAG_NO_LUM_STOP = 8192, // Spatial (GI, experiment, GODOT_GI_LUMSTOP=0): the luminance stop off for settled pixels too.
-		DENOISE_FLAG_VOTES = 32768, // Temporal (GI, GODOT_GI_VOTES=1): the change mark is the gather's tile vote.
-		DENOISE_FLAG_FIREFLY_PAINT = 16384, // Temporal (GI, diagnostics, GODOT_GI_FIREFLY_PAINT=1): the samples the firefly test scaled, painted.
 		DENOISE_FLAG_SPEC_NO_YOUNG = 131072, // Spatial (GI, experiment, GODOT_GI_SPEC_ABLATE=young): a young reflection is not filtered for its youth.
 		DENOISE_FLAG_SPATIAL_OFF = 262144, // Spatial (GI, experiment, GODOT_GI_SPATIAL=0): the pass stores its input unfiltered.
-		DENOISE_FLAG_BORROW_SPEC = 524288, // Temporal (GI, experiment, GODOT_GI_BORROW_SPEC=1): the frame-edge borrow serves a mirror's reflection too.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
-		DENOISE_FLAG_DYN_YOUNG_RAYS = 4194304, // Temporal (GI, GODOT_GI_DYN_SPLIT=2): the young pixel's sample count follows the younger history, as the gather's rays do.
 		DENOISE_FLAG_DYN_SPLIT = 2097152, // GI (GODOT_GI_DYN_SPLIT): the moving lights' term is a history of its own; the temporal pass accumulates it apart and hands the spatial pass the sum, the spatial pass fades each history's share of the stand-in in on its own.
 	};
 
@@ -449,18 +433,18 @@ private:
 		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
 		float card_youth_lod; // The mip a hit reads a card texel relit once through (0 disables); halves per doubling of the texel's relights.
 		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS).
-		float memory_rate; // The cards' screen memory (GODOT_GI_MEMORY): the blend rate a settled screen read is remembered at; 0 off.
+		float pad_memory;
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
-		float screen_radiance_extra[4]; // x: history frames a hit's pixel needs before its screen colour is trusted (GODOT_GI_SRAD_YOUNG); y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO).
-		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger.
-		float cv_params[4]; // The control variate (GODOT_GI_CV): x its weight (0 off), y the card relights at which the field is trusted fully (GODOT_GI_CV_RAMP).
+		float screen_radiance_extra[4]; // y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO); z: the allowance above it (GODOT_GI_SRAD_FLOOR); x, w unused.
+		uint32_t ray_params[4]; // x: diffuse rays per pixel with a history; y: rays for a young pixel (GODOT_GI_YOUNG_RAYS); ray_count is the larger. z, w unused.
+		float pad_cv[4];
 		float mirror_light[4]; // The knob's own light (GODOT_GI_MIRROR): xyz world position, w energy.
 		float mirror_params[4]; // y the knob light's range, z debug bits.
 		SurfaceCache::MirrorPlaneGPU mirrors[SurfaceCache::MAX_MIRROR_PLANES]; // The scene's planar mirrors (mirror_planes_inc.glsl), world space.
 		uint32_t mirror_count;
 		uint32_t mirror_order;
 		float card_coarse_limit; // Cards with a texel wider than this (meters) are not read by the gather, their hits go to hit shading (GODOT_GI_CARD_COARSE; 0 off).
-		float card_pick_weight; // The card pick's weight on the depth mismatch in texels against the facing (GODOT_GI_CARD_PICK; 0 picks by facing alone).
+		float pad_pick;
 		uint32_t card_request_lod; // The coarsest mip a hit requests its card tile's relight at (SurfaceCache::request_lod_max; 0: full density).
 		int32_t card_request_bias; // Levels finer than the read's own the request is shifted (SurfaceCache::request_lod_bias; negative asks coarser).
 		uint32_t card_request_sample; // One read in this many asks at its own level, the rest at the coarsest (SurfaceCache::request_lod_sample).
@@ -474,7 +458,7 @@ private:
 	bool surface_cache_mirror_reflections = true;
 	RID rt_gi_dummy_buffer; // Stands in for the cache's buffers when it is off.
 	RID rt_gi_dummy_rw_buffer; // The same for the buffers a shader writes.
-	RID rt_gi_dummy_image; // And for the cards' screen memory, a storage image.
+	RID rt_gi_dummy_image; // And for the storage images a shader writes.
 
 	enum DenoiseVariant {
 		DENOISE_VARIANT_TEMPORAL,
@@ -490,7 +474,7 @@ private:
 	RID stochastic_denoise_shader_version;
 	RID stochastic_denoise_pipelines[DENOISE_VARIANT_MAX];
 
-	// The rough reflection's spatial resolve before the temporal pass (see the shader).
+	// The half-rate reflection's fill before the temporal pass (see the shader).
 	StochasticReflectionResolveShaderRD reflection_resolve_shader;
 	RID reflection_resolve_shader_version;
 	RID reflection_resolve_pipeline;
@@ -499,11 +483,9 @@ private:
 		float view_from_ndc[16];
 		int32_t screen_size[2];
 		int32_t depth_scale;
-		int32_t radius;
+		int32_t paint; // Diagnostics (GODOT_GI_SPEC_FILL_PAINT=1).
 		float rough_min;
-		float rough_full;
-		float weight_cap;
-		int32_t fill; // 1: only the pixels without a ray of their own are resolved, from the neighbors that traced (half_rate_reflections); 3: only the pixels whose ray is their diffuse ray (GODOT_GI_SPEC_SHARE).
+		float pad[3];
 	};
 
 	struct StochasticDenoisePushConstant {
@@ -521,42 +503,23 @@ private:
 		float fallback_ramp; // Spatial (GI): card relights at which the young pixel's stand-in reaches full weight.
 		float spec_restart_min; // Temporal (GI): the fewest frames the change mark restarts the reflection to (0: none).
 		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
-		// Push constants are capped at 128 bytes: the card correction's
-		// parameters (GI temporal) ride in the reprojection UBO instead.
+		// Push constants are capped at 128 bytes: the GI temporal pass's
+		// further parameters ride in the reprojection UBO instead.
 	};
 
 	// The temporal pass's per-view uniform buffer: the previous frame pair's
-	// reprojection, and the card correction's parameters (GI; see the shader).
+	// reprojection, and the GI temporal pass's parameters that do not fit
+	// its push constant (see the shader).
 	struct ReprojectUBO {
 		float prev_reproject[16];
-		float mod_strength; // The card correction's strength (0 off, 1 the field's whole change).
-		float mod_floor; // The frames a corrected history is shortened to.
-		float mod_motion; // The dynamic lights' motion this frame (0: the field's change is not a lighting change).
-		float mod_dead; // The field's dead band (a relative change under it is the cards' relight noise).
 		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
 		float borrow_band; // The frame-edge history borrow's reach outside the frame, in UV (GODOT_GI_BORROW; 0 off).
 		float young_rays; // Diffuse rays the gather spends on a pixel whose history is under 8 frames (GODOT_GI_YOUNG_RAYS): the temporal pass weighs that frame's sample by as many.
-		float frame_parity; // 0 or 1: the half of the split history this frame's sample joins.
-		// The split history (GODOT_GI_SPLIT: 0 off, 1 the pixel's halves, 2
-		// the 3x3 neighbourhood's), and the relative variance of the mean
-		// under which a settled pixel's kernel is halved (GODOT_GI_SPLIT_THRESH)
-		// or the pixel is not filtered at all (GODOT_GI_SPLIT_SKIP).
-		float split_mode;
-		float split_threshold;
-		float split_skip;
-		// The luminance stop's width (GODOT_GI_SPLIT_SIGMA: 0 the samples'
-		// deviation as SVGF, 1 the mean's from the moments over the frames,
-		// 2 the mean's from the split history), times GODOT_GI_SPLIT_K.
-		float split_sigma_mode;
-		float split_sigma_k;
-		float split_spec; // The reflection's kernel takes the split verdicts too (GODOT_GI_SPLIT_SPEC; 0: filtered as before).
-		float firefly_k; // Temporal (GI): a raw sample above its neighbours' mean by this many deviations is scaled to that bound (GODOT_GI_FIREFLY; 0 off).
-		float firefly_rough; // The roughness from which the reflection takes the firefly test too (GODOT_GI_FIREFLY_ROUGH).
-		float mark_age; // Temporal (GI): 1 restarts the diffuse history on a change mark only where this frame's mark exceeds the history's decayed one; 0 every frame the decayed mark lasts (GODOT_GI_MARK_AGE=0).
-		float mod_delta; // Temporal (GI): 1 carries a corrected history by the field's change instead of replacing its changed fraction by the field (GODOT_GI_MOD_DELTA=1).
-		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's. The std140 block is 144 bytes.
+		float pad0;
+		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's.
+		float pad1[2]; // The std140 block rounds to 96 bytes.
 	};
-	static_assert(sizeof(ReprojectUBO) == 144, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
+	static_assert(sizeof(ReprojectUBO) == 96, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
 public:
 	struct GiCascades;
@@ -581,7 +544,7 @@ private:
 	// The denoisers' guide (rt_denoise_guide.glsl): the depth and normal /
 	// roughness at a signal's resolution, produced once per frame per scale
 	// and read by the spatial passes in place of the full-resolution
-	// textures (GODOT_RT_DENOISE_GUIDE=0 reads those as before).
+	// textures.
 	RtDenoiseGuideShaderRD denoise_guide_shader;
 	RID denoise_guide_shader_version;
 	RID denoise_guide_pipeline;
@@ -769,11 +732,6 @@ public:
 	// ceiling is a second-order image; the third order read nothing more in
 	// the box (its images lie past the lights' range) and costs.
 	static uint32_t mirror_order();
-	// Whether the half-resolution direct lighting is composited as ratios
-	// times the scene shader's own per-pixel analytic term (default) rather
-	// than modulated at half resolution and upsampled (GODOT_RT_HALF_ANALYTIC=0).
-	static bool half_res_pixel_analytic();
-	static bool _change_votes();
 	// See RaytracingScene::set_hit_shading.
 	void set_hit_shading(uint32_t p_mode, RaytracingScene::HitMaterialResolver *p_resolver) { scene.set_hit_shading(p_mode, p_resolver); }
 
