@@ -400,6 +400,26 @@ private:
 	SurfaceCacheLightShaderRD light_shader;
 	RID light_shader_version;
 	RID light_pipeline;
+	// The wavefront split (GODOT_CARD_WAVEFRONT, plan section 95): the
+	// lighting kernel as a setup kernel without ray queries, a trace kernel
+	// dispatched indirectly over the requests it appends, and a resolve
+	// kernel. It covers the first SPLIT_ITEMS work items (the single kernel
+	// takes any past them); the scratch is sized for that many.
+	static constexpr uint32_t SPLIT_ITEMS = 4096;
+	RID light_setup_pipeline;
+	RID light_trace_pipeline;
+	RID light_resolve_pipeline;
+	RID split_count_buffer;
+	RID split_args_buffer;
+	RID split_requests_buffer;
+	RID split_headers_buffer;
+	RID split_texels_buffer;
+	RID split_records_buffer;
+	RID split_dummy_buffer; // The trace kernel's stand-in for the arguments' storage binding.
+	RID split_rest_args_buffer; // The single kernel's indirect arguments for the items past the split's (the setup kernel writes them).
+	uint32_t split_record_slots = 0; // The records per thread the buffer holds.
+	uint32_t split_request_slots = 0; // The requests per thread the buffer holds.
+	bool split_active = false; // This frame's lighting runs split.
 
 	struct PreparePushConstant {
 		uint32_t set_count;
@@ -454,7 +474,9 @@ private:
 		uint32_t mirror_order; // The longest image chain evaluated (Raytracing::mirror_order).
 		uint32_t mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling; see the shader).
 		uint32_t mirror_pad;
+		uint32_t split[4]; // The wavefront split: the items it covers (0: none), the bounce records, the light rays per dynamic light, the records per thread.
 	};
+	static_assert(sizeof(LightParamsUBO) % 16 == 0, "LightParamsUBO must end on a 16-byte boundary (std140).");
 
 	// The dynamic lights, as the card lighting and the GI gather read them
 	// (surface_cache_light.glsl DynamicLights): LightStorage's world-space

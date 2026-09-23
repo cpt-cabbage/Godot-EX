@@ -4,9 +4,33 @@
 
 #VERSION_DEFINES
 
+// The wavefront split (plan section 95, GODOT_CARD_WAVEFRONT): the kernel
+// below is also built as three, as the GI gather was (section 94).
+// SC_SETUP runs the kernel with its ray points emitting requests instead
+// of tracing -- the texels, the light selection, every ray's direction --
+// and skips the accumulation; SC_TRACE is a linear dispatch over the
+// requests: the shadow rays with their coverage test, the bounce and the
+// dynamic lights' rays through their holes (card_hole) and the dynamic
+// landings' connections; SC_RESOLVE runs the kernel again with the ray
+// points reading the answers. The card lookups, the light sums and the
+// accumulation's filter taps then run without the intersector's registers
+// beside them. Setup and resolve must not mention the acceleration
+// structure (the Metal container routes on the capability). The planar
+// mirrors' chains and image legs, and the per-texel (non-quad) layout,
+// keep the single kernel: the host splits only a frame without them.
+#if defined(SC_SETUP) || defined(SC_RESOLVE)
+#define SC_NO_RAYS
+#endif
+#if defined(SC_SETUP) || defined(SC_TRACE) || defined(SC_RESOLVE)
+#define SC_SPLIT
+#endif
+
+#ifndef SC_NO_RAYS
 #extension GL_EXT_ray_query : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_EXT_samplerless_texture_functions : enable
 
 // Surface cache lighting: shades the card texels of this frame's active card
@@ -32,7 +56,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define SDFGI_MAX_CASCADES 8
 #define SDFGI_OCT_SIZE 6
 
+#ifndef SC_NO_RAYS
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+#endif
 
 layout(set = 0, binding = 1, std430) restrict readonly buffer Sets {
 	CardSet data[];
@@ -124,8 +150,71 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint mirror_order; // The longest image chain evaluated (1: single images, 2: pairs too).
 	uint mirror_debug; // GODOT_MIRROR_ABLATE bits (profiling): 1 no image lights, 2 no mirror continuation of the bounce rays, 4 the F0 fold kept on the mirrors' texels, 8 no area-light images, 16 the area-light images weighted through the drawn rect point (see shade_images).
 	uint mirror_pad2;
+	// The wavefront split (see the header): x the work items it covers (the
+	// single kernel takes the items from there on, all of them when 0), y
+	// the bounce records per thread (the most cosine rays a texel traces),
+	// z the light rays per dynamic light, w the ray records per thread (y,
+	// the gradient's, and z per dynamic light).
+	uvec4 split;
 }
 params;
+
+#ifdef SC_SPLIT
+// The split's hand-over, per thread of a covered work item (thread index
+// item * 64 + the local index): a header -- x the shadow rays requested,
+// a bit each (texel k's directional light i at k * (directional count + 1)
+// + i, its drawn light at k * (count + 1) + count), y the ones found
+// occluded (the trace kernel's atomicOr), z the ray records requested, w
+// unused -- then per texel of the quad two uvec4, its ray origin and
+// normal (octahedral) and the drawn light's target and caster mask, and
+// params.split.w ray records: the bounce rays (split.y), the gradient's,
+// the dynamic lights' (split.z each), each written by the setup kernel as
+// the direction and the texel it leaves from and answered in place by the
+// trace kernel (flags, t, the hit instance). The requests are one uint
+// each, thread * 64 + the code (a shadow bit, or 32 + the record).
+layout(set = 1, binding = 0, std430) restrict buffer SplitCount {
+	uint count;
+}
+split_count;
+layout(set = 1, binding = 1, std430) restrict buffer SplitArgs {
+	uvec4 groups;
+}
+split_args;
+layout(set = 1, binding = 2, std430) restrict buffer SplitRequests {
+	uint data[];
+}
+split_requests;
+layout(set = 1, binding = 3, std430) restrict buffer SplitHeaders {
+	uvec4 data[];
+}
+split_headers;
+layout(set = 1, binding = 4, std430) restrict buffer SplitTexels {
+	uvec4 data[]; // Eight per thread.
+}
+split_texels;
+layout(set = 1, binding = 5, std430) restrict buffer SplitRecords {
+	uvec4 data[];
+}
+split_records;
+// The single kernel's indirect arguments for the items past the split's
+// (the setup kernel's first thread writes them; the host resets them).
+layout(set = 1, binding = 6, std430) restrict buffer SplitRestArgs {
+	uvec4 groups;
+}
+split_rest_args;
+
+#define SPLIT_HIT 1u
+#define SPLIT_CONNECTED 2u // A dynamic landing's connection to the texel is clear.
+#define SPLIT_GRADIENT_SLOT params.split.y
+#define SPLIT_DYN_SLOT(i, s) (params.split.y + 1u + (i) * params.split.z + (s))
+
+uint split_thread = 0u;
+uint split_shadow_mask = 0u; // Setup: the shadow bits requested; resolve: the header's x.
+uint split_shadow_hits = 0u; // Resolve: the header's y.
+uint split_ray_mask = 0u; // Setup: the records requested; resolve: the header's z.
+#else
+#define SPLIT_GRADIENT_SLOT 0u
+#endif
 
 #include "mirror_planes_inc.glsl"
 
@@ -806,6 +895,46 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	return true;
 }
 
+// Whether card_lookup() would call the hit a hole (card_reject 3: the set
+// is captured and no card facing the ray has a filled texel under it), the
+// test the bounce and light rays go on through; the trace kernel's, which
+// reads no lighting.
+bool card_hole(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
+	if (p_instance_id == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardInstance inst = card_instances.data[p_instance_id];
+	if (inst.set == SURFACE_CACHE_INVALID) {
+		return false;
+	}
+	CardSet s = sets.data[inst.set];
+	if ((s.flags & SURFACE_CACHE_SET_FLAG_CAPTURED) == 0u || s.card_size < 8.0) {
+		return false;
+	}
+	vec3 local_pos = (inst.local_from_world * vec4(p_world_hit, 1.0)).xyz;
+	vec3 local_dir = normalize(mat3(inst.local_from_world) * p_world_dir);
+	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
+		vec3 axis, u, v;
+		card_basis(k, axis, u, v);
+		if (-dot(axis, local_dir) <= 0.0) {
+			continue;
+		}
+		vec2 uv01;
+		float depth;
+		card_project(s, k, local_pos, uv01, depth);
+		if (depth < 0.0 || any(lessThan(uv01, vec2(0.0))) || any(greaterThan(uv01, vec2(1.0)))) {
+			continue;
+		}
+		uint packed = sets.data[inst.set].cards[k];
+		ivec2 dims = card_dims_packed(packed);
+		ivec2 texel = card_origin_packed(packed) + clamp(ivec2(uv01 * vec2(dims)), ivec2(0), dims - ivec2(1));
+		if (texelFetch(depth_atlas, texel, 0).r > 0.0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 vec3 basis_around(vec3 n, vec2 rnd) {
 	vec3 t = abs(n.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
 	vec3 b1 = normalize(cross(n, t));
@@ -877,6 +1006,7 @@ bool card_covers(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir) {
 	return best_alpha >= 0.5;
 }
 
+#ifndef SC_NO_RAYS
 bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT, mask, origin, 0.0, dir, t_max);
@@ -898,6 +1028,21 @@ bool occluded_opaque(vec3 origin, vec3 dir, float t_max) {
 	while (rayQueryProceedEXT(rq)) {
 	}
 	return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+#endif
+
+// A texel's shadow ray, at its bit of the split's header: traced here in
+// the single kernel, requested by the setup kernel (which reports it
+// clear), read back by the resolve (clear where it was not requested).
+bool shadow_ray(uint bit, vec3 origin, vec3 dir, float t_max, uint mask) {
+#if defined(SC_SETUP)
+	split_shadow_mask |= 1u << bit;
+	return false;
+#elif defined(SC_RESOLVE)
+	return (split_shadow_mask & split_shadow_hits & (1u << bit)) != 0u;
+#else
+	return occluded(origin, dir, t_max, mask);
+#endif
 }
 
 // The local lights that reach a point: its cell of the world light grid
@@ -1187,7 +1332,9 @@ void shade_images(uint set, Texel t, inout uint seed, out ImageCache c) {
 	}
 }
 
-void shade_direct(uint set, Texel t, inout uint seed, inout ImageCache images, out Direct d) {
+// k: the texel's place in its quad (0 outside the quad layout), which names
+// its shadow rays for the split.
+void shade_direct(uint set, Texel t, uint k, inout uint seed, inout ImageCache images, out Direct d) {
 	vec3 direct = vec3(0.0);
 	vec3 direct_unshadowed = vec3(0.0);
 	d.local_geom = 0.0;
@@ -1210,7 +1357,7 @@ void shade_direct(uint set, Texel t, inout uint seed, inout ImageCache images, o
 			direct += c;
 			continue;
 		}
-		float vis = mix(1.0, occluded(t.origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
+		float vis = mix(1.0, shadow_ray(k * (params.directional_light_count + 1u) + i, t.origin, l, 1e4, 0xFFu) ? 0.0 : 1.0, dl.shadow_opacity);
 		direct += c * vis;
 	}
 	vec3 sum = vec3(0.0);
@@ -1319,6 +1466,9 @@ void shade_direct(uint set, Texel t, inout uint seed, inout ImageCache images, o
 			float dist = length(to_light);
 			bool blocked;
 			if (sel_image) {
+#ifdef SC_NO_RAYS
+				blocked = false; // No mirrors in a split frame (see the header).
+#else
 				// Legs: to a centimeter above each mirror of the chain (along
 				// its normal), the target mirrored back a step each time,
 				// then from the last mirror to the real light.
@@ -1345,8 +1495,14 @@ void shade_direct(uint set, Texel t, inout uint seed, inout ImageCache images, o
 				vec3 to_real = target - from;
 				float dr = length(to_real);
 				blocked = blocked || occluded(from, to_real / max(dr, 1e-5), max(dr - 0.01, 0.0), sel_mask);
+#endif
 			} else {
-				blocked = occluded(t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask);
+#ifdef SC_SETUP
+				// The trace kernel's target: the ray is rebuilt from it and the
+				// texel's origin, as here.
+				split_texels.data[split_thread * 8u + k * 2u + 1u] = uvec4(floatBitsToUint(sel_pos), sel_mask);
+#endif
+				blocked = shadow_ray(k * (params.directional_light_count + 1u) + params.directional_light_count, t.origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel_mask);
 			}
 			vis = mix(1.0, blocked ? 0.0 : 1.0, sel_opacity);
 		}
@@ -1404,7 +1560,23 @@ void dyn_stat(uint i, bool ceiling) {
 	}
 }
 
-void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3 dyn_sample, out float landed, out float change_total) {
+// The resolve's answer to a split ray: its record where the setup kernel
+// requested it, nothing (a miss) otherwise.
+#ifdef SC_RESOLVE
+uvec4 split_record(uint r) {
+	return (split_ray_mask & (1u << r)) != 0u ? split_records.data[split_thread * params.split.w + r] : uvec4(0u);
+}
+#endif
+#ifdef SC_SETUP
+// The setup kernel's request of ray record r: its direction and the texel
+// of the quad it leaves from (or connects to).
+void split_request(uint r, vec3 dir, uint k) {
+	split_records.data[split_thread * params.split.w + r] = uvec4(floatBitsToUint(dir), k);
+	split_ray_mask |= 1u << r;
+}
+#endif
+
+void trace_dynamic(ivec2 texel, Texel t, uint k_tracer, float n_cosine, float n_light, out vec3 dyn_sample, out float landed, out float change_total) {
 	dyn_sample = vec3(0.0);
 	landed = 0.0;
 	change_total = 0.0;
@@ -1451,7 +1623,10 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 				float st = sqrt(max(1.0 - ct * ct, 0.0));
 				dir = normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
 			}
-			rayQueryEXT rq;
+#ifdef SC_SETUP
+			split_request(SPLIT_DYN_SLOT(i, sidx), dir, k_tracer);
+			continue;
+#endif
 			dyn_stat(0u, ceiling);
 			// As the bounce ray: a hit under which no facing card has a
 			// filled texel is a hole, and the ray goes on through it.
@@ -1466,6 +1641,20 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 			ivec2 texel_p = ivec2(0);
 			bool blocked = false;
 			bool landed_on_card = false;
+#ifdef SC_RESOLVE
+			uvec4 rec = split_record(SPLIT_DYN_SLOT(i, sidx));
+			if ((rec.x & SPLIT_HIT) != 0u) {
+				d_lp = uintBitsToFloat(rec.y);
+				p = pos + dir * d_lp;
+				blocked = true;
+				landed_on_card = card_lookup(rec.z, p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p);
+			}
+#define DYN_CONNECTED ((rec.x & SPLIT_CONNECTED) != 0u)
+#elif defined(SC_SETUP)
+#define DYN_CONNECTED false
+#else
+#define DYN_CONNECTED !occluded_opaque(t.origin, l, max(d - params.ray_bias, 0.0))
+			rayQueryEXT rq;
 			vec3 ray_origin = pos;
 			float d_base = 0.0;
 			for (uint layer = 0u; layer < 4u; layer++) {
@@ -1487,6 +1676,7 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 				d_base = d_lp + params.ray_bias;
 				ray_origin = pos + dir * d_base;
 			}
+#endif
 			if (!blocked) {
 				continue;
 			}
@@ -1519,7 +1709,7 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 				float cos_pt = dot(n_p, -l);
 				dyn_stat(4u, ceiling && cos_t > 0.0);
 				dyn_stat(5u, ceiling && cos_t > 0.0 && cos_pt > 0.0);
-				if (d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0 && !occluded_opaque(t.origin, l, max(d - params.ray_bias, 0.0))) {
+				if (d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0 && DYN_CONNECTED) {
 					dyn_stat(6u, ceiling);
 					float geom = cos_t * cos_pt / (d * d + 0.01);
 					dyn_sample += l_dyn * (geom / (M_PI * n_light * pdf_area + n_cosine * geom));
@@ -1544,7 +1734,9 @@ void trace_dynamic(ivec2 texel, Texel t, float n_cosine, float n_light, out vec3
 // (see main), the card's radiance at its hit less the dynamic lights' part.
 // r_dyn1 / r_dyn2: the cosine ray's share of the dynamic lights' first and
 // second bounce (see trace_dynamic), n_cosine rays of it this relight.
-void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out vec3 indirect_sample, out vec3 r_dyn1, out vec3 r_dyn2, out float bounce_change, out float bounce_change_total, out uint hit_set_id, out float hit_t) {
+// r_slot and k: the ray's record and the texel of the quad it leaves from,
+// for the split.
+void trace_bounce(Texel t, uint r_slot, uint k, inout uint seed, float n_cosine, float n_light, out vec3 indirect_sample, out vec3 r_dyn1, out vec3 r_dyn2, out float bounce_change, out float bounce_change_total, out uint hit_set_id, out float hit_t) {
 	indirect_sample = vec3(0.0);
 	r_dyn1 = vec3(0.0);
 	r_dyn2 = vec3(0.0);
@@ -1563,7 +1755,10 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		seed = pcg_hash(seed);
 		float r1 = hash_to_float(seed);
 		vec3 ray_dir = basis_around(t.n_world, vec2(r0, r1));
-		rayQueryEXT rq;
+#ifdef SC_SETUP
+		split_request(r_slot, ray_dir, k);
+		return;
+#endif
 		// Opaque: alpha-tested casters occlude the bounce ray whole (the
 		// shadow rays above consult the cards' coverage at every candidate;
 		// the bounce is a diffuse term and those lookups cost a millisecond
@@ -1591,6 +1786,17 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 		float mirror_f = 1.0; // The planar mirror's Fresnel, per reflection the ray took.
 		vec3 plane_diffuse = vec3(0.0); // The plane's own diffuse card, read on the way.
 		uint mirror_bounces = 0u;
+#ifdef SC_RESOLVE
+		uvec4 rec = split_record(r_slot);
+		if ((rec.x & SPLIT_HIT) != 0u) {
+			t_hit = uintBitsToFloat(rec.y);
+			hit_instance = rec.z;
+			hit_pos = t.origin + ray_dir * t_hit;
+			blocked = true;
+			on_card = card_lookup(hit_instance, hit_pos, ray_dir, card_radiance, hit_set, hit_change, hit_change_total, n_hit, albedo_hit, texel_hit);
+		}
+#elif !defined(SC_SETUP)
+		rayQueryEXT rq;
 		for (uint layer = 0u; layer < 4u; layer++) {
 			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
 			while (rayQueryProceedEXT(rq)) {
@@ -1638,6 +1844,7 @@ void trace_bounce(Texel t, inout uint seed, float n_cosine, float n_light, out v
 			t_base = t_hit + params.ray_bias;
 			ray_origin = t.origin + ray_dir * t_base;
 		}
+#endif
 		if (blocked) {
 			hit_t = t_hit;
 			if (on_card) {
@@ -1786,7 +1993,7 @@ uint cosine_rays(bool young, bool young_dynamic) {
 	return ((young || dynamic_young) && (params.debug & 1u) == 0u) ? params.young_rays + 1u : 1u;
 }
 
-void trace_bounce_young(uint n_cosine, float n_light, Texel t, inout uint seed, inout vec3 indirect_sample, inout vec3 dyn1, inout vec3 dyn2, inout float bounce_change, inout float bounce_change_total) {
+void trace_bounce_young(uint n_cosine, float n_light, Texel t, uint k, inout uint seed, inout vec3 indirect_sample, inout vec3 dyn1, inout vec3 dyn2, inout float bounce_change, inout float bounce_change_total) {
 	if (n_cosine <= 1u) {
 		return;
 	}
@@ -1798,7 +2005,7 @@ void trace_bounce_young(uint n_cosine, float n_light, Texel t, inout uint seed, 
 		float extra_total;
 		uint extra_set;
 		float extra_t;
-		trace_bounce(t, seed, float(n_cosine), n_light, extra, extra_dyn1, extra_dyn2, extra_change, extra_total, extra_set, extra_t);
+		trace_bounce(t, r, k, seed, float(n_cosine), n_light, extra, extra_dyn1, extra_dyn2, extra_change, extra_total, extra_set, extra_t);
 		indirect_sample += extra;
 		dyn1 += extra_dyn1;
 		dyn2 += extra_dyn2;
@@ -1817,7 +2024,7 @@ void trace_bounce_young(uint n_cosine, float n_light, Texel t, inout uint seed, 
 // A ray that finds the same surface at the same distance gives nothing,
 // whatever its radiance did. Off for a fresh texel and when the set has no
 // previous relight.
-float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
+float bounce_gradient(ivec2 texel, Texel t, uint k, uint prev_seed, bool have_prev) {
 	if (!have_prev || (params.debug & 16u) != 0u) {
 		return -1.0;
 	}
@@ -1834,7 +2041,10 @@ float bounce_gradient(ivec2 texel, Texel t, uint prev_seed, bool have_prev) {
 	float unused_total;
 	vec3 unused_dyn1;
 	vec3 unused_dyn2;
-	trace_bounce(t, seed, 1.0, 0.0, again, unused_dyn1, unused_dyn2, unused_change, unused_total, set_now, t_now);
+	trace_bounce(t, SPLIT_GRADIENT_SLOT, k, seed, 1.0, 0.0, again, unused_dyn1, unused_dyn2, unused_change, unused_total, set_now, t_now);
+#ifdef SC_SETUP
+	return -1.0;
+#endif
 	// The verdict is the distance's alone. The set's identity was compared
 	// first, and on the TPS bridge it restarted 1.7% of the relit quads
 	// every relight with the geometry still: coincident faces of two
@@ -1998,6 +2208,9 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 float mark_decay = 0.125;
 
 void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample, float bounce_change, float bounce_change_total, float dyn_change_total, vec3 dyn_sample, vec3 dyn2_sample, float dyn_landed, float bounce_gradient, uint bounce_set, float bounce_t, ivec2 card_min, ivec2 card_max) {
+#ifdef SC_SETUP
+	return; // The setup kernel only requests the rays.
+#endif
 	vec4 old = imageLoad(lighting_atlas, texel);
 	Change prev = change_load(texel);
 	// A fresh capture has nothing to compare with, and neither has a texel
@@ -2360,14 +2573,41 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 	}
 }
 
-void main() {
+// The setup kernel's record of a texel's ray origin and normal, for the
+// trace kernel.
+void split_texel_store(uint k, Texel t) {
+#ifdef SC_SETUP
+	split_texels.data[split_thread * 8u + k * 2u] = uvec4(floatBitsToUint(t.origin), packUnorm2x16(vec3_to_oct(t.n_world)));
+#endif
+}
+
+void light_main() {
 	// One workgroup per work item the prepare pass listed: the block of a
 	// card of an active set (a requested tile, or every block of a set due
-	// in full). Nothing here walks blocks a ray never asked for.
-	if (gl_WorkGroupID.x >= active_sets.item_count) {
+	// in full). Nothing here walks blocks a ray never asked for. With the
+	// split, the single kernel is dispatched over the items past the ones
+	// it covers (the setup kernel writes that count).
+#ifdef SC_SPLIT
+	uint item_index = gl_WorkGroupID.x;
+#else
+	uint item_index = gl_WorkGroupID.x + params.split.x;
+#endif
+	if (item_index >= active_sets.item_count) {
 		return;
 	}
-	uint item = active_sets.items[gl_WorkGroupID.x];
+#ifdef SC_SPLIT
+	if (item_index >= params.split.x) {
+		return; // The single kernel's.
+	}
+	split_thread = item_index * 64u + gl_LocalInvocationIndex;
+#ifdef SC_RESOLVE
+	uvec4 header = split_headers.data[split_thread];
+	split_shadow_mask = header.x;
+	split_shadow_hits = header.y;
+	split_ray_mask = header.z;
+#endif
+#endif
+	uint item = active_sets.items[item_index];
 	uint entry = item & SURFACE_CACHE_ITEM_ENTRY_MASK;
 	uint lod = (item >> SURFACE_CACHE_ITEM_LOD_SHIFT) & 7u;
 	uint set = active_sets.list[entry] & 0x7FFFFFFFu;
@@ -2443,6 +2683,7 @@ void main() {
 		if (!read_texel(s, card, dims, texel_in_card, texel, t)) {
 			return;
 		}
+		split_texel_store(0u, t);
 		set_state.state[set * 2u + 1u] = 1u;
 		// The stamps of the representative's own tile (the item spans up to
 		// sixteen, each stamped by the prepare pass as it listed the item),
@@ -2466,8 +2707,8 @@ void main() {
 		Direct d;
 		ImageCache images;
 		images.valid = false;
-		shade_direct(set, t, seed, images, d);
-		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, prev_seed, have_prev));
+		shade_direct(set, t, 0u, seed, images, d);
+		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, 0u, prev_seed, have_prev));
 		vec3 indirect_sample;
 		float bounce_change;
 		float bounce_change_total;
@@ -2483,12 +2724,12 @@ void main() {
 		float n_light = light_rays(young_dynamic);
 		vec3 dyn_sample;
 		vec3 dyn2_sample;
-		trace_bounce(t, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
-		trace_bounce_young(n_cosine, n_light, t, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+		trace_bounce(t, 0u, 0u, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+		trace_bounce_young(n_cosine, n_light, t, 0u, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
 		vec3 dyn_light;
 		float dyn_landed;
 		float dyn_change_total;
-		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+		trace_dynamic(texel, t, 0u, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
@@ -2521,6 +2762,7 @@ void main() {
 		if (!read_texel(s, card, dims, texel_in_card, texel, t)) {
 			return;
 		}
+		split_texel_store(0u, t);
 		set_state.state[set * 2u + 1u] = 1u;
 		uint seed = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		// The bounce ray's seed is its own, not the direct term's advanced
@@ -2531,8 +2773,8 @@ void main() {
 		Direct d;
 		ImageCache images;
 		images.valid = false;
-		shade_direct(set, t, seed, images, d);
-		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, prev_seed, have_prev));
+		shade_direct(set, t, 0u, seed, images, d);
+		float gradient = bounce_gradient_voted(bounce_gradient(texel, t, 0u, prev_seed, have_prev));
 		vec3 indirect_sample;
 		float bounce_change;
 		float bounce_change_total;
@@ -2543,12 +2785,12 @@ void main() {
 		float n_light = light_rays(young_dynamic);
 		vec3 dyn_sample;
 		vec3 dyn2_sample;
-		trace_bounce(t, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
-		trace_bounce_young(n_cosine, n_light, t, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+		trace_bounce(t, 0u, 0u, bounce_seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+		trace_bounce_young(n_cosine, n_light, t, 0u, bounce_seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
 		vec3 dyn_light;
 		float dyn_landed;
 		float dyn_change_total;
-		trace_dynamic(texel, t, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+		trace_dynamic(texel, t, 0u, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 		dyn_sample += dyn_light;
 		accumulate(texel, t, reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 		return;
@@ -2565,6 +2807,7 @@ void main() {
 		ivec2 texel_in_card = quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		valid[k] = read_texel(s, card, dims, texel_in_card, origin_texel + texel_in_card, t[k]);
 		if (valid[k]) {
+			split_texel_store(k, t[k]);
 			set_state.state[set * 2u + 1u] = 1u;
 		}
 		valid_count += valid[k] ? 1u : 0u;
@@ -2598,7 +2841,7 @@ void main() {
 		}
 		ivec2 prev_tracer_texel = origin_texel + quad_in_card + ivec2(int(prev_tracer & 1u), int(prev_tracer >> 1u));
 		uint prev_seed = pcg_hash(uint(prev_tracer_texel.x) + pcg_hash(uint(prev_tracer_texel.y) + pcg_hash(prev_frame)));
-		gradient = bounce_gradient(prev_tracer_texel, t[prev_tracer], prev_seed, true);
+		gradient = bounce_gradient(prev_tracer_texel, t[prev_tracer], prev_tracer, prev_seed, true);
 	}
 	gradient = bounce_gradient_voted(gradient);
 	vec3 indirect_sample;
@@ -2611,12 +2854,12 @@ void main() {
 	float n_light = light_rays(young_dynamic);
 	vec3 dyn_sample;
 	vec3 dyn2_sample;
-	trace_bounce(t[tracer], seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
-	trace_bounce_young(n_cosine, n_light, t[tracer], seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
+	trace_bounce(t[tracer], 0u, tracer, seed, float(n_cosine), n_light, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total, bounce_set, bounce_t);
+	trace_bounce_young(n_cosine, n_light, t[tracer], tracer, seed, indirect_sample, dyn_sample, dyn2_sample, bounce_change, bounce_change_total);
 	vec3 dyn_light;
 	float dyn_landed;
 	float dyn_change_total;
-	trace_dynamic(tracer_texel, t[tracer], float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
+	trace_dynamic(tracer_texel, t[tracer], tracer, float(n_cosine), n_light, dyn_light, dyn_landed, dyn_change_total);
 	dyn_sample += dyn_light;
 	// The image lights' sum, computed at the quad's first texel and shared.
 	ImageCache images;
@@ -2628,7 +2871,144 @@ void main() {
 		ivec2 texel = origin_texel + quad_in_card + ivec2(int(k & 1u), int(k >> 1u));
 		uint seed_k = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) + pcg_hash(params.frame)));
 		Direct d;
-		shade_direct(set, t[k], seed_k, images, d);
+		shade_direct(set, t[k], k, seed_k, images, d);
 		accumulate(texel, t[k], reset, d, indirect_sample, bounce_change, bounce_change_total, dyn_change_total, dyn_sample, dyn2_sample, dyn_landed, gradient, bounce_set, bounce_t, card_min, card_max);
 	}
+}
+
+#ifdef SC_SETUP
+// The setup kernel: the kernel with its ray points requesting, then the
+// requests appended in uniform control flow (a workgroup is covered or not
+// whole): one atomic per SIMD group for the count and one for the trace
+// dispatch's group count. The header goes out for every thread; the
+// resolve reads it wherever it reaches a ray point.
+void setup_main() {
+	if (gl_WorkGroupID.x == 0u && gl_LocalInvocationIndex == 0u) {
+		split_rest_args.groups.x = active_sets.item_count > params.split.x ? active_sets.item_count - params.split.x : 0u;
+	}
+	if (gl_WorkGroupID.x >= active_sets.item_count || gl_WorkGroupID.x >= params.split.x) {
+		return;
+	}
+	light_main();
+	split_headers.data[split_thread] = uvec4(split_shadow_mask, 0u, split_ray_mask, 0u);
+	uint n = bitCount(split_shadow_mask) + bitCount(split_ray_mask);
+	uint base = subgroupExclusiveAdd(n);
+	uint total = subgroupAdd(n);
+	if (total == 0u) {
+		return;
+	}
+	uint first = 0u;
+	if (subgroupElect()) {
+		first = atomicAdd(split_count.count, total);
+		atomicMax(split_args.groups.x, (first + total + 63u) / 64u);
+	}
+	first = subgroupBroadcastFirst(first) + base;
+	uint m = split_shadow_mask;
+	while (m != 0u) {
+		uint b = uint(findLSB(m));
+		m &= m - 1u;
+		split_requests.data[first++] = split_thread * 64u + b;
+	}
+	m = split_ray_mask;
+	while (m != 0u) {
+		uint b = uint(findLSB(m));
+		m &= m - 1u;
+		split_requests.data[first++] = split_thread * 64u + 32u + b;
+	}
+}
+#endif
+
+#ifdef SC_TRACE
+// The trace kernel: one request, one ray (a layered one through holes, and
+// a dynamic landing's connection after it), the answer into the header's
+// occlusion bits or the ray's record. Each ray is the single kernel's,
+// rebuilt from the texel's origin and what the setup kernel stored.
+void trace_main() {
+	uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+	if (i >= split_count.count) {
+		return;
+	}
+	uint key = split_requests.data[i];
+	uint thread = key >> 6u;
+	uint code = key & 63u;
+	if (code < 32u) {
+		uint lights = params.directional_light_count + 1u;
+		uint k = code / lights;
+		uint light = code % lights;
+		vec3 origin = uintBitsToFloat(split_texels.data[thread * 8u + k * 2u].xyz);
+		bool occ;
+		if (light < params.directional_light_count) {
+			vec3 l = normalize(mat3(params.world_from_view) * directional_lights.data[light].direction);
+			occ = occluded(origin, l, 1e4, 0xFFu);
+		} else {
+			uvec4 sel = split_texels.data[thread * 8u + k * 2u + 1u];
+			vec3 to_light = uintBitsToFloat(sel.xyz) - origin;
+			float dist = length(to_light);
+			occ = occluded(origin, to_light / max(dist, 1e-5), max(dist - params.ray_bias, 0.0), sel.w);
+		}
+		if (occ) {
+			atomicOr(split_headers.data[thread].y, 1u << code);
+		}
+		return;
+	}
+	uint r = code - 32u;
+	uint record = thread * params.split.w + r;
+	uvec4 req = split_records.data[record];
+	vec3 dir = uintBitsToFloat(req.xyz);
+	uvec4 frame = split_texels.data[thread * 8u + req.w * 2u];
+	vec3 texel_origin = uintBitsToFloat(frame.xyz);
+	bool dynamic = r > params.split.y;
+	vec3 pos = texel_origin;
+	float range = 1e4;
+	if (dynamic) {
+		LightData ld = dyn_lights.data[(r - params.split.y - 1u) / params.split.z];
+		pos = ld.position;
+		range = 1.0 / ld.inv_radius;
+	}
+	// The layers, as trace_bounce and trace_dynamic walk them: a hit on a
+	// hole goes on from just past it.
+	uvec4 answer = uvec4(0u);
+	rayQueryEXT rq;
+	vec3 ray_origin = pos;
+	float t_base = 0.0;
+	for (uint layer = 0u; layer < 4u; layer++) {
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, dynamic ? range - t_base : 1e4);
+		while (rayQueryProceedEXT(rq)) {
+		}
+		if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+			break;
+		}
+		float t_hit = t_base + rayQueryGetIntersectionTEXT(rq, true);
+		uint instance = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+		if (!card_hole(instance, ray_origin + dir * (t_hit - t_base), dir)) {
+			answer = uvec4(SPLIT_HIT, floatBitsToUint(t_hit), instance, 0u);
+			break;
+		}
+		t_base = t_hit + params.ray_bias;
+		ray_origin = pos + dir * t_base;
+	}
+	if (dynamic && answer.x != 0u) {
+		// The landing's connection to the texel, where the texel faces it
+		// (the resolve tests the landing's side, which needs its card).
+		vec3 p = pos + dir * uintBitsToFloat(answer.y);
+		vec3 rel = p - texel_origin;
+		float d = length(rel);
+		vec3 l = rel / max(d, 1e-4);
+		vec3 n = oct_to_vec3(unpackUnorm2x16(frame.w) * 2.0 - 1.0);
+		if (d >= 1e-4 && dot(n, l) > 0.0 && !occluded_opaque(texel_origin, l, max(d - params.ray_bias, 0.0))) {
+			answer.x |= SPLIT_CONNECTED;
+		}
+	}
+	split_records.data[record] = answer;
+}
+#endif
+
+void main() {
+#if defined(SC_SETUP)
+	setup_main();
+#elif defined(SC_TRACE)
+	trace_main();
+#else
+	light_main();
+#endif
 }

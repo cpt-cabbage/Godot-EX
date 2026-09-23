@@ -76,10 +76,18 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	}
 	{
 		Vector<String> modes;
-		modes.push_back(p_sky_octmap_array ? "\n#define USE_RADIANCE_OCTMAP_ARRAY\n" : "");
+		const String octmap_define = p_sky_octmap_array ? "\n#define USE_RADIANCE_OCTMAP_ARRAY\n" : "";
+		modes.push_back(octmap_define);
+		// The wavefront split's three kernels (see the shader's header).
+		modes.push_back(octmap_define + "\n#define SC_SETUP\n");
+		modes.push_back(octmap_define + "\n#define SC_TRACE\n");
+		modes.push_back(octmap_define + "\n#define SC_RESOLVE\n");
 		light_shader.initialize(modes);
 		light_shader_version = light_shader.version_create();
 		light_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 0));
+		light_setup_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 1));
+		light_trace_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 2));
+		light_resolve_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 3));
 	}
 
 	{
@@ -125,7 +133,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 SurfaceCache::~SurfaceCache() {
 	RD *rd = RD::get_singleton();
 	_free_atlases();
-	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, converge_buffer, set_state_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer }) {
+	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, converge_buffer, set_state_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer, split_count_buffer, split_args_buffer, split_requests_buffer, split_headers_buffer, split_texels_buffer, split_records_buffer, split_dummy_buffer, split_rest_args_buffer }) {
 		if (rid.is_valid()) {
 			rd->free_rid(rid);
 		}
@@ -1302,6 +1310,31 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	const bool count_convergence = true;
 	params.flags |= 4096;
 	rd->buffer_clear(converge_buffer, 0, 20 * sizeof(uint32_t));
+	// The wavefront split (see the shader's header): a frame without planar
+	// mirrors, in the quad layout, whose shadow rays fit a thread's 32 bits
+	// (four texels, each directional light and the drawn one) and its rays
+	// 32 records (the most cosine rays a texel traces, the gradient's, the
+	// light rays of every dynamic light). On the TPS demo at the quarter
+	// tiers (plan section 95) the pass took 5.7 ms on the bridge and 6.9
+	// in the hall; split, 0.6 + 1.9 + 1.7 and 0.6 + 2.5 + 2.3, the frame
+	// 1.5 ms faster. GODOT_CARD_WAVEFRONT=0 runs the single kernel.
+	static const bool card_wavefront = OS::get_singleton()->get_environment("GODOT_CARD_WAVEFRONT") != "0";
+	uint32_t max_lod_rays = 1;
+	for (int i = 0; i < 4; i++) {
+		max_lod_rays = MAX(max_lod_rays, (params.lod_rays >> (8 * i)) & 0xFF);
+	}
+	const uint32_t bounce_slots = MAX(params.young_rays + 1, max_lod_rays);
+	const uint32_t dyn_light_rays = params.dynamic_rays == 0 ? 0 : MAX(params.dynamic_rays, 2u);
+	const uint32_t record_slots = bounce_slots + 1 + dyn.count * dyn_light_rays;
+	split_active = card_wavefront && params.mirror_count == 0 && settings.shared_bounce_ray && 4 * (params.directional_light_count + 1) <= 32 && record_slots <= 32;
+	// GODOT_CARD_SPLIT_ITEMS=<n> (diagnostics): the split covers fewer items,
+	// the single kernel the rest (the path a frame listing more than
+	// SPLIT_ITEMS takes).
+	static const int64_t split_items = OS::get_singleton()->get_environment("GODOT_CARD_SPLIT_ITEMS").to_int();
+	params.split[0] = split_active ? uint32_t(CLAMP(split_items > 0 ? split_items : int64_t(SPLIT_ITEMS), int64_t(1), int64_t(SPLIT_ITEMS))) : 0;
+	params.split[1] = bounce_slots;
+	params.split[2] = MAX(dyn_light_rays, 1u);
+	params.split[3] = record_slots;
 	rd->buffer_update(params_ubo, 0, sizeof(LightParamsUBO), &params);
 
 	// A lighting workgroup covers 8x8 texels, or 16x16 with the bounce ray
@@ -1574,10 +1607,89 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
+	if (split_active) {
+		// The lighting as three kernels (see the shader's header) over the
+		// first SPLIT_ITEMS work items: the setup kernel requests the rays,
+		// the trace kernel answers them, the resolve lights the texels.
+		const uint32_t threads = SPLIT_ITEMS * 64;
+		const uint32_t record_slots = params.split[3];
+		const uint32_t request_slots = 4 * (params.directional_light_count + 1) + record_slots;
+		if (split_records_buffer.is_null() || record_slots > split_record_slots || request_slots > split_request_slots) {
+			for (RID rid : { split_requests_buffer, split_records_buffer }) {
+				if (rid.is_valid()) {
+					rd->free_rid(rid);
+				}
+			}
+			split_record_slots = MAX(record_slots, split_record_slots);
+			split_request_slots = MAX(request_slots, split_request_slots);
+			split_records_buffer = rd->storage_buffer_create(threads * split_record_slots * 4 * sizeof(uint32_t));
+			split_requests_buffer = rd->storage_buffer_create(threads * split_request_slots * sizeof(uint32_t));
+		}
+		if (split_headers_buffer.is_null()) {
+			split_headers_buffer = rd->storage_buffer_create(threads * 4 * sizeof(uint32_t));
+			split_texels_buffer = rd->storage_buffer_create(threads * 8 * 4 * sizeof(uint32_t));
+			split_count_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t));
+			split_args_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+			split_dummy_buffer = rd->storage_buffer_create(16);
+			split_rest_args_buffer = rd->storage_buffer_create(4 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+		}
+		const uint32_t zero[4] = { 0, 0, 0, 0 };
+		const uint32_t args[4] = { 0, 1, 1, 0 };
+		rd->buffer_update(split_count_buffer, 0, sizeof(zero), zero);
+		rd->buffer_update(split_args_buffer, 0, sizeof(args), args);
+		rd->buffer_update(split_rest_args_buffer, 0, sizeof(args), args);
+		RD::Uniform s_count(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ split_count_buffer }));
+		RD::Uniform s_args(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ split_args_buffer }));
+		// The trace kernel takes the arguments as its indirect buffer, which
+		// a list cannot combine with the storage binding; it never reads them.
+		RD::Uniform s_args_dummy(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ split_dummy_buffer }));
+		RD::Uniform s_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ split_requests_buffer }));
+		RD::Uniform s_headers(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ split_headers_buffer }));
+		RD::Uniform s_texels(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ split_texels_buffer }));
+		RD::Uniform s_records(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ split_records_buffer }));
+		RD::Uniform s_rest_args(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, Vector<RID>({ split_rest_args_buffer }));
+		RID setup_rid = light_shader.version_get_shader(light_shader_version, 1);
+		RID trace_rid = light_shader.version_get_shader(light_shader_version, 2);
+		RID resolve_rid = light_shader.version_get_shader(light_shader_version, 3);
+
+		list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, light_setup_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 1, s_count, s_args, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
+		rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+
+		RENDER_TIMESTAMP("Surface Cache Lighting Rays");
+		rd->draw_command_begin_label("Surface Cache Lighting Rays");
+		list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, light_trace_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, s_count, s_args_dummy, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
+		rd->compute_list_dispatch_indirect(list, split_args_buffer, 0);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+
+		RENDER_TIMESTAMP("Surface Cache Lighting Resolve");
+		rd->draw_command_begin_label("Surface Cache Lighting Resolve");
+		list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, light_resolve_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, s_count, s_args, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
+		rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+
+		// The items past the split's (a frame listing more than it covers):
+		// the single kernel, over as many workgroups as the setup kernel
+		// counted (none on the TPS demo's frames).
+		RENDER_TIMESTAMP("Surface Cache Lighting Rest");
+		rd->draw_command_begin_label("Surface Cache Lighting Rest");
+	}
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
 	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
-	rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
+	rd->compute_list_dispatch_indirect(list, split_active ? split_rest_args_buffer : dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
 	// The readbacks are asked for on fixed frames but land when the GPU is
