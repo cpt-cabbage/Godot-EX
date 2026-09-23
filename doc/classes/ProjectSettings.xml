@@ -3497,7 +3497,7 @@
 			How far from the camera the volume reaches, in meters. Transparent surfaces past it fall back to per-pixel lighting.
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/size" type="int" setter="" getter="" default="64">
-			Volume resolution across the screen, in cells. Higher gives sharper shadows on transparent surfaces at a higher cost.
+			Volume resolution across the screen, in cells. Higher gives sharper shadows on transparent surfaces at a higher cost: the pass scales with the square of this (about 4 ms at 64 and 1.5 ms at 32 on an M4 at 1080p on a game level).
 		</member>
 		<member name="rendering/ray_tracing/stochastic_direct_lighting/translucency_volume/spread" type="float" setter="" getter="" default="2.0">
 			How directional the volume's lighting is. Lower is flatter, higher sharpens the lit and shadowed sides of a leaf. Free.
@@ -3537,7 +3537,7 @@
 			Beyond this distance in meters, cached resolution falls off with distance. Keeps large scenes within budget. [code]0.0[/code] keeps full resolution everywhere.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame" type="int" setter="" getter="" default="524288">
-			Cached texels re-lit per frame, spent on the surfaces rays landed on: every texel a ray reads is re-lit in turn, so a level with more visible surface converges more slowly rather than costing more. The cache lighting pass scales with this (the default is about 18 ms worth on an M4 at 1080p); higher follows moving and switching lights faster on large levels.
+			Cached texels re-lit per frame, spent on the surfaces rays landed on: every texel a ray reads is re-lit in turn, so a level with more visible surface converges more slowly rather than costing more. The cache lighting pass scales with this (the default is about 5 ms on an M4 at 1080p on a game level, two thirds of it about 4 ms); higher follows moving and switching lights faster on large levels, lower lets newly seen surfaces settle more slowly.
 		</member>
 		<member name="rendering/ray_tracing/surface_cache/quality/lighting_updates_per_frame" type="int" setter="" getter="" default="64">
 			Instances re-lit whole per frame in a round robin, whether or not rays reach them, with what [member rendering/ray_tracing/surface_cache/quality/lighting_texels_per_frame] leaves: keeps the lighting of surfaces seen only through bounces from going stale.
