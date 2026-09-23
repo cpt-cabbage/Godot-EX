@@ -182,10 +182,18 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 
 	sky_uses_octmap_array = p_sky_use_octmap_array;
 	Vector<String> rt_gi_modes;
-	rt_gi_modes.push_back(p_sky_use_octmap_array ? "\n#define USE_RADIANCE_OCTMAP_ARRAY\n" : "");
+	const String octmap_define = p_sky_use_octmap_array ? "\n#define USE_RADIANCE_OCTMAP_ARRAY\n" : "";
+	rt_gi_modes.push_back(octmap_define);
+	// The wavefront split's three kernels (see the shader's header).
+	rt_gi_modes.push_back(octmap_define + "\n#define GATHER_SETUP\n");
+	rt_gi_modes.push_back(octmap_define + "\n#define GATHER_TRACE\n");
+	rt_gi_modes.push_back(octmap_define + "\n#define GATHER_RESOLVE\n");
 	rt_gi_shader.initialize(rt_gi_modes);
 	rt_gi_shader_version = rt_gi_shader.version_create();
 	rt_gi_pipeline = RD::get_singleton()->compute_pipeline_create(rt_gi_shader.version_get_shader(rt_gi_shader_version, 0));
+	rt_gi_setup_pipeline = RD::get_singleton()->compute_pipeline_create(rt_gi_shader.version_get_shader(rt_gi_shader_version, 1));
+	rt_gi_trace_pipeline = RD::get_singleton()->compute_pipeline_create(rt_gi_shader.version_get_shader(rt_gi_shader_version, 2));
+	rt_gi_resolve_pipeline = RD::get_singleton()->compute_pipeline_create(rt_gi_shader.version_get_shader(rt_gi_shader_version, 3));
 
 	Vector<String> stochastic_denoise_modes;
 	stochastic_denoise_modes.push_back("\n#define MODE_TEMPORAL\n#define DIRECT_DEPTH_VALIDATION\n");
@@ -258,7 +266,7 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 
 Raytracing::~Raytracing() {
 	// The scene (TLAS, BLASes, geometry pools) frees itself as a member.
-	for (RID rid : { hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo, wavefront_count, wavefront_args, wavefront_requests, wavefront_state, wavefront_visibility }) {
+	for (RID rid : { hit_packets, hit_sorted, hit_results, hit_counts, hit_offsets, hit_dispatch_args, hit_params_ubo, wavefront_count, wavefront_args, wavefront_requests, wavefront_state, wavefront_visibility, gather_count, gather_args, gather_requests, gather_records }) {
 		if (rid.is_valid()) {
 			RD::get_singleton()->free_rid(rid);
 		}
@@ -2268,15 +2276,93 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (calibrate || tier_stats) {
 		rd->buffer_clear(calibration.buffer, 0, 360);
 	}
-	RENDER_TIMESTAMP("RT GI Gather");
-	rd->draw_command_begin_label("RT GI Gather");
-	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn), 0);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn), 1);
-	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
-	rd->compute_list_end();
-	rd->draw_command_end_label();
+	// The gather as three kernels (see the shader's header): the pixel's
+	// setup and screen traces without ray-query state, the rays as a
+	// compacted linear dispatch, the resolve. On the TPS demo at the quarter
+	// tiers (plan section 94) the single kernel took 6.9 ms on the bridge
+	// and 6.7 in the hall; split, 0.5 + 1.75 + 2.3 on both, the frame 2.3
+	// ms faster, the same hits and tiers. GODOT_GI_WAVEFRONT=0 runs the
+	// single kernel; a frame with planar mirrors or the GODOT_GI_MIRROR knob
+	// light keeps it either way (the chains and the knob's shadow rays trace
+	// from inside the shading).
+	static const bool gather_wavefront = OS::get_singleton()->get_environment("GODOT_GI_WAVEFRONT") != "0";
+	const bool split = gather_wavefront && params.mirror_count == 0 && params.mirror_light[3] <= 0.0f;
+	if (!split) {
+		RENDER_TIMESTAMP("RT GI Gather");
+		rd->draw_command_begin_label("RT GI Gather");
+		RD::ComputeListID compute_list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn), 0);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn), 1);
+		rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+	} else {
+		const uint32_t slots = uint32_t(size.x) * uint32_t(size.y) * (params.ray_count + 2);
+		if (gather_records.is_null() || slots > gather_capacity) {
+			for (RID rid : { gather_requests, gather_records }) {
+				if (rid.is_valid()) {
+					rd->free_rid(rid);
+				}
+			}
+			gather_capacity = slots;
+			gather_requests = rd->storage_buffer_create(slots * 2 * 4 * sizeof(uint32_t));
+			gather_records = rd->storage_buffer_create(slots * 2 * 4 * sizeof(uint32_t));
+		}
+		if (gather_count.is_null()) {
+			gather_count = rd->storage_buffer_create(4 * sizeof(uint32_t));
+			gather_args = rd->storage_buffer_create(4 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+		}
+		const uint32_t zero[4] = { 0, 0, 0, 0 };
+		const uint32_t args[4] = { 0, 1, 1, 0 };
+		rd->buffer_update(gather_count, 0, sizeof(zero), zero);
+		rd->buffer_update(gather_args, 0, sizeof(args), args);
+
+		RID setup_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 1);
+		RID trace_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 2);
+		RID resolve_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 3);
+		RD::Uniform g_count(RD::UNIFORM_TYPE_STORAGE_BUFFER, 8, Vector<RID>({ gather_count }));
+		RD::Uniform g_args(RD::UNIFORM_TYPE_STORAGE_BUFFER, 9, Vector<RID>({ gather_args }));
+		// The trace kernel takes the arguments as its indirect buffer, which
+		// a list cannot combine with the storage binding; it never reads them.
+		RD::Uniform g_args_dummy(RD::UNIFORM_TYPE_STORAGE_BUFFER, 9, Vector<RID>({ rt_gi_dummy_rw_buffer }));
+		RD::Uniform g_requests(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, Vector<RID>({ gather_requests }));
+		RD::Uniform g_records(RD::UNIFORM_TYPE_STORAGE_BUFFER, 11, Vector<RID>({ gather_records }));
+
+		RENDER_TIMESTAMP("RT GI Gather");
+		rd->draw_command_begin_label("RT GI Gather");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, rt_gi_setup_pipeline);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records), 1);
+			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+		RENDER_TIMESTAMP("RT GI Gather Rays");
+		rd->draw_command_begin_label("RT GI Gather Rays");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, rt_gi_trace_pipeline);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args_dummy, g_requests, g_records), 1);
+			rd->compute_list_dispatch_indirect(list, gather_args, 0);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+		RENDER_TIMESTAMP("RT GI Gather Resolve");
+		rd->draw_command_begin_label("RT GI Gather Resolve");
+		{
+			RD::ComputeListID list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(list, rt_gi_resolve_pipeline);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records), 1);
+			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
+			rd->compute_list_end();
+		}
+		rd->draw_command_end_label();
+	}
 	if (hit_shading) {
 		_process_hit_shading(p_render_buffers, p_view, p_world_from_view, p_view_from_ndc, p_reproject, depth, (p_quality.screen_radiance && p_screen_radiance.is_valid()) ? p_screen_radiance : RID(), size, params.ray_count, raw_ambient, raw_reflection, raw_directional, p_cascades, p_sky, p_quality, params.probe_scale);
 	}

@@ -402,6 +402,20 @@ private:
 	StochasticIndirectGiShaderRD rt_gi_shader;
 	RID rt_gi_shader_version;
 	RID rt_gi_pipeline;
+	// The gather's wavefront split (GODOT_GI_WAVEFRONT, plan section 94):
+	// the kernel above as a setup kernel without ray queries, a trace kernel
+	// dispatched indirectly over the requests it appends, and a resolve
+	// kernel. The scratch is sized to the largest target seen: two uvec4 per
+	// ray slot (ray_count + 2 per pixel) for the records, the same for the
+	// requests.
+	RID rt_gi_setup_pipeline;
+	RID rt_gi_trace_pipeline;
+	RID rt_gi_resolve_pipeline;
+	RID gather_count;
+	RID gather_args;
+	RID gather_requests;
+	RID gather_records;
+	uint32_t gather_capacity = 0; // Ray slots.
 
 	struct RtGiParamsUBO {
 		float view_from_ndc[16];

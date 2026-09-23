@@ -4,10 +4,36 @@
 
 #VERSION_DEFINES
 
+// The wavefront split (plan section 94, GODOT_GI_WAVEFRONT): the one kernel
+// below is also built as three, the shape the direct pass took in section
+// 81. GATHER_SETUP is the kernel up to its rays -- the pixel's surface, its
+// ray count and reflection decisions, every ray's direction and screen
+// trace -- appending a request for each ray the screen did not answer;
+// GATHER_TRACE is a linear dispatch over the requests, the query and
+// nothing else; GATHER_RESOLVE is the kernel again from its rays on, the
+// hit read from the record the trace kernel left instead of the query. The
+// intersector's registers otherwise sit beside the card lookup's (six depth
+// fetches, the boost, the change marks, the packet append) for the whole
+// kernel. Setup and resolve must not mention the acceleration structure:
+// declaring it puts the ray-query capability in the SPIR-V, and the Metal
+// container routes on that. What only the single kernel does -- the planar
+// mirrors' chains, which interleave card reads with continuation rays, and
+// the GODOT_GI_MIRROR knob light's two-leg shadow rays -- keeps it: the
+// host runs the split only for a frame without either.
+#if defined(GATHER_SETUP) || defined(GATHER_RESOLVE)
+#define GATHER_NO_RAYS
+#endif
+#if defined(GATHER_SETUP) || defined(GATHER_TRACE) || defined(GATHER_RESOLVE)
+#define GATHER_SPLIT
+#endif
+
+#ifndef GATHER_NO_RAYS
 #extension GL_EXT_ray_query : require
+#endif
 #extension GL_EXT_samplerless_texture_functions : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 // Ray-traced indirect lighting ("Lumen-lite" final gather).
 // Per pixel: cosine-sampled hemisphere rays traced against the scene BVH,
@@ -30,7 +56,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #define SDFGI_MAX_CASCADES 8
 
+#ifndef GATHER_NO_RAYS
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+#endif
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
 
@@ -557,6 +585,44 @@ layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_spe
 // History frames under which the gather spends the primary ray on it.
 #define FALLBACK_FRAMES 8.0
 
+#ifdef GATHER_SPLIT
+// The split's hand-over. Every pixel has GATHER_SLOTS ray records at fixed
+// places (pixel index * slots + slot): the diffuse rays at 0 .. ray_count -
+// 1, the reflection ray at ray_count (as hit_slot numbers them), the
+// fallback's eye ray at ray_count + 1. A record is two uvec4: the first the
+// answer -- flags and geometry index << 8, then t, the instance's custom
+// index and the primitive index for a traced ray, or the view-space point
+// for a screen-trace hit -- the second the direction traced and, in w, the
+// barycentrics as halves. The setup kernel writes the direction (and the
+// whole of a screen hit's record) and appends a request for each ray the
+// BVH must answer: the absolute origin and t_max, the direction and the
+// record's index, so the trace kernel reads nothing but its request. The
+// count and the dispatch's group count are two buffers: the trace kernel is
+// dispatched indirectly from the second, which a compute list cannot also
+// bind as storage (it gets a dummy there).
+layout(set = 1, binding = 8, std430) restrict buffer GatherCount {
+	uint count;
+}
+gather_count;
+layout(set = 1, binding = 9, std430) restrict buffer GatherArgs {
+	uvec4 groups; // x: (count + 63) / 64, y and z 1.
+}
+gather_args;
+layout(set = 1, binding = 10, std430) restrict buffer GatherRequests {
+	uvec4 data[]; // Two per request: origin xyz and t_max; direction xyz and the record index.
+}
+gather_requests;
+layout(set = 1, binding = 11, std430) restrict buffer GatherRecords {
+	uvec4 data[]; // Two per ray slot (see above).
+}
+gather_records;
+
+#define GATHER_SLOTS (params.ray_count + 2u)
+#define GATHER_RECORD_HIT 1u
+#define GATHER_RECORD_FRONT_FACE 2u
+#define GATHER_RECORD_SCREEN_HIT 4u
+#endif
+
 #define M_PI 3.14159265359
 
 float luminance(vec3 c) {
@@ -755,6 +821,7 @@ uint cache_tier = CACHE_TIER_PROBE;
 
 #include "mirror_planes_inc.glsl"
 
+#ifndef GATHER_NO_RAYS
 // A shadow segment: anything opaque between the two points.
 bool mirror_occluded(vec3 from_world, vec3 to_world) {
 	vec3 d = to_world - from_world;
@@ -768,6 +835,7 @@ bool mirror_occluded(vec3 from_world, vec3 to_world) {
 	}
 	return rayQueryGetIntersectionTypeEXT(sq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }
+#endif
 
 vec3 sdfgi_cache_radiance(vec3 rel_pos, vec3 ray_dir) {
 	cache_tier = CACHE_TIER_PROBE;
@@ -1411,28 +1479,9 @@ vec3 fold_above(vec3 dir, vec3 geo_normal) {
 	return below < 0.0 ? dir - 2.0 * below * geo_normal : dir;
 }
 
-// One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
-// miss. Positions are camera-relative world space (the cascade convention).
-// r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
-// escaped), which the denoiser uses to keep contact GI away from far-field GI.
-// world_geo_normal is the geometric normal: the ray origins are pushed off
-// the surface along it, and the shading normal, which may lean into the
-// surface, has no say in that.
-vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
-	r_hit_distance = params.ao_range; // Nothing hit within range.
-	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
-		vec3 hit_view;
-		vec3 view_normal = transpose(mat3(params.world_from_view)) * world_geo_normal;
-		if (screen_trace_hit(view_origin, view_normal, view_dir, jitter, hit_view)) {
-			mat3 world_basis = mat3(params.world_from_view);
-			vec3 rel_hit = world_basis * hit_view;
-			r_hit_distance = length(hit_view - view_origin);
-			return screen_radiance_boost(hit_view, sdfgi_cache_radiance(rel_hit, world_dir));
-		}
-	}
-
-	// Limit rays to the outermost cascade like the probe integrator; without
-	// SDFGI (sky-visibility mode) use a fixed generous range.
+// The BVH ray's range: the outermost cascade like the probe integrator;
+// without SDFGI (sky-visibility mode) a fixed generous range.
+float gather_t_max(vec3 rel_origin, vec3 world_dir) {
 	float t_max = min(params.z_far * 4.0, 4000.0);
 	if (bool(params.flags & FLAG_SDFGI)) {
 		uint last = sdfgi.max_cascades - 1u;
@@ -1451,8 +1500,68 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 			t_max = t_exit / d_len;
 		}
 	}
+	return t_max;
+}
+
+// The ray's hit, from the query in the single kernel or from the record the
+// trace kernel left in the resolve (rec, the record's first uvec4, loaded
+// by trace_radiance_chain). Read where they are used, as the query's
+// accessors were: the single kernel keeps its form.
+#ifdef GATHER_RESOLVE
+#define GATHER_HIT_COMMITTED ((rec.x & GATHER_RECORD_HIT) != 0u)
+#define GATHER_HIT_T uintBitsToFloat(rec.y)
+#define GATHER_HIT_INSTANCE rec.z
+#define GATHER_HIT_PRIMITIVE rec.w
+#define GATHER_HIT_GEOMETRY (rec.x >> 8u)
+#define GATHER_HIT_FRONT_FACE ((rec.x & GATHER_RECORD_FRONT_FACE) != 0u)
+#define GATHER_HIT_BARYCENTRICS_PACKED gather_records.data[gather_record * 2u + 1u].w
+#else
+#define GATHER_HIT_COMMITTED (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT)
+#define GATHER_HIT_T rayQueryGetIntersectionTEXT(rq, true)
+#define GATHER_HIT_INSTANCE rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
+#define GATHER_HIT_PRIMITIVE rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
+#define GATHER_HIT_GEOMETRY rayQueryGetIntersectionGeometryIndexEXT(rq, true)
+#define GATHER_HIT_FRONT_FACE rayQueryGetIntersectionFrontFaceEXT(rq, true)
+#define GATHER_HIT_BARYCENTRICS_PACKED packHalf2x16(rayQueryGetIntersectionBarycentricsEXT(rq, true))
+#endif
+
+#ifdef GATHER_RESOLVE
+uint gather_record = 0u; // The current ray's record (set per ray in main).
+#endif
+
+// The setup kernel shades nothing (and has no query to fall back on).
+#ifndef GATHER_SETUP
+// One gather ray: screen trace, then BVH, cache radiance at the hit, sky on
+// miss. Positions are camera-relative world space (the cascade convention).
+// r_hit_distance reports how far the ray got (HIT_DISTANCE_MISS when it
+// escaped), which the denoiser uses to keep contact GI away from far-field GI.
+// world_geo_normal is the geometric normal: the ray origins are pushed off
+// the surface along it, and the shading normal, which may lean into the
+// surface, has no say in that.
+vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
+	r_hit_distance = params.ao_range; // Nothing hit within range.
+	bool screen_hit = false;
+	vec3 hit_view;
+#ifdef GATHER_RESOLVE
+	uvec4 rec = gather_records.data[gather_record * 2u];
+	screen_hit = (rec.x & GATHER_RECORD_SCREEN_HIT) != 0u;
+	hit_view = uintBitsToFloat(rec.yzw);
+#else
+	if (bool(params.flags & FLAG_SCREEN_TRACES)) {
+		vec3 view_normal = transpose(mat3(params.world_from_view)) * world_geo_normal;
+		screen_hit = screen_trace_hit(view_origin, view_normal, view_dir, jitter, hit_view);
+	}
+#endif
+	if (screen_hit) {
+		mat3 world_basis = mat3(params.world_from_view);
+		vec3 rel_hit = world_basis * hit_view;
+		r_hit_distance = length(hit_view - view_origin);
+		return screen_radiance_boost(hit_view, sdfgi_cache_radiance(rel_hit, world_dir));
+	}
 
 	vec3 origin = rel_origin + world_geo_normal * params.ray_bias;
+#ifndef GATHER_RESOLVE
+	float t_max = gather_t_max(rel_origin, world_dir);
 	// The TLAS lives in absolute world space; positions here are
 	// camera-relative, so the query origin adds the camera origin back.
 	rayQueryEXT rq;
@@ -1471,14 +1580,15 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, bool(params.flags & FLAG_ABLATE_RAYS) ? params.ray_bias : t_max);
 	while (rayQueryProceedEXT(rq)) {
 	}
-	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-		float t_hit = rayQueryGetIntersectionTEXT(rq, true);
+#endif
+	if (GATHER_HIT_COMMITTED) {
+		float t_hit = GATHER_HIT_T;
 		r_hit_distance = t_hit;
 		vec3 rel_hit = origin + world_dir * t_hit;
 		mat3 view_basis = transpose(mat3(params.world_from_view));
 		vec3 view_hit = view_basis * rel_hit;
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
-			uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+			uint instance_id = GATHER_HIT_INSTANCE;
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
 			// The glossy reflection rays take the mirror path too
 			// (GODOT_GI_MIRROR_SPEC=0 keeps them on the screen read): the
@@ -1497,6 +1607,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 			// light's stop (the floor flash at stop + 32: err 0.026 and 18
 			// hot pixels per thousand with them on the path, 0.020 and 3.5
 			// without), while the ceiling's screen pixel is exact each frame.
+#ifndef GATHER_NO_RAYS
 			bool spec_path = hit_specular && !hit_mirror && (uint(params.mirror_params.z) & 8u) == 0u;
 			bool mirror_path = mirror_on() && (uint(params.mirror_params.z) & 2u) == 0u && (!hit_specular || spec_path);
 			uint hit_plane = mirror_path ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
@@ -1609,6 +1720,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				}
 				return answer;
 			}
+#endif
 			// The ray's footprint at the hit: the diffuse cone, or the lobe's
 			// for the reflection ray (a mirror's is a point).
 			card_lookup_footprint = t_hit * (hit_specular ? specular_cone_tan : abs(params.card_cone_tan));
@@ -1630,7 +1742,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 				uint geometry_base = card_instances.data[instance_id].geometry_base;
 				uint material_base = card_instances.data[instance_id].material_base;
 				if (geometry_base != SURFACE_CACHE_INVALID && material_base != SURFACE_CACHE_INVALID) {
-					uint geometry_index = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+					uint geometry_index = GATHER_HIT_GEOMETRY;
 					uint slot = hit_materials.data[material_base + geometry_index];
 					if (slot != RT_HIT_INVALID && bool(params.flags & FLAG_HIT_DEBUG_CONSTANT)) {
 						return vec3(0.6);
@@ -1639,13 +1751,13 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 						uint idx = atomicAdd(hit_counts.data[RT_HIT_COUNT_TOTAL], 1u);
 						if (idx < params.hit_capacity) {
 							atomicAdd(hit_counts.data[slot], 1u);
-							uint flags = (rayQueryGetIntersectionFrontFaceEXT(rq, true) ? RT_HIT_PACKET_FRONT_FACE : 0u) | (hit_specular ? RT_HIT_PACKET_MIRROR : 0u);
+							uint flags = (GATHER_HIT_FRONT_FACE ? RT_HIT_PACKET_FRONT_FACE : 0u) | (hit_specular ? RT_HIT_PACKET_MIRROR : 0u);
 							uint b = idx * RT_HIT_PACKET_WORDS;
 							hit_packets.data[b] = rt_hit_pack_pixel(hit_pixel, hit_slot, flags);
 							hit_packets.data[b + 1u] = instance_id;
-							hit_packets.data[b + 2u] = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+							hit_packets.data[b + 2u] = GATHER_HIT_PRIMITIVE;
 							hit_packets.data[b + 3u] = (slot & 0xFFFFu) | ((geometry_index & 0xFFu) << 16u) | ((pixel_rays - 1u) << 24u);
-							hit_packets.data[b + 4u] = packHalf2x16(rayQueryGetIntersectionBarycentricsEXT(rq, true));
+							hit_packets.data[b + 4u] = GATHER_HIT_BARYCENTRICS_PACKED;
 							hit_packets.data[b + 5u] = rt_hit_pack_dir(world_dir);
 							hit_packets.data[b + 6u] = floatBitsToUint(world_hit.x);
 							hit_packets.data[b + 7u] = floatBitsToUint(world_hit.y);
@@ -1715,8 +1827,10 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 	}
 	return radiance;
 }
+#endif
 
-void main() {
+// The pixel a thread of the per-pixel kernels takes.
+ivec2 gather_pixel_coord() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (bool(params.flags & FLAG_SPEC_HALF_RATE)) {
 		// The half-rate reflection's threads, remapped: a ray costs its
@@ -1726,44 +1840,56 @@ void main() {
 		// bridge, inside the spread, against 3.5 for no reflection ray at
 		// all). The block's 32 traced pixels go to the first SIMD group of
 		// the 8x8 workgroup and the 32 skipped to the second, and the
-		// group that skips is idle for the whole ray.
+		// group that skips is idle for the whole ray. (The split's trace
+		// kernel is compacted and does not need it; its setup and resolve
+		// keep the mapping so a pixel's thread ids, which seed the card
+		// requests' sampling, are the single kernel's.)
 		uint l = gl_LocalInvocationIndex;
 		uint k = l & 31u;
 		ivec2 lp = ivec2(int((k & 3u) * 2u), int(k >> 2u));
 		lp.x += int((uint(lp.y) + (l >> 5u)) & 1u);
 		pixel = ivec2(gl_WorkGroupID.xy) * 8 + lp;
 	}
-	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
-		return;
+	return pixel;
+}
+
+// What a pixel's rays leave from, and which rays it traces: the same inputs
+// and the same code in the single kernel, the setup and the resolve, so the
+// three agree on every decision.
+struct GatherPixel {
+	ivec2 full_pixel;
+	vec2 uv;
+	float depth;
+	vec3 view_pos;
+	vec3 view_normal;
+	vec3 geo_view_normal;
+	float roughness;
+	vec3 rel_pos;
+	vec3 world_normal;
+	vec3 world_geo_normal;
+	float prev_frames;
+	float prev_frames_static;
+	uint rays; // The diffuse rays traced.
+	bool mirror; // The reflection ray is a mirror ray, not a GGX sample.
+	bool spec_stand_in;
+	bool spec_trace; // The reflection ray is traced.
+	bool fallback; // The eye ray for the cards' stand-in is traced.
+};
+
+// False for the sky.
+bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
+	g.full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	g.depth = texelFetch(depth_texture, g.full_pixel, 0).r;
+	if (g.depth == 0.0) {
+		return false;
 	}
 
-	ivec2 full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
-	float depth = texelFetch(depth_texture, full_pixel, 0).r;
-	if (depth == 0.0) {
-		imageStore(out_ambient, pixel, vec4(0.0));
-		if (bool(params.flags & FLAG_DYN_SPLIT)) {
-			imageStore(out_ambient_dyn, pixel, vec4(0.0));
-			imageStore(out_fallback_dyn, pixel, vec4(0.0));
-		}
-		imageStore(out_reflection, pixel, vec4(0.0));
-		imageStore(out_spec_ray, pixel, vec4(0.0));
-		imageStore(out_view_depth, pixel, vec4(0.0));
-		// Sky: unoccluded, no directional bias.
-		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
-		imageStore(out_fallback, pixel, vec4(0.0));
-		return;
-	}
+	g.uv = (vec2(g.full_pixel) + 0.5) / vec2(params.full_screen_size);
+	vec4 view_pos4 = params.view_from_ndc * vec4(g.uv * 2.0 - 1.0, g.depth, 1.0);
+	g.view_pos = view_pos4.xyz / view_pos4.w;
 
-	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
-	vec4 view_pos4 = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);
-	vec3 view_pos = view_pos4.xyz / view_pos4.w;
-
-	// One pixel in sixteen feeds the calibration sums: plenty for a mean, and
-	// the 32-bit fixed-point sums cannot overflow at any screen size in use.
-	calibrate_pixel = bool(params.flags & FLAG_CALIBRATE_CACHE) && ((pixel.x | pixel.y) & 3) == 0;
-
-	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
-	vec3 view_normal = nr_normal(nr);
+	vec4 nr = texelFetch(normal_roughness_texture, g.full_pixel, 0);
+	g.view_normal = nr_normal(nr);
 	// The surface the rays actually leave from. The buffer holds the shading
 	// normal, and two things about it can put a ray behind the surface:
 	//
@@ -1783,52 +1909,287 @@ void main() {
 	//
 	// So the shading normal is made to agree with the geometric one, and the
 	// rays below are kept on the geometric normal's side.
-	vec3 geo_view_normal = geometric_normal(full_pixel, view_pos, view_normal);
-	if (dot(view_normal, geo_view_normal) < 0.0) {
-		view_normal = -view_normal;
+	g.geo_view_normal = geometric_normal(g.full_pixel, g.view_pos, g.view_normal);
+	if (dot(g.view_normal, g.geo_view_normal) < 0.0) {
+		g.view_normal = -g.view_normal;
 	}
-	float roughness = nr_roughness(nr);
+	g.roughness = nr_roughness(nr);
 
 	// Camera-relative world space: the cascade data is stored relative to the
 	// camera origin, and staying camera-relative preserves precision far from
 	// the world origin. The TLAS is absolute, so rays offset by the origin.
 	mat3 world_basis = mat3(params.world_from_view);
-	vec3 rel_pos = world_basis * view_pos;
-	vec3 world_normal = normalize(world_basis * view_normal);
-	vec3 world_geo_normal = normalize(world_basis * geo_view_normal);
+	g.rel_pos = world_basis * g.view_pos;
+	g.world_normal = normalize(world_basis * g.view_normal);
+	g.world_geo_normal = normalize(world_basis * g.geo_view_normal);
 
 	// How young this pixel's screen history is (last frame's frame count at
 	// its reprojection, none off frame): a young pixel traces more rays
 	// (ray_params.y), and reads the cards' stand-in below.
-	float prev_frames = 0.0;
-	float prev_frames_static = 0.0;
+	g.prev_frames = 0.0;
+	g.prev_frames_static = 0.0;
 	{
-		vec4 prev_ndc = params.reproject * vec4(uv * 2.0 - 1.0, depth, 1.0);
+		vec4 prev_ndc = params.reproject * vec4(g.uv * 2.0 - 1.0, g.depth, 1.0);
 		if (prev_ndc.w > 0.0) {
 			vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 			if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
 				vec4 prev_meta = textureLod(prev_gi_meta, prev_uv, 0.0);
-				prev_frames = prev_meta.r * 64.0;
+				g.prev_frames = prev_meta.r * 64.0;
 				if (bool(params.flags & FLAG_DYN_SPLIT)) {
 					// The moving lights' history restarts under every sweep
 					// and its stand-in is the cards' own estimate of the
 					// same term: it wants the stand-in, not the extra rays
 					// (which cost the TPS demo's frame under its beams).
-					prev_frames_static = prev_frames;
-					prev_frames = min(prev_frames, prev_meta.b * 64.0);
+					g.prev_frames_static = g.prev_frames;
+					g.prev_frames = min(g.prev_frames, prev_meta.b * 64.0);
 				}
 			}
 		}
 	}
 	if (!bool(params.flags & FLAG_DYN_SPLIT)) {
-		prev_frames_static = prev_frames;
+		g.prev_frames_static = g.prev_frames;
 	}
-	uint rays = clamp(prev_frames_static < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
+	g.rays = clamp(g.prev_frames_static < FALLBACK_FRAMES ? params.ray_params.y : params.ray_params.x, 1u, params.ray_count);
+
+	// Smooth surfaces get a mirror ray only when the surface cache is there to
+	// give the hit a surface at texture resolution; otherwise the rough band
+	// alone, with sharp reflections left to SSR / probes, whose sharpness the
+	// blurry cache cannot match.
+	g.mirror = bool(params.flags & FLAG_MIRROR) && g.roughness <= 0.2;
+	// Diagnostics (FLAG_ABLATE_SPEC): no reflection ray, the diffuse rays'
+	// mean radiance standing in (what a lobe as wide as the hemisphere
+	// would return; as a budget for rough dielectrics it read 12% bright on
+	// the TPS demo's floor, section 84).
+	g.spec_stand_in = bool(params.flags & FLAG_ABLATE_SPEC);
+	// The half-rate form (FLAG_SPEC_HALF_RATE): a rough pixel traces its
+	// reflection ray on alternate frames, its four neighbors on the
+	// others, and the resolve pass reweights the neighbours' hits into
+	// this pixel's lobe (the same reuse the full resolve does, here only
+	// for the pixels without a ray: spec_ray stays zero to mark them). A
+	// mirror keeps its ray: no neighbour's sample is its image. The stand-in
+	// (the diffuse mean) was measured as the cheaper form first and is a
+	// bias, not a budget: a grazing lobe on the TPS demo's floor sees the
+	// dark far end of the ring, the hemisphere mean sees the lit ceiling,
+	// and the frame read 12% brighter.
+	// The checkerboard does not alternate by frame: it did first, and a
+	// pixel then toggled between its own sample and its neighbours' mean,
+	// two estimators that agree on a flat wall and not on a normal-mapped
+	// pipe or a highlight a pixel wide -- the machines' flicker at rest
+	// doubled and a strafe past the hall's pipes left a mottle where the
+	// two patterns met in the history. Fixed, a skipped pixel is always
+	// the mean of its four traced neighbors: a blurrier reflection on
+	// half the pixels, and a still one.
+	bool spec_skip = bool(params.flags & FLAG_SPEC_HALF_RATE) && !g.mirror && g.roughness > 0.2 && ((pixel.x + pixel.y) & 1) != 0;
+	if (spec_skip) {
+		// Only where a 4-neighbour is on this surface by the fill's own
+		// stops (a twentieth of the depth, the normal to a few degrees):
+		// a railing or a pipe a pixel wide at the quarter tier has none,
+		// and a fill with nothing to read is a black sample. Those trace.
+		bool has_neighbour = false;
+		for (int k = 0; k < 4 && !has_neighbour; k++) {
+			ivec2 sp = pixel + ivec2(k == 0 ? -1 : (k == 1 ? 1 : 0), k == 2 ? -1 : (k == 3 ? 1 : 0));
+			if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, params.screen_size))) {
+				continue;
+			}
+			ivec2 sfp = min(sp * int(params.depth_scale), params.full_screen_size - 1);
+			float sd = texelFetch(depth_texture, sfp, 0).r;
+			if (sd == 0.0) {
+				continue;
+			}
+			vec2 suv = (vec2(sfp) + 0.5) / vec2(params.full_screen_size);
+			vec4 sp4 = params.view_from_ndc * vec4(suv * 2.0 - 1.0, sd, 1.0);
+			float s_depth = -sp4.z / sp4.w;
+			if (abs(s_depth + g.view_pos.z) > 0.05 * max(-g.view_pos.z, 1.0)) {
+				continue;
+			}
+			vec3 sn = nr_normal(texelFetch(normal_roughness_texture, sfp, 0));
+			has_neighbour = pow(max(dot(g.view_normal, sn), 0.0), 32.0) > 1e-3;
+		}
+		spec_skip = has_neighbour;
+	}
+	// Measured and not kept (section 90): the diffuse ray standing in as a
+	// rough pixel's reflection sample, reweighted into the lobe by the
+	// resolve -- +8% brighter for -1.8 ms, +2.7% gated to steep views.
+	g.spec_trace = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && (g.roughness > 0.2 || g.mirror) && !spec_skip;
+	g.fallback = bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF) && (g.prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL));
+	return true;
+}
+
+// Diffuse ray r's direction: cosine-weighted about the shading normal, kept
+// on the geometric normal's side.
+vec3 gather_diffuse_dir(GatherPixel g, ivec2 pixel, uint r) {
+	return fold_above(cosine_hemisphere(g.world_normal, stbn_sample(pixel, r)), g.world_geo_normal);
+}
+
+// The reflection ray's direction: GGX half-vector sampling around the
+// mirror direction (the mirror direction itself for a mirror).
+vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel) {
+	vec2 rnd = stbn_sample(pixel, 6u);
+	vec3 v = normalize(-g.rel_pos);
+	// (Measured and not kept: narrowing a young pixel's lobe toward the
+	// mirror direction by its youth, against the entering band's
+	// one-sample sparkle. The sparkle went, but the sharp image it left
+	// in the history read 0.034 against 0.028 at the stop of the flick
+	// case and was still behind at stop + 16; a rough lobe's blur is
+	// what the eye expects there.)
+	float alpha = g.roughness * g.roughness;
+	float phi = rnd.x * 2.0 * M_PI;
+	float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
+	float st = sqrt(max(1.0 - ct * ct, 0.0));
+	vec3 h = normalize(basis_around(g.world_normal) * vec3(st * cos(phi), st * sin(phi), ct));
+	vec3 dir = g.mirror ? reflect(-v, g.world_normal) : reflect(-v, h);
+	if (dot(dir, g.world_normal) <= 1e-4) {
+		dir = reflect(-v, g.world_normal);
+	}
+	return fold_above(dir, g.world_geo_normal);
+}
+
+#ifdef GATHER_SETUP
+// One request per lane that wants a ray, appended in uniform control flow:
+// one atomic per SIMD group for the count and one for the dispatch's group
+// count, instead of two per ray. Nothing bounds the index: the buffer holds
+// a request per slot per pixel, the most the kernel can append.
+void gather_append(bool want, uvec4 a, uvec4 b) {
+	uint base = subgroupExclusiveAdd(want ? 1u : 0u);
+	uint total = subgroupAdd(want ? 1u : 0u);
+	if (total == 0u) {
+		return;
+	}
+	uint first = 0u;
+	if (subgroupElect()) {
+		first = atomicAdd(gather_count.count, total);
+		atomicMax(gather_args.groups.x, (first + total + 63u) / 64u);
+	}
+	first = subgroupBroadcastFirst(first);
+	if (want) {
+		gather_requests.data[(first + base) * 2u] = a;
+		gather_requests.data[(first + base) * 2u + 1u] = b;
+	}
+}
+
+// The setup kernel: every ray's direction into its record, the screen
+// trace where it answers (the record then holds the hit), a request where
+// it does not. The loop over the slots is uniform (the lanes past the
+// screen and on the sky take part in the appends with nothing to add).
+void setup_main() {
+	ivec2 pixel = gather_pixel_coord();
+	GatherPixel g;
+	bool on_surface = pixel.x < params.screen_size.x && pixel.y < params.screen_size.y && gather_pixel_setup(pixel, g);
+	uint record_base = on_surface ? uint(pixel.y * params.screen_size.x + pixel.x) * GATHER_SLOTS : 0u;
+	vec3 camera = params.world_from_view[3].xyz;
+	for (uint s = 0u; s < GATHER_SLOTS; s++) {
+		bool want = false;
+		uvec4 a = uvec4(0u);
+		uvec4 b = uvec4(0u);
+		if (on_surface) {
+			uint record = record_base + s;
+			if (s == params.ray_count + 1u) {
+				if (g.fallback) {
+					// The eye ray: from the camera to just past the surface.
+					float view_len = length(g.rel_pos);
+					vec3 eye_dir = g.rel_pos / max(view_len, 1e-4);
+					a = uvec4(floatBitsToUint(camera), floatBitsToUint(view_len * 1.02));
+					b = uvec4(floatBitsToUint(eye_dir), record);
+					want = true;
+				}
+			} else if (s < g.rays || (s == params.ray_count && g.spec_trace)) {
+				bool spec = s == params.ray_count;
+				vec3 dir = spec ? gather_reflection_dir(g, pixel) : gather_diffuse_dir(g, pixel, s);
+				gather_records.data[record * 2u + 1u] = uvec4(floatBitsToUint(dir), 0u);
+				bool screen_hit = false;
+				vec3 hit_view;
+				if (bool(params.flags & FLAG_SCREEN_TRACES)) {
+					mat3 view_basis = transpose(mat3(params.world_from_view));
+					screen_hit = screen_trace_hit(g.view_pos, view_basis * g.world_geo_normal, view_basis * dir, stbn_sample(pixel, spec ? 5u : 7u).r, hit_view);
+				}
+				if (screen_hit) {
+					gather_records.data[record * 2u] = uvec4(GATHER_RECORD_SCREEN_HIT, floatBitsToUint(hit_view));
+				} else {
+					vec3 origin = g.rel_pos + g.world_geo_normal * params.ray_bias + camera;
+					float t_max = bool(params.flags & FLAG_ABLATE_RAYS) ? params.ray_bias : gather_t_max(g.rel_pos, dir);
+					a = uvec4(floatBitsToUint(origin), floatBitsToUint(t_max));
+					b = uvec4(floatBitsToUint(dir), record);
+					want = true;
+				}
+			}
+		}
+		gather_append(want, a, b);
+	}
+}
+#endif
+
+#ifdef GATHER_TRACE
+// The trace kernel: one request, one ray, the answer into its record.
+void trace_main() {
+	uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+	if (i >= gather_count.count) {
+		return;
+	}
+	uvec4 a = gather_requests.data[i * 2u];
+	uvec4 b = gather_requests.data[i * 2u + 1u];
+	uint record = b.w;
+	// The eye ray starts at the camera; the others a bias off their surface,
+	// as in the single kernel.
+	float t_min = (record % GATHER_SLOTS) == params.ray_count + 1u ? 0.0 : params.ray_bias;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, uintBitsToFloat(a.xyz), t_min, uintBitsToFloat(b.xyz), uintBitsToFloat(a.w));
+	while (rayQueryProceedEXT(rq)) {
+	}
+	uvec4 answer = uvec4(0u);
+	if (GATHER_HIT_COMMITTED) {
+		answer = uvec4(GATHER_RECORD_HIT | (GATHER_HIT_FRONT_FACE ? GATHER_RECORD_FRONT_FACE : 0u) | (GATHER_HIT_GEOMETRY << 8u), floatBitsToUint(GATHER_HIT_T), GATHER_HIT_INSTANCE, GATHER_HIT_PRIMITIVE);
+		gather_records.data[record * 2u + 1u].w = GATHER_HIT_BARYCENTRICS_PACKED;
+	}
+	gather_records.data[record * 2u] = answer;
+}
+#endif
+
+#if !defined(GATHER_SETUP) && !defined(GATHER_TRACE)
+// The single kernel, and the resolve: the same code, the rays' answers
+// from the query or from the records.
+void gather_main() {
+	ivec2 pixel = gather_pixel_coord();
+	if (pixel.x >= params.screen_size.x || pixel.y >= params.screen_size.y) {
+		return;
+	}
+
+	GatherPixel g;
+	if (!gather_pixel_setup(pixel, g)) {
+		imageStore(out_ambient, pixel, vec4(0.0));
+		if (bool(params.flags & FLAG_DYN_SPLIT)) {
+			imageStore(out_ambient_dyn, pixel, vec4(0.0));
+			imageStore(out_fallback_dyn, pixel, vec4(0.0));
+		}
+		imageStore(out_reflection, pixel, vec4(0.0));
+		imageStore(out_spec_ray, pixel, vec4(0.0));
+		imageStore(out_view_depth, pixel, vec4(0.0));
+		// Sky: unoccluded, no directional bias.
+		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+		imageStore(out_fallback, pixel, vec4(0.0));
+		return;
+	}
+	ivec2 full_pixel = g.full_pixel;
+	vec3 view_pos = g.view_pos;
+	vec3 world_normal = g.world_normal;
+	vec3 world_geo_normal = g.world_geo_normal;
+	vec3 rel_pos = g.rel_pos;
+	float roughness = g.roughness;
+	bool mirror = g.mirror;
+	mat3 world_basis = mat3(params.world_from_view);
+#ifdef GATHER_RESOLVE
+	uint record_base = uint(pixel.y * params.screen_size.x + pixel.x) * GATHER_SLOTS;
+#endif
+
+	// One pixel in sixteen feeds the calibration sums: plenty for a mean, and
+	// the 32-bit fixed-point sums cannot overflow at any screen size in use.
+	calibrate_pixel = bool(params.flags & FLAG_CALIBRATE_CACHE) && ((pixel.x | pixel.y) & 3) == 0;
+
+	uint rays = g.rays;
 	pixel_rays = rays;
 	if (bool(params.flags & FLAG_TIER_STATS)) {
 		uint n = subgroupAdd(1u);
-		uint young = subgroupAdd(prev_frames < FALLBACK_FRAMES ? 1u : 0u);
-		uint young_static = subgroupAdd(prev_frames_static < FALLBACK_FRAMES ? 1u : 0u);
+		uint young = subgroupAdd(g.prev_frames < FALLBACK_FRAMES ? 1u : 0u);
+		uint young_static = subgroupAdd(g.prev_frames_static < FALLBACK_FRAMES ? 1u : 0u);
 		if (subgroupElect()) {
 			atomicAdd(calibration.pixels, n);
 			if (young > 0u) {
@@ -1850,8 +2211,12 @@ void main() {
 	hit_mirror = false;
 	hit_specular = false;
 	for (uint r = 0u; r < rays; r++) {
-		vec2 rnd = stbn_sample(pixel, r);
-		vec3 dir = fold_above(cosine_hemisphere(world_normal, rnd), world_geo_normal);
+#ifdef GATHER_RESOLVE
+		gather_record = record_base + r;
+		vec3 dir = uintBitsToFloat(gather_records.data[gather_record * 2u + 1u].xyz);
+#else
+		vec3 dir = gather_diffuse_dir(g, pixel, r);
+#endif
 		vec3 view_dir = transpose(world_basis) * dir;
 		float t_hit;
 		hit_slot = r;
@@ -1873,6 +2238,7 @@ void main() {
 	irradiance_dyn *= inv_rays;
 	moment *= inv_rays;
 	visibility *= inv_rays;
+#ifndef GATHER_NO_RAYS
 	if (mirror_on() && params.mirror_light.w > 0.0) {
 		// The knob light's images through the planar mirrors: direct light
 		// a mirror throws onto this surface, which no ray can find (a point
@@ -1929,6 +2295,7 @@ void main() {
 			moment += luminance(c) * dir;
 		}
 	}
+#endif
 	vec3 reflection = vec3(0.0);
 	// Where the reflected image lives: the virtual point behind the surface,
 	// at the hit distance beyond it along the view ray, expressed as a view
@@ -1937,88 +2304,18 @@ void main() {
 	// from smearing as the camera moves. Defaults to the surface itself.
 	float virtual_view_depth = -view_pos.z;
 	vec4 spec_ray = vec4(0.0);
-	// Smooth surfaces get a mirror ray only when the surface cache is there to
-	// give the hit a surface at texture resolution; otherwise the rough band
-	// alone, with sharp reflections left to SSR / probes, whose sharpness the
-	// blurry cache cannot match.
-	bool mirror = bool(params.flags & FLAG_MIRROR) && roughness <= 0.2;
-	// Diagnostics (FLAG_ABLATE_SPEC): no reflection ray, the diffuse rays'
-	// mean radiance standing in (what a lobe as wide as the hemisphere
-	// would return; as a budget for rough dielectrics it read 12% bright on
-	// the TPS demo's floor, section 84).
-	bool spec_stand_in = bool(params.flags & FLAG_ABLATE_SPEC);
-	// The half-rate form (FLAG_SPEC_HALF_RATE): a rough pixel traces its
-	// reflection ray on alternate frames, its four neighbors on the
-	// others, and the resolve pass reweights the neighbours' hits into
-	// this pixel's lobe (the same reuse the full resolve does, here only
-	// for the pixels without a ray: spec_ray stays zero to mark them). A
-	// mirror keeps its ray: no neighbour's sample is its image. The stand-in
-	// (the diffuse mean) was measured as the cheaper form first and is a
-	// bias, not a budget: a grazing lobe on the TPS demo's floor sees the
-	// dark far end of the ring, the hemisphere mean sees the lit ceiling,
-	// and the frame read 12% brighter.
-	// The checkerboard does not alternate by frame: it did first, and a
-	// pixel then toggled between its own sample and its neighbours' mean,
-	// two estimators that agree on a flat wall and not on a normal-mapped
-	// pipe or a highlight a pixel wide -- the machines' flicker at rest
-	// doubled and a strafe past the hall's pipes left a mottle where the
-	// two patterns met in the history. Fixed, a skipped pixel is always
-	// the mean of its four traced neighbors: a blurrier reflection on
-	// half the pixels, and a still one.
-	bool spec_skip = bool(params.flags & FLAG_SPEC_HALF_RATE) && !mirror && roughness > 0.2 && ((pixel.x + pixel.y) & 1) != 0;
-	if (spec_skip) {
-		// Only where a 4-neighbour is on this surface by the fill's own
-		// stops (a twentieth of the depth, the normal to a few degrees):
-		// a railing or a pipe a pixel wide at the quarter tier has none,
-		// and a fill with nothing to read is a black sample. Those trace.
-		bool has_neighbour = false;
-		for (int k = 0; k < 4 && !has_neighbour; k++) {
-			ivec2 sp = pixel + ivec2(k == 0 ? -1 : (k == 1 ? 1 : 0), k == 2 ? -1 : (k == 3 ? 1 : 0));
-			if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, params.screen_size))) {
-				continue;
-			}
-			ivec2 sfp = min(sp * int(params.depth_scale), params.full_screen_size - 1);
-			float sd = texelFetch(depth_texture, sfp, 0).r;
-			if (sd == 0.0) {
-				continue;
-			}
-			vec2 suv = (vec2(sfp) + 0.5) / vec2(params.full_screen_size);
-			vec4 sp4 = params.view_from_ndc * vec4(suv * 2.0 - 1.0, sd, 1.0);
-			float s_depth = -sp4.z / sp4.w;
-			if (abs(s_depth + view_pos.z) > 0.05 * max(-view_pos.z, 1.0)) {
-				continue;
-			}
-			vec3 sn = nr_normal(texelFetch(normal_roughness_texture, sfp, 0));
-			has_neighbour = pow(max(dot(view_normal, sn), 0.0), 32.0) > 1e-3;
-		}
-		spec_skip = has_neighbour;
-	}
-	// Measured and not kept (section 90): the diffuse ray standing in as a
-	// rough pixel's reflection sample, reweighted into the lobe by the
-	// resolve -- +8% brighter for -1.8 ms, +2.7% gated to steep views.
-	if (spec_stand_in) {
+	if (g.spec_stand_in) {
 		reflection = irradiance;
-	} else if (bool(params.flags & FLAG_SPECULAR) && (roughness > 0.2 || mirror) && !spec_skip) {
-		// GGX half-vector sampling around the mirror direction.
-		vec2 rnd = stbn_sample(pixel, 6u);
-		vec3 v = normalize(-(world_basis * view_pos));
-		// (Measured and not kept: narrowing a young pixel's lobe toward the
-		// mirror direction by its youth, against the entering band's
-		// one-sample sparkle. The sparkle went, but the sharp image it left
-		// in the history read 0.034 against 0.028 at the stop of the flick
-		// case and was still behind at stop + 16; a rough lobe's blur is
-		// what the eye expects there.)
+	} else if (g.spec_trace) {
+		vec3 v = normalize(-rel_pos);
 		float alpha = roughness * roughness;
 		specular_cone_tan = mirror ? 0.0 : min(2.0 * alpha, params.card_cone_tan);
-		float phi = rnd.x * 2.0 * M_PI;
-		float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
-		float st = sqrt(max(1.0 - ct * ct, 0.0));
-		vec3 h = normalize(basis_around(world_normal) * vec3(st * cos(phi), st * sin(phi), ct));
-		vec3 dir = mirror ? reflect(-v, world_normal) : reflect(-v, h);
-		if (dot(dir, world_normal) <= 1e-4) {
-			dir = reflect(-v, world_normal);
-		}
-		dir = fold_above(dir, world_geo_normal);
+#ifdef GATHER_RESOLVE
+		gather_record = record_base + params.ray_count;
+		vec3 dir = uintBitsToFloat(gather_records.data[gather_record * 2u + 1u].xyz);
+#else
+		vec3 dir = gather_reflection_dir(g, pixel);
+#endif
 		vec3 view_dir = transpose(world_basis) * dir;
 		float spec_t_hit;
 		hit_slot = params.ray_count;
@@ -2046,7 +2343,7 @@ void main() {
 		// reprojected, and every highlight on it doubled and smeared under a
 		// dolly (rt_lab temporal_test MOTION=dolly, the pillar was the whole
 		// of the diff). Planes read zero curvature and keep the hit distance.
-		float curvature = surface_curvature(full_pixel, view_pos, geo_view_normal);
+		float curvature = surface_curvature(full_pixel, view_pos, g.geo_view_normal);
 		float t_image = min(spec_t_hit, 1e4);
 		t_image /= (1.0 + 2.0 * curvature * t_image);
 		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
@@ -2083,81 +2380,83 @@ void main() {
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
 	vec3 fallback_dyn = vec3(0.0);
-	if (bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF)) {
-		if (prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL)) {
-			float view_len = length(rel_pos);
-			vec3 eye_dir = rel_pos / max(view_len, 1e-4);
-			rayQueryEXT rq;
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, params.world_from_view[3].xyz, 0.0, eye_dir, view_len * 1.02);
-			while (rayQueryProceedEXT(rq)) {
-			}
-			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-				uint instance_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-				vec3 world_hit = params.world_from_view[3].xyz + eye_dir * rayQueryGetIntersectionTEXT(rq, true);
-				float change_before = pixel_change;
-				float change_dyn_before = pixel_change_dyn;
-				vec3 card_radiance;
-				uint card_set;
-				// Looked up along the surface's normal, not the eye ray: the
-				// card facing the surface is the one that holds it, and a
-				// wall at a grazing angle picked its neighbour's otherwise.
-				card_lookup_footprint = 0.0;
-				if (surface_cache_lookup(instance_id, world_hit, -world_normal, card_radiance, card_set)) {
-					card_requests.frame[card_set] = params.surface_cache_frame;
-					// A tent over the card's texels (never across its border):
-					// the card is coarse against the screen, and its texels
-					// would show as blocks at the fade's full weight. The tent
-					// widens the younger the texel's accumulation is (see
-					// surface_cache_lookup: a few samples per texel read as a
-					// mottle over the whole surface, and the fade shows this
-					// read at full weight): a texel relit once is read as a
-					// four-by-four grid of bilinear taps four texels apart (a
-					// wider grid, eight apart, leaked light across the walls and
-					// flickered against the history it fades into), the spacing
-					// shrinking by root two with every doubling of its relights
-					// (exp2 of the youth level, which falls half a step per
-					// doubling).
-					vec4 ind0 = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0);
-					float relights = ind0.a * 64.0;
-					if (dyn_lights.count > 0u) {
-						// And the dynamic histories' age, by their share:
-						// the stand-in is then as fresh as the pixel's own
-						// samples where a moving light is the light, and
-						// fades out like them.
-						relights = min(relights, card_dynamic_age(ivec2(card_atlas_texel), ind0.rgb));
-					}
-					vec2 dims = vec2(card_atlas_dims);
-					float spacing = 1.0;
-					if (params.card_youth_lod > 0.0 && relights > 0.0) {
-						float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
-						spacing = clamp(exp2(youth_lod - 1.0), 1.0, max(min(dims.x, dims.y) / 8.0, 1.0));
-					}
-					vec2 t_min = vec2(card_atlas_origin) + 0.5;
-					vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
-					vec3 ind = vec3(0.0);
-					vec3 ind_dyn = vec3(0.0);
-					for (int dy = 0; dy < 4; dy++) {
-						for (int dx = 0; dx < 4; dx++) {
-							vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
-							vec2 uv = t / float(params.surface_cache_atlas_size);
-							uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
-							// The dynamic bounces come summed and filtered in the one atlas (parts 2 and 4 both select it).
-							ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0));
-							ind_dyn += ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
-						}
-					}
-					ind /= 16.0;
-					ind_dyn /= 16.0;
-					// The moving lights' share apart (FLAG_DYN_SPLIT: the
-					// spatial pass fades each history's own share in);
-					// the stand-in itself is the sum, as before.
-					ind += ind_dyn;
-					fallback = vec4(max(ind, vec3(0.0)), min(relights, 64.0) / 64.0 * card_lookup_confidence);
-					fallback_dyn = max(ind_dyn, vec3(0.0));
+	if (g.fallback) {
+		float view_len = length(rel_pos);
+		vec3 eye_dir = rel_pos / max(view_len, 1e-4);
+#ifdef GATHER_RESOLVE
+		uvec4 rec = gather_records.data[(record_base + params.ray_count + 1u) * 2u];
+#else
+		rayQueryEXT rq;
+		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, params.world_from_view[3].xyz, 0.0, eye_dir, view_len * 1.02);
+		while (rayQueryProceedEXT(rq)) {
+		}
+#endif
+		if (GATHER_HIT_COMMITTED) {
+			uint instance_id = GATHER_HIT_INSTANCE;
+			vec3 world_hit = params.world_from_view[3].xyz + eye_dir * GATHER_HIT_T;
+			float change_before = pixel_change;
+			float change_dyn_before = pixel_change_dyn;
+			vec3 card_radiance;
+			uint card_set;
+			// Looked up along the surface's normal, not the eye ray: the
+			// card facing the surface is the one that holds it, and a
+			// wall at a grazing angle picked its neighbour's otherwise.
+			card_lookup_footprint = 0.0;
+			if (surface_cache_lookup(instance_id, world_hit, -world_normal, card_radiance, card_set)) {
+				card_requests.frame[card_set] = params.surface_cache_frame;
+				// A tent over the card's texels (never across its border):
+				// the card is coarse against the screen, and its texels
+				// would show as blocks at the fade's full weight. The tent
+				// widens the younger the texel's accumulation is (see
+				// surface_cache_lookup: a few samples per texel read as a
+				// mottle over the whole surface, and the fade shows this
+				// read at full weight): a texel relit once is read as a
+				// four-by-four grid of bilinear taps four texels apart (a
+				// wider grid, eight apart, leaked light across the walls and
+				// flickered against the history it fades into), the spacing
+				// shrinking by root two with every doubling of its relights
+				// (exp2 of the youth level, which falls half a step per
+				// doubling).
+				vec4 ind0 = texelFetch(card_indirect_atlas, ivec2(card_atlas_texel), 0);
+				float relights = ind0.a * 64.0;
+				if (dyn_lights.count > 0u) {
+					// And the dynamic histories' age, by their share:
+					// the stand-in is then as fresh as the pixel's own
+					// samples where a moving light is the light, and
+					// fades out like them.
+					relights = min(relights, card_dynamic_age(ivec2(card_atlas_texel), ind0.rgb));
 				}
-				pixel_change = change_before;
-				pixel_change_dyn = change_dyn_before;
+				vec2 dims = vec2(card_atlas_dims);
+				float spacing = 1.0;
+				if (params.card_youth_lod > 0.0 && relights > 0.0) {
+					float youth_lod = params.card_youth_lod * (1.0 - log2(max(relights, 1.0)) / 6.0);
+					spacing = clamp(exp2(youth_lod - 1.0), 1.0, max(min(dims.x, dims.y) / 8.0, 1.0));
+				}
+				vec2 t_min = vec2(card_atlas_origin) + 0.5;
+				vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
+				vec3 ind = vec3(0.0);
+				vec3 ind_dyn = vec3(0.0);
+				for (int dy = 0; dy < 4; dy++) {
+					for (int dx = 0; dx < 4; dx++) {
+						vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
+						vec2 uv = t / float(params.surface_cache_atlas_size);
+						uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
+						// The dynamic bounces come summed and filtered in the one atlas (parts 2 and 4 both select it).
+						ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0));
+						ind_dyn += ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
+					}
+				}
+				ind /= 16.0;
+				ind_dyn /= 16.0;
+				// The moving lights' share apart (FLAG_DYN_SPLIT: the
+				// spatial pass fades each history's own share in);
+				// the stand-in itself is the sum, as before.
+				ind += ind_dyn;
+				fallback = vec4(max(ind, vec3(0.0)), min(relights, 64.0) / 64.0 * card_lookup_confidence);
+				fallback_dyn = max(ind_dyn, vec3(0.0));
 			}
+			pixel_change = change_before;
+			pixel_change_dyn = change_dyn_before;
 		}
 	}
 	imageStore(out_fallback, pixel, fallback);
@@ -2182,4 +2481,15 @@ void main() {
 		imageStore(out_ambient, pixel, vec4(irradiance, clamp(pixel_change, 0.0, 1.0)));
 	}
 	imageStore(out_directional, pixel, directional_out);
+}
+#endif
+
+void main() {
+#if defined(GATHER_SETUP)
+	setup_main();
+#elif defined(GATHER_TRACE)
+	trace_main();
+#else
+	gather_main();
+#endif
 }
