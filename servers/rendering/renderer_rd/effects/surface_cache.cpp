@@ -1156,6 +1156,13 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	if (dyn_filter) {
 		params.flags |= 128;
 	}
+	// GODOT_CARD_LOD_SPLAT=0: a coarse relight's cell (section 92) takes the
+	// representative's material with its lighting and filters its bounce at
+	// the texel's stride, inside its own cell (the form before section 96).
+	static const bool lod_splat = OS::get_singleton()->get_environment("GODOT_CARD_LOD_SPLAT") != "0";
+	if (lod_splat) {
+		params.flags |= 256;
+	}
 	params.temporal_frames = MAX(settings.temporal_frames, 1u);
 	params.atlas_size = settings.atlas_size;
 	// The world light grid: GRID_N cells across twice the light radius,

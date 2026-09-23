@@ -225,6 +225,7 @@ uint split_ray_mask = 0u; // Setup: the records requested; resolve: the header's
 #define FLAG_DYN_FILTER 128u // The static and the dynamic bounce histories filtered over the card at every age (filter_bounces; GODOT_CARD_DYN_FILTER=0 clears it).
 #define FLAG_DYNAMIC_YOUNG 64u // The young texels' extra cosine rays while a dynamic light moves (GODOT_CARD_DYN_YOUNG).
 #define FLAG_GRID 32u // The world light grid was built this frame: a texel inside it reads its cell's lights.
+#define FLAG_SPLAT_CELL 256u // A coarse relight's cell (see light_main): the bounce filter's taps a cell apart, every texel's own material over the shared lighting (GODOT_CARD_LOD_SPLAT=0 clears it).
 
 layout(set = 0, binding = 8) uniform texture2D albedo_atlas;
 layout(set = 0, binding = 9) uniform texture2D normal_atlas;
@@ -2131,6 +2132,16 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 		return;
 	}
 	int stride = age <= 2.0 ? 3 : (age <= 6.0 ? 2 : 1);
+	// A coarse relight's representative (see light_main): at a texel's
+	// stride the taps fall in its own cell, which holds its own splatted
+	// history, so the filter averaged one estimate with itself (at level 3
+	// every tap) and counted it as twenty-five. A cell's stride reaches the
+	// neighboring cells' representatives. The depth tolerance stays the
+	// texel stride's, so the far taps join only on surfaces nearly parallel
+	// to the card: grown with the step (to two meters at level 3's widest)
+	// they reached across the machines' parts, fireflies +80% at rest
+	// (plan section 96).
+	int step = (params.flags & FLAG_SPLAT_CELL) != 0u ? stride * splat_side : stride;
 	float depth_c = texelFetch(depth_atlas, texel, 0).r;
 	vec3 n_c = normalize(texelFetch(normal_atlas, texel, 0).rgb * 2.0 - 1.0);
 	float depth_tol = 0.1 + 0.08 * float(stride);
@@ -2141,7 +2152,7 @@ void filter_bounces(ivec2 texel, vec3 own_static, float static_age, vec3 own_dyn
 	float taps = 0.0;
 	for (int dy = -2; dy <= 2; dy++) {
 		for (int dx = -2; dx <= 2; dx++) {
-			ivec2 n = texel + ivec2(dx, dy) * stride;
+			ivec2 n = texel + ivec2(dx, dy) * step;
 			if (any(lessThan(n, card_min)) || any(greaterThan(n, card_max))) {
 				continue;
 			}
@@ -2557,15 +2568,40 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		radiance = vec3(luminance(d.local_sum), float(d.local_count) / 8.0, d.local_nearest);
 	}
 	vec3 static_radiance = max(t.albedo * (direct + ind_read) + t.emission, vec3(0.0));
+	bool splat_material = splat_side > 1 && (params.flags & FLAG_SPLAT_CELL) != 0u && (params.debug & (262144u | 524288u)) == 0u;
 	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(static_radiance)) || any(isinf(static_radiance))) {
 		radiance = vec3(0.0);
 		static_radiance = vec3(0.0);
+		splat_material = false;
 		if ((params.debug & 8192u) != 0u) {
 			atomicAdd(dyn_stats.count[31], 1u);
 		}
 	}
-	SPLAT_STORE(static_atlas, texel, vec4(static_radiance, vis_dyn));
-	SPLAT_STORE(lighting_atlas, texel, vec4(radiance, frames / 64.0));
+	if (splat_material) {
+		// A coarse relight's cell shares the representative's lighting, not
+		// its material: every texel's radiance is its own albedo and emission
+		// over the cell's light, so a textured or partly emissive cell keeps
+		// its pattern (the representative's colour splatted over sixty-four
+		// texels made hot blocks of a bright fleck), and the mip chain's
+		// average is the cell's.
+		vec3 lit = direct + ind_read + dyn_read;
+		vec3 lit_static = direct + ind_read;
+		for (int sy = 0; sy < splat_side; sy++) {
+			for (int sx = 0; sx < splat_side; sx++) {
+				uint bi = uint(sy * splat_side + sx);
+				if (((bi < 32u ? splat_mask.x >> bi : splat_mask.y >> (bi - 32u)) & 1u) != 0u) {
+					ivec2 c = splat_origin + ivec2(sx, sy);
+					vec3 albedo_c = card_diffuse_albedo(c, t.world_pos);
+					vec3 emission_c = texelFetch(emission_atlas, c, 0).rgb;
+					imageStore(static_atlas, c, vec4(max(albedo_c * lit_static + emission_c, vec3(0.0)), vis_dyn));
+					imageStore(lighting_atlas, c, vec4(max(albedo_c * lit + emission_c, vec3(0.0)), frames / 64.0));
+				}
+			}
+		}
+	} else {
+		SPLAT_STORE(static_atlas, texel, vec4(static_radiance, vis_dyn));
+		SPLAT_STORE(lighting_atlas, texel, vec4(radiance, frames / 64.0));
+	}
 	mip_dirty.tiles[uint(texel.y >> 5) * (params.atlas_size >> 5u) + uint(texel.x >> 5)] = 1u;
 	if (splat_side > 1) {
 		ivec2 far_corner = splat_origin + ivec2(splat_side - 1);
