@@ -565,6 +565,18 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 	if (surface_cache == nullptr || scene.get_tlas().is_null()) {
 		return;
 	}
+	// Diagnostic: GODOT_CARD_FREEZE=<frame> stops relighting the cards after
+	// that scene frame, so a still camera's remaining boil is the screen
+	// passes' own and not the cards' relights (2026-09-24, the TPS splotch).
+	static const int64_t freeze_frame = OS::get_singleton()->get_environment("GODOT_CARD_FREEZE").to_int();
+	if (freeze_frame > 0 && int64_t(scene.get_frame()) > freeze_frame) {
+		static bool frozen_printed = false;
+		if (!frozen_printed) {
+			frozen_printed = true;
+			print_line(vformat("GODOT_CARD_FREEZE: the cards' lighting stops at scene frame %d.", scene.get_frame()));
+		}
+		return;
+	}
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	SurfaceCache::LightingInputs in;
 	in.tlas = scene.get_tlas();
