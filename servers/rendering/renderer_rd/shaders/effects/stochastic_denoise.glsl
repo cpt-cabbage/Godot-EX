@@ -37,6 +37,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_PAINT 512u // Diagnostics (GODOT_GI_SPEC_ABLATE=paint): the reflection's frame count as a colour.
 #define FLAG_SPEC_PAINT_WHY 1024u // Diagnostics (GODOT_GI_SPEC_ABLATE=why): why the history is short (see the store).
 #define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
+#define FLAG_SPATIAL_OFF_D 16384u // Diagnostics (GODOT_GI_SPATIAL=nodiffuse): the diffuse signal only unfiltered.
+#define FLAG_SPATIAL_OFF_S 32768u // Diagnostics (GODOT_GI_SPATIAL=nospec): the reflection only unfiltered.
+#define FLAG_SPATIAL_SIGMA 524288u // clamp_gamma is the luminance stop's width in standard deviations (GODOT_GI_ATROUS_SIGMA; 4 otherwise).
 #define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
 #define FLAG_MARK_COHERENT 4096u // GODOT_GI_MARK_MEAN=1 drops it: with FLAG_MARK_MEAN, a mark a third of the neighbourhood shares is kept whole (see there).
@@ -1488,6 +1491,12 @@ void main() {
 		filter_d = false;
 		filter_s = false;
 	}
+	if ((params.flags & FLAG_SPATIAL_OFF_D) != 0u) {
+		filter_d = false;
+	}
+	if ((params.flags & FLAG_SPATIAL_OFF_S) != 0u) {
+		filter_s = false;
+	}
 	// Ramp the directional term in over the first frames of accumulation.
 	float dir_confidence = clamp((frames_d - 4.0) * 0.125, 0.0, 1.0);
 	// And the cards' stand-in out (GI only; see store_result).
@@ -1511,8 +1520,9 @@ void main() {
 	float depth_min = min(depth_bound_a, depth_bound_b);
 	float depth_max = max(depth_bound_a, depth_bound_b);
 	vec3 center_normal = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
-	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
-	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
+	float sigma_k = (params.flags & FLAG_SPATIAL_SIGMA) != 0u ? params.clamp_gamma : 4.0;
+	float sigma_d = sigma_k * sqrt(var_d) + 1e-4;
+	float sigma_s = sigma_k * sqrt(var_s) + 1e-4;
 
 	// Newly revealed pixels have no usable variance estimate yet, so widen the
 	// kernel and ignore the luminance stopping function for a few frames.
