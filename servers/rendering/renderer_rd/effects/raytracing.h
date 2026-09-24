@@ -317,6 +317,9 @@ private:
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
 		DENOISE_FLAG_SPEC_NO_YOUNG = 131072, // Spatial (GI, experiment, GODOT_GI_SPEC_ABLATE=young): a young reflection is not filtered for its youth.
 		DENOISE_FLAG_SPATIAL_OFF = 262144, // Spatial (GI, experiment, GODOT_GI_SPATIAL=0): the pass stores its input unfiltered.
+		DENOISE_FLAG_SPATIAL_OFF_D = 16384, // Spatial (GI, diagnostics, GODOT_GI_SPATIAL=nodiffuse): the diffuse signal unfiltered.
+		DENOISE_FLAG_SPATIAL_OFF_S = 32768, // Spatial (GI, diagnostics, GODOT_GI_SPATIAL=nospec): the reflection unfiltered.
+		DENOISE_FLAG_SPATIAL_SIGMA = 524288, // Spatial (GI, GODOT_GI_ATROUS_SIGMA): clamp_gamma carries the luminance stop's width in standard deviations.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.

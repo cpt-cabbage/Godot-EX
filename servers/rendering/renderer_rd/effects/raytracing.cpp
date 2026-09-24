@@ -2991,9 +2991,21 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (fallback_coverage) {
 			denoise_push_constant.flags |= DENOISE_FLAG_FALLBACK_COVERAGE;
 		}
-		static const bool spatial_off = OS::get_singleton()->get_environment("GODOT_GI_SPATIAL") == "0";
-		if (spatial_off) {
+		// GODOT_GI_SPATIAL=0 | nodiffuse | nospec (diagnostics): the a-trous
+		// off for both signals or for one; GODOT_GI_ATROUS_SIGMA=<k> the
+		// luminance stop's width in standard deviations (4).
+		static const String spatial_env = OS::get_singleton()->get_environment("GODOT_GI_SPATIAL");
+		if (spatial_env == "0") {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_OFF;
+		} else if (spatial_env == "nodiffuse") {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_OFF_D;
+		} else if (spatial_env == "nospec") {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_OFF_S;
+		}
+		static const String sigma_env = OS::get_singleton()->get_environment("GODOT_GI_ATROUS_SIGMA");
+		if (!sigma_env.is_empty()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPATIAL_SIGMA;
+			denoise_push_constant.clamp_gamma = MAX(float(sigma_env.to_float()), 1e-3f);
 		}
 		// GODOT_GI_FALLBACK_RAMP=<relights>: the card accumulation at which
 		// the young pixel's stand-in reaches full weight.
