@@ -59,6 +59,7 @@
 #include "../normal_roughness_inc.glsl"
 #include "../oct_inc.glsl"
 #include "rt_hit_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 #define M_PI 3.14159265359
 
@@ -105,7 +106,7 @@ layout(push_constant, std430) uniform Params {
 	mat4 view_from_ndc;
 	ivec2 screen_size; // The gather's.
 	ivec2 full_screen_size; // The depth and G-buffer's.
-	int depth_scale;
+	int depth_scale; // With the block's center sample in bit 8 (rt_sample_offset_inc.glsl).
 	uint slots;
 	uint ray_count;
 	uint flags;
@@ -139,10 +140,10 @@ struct Surface {
 	bool mirror;
 };
 
-// The gather's sampling point: the full-resolution pixel at the block's
-// corner (gather_pixel_setup), so a pixel's own ray reads its own direction.
+// The gather's sampling point: the full-resolution pixel of the block it
+// sampled (gather_pixel_setup), so a pixel's own ray reads its own direction.
 bool surface_at(ivec2 pixel, out Surface s) {
-	ivec2 full_pixel = min(pixel * params.depth_scale, params.full_screen_size - 1);
+	ivec2 full_pixel = rt_full_pixel(pixel, params.depth_scale, params.full_screen_size);
 	float depth = texelFetch(depth_texture, full_pixel, 0).r;
 	if (depth == 0.0) {
 		return false;

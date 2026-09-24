@@ -43,6 +43,7 @@
 
 #include "../albedo_f0_inc.glsl"
 #include "../normal_roughness_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -111,7 +112,8 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	uint area_light_count;
 	ivec2 full_screen_size;
 	// 2 when sampling at half resolution (screen_size is then the half size
-	// and every depth / normal / cluster lookup scales up to full pixels).
+	// and every depth / normal / cluster lookup scales up to full pixels;
+	// bit 8 the block's center sample, rt_sample_offset_inc.glsl).
 	uint depth_scale;
 	uint reservoir_count; // Rays per pixel, 1..MAX_RESERVOIRS.
 	uint flags; // FLAG_*.
@@ -1184,7 +1186,7 @@ void sample_pixel(ivec2 pixel) {
 		return;
 	}
 
-	ivec2 full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	ivec2 full_pixel = rt_full_pixel(pixel, int(params.depth_scale), params.full_screen_size);
 	float depth = texelFetch(depth_texture, full_pixel, 0).r;
 	if (depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
@@ -1948,7 +1950,7 @@ void trace_main() {
 	ivec2 pixel = ivec2(req.x & 0x3FFFu, (req.x >> 14u) & 0x3FFFu);
 	uint r = req.x >> 28u;
 	uint entry = req.y;
-	ivec2 full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	ivec2 full_pixel = rt_full_pixel(pixel, int(params.depth_scale), params.full_screen_size);
 	float depth = texelFetch(depth_texture, full_pixel, 0).r;
 	vec2 uv = (vec2(full_pixel) + 0.5) / vec2(params.full_screen_size);
 	vec4 view_pos4 = params.view_from_ndc * vec4(uv * 2.0 - 1.0, depth, 1.0);

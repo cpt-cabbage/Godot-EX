@@ -2384,7 +2384,10 @@ void fragment_shader(in SceneData scene_data) {
 			int rtgi_scale = 1 << int((implementation_data.rt_gi & 3u) - 1u);
 			ivec2 rtgi_full_size = ivec2(round(1.0 / scene_data.screen_pixel_size));
 			ivec2 rtgi_half_size = (rtgi_full_size + ivec2(rtgi_scale - 1)) / rtgi_scale;
-			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5) / float(rtgi_scale);
+			// rt_gi bit 2048 (the quarter tier): the gather lit each
+			// texel at its block's center pixel, not the corner.
+			int rtgi_offset = (implementation_data.rt_gi & 2048u) != 0u ? rtgi_scale >> 1 : 0;
+			vec2 rtgi_pos = (screen_uv * vec2(rtgi_full_size) - 0.5 - float(rtgi_offset)) / float(rtgi_scale);
 			ivec2 rtgi_base = ivec2(floor(rtgi_pos));
 			vec2 rtgi_fr = rtgi_pos - vec2(rtgi_base);
 			float rtgi_own_depth = -vertex.z;
@@ -2432,7 +2435,7 @@ void fragment_shader(in SceneData scene_data) {
 				for (int k = 0; k < 4 && rtgi_fast; k++) {
 					ivec2 goff = ivec2(k == 1 || k == 2 ? 1 : 0, k < 2 ? 1 : 0);
 					ivec2 ghp = clamp(rtgi_base + goff, ivec2(0), rtgi_half_size - 1);
-					ivec2 gfp = min(ghp * rtgi_scale, rtgi_full_size - ivec2(1));
+					ivec2 gfp = min(ghp * rtgi_scale + rtgi_offset, rtgi_full_size - ivec2(1));
 					float pd = plane_depth_at_tap(inv_projection_matrix, gfp, rtgi_full_size, vertex, rt_gi_face);
 					vec3 gn = nr_normal(vec4(gnx[k], gny[k], 0.0, 0.0));
 					gn = dot(gn, view) < 0.0 ? -gn : gn;
@@ -2462,7 +2465,7 @@ void fragment_shader(in SceneData scene_data) {
 				ivec2 hp = clamp(rtgi_base + off, ivec2(0), rtgi_half_size - 1);
 				// The full-res pixel the gather read its normal from (it clamps
 				// the same way for odd sizes).
-				ivec2 rtgi_fp = min(hp * rtgi_scale, rtgi_full_size - ivec2(1));
+				ivec2 rtgi_fp = min(hp * rtgi_scale + rtgi_offset, rtgi_full_size - ivec2(1));
 #ifdef USE_MULTIVIEW
 				float sd = texelFetch(sampler2DArray(rt_gi_depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0).r;
 				vec3 sn = (implementation_data.rt_gi & 256u) == 0u ? nr_normal((implementation_data.rt_gi & 512u) != 0u ? texelFetch(sampler2DArray(rt_gi_guide_normal, SAMPLER_NEAREST_CLAMP), ivec3(hp, int(ViewIndex)), 0) : texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(rtgi_fp, int(ViewIndex)), 0)) : rt_gi_face;
@@ -3717,7 +3720,9 @@ void fragment_shader(in SceneData scene_data) {
 		// tap index. The denoised signal is smooth enough that correcting this
 		// is not visible in the scenes measured so far; it is fixed because the
 		// reconstruction should stand on the sampling grid that exists.
-		vec2 pos = (screen_uv * vec2(full_size) - 0.5) / float(stochastic_scale);
+		// Bit 256 (the quarter tier): lit at the block's center pixel.
+		int stochastic_offset = (implementation_data.stochastic_direct_lights & 256u) != 0u ? stochastic_scale >> 1 : 0;
+		vec2 pos = (screen_uv * vec2(full_size) - 0.5 - float(stochastic_offset)) / float(stochastic_scale);
 		ivec2 base = ivec2(floor(pos));
 		vec2 fr = pos - vec2(base);
 		float own_depth = -vertex.z;
@@ -3806,7 +3811,7 @@ void fragment_shader(in SceneData scene_data) {
 				// Gather order: (x0,y1) (x1,y1) (x1,y0) (x0,y0).
 				ivec2 goff = ivec2(k == 1 || k == 2 ? 1 : 0, k < 2 ? 1 : 0);
 				ivec2 ghp = clamp(base + goff, ivec2(0), half_size - 1);
-				ivec2 gfp = min(ghp * stochastic_scale, full_size - ivec2(1));
+				ivec2 gfp = min(ghp * stochastic_scale + stochastic_offset, full_size - ivec2(1));
 				float pd = plane_depth_at_tap(inv_projection_matrix, gfp, full_size, vertex, stochastic_face);
 				vec3 gn = nr_normal(vec4(gnx[k], gny[k], 0.0, 0.0));
 				gn = dot(gn, view) < 0.0 ? -gn : gn;
@@ -3850,7 +3855,7 @@ void fragment_shader(in SceneData scene_data) {
 			ivec2 hp = clamp(base + off, ivec2(0), half_size - 1);
 			// The full-res pixel the sampling pass lit texel hp at (it clamps
 			// the same way for odd sizes).
-			ivec2 fp = min(hp * stochastic_scale, full_size - ivec2(1));
+			ivec2 fp = min(hp * stochastic_scale + stochastic_offset, full_size - ivec2(1));
 			vec3 tap_image_diffuse = vec3(0.0);
 			vec4 tap_image_specular = vec4(0.0);
 			vec3 tap_analytic_diffuse = vec3(0.0);

@@ -39,6 +39,7 @@
 
 #include "../normal_roughness_inc.glsl"
 #include "../oct_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -56,7 +57,7 @@ layout(set = 1, binding = 0, rgba16f) uniform restrict writeonly image2D out_ref
 layout(push_constant, std430) uniform Params {
 	mat4 view_from_ndc;
 	ivec2 screen_size;
-	int depth_scale; // 2 when the reflection buffers are half resolution.
+	int depth_scale; // 2 when the reflection buffers are half resolution; bit 8 the block's center sample (rt_sample_offset_inc.glsl).
 	int paint; // Diagnostics (GODOT_GI_SPEC_FILL_PAINT=1): why each pixel got what it got.
 	float rough_min; // At or below this roughness the pixel traced its own ray (the mirror path).
 	uint flags;
@@ -120,8 +121,8 @@ void main() {
 		return;
 	}
 	vec4 center = texelFetch(raw_reflection, pixel, 0);
-	float depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
-	vec4 nr = texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0);
+	float depth = texelFetch(depth_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
+	vec4 nr = texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0);
 	float roughness = nr_roughness(nr);
 	bool paint = params.paint != 0;
 	// A pixel with a ray of its own passes through (weighted, FLAG_WEIGHT);
@@ -151,14 +152,14 @@ void main() {
 			if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, params.screen_size))) {
 				continue;
 			}
-			float sd = texelFetch(depth_texture, sp * params.depth_scale, 0).r;
+			float sd = texelFetch(depth_texture, rt_full_pixel(sp, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 			if (sd == 0.0 || texelFetch(spec_ray, sp, 0).z == 0.0) {
 				continue;
 			}
 			if (abs(-view_position(sp, sd).z - view_depth) > 0.05 * max(view_depth, 1.0)) {
 				continue;
 			}
-			vec4 snr = texelFetch(normal_roughness_texture, sp * params.depth_scale, 0);
+			vec4 snr = texelFetch(normal_roughness_texture, rt_full_pixel(sp, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0);
 			vec3 sn = nr_normal(snr);
 			float w_normal = pow(max(dot(n, sn), 0.0), 32.0);
 			if (w_normal <= 1e-3) {

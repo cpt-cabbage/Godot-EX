@@ -46,6 +46,7 @@
 
 #include "../albedo_f0_inc.glsl"
 #include "../normal_roughness_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -78,7 +79,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	mat4 reproject; // Current NDC -> previous frame NDC, for screen radiance.
 	ivec2 screen_size;
 	ivec2 full_screen_size;
-	uint depth_scale; // 2 when sampling at half resolution.
+	uint depth_scale; // 2 when sampling at half resolution; bit 8 the block's center sample (rt_sample_offset_inc.glsl).
 	uint frame_index;
 	uint ray_count; // Diffuse rays per pixel.
 	uint flags; // FLAG_*.
@@ -1961,7 +1962,7 @@ struct GatherPixel {
 
 // False for the sky.
 bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
-	g.full_pixel = min(pixel * int(params.depth_scale), params.full_screen_size - 1);
+	g.full_pixel = rt_full_pixel(pixel, int(params.depth_scale), params.full_screen_size);
 	g.depth = texelFetch(depth_texture, g.full_pixel, 0).r;
 	if (g.depth == 0.0) {
 		return false;
@@ -2074,7 +2075,7 @@ bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
 			if (any(lessThan(sp, ivec2(0))) || any(greaterThanEqual(sp, params.screen_size))) {
 				continue;
 			}
-			ivec2 sfp = min(sp * int(params.depth_scale), params.full_screen_size - 1);
+			ivec2 sfp = rt_full_pixel(sp, int(params.depth_scale), params.full_screen_size);
 			float sd = texelFetch(depth_texture, sfp, 0).r;
 			if (sd == 0.0) {
 				continue;

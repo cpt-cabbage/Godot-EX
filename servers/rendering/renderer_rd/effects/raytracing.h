@@ -976,6 +976,13 @@ public:
 	// pick the freshly written texture, like the GI view depth). Valid for the
 	// buffer named by the most recent advance_frame().
 	bool get_history_parity() const { return rb_state != nullptr && rb_state->history_parity; }
+	// The quarter tier's passes light each texel at its block's center
+	// pixel, not its corner (plan J0, section 107; GODOT_RT_SAMPLE_CENTER=0
+	// reverts). The scale word they take carries it
+	// (rt_sample_offset_inc.glsl), the scene shader a bit of its own (rt_gi
+	// 2048, stochastic_direct_lights 256).
+	static bool sample_center();
+	static int32_t packed_sample_scale(uint32_t p_scale);
 	// The denoisers' guide normal at a pass's scale (rt_denoise_guide.glsl),
 	// if a spatial pass wrote it this frame: the scene shader's composites
 	// read their taps' normals from it, packed like the signal, instead of
