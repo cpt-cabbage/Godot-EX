@@ -652,6 +652,20 @@ static void _unpack_r11g11b10(uint32_t p_v, float *r_out) {
 	r_out[2] = f10((p_v >> 22) & 0x3ff);
 }
 
+bool Raytracing::sample_center() {
+	static const bool center = OS::get_singleton()->get_environment("GODOT_RT_SAMPLE_CENTER") != "0";
+	return center;
+}
+
+int32_t Raytracing::packed_sample_scale(uint32_t p_scale) {
+	// The low-resolution passes light each texel at its block's center pixel
+	// (GODOT_RT_SAMPLE_CENTER=0: the corner; rt_sample_offset_inc.glsl). Only
+	// from the quarter tier up: a 2x2 block has no center pixel, and moving
+	// the half tier's sample to the opposite corner measured as nothing but
+	// a different aliasing under motion (plan section 107).
+	return int32_t(p_scale) | (sample_center() && p_scale >= 4 ? 0x100 : 0);
+}
+
 void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 	if (!OS::get_singleton()->has_environment("GODOT_RT_DUMP_NOW")) {
 		return;
@@ -1237,7 +1251,7 @@ bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint
 	pc.size[1] = p_size.y;
 	pc.full_size[0] = full_size.x;
 	pc.full_size[1] = full_size.y;
-	pc.scale = int32_t(p_scale);
+	pc.scale = packed_sample_scale(p_scale);
 	RID shader_rid = denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 0);
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	RD::Uniform g_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_depth }));
@@ -1300,8 +1314,8 @@ uint32_t Raytracing::composite_upsample(Ref<RenderSceneBuffersRD> p_render_buffe
 	}
 	pc.full_size[0] = full_size.x;
 	pc.full_size[1] = full_size.y;
-	pc.stochastic_scale = int32_t(MAX(p_stochastic_scale, 1u));
-	pc.gi_scale = int32_t(MAX(p_gi_scale, 1u));
+	pc.stochastic_scale = packed_sample_scale(MAX(p_stochastic_scale, 1u));
+	pc.gi_scale = packed_sample_scale(MAX(p_gi_scale, 1u));
 	// The scene shader rotates the world-space moment by
 	// transpose(mat3(inv_view_matrix)): the camera basis transposed.
 	const Quaternion view_from_world = p_world_from_view.basis.orthonormalized().transposed().get_quaternion();
@@ -1567,7 +1581,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	params.area_light_count = p_area_light_count;
 	params.full_screen_size[0] = full_size.x;
 	params.full_screen_size[1] = full_size.y;
-	params.depth_scale = depth_scale;
+	params.depth_scale = uint32_t(packed_sample_scale(depth_scale));
 	// MAX_RESERVOIRS in the shader bounds this: the per-reservoir arrays are
 	// registers, and sizing them past the rays actually requested costs
 	// occupancy on every pixel.
@@ -1843,7 +1857,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	// keeps only the current frame and the spatial pass passes through.
 	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
 	denoise_push_constant.blend_alpha = p_quality.denoise ? denoise_push_constant.blend_alpha : 1.0f;
-	denoise_push_constant.depth_scale = (int32_t)depth_scale;
+	denoise_push_constant.depth_scale = packed_sample_scale(depth_scale);
 	// Neighborhood clamp width. This was 1.5 while the clamp was measuring the
 	// wrong axis: it read a scalar ratio's packed-format rounding as chroma, so
 	// its confidence output collapsed and pinned the accumulated frame count
@@ -1932,7 +1946,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RID guide_depth = depth;
 	RID guide_nr = p_normal_roughness;
 	const bool guided = _denoise_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness, guide_depth, guide_nr);
-	denoise_push_constant.depth_scale = guided ? 1 : (int32_t)depth_scale;
+	denoise_push_constant.depth_scale = guided ? 1 : packed_sample_scale(depth_scale);
 	RID scratch_d[2] = { diffuse_slice, hist_read_d };
 	RID scratch_s[2] = { specular_slice, hist_read_s };
 	RID moments_scratch = p_render_buffers->get_texture_slice(RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_MOMENTS_SCRATCH, p_view, 0);
@@ -2159,7 +2173,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	params.screen_size[1] = size.y;
 	params.full_screen_size[0] = full_size.x;
 	params.full_screen_size[1] = full_size.y;
-	params.depth_scale = depth_scale;
+	params.depth_scale = uint32_t(packed_sample_scale(depth_scale));
 	params.frame_index = rb_state->frame_index;
 	// GODOT_GI_YOUNG_RAYS=<n>: the diffuse rays a pixel whose history is
 	// young (under 8 frames) traces, in place of the setting's count; the
@@ -2682,7 +2696,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		reuse_push.screen_size[1] = size.y;
 		reuse_push.full_screen_size[0] = full_size.x;
 		reuse_push.full_screen_size[1] = full_size.y;
-		reuse_push.depth_scale = int32_t(depth_scale);
+		reuse_push.depth_scale = packed_sample_scale(depth_scale);
 		reuse_push.slots = params.ray_count + 1;
 		reuse_push.ray_count = params.ray_count;
 		static const bool reuse_no_pool = OS::get_singleton()->get_environment("GODOT_GI_REUSE_POOL") == "0";
@@ -2784,7 +2798,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		}
 		resolve_push.screen_size[0] = size.x;
 		resolve_push.screen_size[1] = size.y;
-		resolve_push.depth_scale = guided ? 1 : (int32_t)depth_scale;
+		resolve_push.depth_scale = guided ? 1 : packed_sample_scale(depth_scale);
 		static const bool fill_paint = OS::get_singleton()->get_environment("GODOT_GI_SPEC_FILL_PAINT") == "1";
 		resolve_push.paint = fill_paint ? 1 : 0;
 		resolve_push.rough_min = 0.2f; // The gather's mirror threshold: a mirror traces its own ray.
@@ -2810,7 +2824,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	}
 	denoise_push_constant.depth_tolerance = 0.05f;
 	denoise_push_constant.variance_threshold = p_quality.denoise ? p_quality.variance_threshold : 1e6f;
-	denoise_push_constant.depth_scale = (int32_t)depth_scale;
+	denoise_push_constant.depth_scale = packed_sample_scale(depth_scale);
 	// Sparse Monte Carlo input: history clipping would reject converged
 	// history wherever this frame's neighborhood misses the bright samples.
 	// Disocclusion is caught by validating the reprojected depth instead.
@@ -2947,7 +2961,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// intermediate iterations use the variant that writes it, leaves the
 	// directional moment un-renormalized, and carries the filtered moments on.
 	const int spatial_iterations = p_quality.denoise ? CLAMP(p_quality.spatial_iterations, 1, 3) : 1;
-	denoise_push_constant.depth_scale = guided ? 1 : (int32_t)depth_scale;
+	denoise_push_constant.depth_scale = guided ? 1 : packed_sample_scale(depth_scale);
 	RID scratch_a[2] = { raw_ambient, hist_read_a };
 	RID scratch_r[2] = { raw_reflection, hist_read_r };
 	RID scratch_dir[2] = { raw_directional, hist_read_d };

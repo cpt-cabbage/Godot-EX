@@ -18,6 +18,7 @@
 // in at the end of the spatial pass), for GI they are radiance.
 
 #include "../normal_roughness_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -286,7 +287,7 @@ layout(push_constant, std430) uniform Params {
 	float depth_tolerance; // Spatial only: the temporal pass hardcodes its 0.1 (and BORROW_DEPTH_TOLERANCE for a borrowed history).
 	float variance_threshold; // Relative variance below which filtering is skipped.
 	int stride; // Spatial kernel stride.
-	int depth_scale; // 2 when the lighting buffers are half resolution.
+	int depth_scale; // 2 when the lighting buffers are half resolution; bit 8 the block's center sample (rt_sample_offset_inc.glsl).
 	// Neighborhood clamp width in standard deviations; <= 0 disables history
 	// clipping entirely. Every signal takes 4.0 now (Raytracing::process_stochastic
 	// measured 1.5 on the direct ratio as a darkening); sparse Monte Carlo
@@ -390,7 +391,7 @@ void main() {
 		return;
 	}
 
-	float center_depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
+	float center_depth = texelFetch(depth_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 	if (center_depth == 0.0) {
 		imageStore(out_diffuse, pixel, vec4(0.0));
 		imageStore(out_specular, pixel, vec4(0.0));
@@ -427,7 +428,7 @@ void main() {
 	// of the way toward it the reflection's history is looked up: all of it
 	// for a mirror, none for a rough surface whose lobe has no single image.
 	float virtual_view_depth = current_specular4.a;
-	float nr_rough = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+	float nr_rough = nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 	float virtual_weight = 1.0 - smoothstep(0.15, 0.6, nr_rough);
 #endif
 
@@ -579,12 +580,12 @@ void main() {
 			// camera reprojection puts it to the precision of the two; the
 			// difference is kept as the object's own motion for the
 			// reflection's virtual image.
-			vec2 velocity = texelFetch(velocity_texture, pixel * params.depth_scale, 0).xy;
+			vec2 velocity = texelFetch(velocity_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(velocity_texture, 0)), 0).xy;
 			vec2 predicted = uv + velocity + reprojection.jitter_delta;
 			object_delta = predicted - prev_uv;
 			prev_uv = predicted;
 		} else if ((params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_OBJECTS) == 0u && velocity_in_frame) {
-			ivec2 velocity_pixel = ivec2(prev_uv * vec2(params.screen_size * params.depth_scale));
+			ivec2 velocity_pixel = ivec2(prev_uv * vec2(params.screen_size * rt_scale(params.depth_scale)));
 			vec2 velocity = texelFetch(velocity_texture, velocity_pixel, 0).xy;
 			vec4 prevprev_ndc = reprojection.prev_reproject * vec4(prev_ndc.xyz / prev_ndc.w, 1.0);
 			// Under FSR2 the pixels no geometry wrote carry a (-1, -1)
@@ -595,7 +596,7 @@ void main() {
 				// Threshold of 2 full-resolution pixels: the velocity buffer is
 				// unjittered while the reprojection matrices carry the TAA
 				// jitter of both frames.
-				vec2 object_pixels = (velocity - static_motion) * vec2(params.screen_size * params.depth_scale);
+				vec2 object_pixels = (velocity - static_motion) * vec2(params.screen_size * rt_scale(params.depth_scale));
 				if (any(greaterThan(abs(object_pixels), vec2(2.0)))) {
 					object_delta = uv + velocity - prev_uv;
 					prev_uv = uv + velocity;
@@ -643,7 +644,7 @@ void main() {
 				vec4 v4 = movers.view_from_ndc * vec4(ndc_xy, depth_from_linear(virtual_view_depth), 1.0);
 				vec3 surface = p4.xyz / p4.w;
 				vec3 image = v4.xyz / v4.w;
-				vec3 n = nr_normal(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+				vec3 n = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 				// The hit: the virtual point mirrored back across the plane.
 				vec3 hit = image - 2.0 * dot(image - surface, n) * n;
 				bool hit_moved = false;
@@ -667,7 +668,7 @@ void main() {
 					// the camera alone would: past a pixel apart the point
 					// itself moved, and it was at that uv at the depth last
 					// frame's signal recorded there.
-					ivec2 full_size = params.screen_size * params.depth_scale;
+					ivec2 full_size = params.screen_size * rt_scale(params.depth_scale);
 					vec2 hit_uv = vec2(float(hit_id & 0x7FFFu), float((hit_id >> 15u) & 0x7FFFu)) / 32767.0;
 					ivec2 hit_px = clamp(ivec2(hit_uv * vec2(full_size)), ivec2(0), full_size - 1);
 					vec4 h4 = movers.view_from_ndc * vec4(hit_uv * 2.0 - 1.0, texelFetch(depth_texture, hit_px, 0).r, 1.0);
@@ -1401,7 +1402,7 @@ void main() {
 		return;
 	}
 
-	float center_depth = texelFetch(depth_texture, pixel * params.depth_scale, 0).r;
+	float center_depth = texelFetch(depth_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 	vec4 center_d4 = texelFetch(in_diffuse, pixel, 0);
 	vec4 center_s4 = texelFetch(in_specular, pixel, 0);
 #ifdef FILTER_DIRECTIONAL
@@ -1509,7 +1510,7 @@ void main() {
 	float depth_bound_b = depth_from_linear(center_view_depth * (1.0 + params.depth_tolerance));
 	float depth_min = min(depth_bound_a, depth_bound_b);
 	float depth_max = max(depth_bound_a, depth_bound_b);
-	vec3 center_normal = nr_normal(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+	vec3 center_normal = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 	float sigma_d = 4.0 * sqrt(var_d) + 1e-4;
 	float sigma_s = 4.0 * sqrt(var_s) + 1e-4;
 
@@ -1527,7 +1528,7 @@ void main() {
 	// The reflection's kernel follows roughness: a rough lobe is as wide as
 	// the diffuse one, a mirror's image must not be filtered at all.
 	{
-		float r = nr_roughness(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+		float r = nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
 		if (spec_scale < 0.25) {
 			// A mirror's image is never filtered. Filtering a young mirror
@@ -1581,13 +1582,13 @@ void main() {
 				continue;
 			}
 			ivec2 sp = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride)))), ivec2(0), params.screen_size - 1);
-			float sd = texelFetch(depth_texture, sp * params.depth_scale, 0).r;
+			float sd = texelFetch(depth_texture, rt_full_pixel(sp, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 			// SVGF edge-stopping functions: depth, normal and luminance. The
 			// depth test is the view-space tolerance expressed as a raw-depth
 			// window, so it means the same thing at every range.
 			float w_spatial = 0.0;
 			if (sd != 0.0 && sd >= depth_min && sd <= depth_max) {
-				vec3 n = nr_normal(texelFetch(normal_roughness_texture, sp * params.depth_scale, 0));
+				vec3 n = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(sp, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 				float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
 				w_spatial = exp(-0.3 * float(x * x + y * y)) * w_normal;
 			}
@@ -1596,10 +1597,10 @@ void main() {
 			float w_spatial_s = w_spatial;
 			if (stride_s != stride) {
 				sp_s = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride_s)))), ivec2(0), params.screen_size - 1);
-				float sd_s = texelFetch(depth_texture, sp_s * params.depth_scale, 0).r;
+				float sd_s = texelFetch(depth_texture, rt_full_pixel(sp_s, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 				w_spatial_s = 0.0;
 				if (sd_s != 0.0 && sd_s >= depth_min && sd_s <= depth_max) {
-					vec3 n_s = nr_normal(texelFetch(normal_roughness_texture, sp_s * params.depth_scale, 0));
+					vec3 n_s = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(sp_s, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 					w_spatial_s = exp(-0.3 * float(x * x + y * y)) * pow(max(dot(center_normal, n_s), 0.0), 32.0);
 				}
 			}

@@ -910,6 +910,19 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			scene_state.ubo.rt_gi |= 1024u;
 		}
 	}
+	// The quarter tier's signals were lit at each
+	// block's center pixel, and the fragments that still run their own
+	// upsample loop (a bent normal map, GODOT_RT_COMPOSITE_UPSAMPLE=0) place
+	// the taps there too (GODOT_RT_SAMPLE_CENTER=0 reverts).
+	if (RendererRD::Raytracing::sample_center()) {
+		// The quarter tiers only (Raytracing::packed_sample_scale).
+		if ((scene_state.ubo.stochastic_direct_lights & 3u) >= 2u && (scene_state.ubo.stochastic_direct_lights & 4u) != 0u) {
+			scene_state.ubo.stochastic_direct_lights |= 256u;
+		}
+		if ((scene_state.ubo.rt_gi & 3u) == 3u) {
+			scene_state.ubo.rt_gi |= 2048u;
+		}
+	}
 	if (OS::get_singleton()->has_environment("GODOT_RT_STATE_PRINT") && p_opaque_render_buffers) {
 		static uint32_t last_words[2] = { UINT32_MAX, UINT32_MAX };
 		if (last_words[0] != scene_state.ubo.stochastic_direct_lights || last_words[1] != scene_state.ubo.rt_gi) {

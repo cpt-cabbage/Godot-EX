@@ -37,6 +37,7 @@
 // and their specular lobe, in two RGBA16F textures beside those.
 
 #include "../normal_roughness_inc.glsl"
+#include "rt_sample_offset_inc.glsl"
 
 // 16x16 pixels a group. Its taps are a block of the sampling grid at most
 // 16 / scale + 2 texels wide, loaded once into shared memory (the first
@@ -141,8 +142,12 @@ float plane_depth_at_tap(ivec2 p_full_pixel, vec3 p_vertex, vec3 p_normal) {
 // a silhouette the tap is as far off the plane as it was off the depth.
 // pow(x, 8) as three squarings: the loops' arithmetic, not their reads,
 // was half this kernel's time.
-void tap_weights(bool p_gi, ivec2 p_pixel, int p_scale, ivec2 p_origin, int p_width, vec3 p_vertex, vec3 p_view, vec3 p_face, out ivec4 r_k, out vec4 r_w, out vec4 r_depth_w) {
-	vec2 pos = vec2(p_pixel) / float(p_scale);
+void tap_weights(bool p_gi, ivec2 p_pixel, int p_packed_scale, ivec2 p_origin, int p_width, vec3 p_vertex, vec3 p_view, vec3 p_face, out ivec4 r_k, out vec4 r_w, out vec4 r_depth_w) {
+	// Grid texel t was lit at full-res pixel scale * t + the sample offset
+	// (rt_sample_offset_inc.glsl; zero below the quarter tier).
+	int p_scale = rt_scale(p_packed_scale);
+	ivec2 sample_offset = rt_sample_offset(p_packed_scale);
+	vec2 pos = vec2(p_pixel - sample_offset) / float(p_scale);
 	ivec2 base = ivec2(floor(pos));
 	vec2 fr = pos - vec2(base);
 	ivec2 half_size = (params.full_size + ivec2(p_scale - 1)) / p_scale;
@@ -152,7 +157,7 @@ void tap_weights(bool p_gi, ivec2 p_pixel, int p_scale, ivec2 p_origin, int p_wi
 		ivec2 t = base + off - p_origin;
 		int k = t.x + t.y * p_width;
 		// The full-res pixel the pass lit the (clamped) texel at.
-		ivec2 fp = min(clamp(base + off, ivec2(0), half_size - 1) * p_scale, params.full_size - ivec2(1));
+		ivec2 fp = min(clamp(base + off, ivec2(0), half_size - 1) * p_scale + sample_offset, params.full_size - ivec2(1));
 		float depth = p_gi ? g_depth[k] : s_depth[k];
 		float depth_w = exp(-abs(depth - plane_depth_at_tap(fp, p_vertex, p_face)) * inv_tolerance);
 		float c = max(dot(p_face, tap_normal(p_gi, k, p_view)), 0.0);
@@ -172,10 +177,15 @@ void main() {
 
 	// The group's grid blocks: from the tap base of its first pixel to one
 	// past its last pixel's, clamped at the grid's edge as the loop clamps.
-	ivec2 s_origin = tile_origin / max(params.stochastic_scale, 1);
-	ivec2 g_origin = tile_origin / max(params.gi_scale, 1);
-	int s_width = TILE / max(params.stochastic_scale, 1) + 2;
-	int g_width = TILE / max(params.gi_scale, 1) + 2;
+	// The sample offset moves each block's texel right and down by half a
+	// block, so the group's first tap base can be one texel before the
+	// tile's (floored, -1 at the frame's edge; the loads clamp).
+	int s_scale = max(rt_scale(params.stochastic_scale), 1);
+	int g_scale = max(rt_scale(params.gi_scale), 1);
+	ivec2 s_origin = ivec2(floor(vec2(tile_origin - rt_sample_offset(params.stochastic_scale)) / float(s_scale)));
+	ivec2 g_origin = ivec2(floor(vec2(tile_origin - rt_sample_offset(params.gi_scale)) / float(g_scale)));
+	int s_width = TILE / s_scale + 2;
+	int g_width = TILE / g_scale + 2;
 	// Both on one grid with one guide (the played configuration: both at
 	// the quarter tier), the two passes' view depths and tap normals are
 	// the same texels, so are the weights: computed once, from the
@@ -183,10 +193,10 @@ void main() {
 	const uint guides = FLAG_STOCHASTIC_GUIDE | FLAG_GI_GUIDE;
 	bool shared_taps = (params.flags & (FLAG_STOCHASTIC | FLAG_GI)) == (FLAG_STOCHASTIC | FLAG_GI) && params.stochastic_scale == params.gi_scale && ((params.flags & guides) == 0u || (params.flags & guides) == guides);
 	if ((params.flags & FLAG_STOCHASTIC) != 0u && local < uint(s_width * s_width)) {
-		int scale = params.stochastic_scale;
+		int scale = s_scale;
 		ivec2 half_size = (params.full_size + ivec2(scale - 1)) / scale;
 		ivec2 hp = clamp(s_origin + ivec2(int(local) % s_width, int(local) / s_width), ivec2(0), half_size - 1);
-		ivec2 fp = min(hp * scale, params.full_size - ivec2(1));
+		ivec2 fp = min(hp * scale + rt_sample_offset(params.stochastic_scale), params.full_size - ivec2(1));
 		s_depth[local] = texelFetch(stochastic_depth, hp, 0).r;
 		s_normal[local] = nr_normal(texelFetch(stochastic_normal, (params.flags & FLAG_STOCHASTIC_GUIDE) != 0u ? hp : fp, 0));
 		s_ratio[local] = vec2(texelFetch(stochastic_diffuse, hp, 0).r, texelFetch(stochastic_specular, hp, 0).r);
@@ -197,10 +207,10 @@ void main() {
 #endif
 	}
 	if ((params.flags & FLAG_GI) != 0u && local < uint(g_width * g_width)) {
-		int scale = params.gi_scale;
+		int scale = g_scale;
 		ivec2 half_size = (params.full_size + ivec2(scale - 1)) / scale;
 		ivec2 hp = clamp(g_origin + ivec2(int(local) % g_width, int(local) / g_width), ivec2(0), half_size - 1);
-		ivec2 fp = min(hp * scale, params.full_size - ivec2(1));
+		ivec2 fp = min(hp * scale + rt_sample_offset(params.gi_scale), params.full_size - ivec2(1));
 		if (!shared_taps) {
 			g_depth[local] = texelFetch(gi_depth, hp, 0).r;
 			g_normal[local] = nr_normal(texelFetch(gi_normal, (params.flags & FLAG_GI_GUIDE) != 0u ? hp : fp, 0));
@@ -235,7 +245,7 @@ void main() {
 	vec4 s_depth_w = vec4(0.0);
 	if ((params.flags & FLAG_STOCHASTIC) != 0u) {
 		// The scene shader's loop: the sampling pass lit full-res pixel
-		// scale * p for grid texel p.
+		// scale * p (+ the sample offset) for grid texel p.
 		tap_weights(false, pixel, params.stochastic_scale, s_origin, s_width, vertex, view, face, s_k, s_w, s_depth_w);
 		vec2 up_ratio = vec2(0.0);
 		vec4 up_image_diffuse = vec4(0.0);
@@ -281,7 +291,7 @@ void main() {
 		}
 		// The GI's taps' normals are in the block their weights came from.
 		bool normals_gi = !shared_taps;
-		vec2 fr = fract(vec2(pixel) / float(params.gi_scale));
+		vec2 fr = fract(vec2(pixel - rt_sample_offset(params.gi_scale)) / float(g_scale));
 		ivec2 near_tap = ivec2(greaterThanEqual(fr, vec2(0.5)));
 		int near_i = near_tap.x + near_tap.y * 2;
 		vec3 ambient = vec3(0.0);
