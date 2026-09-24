@@ -25,6 +25,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_HAS_VELOCITY 1u // A real velocity buffer is bound (else the binding is a dummy and must not be fetched).
 #define FLAG_HAS_META 2u // Temporal: raw_meta is a real shading-confidence texture.
 #define FLAG_MODULATE_ANALYTIC 4u // Spatial: multiply the filtered ratios by the analytic lighting buffers.
+#define FLAG_FALLBACK_COVERAGE 8192u // Spatial (GI; GODOT_GI_FALLBACK_COVERAGE=0 reverts; with FLAG_DYN_SPLIT): the stand-in's trust scaled by the covered share of the gather's tent (fallback_dyn_texture's alpha).
 #define FLAG_FALLBACK_ALL 32u // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 // Temporal (GI, diagnostics): the reflection history keeps its frames through
 // the named restart (GODOT_GI_SPEC_ABLATE=change,smear,mismatch).
@@ -1359,6 +1360,9 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, flo
 		// The card's own accumulation counts too: a texel relit once is no
 		// better than the pixel's sample.
 		float trust = clamp(fb.a * 64.0 / max(params.fallback_ramp, 1.0), 0.0, 1.0);
+		if ((params.flags & FLAG_FALLBACK_COVERAGE) != 0u && (params.flags & FLAG_DYN_SPLIT) != 0u) {
+			trust *= texelFetch(fallback_dyn_texture, pixel, 0).a;
+		}
 		if ((params.flags & FLAG_DYN_SPLIT) != 0u) {
 			vec3 fb_dyn = max(texelFetch(fallback_dyn_texture, pixel, 0).rgb, vec3(0.0));
 			vec3 fb_static = max(fb.rgb - fb_dyn, vec3(0.0));

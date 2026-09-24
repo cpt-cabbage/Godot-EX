@@ -2346,7 +2346,20 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// bounce histories in the fallback (1 the static, 2 the dynamic lights'
 	// first bounce, 4 their later bounces; 0 all).
 	static const int64_t fallback_parts = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_PARTS").to_int();
-	params.fallback_parts = uint32_t(fallback_parts);
+	params.fallback_parts = uint32_t(fallback_parts) & 7u;
+	// The young pixel's stand-in averages only the card texels a surface
+	// filled, and the spatial pass trusts it by the share of its tent that
+	// was covered (plan S2, section 106: the tent read black past a card's
+	// holes and edges -- a dark line along the lab's window reveal after
+	// every strafe -- and renormalised alone, a few texels beside a hole
+	// made a noisier stand-in than sixteen: hot pixels +119%). The share
+	// rides in the moving lights' stand-in's alpha, so it needs their split;
+	// GODOT_GI_FALLBACK_COVERAGE=0 reverts. Bit 3 of the same word.
+	static const bool fallback_coverage_env = OS::get_singleton()->get_environment("GODOT_GI_FALLBACK_COVERAGE") != "0";
+	const bool fallback_coverage = fallback_coverage_env && dyn_split;
+	if (fallback_coverage) {
+		params.fallback_parts |= 8u;
+	}
 	if (fallback_all && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
 	}
@@ -2960,6 +2973,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		static const bool spec_no_young = OS::get_singleton()->get_environment("GODOT_GI_SPEC_ABLATE").contains("young");
 		if (spec_no_young) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_YOUNG;
+		}
+		if (fallback_coverage) {
+			denoise_push_constant.flags |= DENOISE_FLAG_FALLBACK_COVERAGE;
 		}
 		static const bool spatial_off = OS::get_singleton()->get_environment("GODOT_GI_SPATIAL") == "0";
 		if (spatial_off) {

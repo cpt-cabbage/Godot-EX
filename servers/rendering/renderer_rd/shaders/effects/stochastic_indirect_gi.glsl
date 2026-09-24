@@ -100,7 +100,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
 	uint hit_capacity; // Packets the deferred hit shading has room for this frame.
 	float card_cone_tan; // The diffuse rays' cone (tangent of the half-angle); a hit reads its card through the mip its footprint covers.
 	float card_youth_lod; // The mip a texel relit once is read through (0 disables); half a level less per doubling of its relights at the default 3.0 (the setting over six, see surface_cache_lookup).
-	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces).
+	uint fallback_parts; // Diagnostics: which histories the fallback shows (0 all; 1 static, 2 dynamic first bounce, 4 later bounces); bit 3 weights the tent by coverage (GODOT_GI_FALLBACK_COVERAGE=0 clears it).
 	float pad_memory;
 	vec4 luma_weights; // The working colour space's luminance weights (ColorManagement), rgb.
 	// y: the firefly ceiling's ratio over the cache value; z: the allowance
@@ -2541,6 +2541,7 @@ void gather_main() {
 	// primary ray recovers it, spent only where the history is young.
 	vec4 fallback = vec4(0.0);
 	vec3 fallback_dyn = vec3(0.0);
+	float fallback_coverage = 0.0;
 	if (g.fallback) {
 		float view_len = length(rel_pos);
 		vec3 eye_dir = rel_pos / max(view_len, 1e-4);
@@ -2597,24 +2598,52 @@ void gather_main() {
 				vec2 t_max = vec2(card_atlas_origin + card_atlas_dims) - 0.5;
 				vec3 ind = vec3(0.0);
 				vec3 ind_dyn = vec3(0.0);
+				uint parts = (params.fallback_parts & 7u) == 0u ? 7u : (params.fallback_parts & 7u);
+				// The tent weighted by the texels under it that a card filled
+				// and the lighting has reached (the mip chain's rule; plan
+				// section 106): a card is a rectangle over its instance, and
+				// where the surface has a hole or an edge -- a wall's
+				// window, the reveal's concave corner -- the taps that land
+				// beyond it read the atlas's black. Unweighted, the stand-in
+				// fell linearly toward the edge, 40% low at the texel beside
+				// it: a dark strip along the lab's window reveal for the
+				// frames after a strafe, while the wall was young.
+				bool coverage = (params.fallback_parts & 8u) != 0u;
+				float covered = 0.0;
 				for (int dy = 0; dy < 4; dy++) {
 					for (int dx = 0; dx < 4; dx++) {
 						vec2 t = clamp(card_atlas_texel + (vec2(dx, dy) - 1.5) * spacing, t_min, t_max);
 						vec2 uv = t / float(params.surface_cache_atlas_size);
-						uint parts = params.fallback_parts == 0u ? 7u : params.fallback_parts;
 						// The dynamic bounces come summed and filtered in the one atlas (parts 2 and 4 both select it).
 						ind += ((parts & 1u) != 0u ? textureLod(card_indirect_atlas, uv, 0.0).rgb : vec3(0.0));
 						ind_dyn += ((parts & 6u) != 0u ? max(textureLod(card_indirect_dyn_atlas, uv, 0.0).rgb, vec3(0.0)) : vec3(0.0));
+						if (coverage) {
+							// The bilinear tap's own weights on its four
+							// texels, in textureGather's order (i0 j1, i1 j1,
+							// i1 j0, i0 j0).
+							vec2 f = fract(t - 0.5);
+							vec4 w = vec4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
+							vec4 depth4 = textureGather(card_depth_atlas, uv, 0);
+							vec4 relit4 = textureGather(card_indirect_atlas, uv, 3);
+							covered += dot(w, vec4(greaterThan(depth4, vec4(0.0))) * vec4(greaterThan(relit4, vec4(0.0))));
+						}
 					}
 				}
-				ind /= 16.0;
-				ind_dyn /= 16.0;
+				float norm = coverage ? 1.0 / max(covered, 1e-3) : 1.0 / 16.0;
+				ind *= norm;
+				ind_dyn *= norm;
 				// The moving lights' share apart (FLAG_DYN_SPLIT: the
 				// spatial pass fades each history's own share in);
 				// the stand-in itself is the sum, as before.
 				ind += ind_dyn;
 				fallback = vec4(max(ind, vec3(0.0)), min(relights, 64.0) / 64.0 * card_lookup_confidence);
 				fallback_dyn = max(ind_dyn, vec3(0.0));
+				// The tent's covered share rides in the moving lights'
+				// stand-in's spare alpha: beside a hole the stand-in is the
+				// mean of a few texels, not sixteen, and the spatial pass
+				// trusts it that much less (renormalised at full trust, the
+				// junctions' hot pixels doubled).
+				fallback_coverage = coverage ? min(covered / 16.0, 1.0) : 1.0;
 			}
 			pixel_change = change_before;
 			pixel_change_dyn = change_dyn_before;
@@ -2622,7 +2651,7 @@ void gather_main() {
 	}
 	imageStore(out_fallback, pixel, fallback);
 	if (bool(params.flags & FLAG_DYN_SPLIT)) {
-		imageStore(out_fallback_dyn, pixel, vec4(fallback_dyn, 0.0));
+		imageStore(out_fallback_dyn, pixel, vec4(fallback_dyn, fallback_coverage));
 	}
 
 	// Measured and not kept (section 39): the cards' field under the surface
