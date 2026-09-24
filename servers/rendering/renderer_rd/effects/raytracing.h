@@ -94,6 +94,8 @@
 #define RB_RT_GI_HIST_AMBIENT_1 SNAME("hist_ambient_1")
 #define RB_RT_GI_HIST_REFLECTION_0 SNAME("hist_reflection_0")
 #define RB_RT_GI_HIST_REFLECTION_1 SNAME("hist_reflection_1")
+#define RB_RT_GI_SPEC_IDENT_0 SNAME("spec_ident_0") // What the reflection history's image is of (the temporal pass's FLAG_SPEC_OBJECTS): a moving object, or nothing that moved.
+#define RB_RT_GI_SPEC_IDENT_1 SNAME("spec_ident_1")
 #define RB_RT_GI_MOMENTS_0 SNAME("moments_0")
 #define RB_RT_GI_MOMENTS_1 SNAME("moments_1")
 #define RB_RT_GI_MOMENTS_SCRATCH SNAME("moments_scratch")
@@ -109,6 +111,7 @@
 #define RB_RT_GI_FALLBACK SNAME("gi_fallback")
 // The rough reflection ray's direction and density (the gather), and the reflection the half-rate fill resolved over the neighbors that traced (the resolve pass).
 #define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
+#define RB_RT_GI_SPEC_HIT SNAME("spec_hit") // What the reflection ray hit (SPEC_HIT_* in the gather): a card set, a screen position, or nothing.
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
@@ -164,6 +167,8 @@ public:
 		Projection previous;
 		uint32_t frame = UINT32_MAX;
 		RID ubo;
+		RID movers; // The GI temporal pass's moving objects (Raytracing::_update_movers_buffer).
+		uint32_t movers_frame = UINT32_MAX;
 	};
 	LocalVector<ReprojectHistory> reproject_history; // Per view.
 
@@ -302,12 +307,17 @@ private:
 		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
 		DENOISE_FLAG_SPEC_NO_SMEAR = 128, // ... nor capped by the parallax smear.
 		DENOISE_FLAG_SPEC_NO_MISMATCH = 256, // ... nor restarted by the virtual depth mismatch.
+		DENOISE_FLAG_MARK_COHERENT = 4096, // Temporal (GI; GODOT_GI_MARK_MEAN=1 drops it): a mark a third of the 5x5 carries is kept whole.
+		DENOISE_FLAG_MARK_MEAN = 16, // Temporal (GI; GODOT_GI_MARK_MEAN=0 reverts): the restart's lighting-change mark is the 5x5 neighbourhood's mean.
+		DENOISE_FLAG_SPEC_OBJECTS = 2048, // Temporal (GI; GODOT_GI_SPEC_OBJECTS=0 reverts): a mirror's image of a moving object is fetched where the object was.
+		DENOISE_FLAG_SPEC_DISOCC = 8, // Temporal (GI; GODOT_GI_SPEC_DISOCC=0 reverts): a reflection whose every virtual tap fails restarts by its virtual weight.
 		DENOISE_FLAG_SPEC_PAINT = 512, // Temporal (GI, diagnostics): the reflection's frame count as a colour.
 		DENOISE_FLAG_SPEC_PAINT_WHY = 1024, // Temporal (GI, diagnostics): why a pixel's history is short, as a colour.
 		DENOISE_FLAG_SPEC_NO_YOUNG = 131072, // Spatial (GI, experiment, GODOT_GI_SPEC_ABLATE=young): a young reflection is not filtered for its youth.
 		DENOISE_FLAG_SPATIAL_OFF = 262144, // Spatial (GI, experiment, GODOT_GI_SPATIAL=0): the pass stores its input unfiltered.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
+		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.
 		DENOISE_FLAG_DYN_SPLIT = 2097152, // GI (GODOT_GI_DYN_SPLIT): the moving lights' term is a history of its own; the temporal pass accumulates it apart and hands the spatial pass the sum, the spatial pass fades each history's share of the stand-in in on its own.
 	};
 
@@ -327,6 +337,25 @@ private:
 	uint32_t _velocity_flags(RID p_velocity) const;
 
 	RID _update_reproject_ubo(uint32_t p_view, const Projection &p_reproject);
+	// The GI temporal pass's moving objects (GODOT_GI_SPEC_OBJECTS): the
+	// view's matrices, then per object its card set and where a point on it
+	// now was the frame before, in this view's space. Layout: a
+	// MoversHeader, then MAX_MOVERS MoverRecord.
+	struct MoversHeader {
+		float view_from_ndc[16];
+		float prev_ndc_from_view[16];
+		float view_from_prev_ndc[16]; // This view's space from the frame before's NDC.
+		uint32_t count;
+		uint32_t pad[3];
+	};
+	static_assert(sizeof(MoversHeader) == 208, "MoversHeader layout must match the shader.");
+	struct MoverRecord {
+		uint32_t set;
+		uint32_t pad[3];
+		float previous_from_current[12]; // Three rows of a 3x4, view space.
+	};
+	static_assert(sizeof(MoverRecord) == 64, "MoverRecord layout must match the shader.");
+	RID _update_movers_buffer(uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject);
 
 	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.
 	RID stbn_texture;
@@ -701,6 +730,7 @@ private:
 	static float last_lookup_fail[7]; // The card lookups that failed, by reason, as a share of the lookups.
 	static const char *lookup_fail_names[7];
 	static float last_young_share;
+	static float last_young_cause[5]; // Of the pixels, the share young this frame by why: off frame, borrowed, disoccluded, change mark, carried (the GI temporal pass's FLAG_CAUSE_STATS).
 	static float last_young_static_share; // The gather's pixels under FALLBACK_FRAMES of history, as a share.
 	static uint32_t last_tier_rays;
 	static uint32_t last_hit_appended;

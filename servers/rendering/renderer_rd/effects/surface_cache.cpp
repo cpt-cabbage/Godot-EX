@@ -480,6 +480,7 @@ void SurfaceCache::begin_frame(uint32_t p_frame, const Vector3 &p_camera_positio
 	frame = p_frame;
 	camera_position = p_camera_position;
 	instance_records.clear();
+	movers.clear();
 }
 
 // The card edge an instance wants: its world extent at texels_per_meter, and
@@ -529,7 +530,21 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		*s = CardSet();
 		s->owner = p_instance;
 		s->in_use = true;
+		s->last_seen_frame = UINT32_MAX - 1; // Not seen the frame before: no motion.
 		set_by_instance.insert(p_instance, set_index);
+	}
+	// The set's motion over the last frame: the transform it had then is kept
+	// through every view of this frame, so a second render sees the move the
+	// first did.
+	const bool seen_last_frame = s->last_seen_frame + 1 == frame;
+	if (s->last_seen_frame != frame) {
+		s->previous_transform = seen_last_frame ? s->transform : p_instance->transform;
+	}
+	if ((seen_last_frame || s->last_seen_frame == frame) && movers.size() < MAX_MOVERS && !s->previous_transform.is_equal_approx(p_instance->transform)) {
+		Mover m;
+		m.set = set_index;
+		m.previous_from_current = s->previous_transform * p_instance->transform.affine_inverse();
+		movers.push_back(m);
 	}
 	s->last_seen_frame = frame;
 	s->skinned = p_skinned;
@@ -1229,7 +1244,11 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	// GODOT_GI_TIER_PRINT: the static bounce rays' sources, counted in the
 	// stats buffer and printed every sixty frames (debug bit 8192).
 	static const bool tier_stats = OS::get_singleton()->has_environment("GODOT_GI_TIER_PRINT");
-	params.debug = ablate | (tier_stats ? 8192 : 0);
+	// GODOT_CARD_GRAD_MEAN=1 (experiment): the bounce gradient's size is the
+	// share of the SIMD group's rays that saw the move (the shader's
+	// bounce_gradient_voted).
+	static const bool grad_mean = OS::get_singleton()->get_environment("GODOT_CARD_GRAD_MEAN") == "1";
+	params.debug = ablate | (tier_stats ? 8192 : 0) | (grad_mean ? 1048576 : 0);
 	// GODOT_CARD_YOUNG_RAYS=<n>: extra bounce rays for a texel whose
 	// accumulation is under eight relights (a restart, a fresh capture).
 	static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS") == "" ? 3 : OS::get_singleton()->get_environment("GODOT_CARD_YOUNG_RAYS").to_int();

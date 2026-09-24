@@ -159,6 +159,8 @@ params;
 #define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
 #define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
+#define FLAG_SPEC_SOURCE_PAINT 524288u // Diagnostics (GODOT_GI_SPEC_SOURCE_PAINT=1): the reflection painted by what answered its ray (see the end of main).
+#define FLAG_SRAD_PREV_DEPTH 8388608u // GODOT_GI_SRAD_PREV_DEPTH=0 reverts: a screen read is validated against last frame's depth where it reads last frame's colour.
 #define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
 #define FLAG_NO_REQUESTS 16777216u // Diagnostics (GODOT_GI_REQUESTS=0): the card reads ask for no relight.
@@ -306,6 +308,7 @@ layout(set = 0, binding = 17, std430) restrict buffer CalibrationBuffer {
 	uint young_static; // Of them, the pixels whose static history is young (FLAG_DYN_SPLIT; the same count otherwise).
 	uint pad_young;
 	uint request_lod[4]; // Diagnostics (FLAG_TIER_STATS): the card reads by the level they requested their relight at.
+	uint young_cause[16]; // Diagnostics: written by the GI temporal pass (stochastic_denoise.glsl FLAG_CAUSE_STATS, word 90), why its young pixels are young.
 }
 calibration;
 
@@ -324,6 +327,8 @@ calibration;
 #define SPEC_SRC_SKY 5u
 #define SPEC_SRC_OTHER 6u // The cascades or probes, screen-boosted or not.
 uint boost_source = SPEC_SRC_OTHER; // What the last screen_radiance_boost answered with.
+bool srad_prev_rejected = false; // Diagnostics: the last screen read failed FLAG_SRAD_PREV_DEPTH's test.
+uint spec_paint_src = SPEC_SRC_OTHER; // Diagnostics (FLAG_SPEC_SOURCE_PAINT): what answered the reflection ray.
 bool boost_fold = true; // screen_radiance_boost adds the fold (FLAG_SRAD_FOLD); the mirror path reads a plane's diffuse without it, its specular being the continuation.
 
 // The surface cache (see surface_cache.cpp): per TLAS instance the record the
@@ -356,6 +361,7 @@ layout(set = 0, binding = 23) uniform usampler2D card_change_atlas; // Packed ha
 // with its decay: an on-screen hit reads last frame's colour, so it inherits
 // that pixel's mark and a restart propagates through the screen bounces.
 layout(set = 0, binding = 24) uniform sampler2D prev_gi_history;
+layout(set = 0, binding = 44) uniform sampler2D prev_signal_view_depth; // Last frame's view depth at the signal's pixels (FLAG_SRAD_PREV_DEPTH).
 layout(set = 0, binding = 43) uniform sampler2D prev_gi_history_dyn; // The moving lights' history (FLAG_DYN_SPLIT), for the mark its alpha carries.
 
 // Deferred hit shading (see rt_hit_inc.glsl): the material slot of every
@@ -390,6 +396,7 @@ ivec2 hit_pixel = ivec2(0);
 uint hit_slot = 0u;
 bool hit_specular = false;
 bool hit_mirror = false;
+uint spec_hit_id = 0u; // The reflection ray's hit (out_spec_hit), set by trace_radiance_chain.
 uint pixel_rays = 1u; // The diffuse rays this pixel traces (ray_params), for the deferred hits' packets.
 
 // Set per pixel in main(): the largest lighting change a ray of this pixel
@@ -582,6 +589,15 @@ layout(set = 1, binding = 4, rgba16f) uniform restrict writeonly image2D out_fal
 // (octahedral), z the density it was drawn with (0: no rough ray, a
 // mirror's included), w the hit distance (1e4 and above: a miss).
 layout(set = 1, binding = 5, rgba16f) uniform restrict writeonly image2D out_spec_ray;
+// What the reflection ray hit, for the temporal pass to follow a moving
+// object's image in a mirror (its FLAG_SPEC_OBJECTS): a card set, by the TLAS
+// instance the ray query committed; a screen position, where the screen trace
+// answered (the prepass motion vector there says whether that point moved);
+// or nothing (the sky, a probe, a chain through a planar mirror, whose image
+// is of whatever the continuation met).
+layout(set = 1, binding = 12, r32ui) uniform restrict writeonly uimage2D out_spec_hit;
+#define SPEC_HIT_SET (1u << 30u) // | the card set.
+#define SPEC_HIT_SCREEN (2u << 30u) // | the hit's screen uv, 15 bits each (y << 15 | x) over 32767.
 // History frames under which the gather spends the primary ray on it.
 #define FALLBACK_FRAMES 8.0
 
@@ -997,6 +1013,26 @@ vec3 screen_radiance_boost(vec3 view_hit, vec3 raw_cache_radiance) {
 	vec2 prev_uv = (prev_ndc.xy / prev_ndc.w) * 0.5 + 0.5;
 	if (any(lessThan(prev_uv, vec2(0.0))) || any(greaterThan(prev_uv, vec2(1.0)))) {
 		return cache_radiance;
+	}
+	// FLAG_SRAD_PREV_DEPTH: the colour is last frame's, so the
+	// surface it shows is last frame's too. The test above is this frame's
+	// depth: where a moving object stood last frame and has since left, the
+	// hit's surface is visible now and passes, and the read returns the
+	// object. Behind the lab's gray box sweeping along the wall the floor's
+	// reflection of the wall's foot read the box's gray where it had been, a
+	// comb of streaks along the floor's edge (0.026 against the converged
+	// image there; the cards alone, screen reads off, 0.003). So the read is
+	// held to last frame's depth at the pixel it reads, the signal's (one
+	// sample of its block: an edge falls back to the card).
+	if (bool(params.flags & FLAG_SRAD_PREV_DEPTH)) {
+		ivec2 prev_size = textureSize(prev_signal_view_depth, 0);
+		float prev_depth = texelFetch(prev_signal_view_depth, clamp(ivec2(prev_uv * vec2(prev_size)), ivec2(0), prev_size - 1), 0).r;
+		vec4 pv = params.view_from_ndc * vec4(0.0, 0.0, prev_ndc.z / prev_ndc.w, 1.0);
+		float expected = -pv.z / pv.w;
+		if (prev_depth <= 0.0 || abs(prev_depth - expected) > max(expected * 0.05, 0.05)) {
+			srad_prev_rejected = true;
+			return cache_radiance;
+		}
 	}
 	vec3 col = textureLod(screen_radiance_texture, prev_uv, 0.0).rgb;
 	if (bool(params.flags & FLAG_SRAD_FOLD) && boost_fold && tier == CACHE_TIER_CARD) {
@@ -1556,6 +1592,11 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		mat3 world_basis = mat3(params.world_from_view);
 		vec3 rel_hit = world_basis * hit_view;
 		r_hit_distance = length(hit_view - view_origin);
+		if (hit_specular) {
+			vec4 hit_ndc = params.ndc_from_view * vec4(hit_view, 1.0);
+			uvec2 q = uvec2(clamp((hit_ndc.xy / hit_ndc.w) * 0.5 + 0.5, vec2(0.0), vec2(1.0)) * 32767.0 + 0.5);
+			spec_hit_id = SPEC_HIT_SCREEN | (q.y << 15u) | q.x;
+		}
 		return screen_radiance_boost(hit_view, sdfgi_cache_radiance(rel_hit, world_dir));
 	}
 
@@ -1590,6 +1631,10 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		if (bool(params.flags & FLAG_SURFACE_CACHE)) {
 			uint instance_id = GATHER_HIT_INSTANCE;
 			vec3 world_hit = rel_hit + params.world_from_view[3].xyz;
+			if (hit_specular) {
+				uint hit_set = card_instances.data[instance_id].set;
+				spec_hit_id = hit_set == SURFACE_CACHE_INVALID ? 0u : (SPEC_HIT_SET | hit_set);
+			}
 			// The glossy reflection rays take the mirror path too
 			// (GODOT_GI_MIRROR_SPEC=0 keeps them on the screen read): the
 			// ceiling's lobe lands on the mirror floor and wants the floor's
@@ -1612,6 +1657,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 			bool mirror_path = mirror_on() && (uint(params.mirror_params.z) & 2u) == 0u && (!hit_specular || spec_path);
 			uint hit_plane = mirror_path ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
 			if (hit_plane < MAX_MIRROR_PLANES) {
+				spec_hit_id = 0u; // The image is the continuation's.
 				// A planar mirror: the ray reads the mirror's diffuse card,
 				// reflects and goes on, weighted by the Fresnel at the
 				// bounce, through up to MIRROR_BOUNCES_MAX mirrors (a ray off
@@ -1800,7 +1846,19 @@ vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3
 	boost_from_screen = false;
 	boost_source = SPEC_SRC_OTHER;
 	cache_tier = CACHE_TIER_PROBE;
+	srad_prev_rejected = false;
 	vec3 radiance = trace_radiance_chain(rel_origin, world_geo_normal, world_dir, view_origin, view_dir, jitter, r_hit_distance);
+	if (hit_specular && bool(params.flags & FLAG_SPEC_SOURCE_PAINT)) {
+		uint s = boost_source;
+		if (trace_source == TIER_SRC_HIT_SHADED) {
+			s = SPEC_SRC_HIT_SHADED;
+		} else if (trace_source == TIER_SRC_SKY) {
+			s = SPEC_SRC_SKY;
+		} else if (trace_source == TIER_SRC_NONE) {
+			s = SPEC_SRC_OTHER;
+		}
+		spec_paint_src = srad_prev_rejected ? 7u : s;
+	}
 	if (bool(params.flags & FLAG_TIER_STATS)) {
 		uint src = trace_source;
 		if (src == TIER_SRC_UNSET) {
@@ -2162,6 +2220,7 @@ void gather_main() {
 		}
 		imageStore(out_reflection, pixel, vec4(0.0));
 		imageStore(out_spec_ray, pixel, vec4(0.0));
+		imageStore(out_spec_hit, pixel, uvec4(0u));
 		imageStore(out_view_depth, pixel, vec4(0.0));
 		// Sky: unoccluded, no directional bias.
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
@@ -2363,8 +2422,17 @@ void gather_main() {
 			atomicAdd(calibration.tier_count[7], 1u); // Diagnostics (GODOT_GI_TIER_PRINT): the pixels whose gather went non-finite.
 		}
 	}
+	if (bool(params.flags & FLAG_SPEC_SOURCE_PAINT) && g.spec_trace) {
+		// Diagnostics: screen green, partial (the border fade) dark green,
+		// card blue, hit-shaded magenta, sky cyan, cascades/probes red, and
+		// white a card standing in for a screen read FLAG_SRAD_PREV_DEPTH
+		// rejected.
+		const vec3 src_colors[8] = vec3[8](vec3(0.0, 1.0, 0.0), vec3(0.0, 0.4, 0.0), vec3(0.5), vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 1.0, 1.0), vec3(1.0, 0.0, 0.0), vec3(1.0));
+		reflection = src_colors[min(spec_paint_src, 7u)];
+	}
 	imageStore(out_reflection, pixel, vec4(reflection, virtual_view_depth));
 	imageStore(out_spec_ray, pixel, spec_ray);
+	imageStore(out_spec_hit, pixel, uvec4(g.spec_trace && !g.spec_stand_in ? spec_hit_id : 0u));
 	imageStore(out_view_depth, pixel, vec4(-view_pos.z, 0.0, 0.0, 0.0));
 
 	// The young pixel's stand-in. A fast turn refreshes most of the screen

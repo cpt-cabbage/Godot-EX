@@ -129,7 +129,7 @@ layout(set = 0, binding = 7, std140) uniform Params {
 	uint flags;
 	uint temporal_frames;
 	uint atlas_size;
-	uint debug; // Ablations (GODOT_CARD_ABLATE): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no gradient, 32 no bounce restart, 64 no visibility restart, 16384 strict card lookups; diagnostics 128/256/512/2048/131072/262144 paint views (paint, paint2, paint3, paint5, paint8, paintn), 4096 dynamic-ray stats, 8192 tier stats (GODOT_GI_TIER_PRINT).
+	uint debug; // Ablations (GODOT_CARD_ABLATE): 1 no bounce ray, 2 no shadow rays, 4 no local lights, 8 no directional lights, 16 no gradient, 32 no bounce restart, 64 no visibility restart, 16384 strict card lookups; experiment 1048576 the bounce gradient as its group's share (GODOT_CARD_GRAD_MEAN); diagnostics 128/256/512/2048/131072/262144 paint views (paint, paint2, paint3, paint5, paint8, paintn), 4096 dynamic-ray stats, 8192 tier stats (GODOT_GI_TIER_PRINT).
 	vec3 grid_origin; // The world light grid, when FLAG_GRID: its corner, cell size, cells per edge, entries per cell.
 	float grid_cell;
 	uint grid_n;
@@ -2080,13 +2080,38 @@ float bounce_gradient(ivec2 texel, Texel t, uint k, uint prev_seed, bool have_pr
 // that came back from another face of the same still level (the TPS
 // bridge's residue, section 77) is not, and through the readers' chain and
 // the neighbours' spread it had restarted the whole level's history.
+// Under GODOT_CARD_GRAD_MEAN: the voted verdict at its full size, for the
+// texel's own bounce restart (accumulate); the returned one is the group's
+// share, the mark it hands on.
+float gradient_local = -1.0;
+
 float bounce_gradient_voted(float gradient) {
 	uint votes = subgroupAdd(gradient > 0.3 ? 1u : 0u);
 	if ((params.debug & 65536u) != 0u && gradient > 0.3) {
 		// Diagnostics (GODOT_CARD_ABLATE=gradvote): verdicts by their votes.
 		atomicAdd(converge.gradient_t[votes >= 3u ? 5u : 4u], 1u);
 	}
-	return gradient * smoothstep(1.0, 3.0, float(votes));
+	float gate = smoothstep(1.0, 3.0, float(votes));
+	gradient_local = gradient >= 0.0 ? gradient * gate : gradient;
+	if ((params.debug & 1048576u) != 0u) {
+		// Experiment (GODOT_CARD_GRAD_MEAN=1): the verdict's size is the
+		// share of the group's rays that saw the move, A-SVGF's gradient
+		// normalized over its stratum, not the one ray's. A ray is one
+		// direction of the texel's hemisphere: a gray box crossing the lab
+		// changed a sliver of it for the few texels whose rays met it, and a
+		// whole-size mark from each, carried on by the readers' chain and the
+		// neighbours' spread, restarted 97% of the screen's GI history every
+		// frame of the move. A wall that swings into the way of most of the
+		// block's rays still reads near one. The texel's own bounce still
+		// restarts by its ray's whole verdict (gradient_local): the lab's
+		// wall beside the sweeping box, restarted by the share alone, held
+		// the box's gray bounce, and the floor's reflection of the wall's
+		// foot read it (its raw sample 0.052 green against 0.031 converged).
+		float traced = subgroupAdd(gradient >= 0.0 ? 1.0 : 0.0);
+		float share = subgroupAdd(max(gradient, 0.0)) / max(traced, 1.0);
+		return gradient >= 0.0 ? share * gate : gradient;
+	}
+	return gradient * gate;
 }
 
 // The bounce a texel hands its readers: its histories filtered over the
@@ -2414,7 +2439,11 @@ void accumulate(ivec2 texel, Texel t, bool reset, Direct d, vec3 indirect_sample
 		dyn2 = mix(max(dyn2_old.rgb, vec3(0.0)), dyn2_sample, dyn_alpha);
 		dyn_frames = min(dyn_frames + 1.0, 64.0);
 	}
-	float keep_ind = (change > 0.02 && (params.debug & 32u) == 0u) ? max(1.0, 1.0 / change) : 64.0;
+	// Under GODOT_CARD_GRAD_MEAN the mark is the group's share; the texel's
+	// own bounce restarts by its ray's whole verdict (see
+	// bounce_gradient_voted).
+	float change_ind = (params.debug & 1048576u) != 0u ? max(change, gradient_local) : change;
+	float keep_ind = (change_ind > 0.02 && (params.debug & 32u) == 0u) ? max(1.0, 1.0 / change_ind) : 64.0;
 	vec4 old_indirect = imageLoad(indirect_atlas, texel);
 	// The hand-over of a light joining the dynamic set (params.dynamic_join,
 	// the frame every set is relit). Until it moved, the light was one of

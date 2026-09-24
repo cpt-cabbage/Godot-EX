@@ -4,6 +4,9 @@
 
 #VERSION_DEFINES
 
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
 // Denoiser for the stochastic direct lighting buffers, following the
 // MegaLights / SVGF structure: temporal accumulation of lighting and its
 // luminance moments (giving a per-pixel variance estimate), then a
@@ -34,6 +37,11 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_NO_YOUNG 131072u // Experiment (GODOT_GI_SPEC_ABLATE=young): the spatial pass does not filter a reflection for being young; its variance alone decides.
 #define FLAG_SPATIAL_OFF 262144u // Experiment (GODOT_GI_SPATIAL=0): the spatial pass stores its input unfiltered (the temporal output reaches the scene shader).
 #define FLAG_NO_OBJECTS 65536u // Experiment (GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer; every history at the camera reprojection.
+#define FLAG_MARK_COHERENT 4096u // GODOT_GI_MARK_MEAN=1 drops it: with FLAG_MARK_MEAN, a mark a third of the neighbourhood shares is kept whole (see there).
+#define FLAG_MARK_MEAN 16u // The restart takes the lighting-change mark's mean over the 5x5 neighbourhood, not the pixel's own.
+#define FLAG_SPEC_OBJECTS 2048u // A mirror's image of an object that moved this frame is fetched where the object was.
+#define FLAG_SPEC_DISOCC 8u // A near-mirror reflection whose every virtual tap fails its depth test restarts by its virtual weight.
+#define FLAG_CAUSE_STATS 4194304u // Diagnostics (GI temporal; GODOT_GI_TIER_PRINT / GODOT_RT_STATE_PRINT): count why this frame's young pixels are young into the gather's calibration buffer (see cause_stats).
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
@@ -169,6 +177,48 @@ layout(set = 0, binding = 17) uniform sampler2D in_dyn;
 layout(set = 0, binding = 18) uniform sampler2D history_dyn;
 layout(set = 1, binding = 7, rgba16f) uniform restrict writeonly image2D out_dyn;
 layout(set = 1, binding = 8, rgba16f) uniform restrict writeonly image2D out_sum;
+#endif
+#ifdef VALIDATE_DEPTH
+// Diagnostics (FLAG_CAUSE_STATS): the gather's CalibrationBuffer
+// (stochastic_indirect_gi.glsl), whose young_cause[8] tail starts at word
+// YOUNG_CAUSE_WORD. Per frame: [0] the pixels, [1] the young ones (under
+// YOUNG_FRAMES after this frame's update), and the young pixels by why: [2]
+// history off frame, [3] borrowed at the frame edge, [4] disoccluded (every
+// depth tap failed), [5] restarted by a lighting-change mark, [6] a short
+// history carried on (the tail of an earlier restart). The first four are the
+// frame's new restarts; [6] is how long they stay young. Words [8..13] are the
+// reflection's history (see the counting at the end of the pass).
+layout(set = 1, binding = 9, std430) restrict buffer CauseStats {
+	uint words[];
+}
+cause_stats;
+#define YOUNG_CAUSE_WORD 90
+// FLAG_SPEC_OBJECTS: the card sets that moved this frame
+// (Raytracing::_update_movers_buffer), each with where a point on it now was
+// the frame before (view space, a 3x4 as three rows), and what each pixel's
+// reflection ray hit (the gather's out_spec_hit).
+layout(set = 1, binding = 10, std430) restrict readonly buffer Movers {
+	mat4 view_from_ndc;
+	mat4 prev_ndc_from_view;
+	mat4 view_from_prev_ndc;
+	uint count;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+	vec4 records[]; // Four per object: the set (x, as bits), the three rows.
+}
+movers;
+layout(set = 1, binding = 11, r32ui) uniform restrict readonly uimage2D spec_hit_image;
+// What each pixel's reflection history is an image of, last frame's and this
+// frame's: SPEC_IDENT_MOVING with the card set (or SPEC_IDENT_SCREEN for a
+// screen point that moved) where the image was of a moving object, 0 where
+// nothing it showed moved.
+layout(set = 1, binding = 12, r32ui) uniform restrict readonly uimage2D spec_ident_history;
+layout(set = 1, binding = 13, r32ui) uniform restrict writeonly uimage2D out_spec_ident;
+#define SPEC_IDENT_MOVING 0x80000000u
+#define SPEC_IDENT_SCREEN 0x3FFFFFFFu
+#define SPEC_HIT_SET 1u // spec_hit_image >> 30: a card set, in the low 30 bits.
+#define SPEC_HIT_SCREEN 2u // A screen uv, 15 bits each (y << 15 | x) over 32767.
 #endif
 #else // MODE_SPATIAL
 layout(set = 0, binding = 3) uniform sampler2D moments_texture;
@@ -386,11 +436,36 @@ void main() {
 	vec3 m2_d = vec3(0.0);
 	vec3 m2_s = vec3(0.0);
 	float count = 0.0;
+	float mark_sum = 0.0;
+	float mark_sum_dyn = 0.0;
+	float mark_count = 0.0; // Taps carrying a mark (FLAG_MARK_COHERENT).
+	float mark_count_dyn = 0.0;
+	// The reflection's virtual depths over the 3x3 (FLAG_SPEC_DISOCC's tap
+	// tolerance: how far the image's depth varies within a pixel or so).
+	float vd_min = 1e30;
+	float vd_max = 0.0;
 	for (int y = -2; y <= 2; y++) {
 		for (int x = -2; x <= 2; x++) {
 			ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
-			vec3 d = texelFetch(in_diffuse, sp, 0).rgb;
-			vec3 s = texelFetch(in_specular, sp, 0).rgb;
+			vec4 d4 = texelFetch(in_diffuse, sp, 0);
+			vec3 d = d4.rgb;
+			vec4 s4 = texelFetch(in_specular, sp, 0);
+			vec3 s = s4.rgb;
+			if (abs(x) <= 1 && abs(y) <= 1 && s4.a > 0.0) {
+				vd_min = min(vd_min, s4.a);
+				vd_max = max(vd_max, s4.a);
+			}
+#ifdef HAS_DIRECTIONAL
+			if ((params.flags & FLAG_MARK_MEAN) != 0u) {
+				mark_sum += d4.a;
+				mark_count += d4.a > 0.02 ? 1.0 : 0.0;
+				if (dyn_split) {
+					float md = texelFetch(in_dyn, sp, 0).a;
+					mark_sum_dyn += md;
+					mark_count_dyn += md > 0.02 ? 1.0 : 0.0;
+				}
+			}
+#endif
 			mean_d += d;
 			mean_s += s;
 			m2_d += d * d;
@@ -400,6 +475,32 @@ void main() {
 	}
 	mean_d /= count;
 	mean_s /= count;
+#ifdef HAS_DIRECTIONAL
+	// FLAG_MARK_MEAN: the mark a pixel restarts by is its
+	// neighbourhood's mean, A-SVGF's gradient filtered before it sets the
+	// blend. A pixel's own mark is its one ray's: whether that ray happened to
+	// land on a card that changed. Under a gray box crossing the lab a few of
+	// the floor's rays met the cards its shadow and bounce had marked, and
+	// each of those pixels restarted alone -- a speckle of young pixels over
+	// the floor and the reflected corner of the wall, their neighbors
+	// holding their histories. A change over the whole neighbourhood (a
+	// light switched, a flashlight's spot) reads the same in the mean; one
+	// ray in twenty-five barely restarts. The mean is also what the history
+	// carries on for the gather's screen hits to read, so a lone ray no
+	// longer propagates either. (Section 45's vote splat was the tile form of
+	// this, measured on the flashlight flick only, neutral.)
+	if ((params.flags & FLAG_MARK_MEAN) != 0u) {
+		// FLAG_MARK_COHERENT: the mean dilutes a coherent change at its
+		// edges too -- a spot sweeping the lab's floor left thirteen times
+		// the hot pixels along its edge, the flashlight flick five times --
+		// so a mark a third of the neighbourhood carries is a change here,
+		// kept whole; one ray's in twenty-five is the lone ray the mean is
+		// for. A cheap stand-in for the neighbourhood's median.
+		bool keep_whole = (params.flags & FLAG_MARK_COHERENT) != 0u;
+		change_age = (keep_whole && mark_count >= 0.3 * count) ? max(change_age, mark_sum / count) : mark_sum / count;
+		change_age_dyn = (keep_whole && mark_count_dyn >= 0.3 * count) ? max(change_age_dyn, mark_sum_dyn / count) : mark_sum_dyn / count;
+	}
+#endif
 	vec3 stddev_d = sqrt(max(m2_d / count - mean_d * mean_d, vec3(0.0)));
 	vec3 stddev_s = sqrt(max(m2_s / count - mean_s * mean_s, vec3(0.0)));
 
@@ -428,6 +529,15 @@ void main() {
 	float reveal = 1.0;
 	// Diagnostics (FLAG_SPEC_PAINT_WHY): 1 history off frame, 2 borrowed, 3 every depth tap failed, 4 velocity-classified moving object.
 	int paint_why = 0;
+	bool mark_restart = false; // Diagnostics (FLAG_CAUSE_STATS): this frame's change mark cut the diffuse history.
+	// Diagnostics (FLAG_CAUSE_STATS), the reflection's history: 1 its image
+	// reprojected off frame (the surface's taps kept), 2 every virtual tap
+	// failed its depth test (the unvalidated bilinear fetch kept).
+	int spec_why = 0;
+	float spec_mismatch = 0.0;
+	bool spec_mover = false; // The reflection's hit was on an object that moved (FLAG_SPEC_OBJECTS); also counted and painted.
+	uint spec_ident = 0u; // What this frame's reflection is an image of (spec_ident_history).
+
 	// Shading confidence from the sampling pass (share of energy carried by
 	// the strongest single light).
 	float dominance = (params.flags & FLAG_HAS_META) != 0u ? texelFetch(raw_meta, pixel, 0).r : 0.0;
@@ -508,6 +618,83 @@ void main() {
 				parallax_px = length((prev_uv_virtual - prev_uv) * vec2(params.screen_size));
 				predicted_virtual_depth = linearize_depth(prev_ndc_v.z / prev_ndc_v.w);
 			}
+#ifdef VALIDATE_DEPTH
+			// FLAG_SPEC_OBJECTS: the reprojection above takes the
+			// reflected scene for still. A mirror's image of a moving object
+			// was elsewhere the frame before, and its history, fetched where
+			// the image is now, held another part of the object: on the lab's
+			// mirror floor the gray box's reflection carried the lines of its
+			// own edges from the frames before, one per frame where the images
+			// overlapped. The gather names what its reflection ray hit. A card
+			// set that moved this frame gives the point's motion exactly; a
+			// screen hit gives it through the prepass motion vector at that
+			// point and last frame's depth where it went. The point is taken
+			// to where it was, mirrored across the surface's plane (the surface
+			// still), and projected into the frame before: the history then
+			// holds the same part of the object, its taps validated at the
+			// depth the image had there. Nothing here guesses which object was
+			// hit; a hit that did not move keeps the reprojection above.
+			uint hit_id = (params.flags & FLAG_SPEC_OBJECTS) != 0u && virtual_weight > 0.0 ? imageLoad(spec_hit_image, pixel).r : 0u;
+			uint hit_kind = hit_id >> 30u;
+			if (hit_kind == SPEC_HIT_SET && movers.count > 0u || hit_kind == SPEC_HIT_SCREEN && (params.flags & FLAG_VELOCITY_CURRENT) != 0u && (params.flags & FLAG_HAS_VELOCITY) != 0u) {
+				vec2 ndc_xy = uv * 2.0 - 1.0;
+				vec4 p4 = movers.view_from_ndc * vec4(ndc_xy, center_depth, 1.0);
+				vec4 v4 = movers.view_from_ndc * vec4(ndc_xy, depth_from_linear(virtual_view_depth), 1.0);
+				vec3 surface = p4.xyz / p4.w;
+				vec3 image = v4.xyz / v4.w;
+				vec3 n = nr_normal(texelFetch(normal_roughness_texture, pixel * params.depth_scale, 0));
+				// The hit: the virtual point mirrored back across the plane.
+				vec3 hit = image - 2.0 * dot(image - surface, n) * n;
+				bool hit_moved = false;
+				vec3 hit_before = hit;
+				if (hit_kind == SPEC_HIT_SET) {
+					uint hit_set = hit_id & 0x3FFFFFFFu;
+					uint n_movers = min(movers.count, 32u);
+					for (uint i = 0u; i < n_movers; i++) {
+						if (floatBitsToUint(movers.records[i * 4u].x) != hit_set) {
+							continue;
+						}
+						vec4 hit4 = vec4(hit, 1.0);
+						hit_before = vec3(dot(movers.records[i * 4u + 1u], hit4), dot(movers.records[i * 4u + 2u], hit4), dot(movers.records[i * 4u + 3u], hit4));
+						hit_moved = true;
+						break;
+					}
+				} else {
+					// The screen point the trace hit -- its pixel and the depth
+					// buffer there, not the point rebuilt from the virtual
+					// depth -- where its motion vector sends it, against where
+					// the camera alone would: past a pixel apart the point
+					// itself moved, and it was at that uv at the depth last
+					// frame's signal recorded there.
+					ivec2 full_size = params.screen_size * params.depth_scale;
+					vec2 hit_uv = vec2(float(hit_id & 0x7FFFu), float((hit_id >> 15u) & 0x7FFFu)) / 32767.0;
+					ivec2 hit_px = clamp(ivec2(hit_uv * vec2(full_size)), ivec2(0), full_size - 1);
+					vec4 h4 = movers.view_from_ndc * vec4(hit_uv * 2.0 - 1.0, texelFetch(depth_texture, hit_px, 0).r, 1.0);
+					hit = h4.xyz / h4.w;
+					vec2 hit_uv_before = hit_uv + texelFetch(velocity_texture, hit_px, 0).xy + reprojection.jitter_delta;
+					vec4 still = movers.prev_ndc_from_view * vec4(hit, 1.0);
+					vec2 still_uv = (still.xy / still.w) * 0.5 + 0.5;
+					if (length((hit_uv_before - still_uv) * vec2(full_size)) > 1.0 && all(greaterThanEqual(hit_uv_before, vec2(0.0))) && all(lessThan(hit_uv_before, vec2(1.0)))) {
+						float depth_before = texelFetch(prev_view_depth_texture, clamp(ivec2(hit_uv_before * vec2(params.screen_size)), ivec2(0), params.screen_size - 1), 0).r;
+						if (depth_before > 0.0) {
+							vec4 hb = movers.view_from_prev_ndc * vec4(hit_uv_before * 2.0 - 1.0, depth_from_linear(depth_before), 1.0);
+							hit_before = hb.xyz / hb.w;
+							hit_moved = true;
+						}
+					}
+				}
+				if (hit_moved) {
+					spec_ident = SPEC_IDENT_MOVING | (hit_kind == SPEC_HIT_SET ? (hit_id & 0x3FFFFFFFu) : SPEC_IDENT_SCREEN);
+					vec3 image_before = hit_before - 2.0 * dot(hit_before - surface, n) * n;
+					vec4 c = movers.prev_ndc_from_view * vec4(image_before, 1.0);
+					if (c.w > 0.0) {
+						prev_uv_virtual = (c.xy / c.w) * 0.5 + 0.5 + object_delta;
+						predicted_virtual_depth = linearize_depth(c.z / c.w);
+						spec_mover = true;
+					}
+				}
+			}
+#endif
 		}
 #endif
 		bool history_usable = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
@@ -647,6 +834,30 @@ void main() {
 			if (all(greaterThanEqual(prev_uv_v, vec2(0.0))) && all(lessThanEqual(prev_uv_v, vec2(1.0)))) {
 				vec4 hist_blend = textureLod(history_specular, prev_uv_v, 0.0);
 				bool validate = predicted_virtual_depth > 0.0 && (params.flags & FLAG_SPEC_NO_MISMATCH) == 0u;
+				// FLAG_SPEC_DISOCC: a mirror's taps are held to its
+				// image's depth within 2%. The fifth that suits a lobe whose one
+				// sample lands somewhere new every frame is a meter at five: the
+				// lab's pillar, less than that behind the gray box crossing it,
+				// passed for the box and showed through its reflection in
+				// stripes. A mirror's ray is deterministic, so its depth is exact
+				// and a restart costs it no noise.
+				float tap_tolerance = SPEC_TAP_DEPTH_TOLERANCE;
+				// Floored by how far this frame's image depth varies over the
+				// 3x3: under MetalFX the signal's depth is one jittered sample
+				// of its block, and where the image has depth edges its
+				// virtual depth moved more than 2% from frame to frame at
+				// rest -- the TPS bridge's reflections read 4.0% young still,
+				// 0.4% before the tight tolerance.
+				float tap_floor = 0.0;
+				if ((params.flags & FLAG_SPEC_DISOCC) != 0u) {
+					float mirror_w = smoothstep(0.9, 1.0, virtual_weight);
+					tap_tolerance = mix(SPEC_TAP_DEPTH_TOLERANCE, 0.02, mirror_w);
+					// Only where the tolerance is the mirror's: on a glossy lobe
+					// the spread across a railing's slats widened the fifth and
+					// blended slat and wall histories (the lab's railing under
+					// yaw, 23% more error on its floor).
+					tap_floor = vd_max > vd_min ? (vd_max - vd_min) * mirror_w : 0.0;
+				}
 				vec4 acc = vec4(0.0);
 				float acc_w = 0.0;
 				if (validate) {
@@ -661,14 +872,33 @@ void main() {
 							continue;
 						}
 						vec4 h = texelFetch(history_specular, tp, 0);
-						if (h.a > 0.0 && abs(h.a - predicted_virtual_depth) > SPEC_TAP_DEPTH_TOLERANCE * max(predicted_virtual_depth, 1.0)) {
+						if (h.a > 0.0 && abs(h.a - predicted_virtual_depth) > max(tap_tolerance * max(predicted_virtual_depth, 1.0), tap_floor)) {
 							continue;
 						}
+#ifdef VALIDATE_DEPTH
+						// FLAG_SPEC_OBJECTS: a tap whose image was of
+						// a moving object is another image unless this frame's is
+						// of the same one. Behind the gray box sweeping along the
+						// lab's wall the glossy floor kept the box's gray for its
+						// whole window: the wall it shows now is within the lobe's
+						// depth tolerance of the box that stood against it.
+						if ((params.flags & FLAG_SPEC_OBJECTS) != 0u) {
+							uint hist_ident = imageLoad(spec_ident_history, tp).r;
+							if ((hist_ident & SPEC_IDENT_MOVING) != 0u && hist_ident != spec_ident) {
+								continue;
+							}
+						}
+#endif
 						acc += h * w;
 						acc_w += w;
 					}
 				}
 				hist_s4 = (validate && acc_w > 0.05) ? acc / acc_w : hist_blend;
+				if (validate && acc_w <= 0.05) {
+					spec_why = 2;
+				}
+			} else {
+				spec_why = 1;
 			}
 		}
 #endif
@@ -788,6 +1018,7 @@ void main() {
 			}
 			if (changed && mark_new) {
 				frames_d = min(frames_d, max(1.0, 1.0 / change_age));
+				mark_restart = true;
 			}
 			if (change_age_s > 0.02) {
 				if ((params.flags & FLAG_SPEC_NO_CHANGE) == 0u) {
@@ -845,7 +1076,37 @@ void main() {
 			if (virtual_weight > 0.0 && predicted_virtual_depth > 0.0 && hist_s4.a > 0.0 && (params.flags & FLAG_SPEC_NO_MISMATCH) == 0u) {
 				float rel = abs(hist_s4.a - predicted_virtual_depth) / max(predicted_virtual_depth, 1.0);
 				float mismatch = smoothstep(0.1, 0.5, rel) * virtual_weight;
+				spec_mismatch = mismatch;
 				frames_s = min(frames_s, mix(frames_cap, 2.0, mismatch));
+			}
+			// FLAG_SPEC_DISOCC: every virtual tap disagreeing
+			// with the depth this frame's image is predicted at is the
+			// reflection's disocclusion -- an object moved into or out of the
+			// image -- and the fallback fetch above holds the other image. On
+			// the mirror floor a gray box crossing the lab showed at a sixth of
+			// its opacity over the background it covered: the mismatch left
+			// seven frames of the old image (its depth only tens of percent
+			// off the box's), and the trailing side kept the box. A mirror
+			// takes this frame's sample whole; a glossy lobe, whose one sample
+			// lands at a new depth every frame anyway, keeps its history.
+			// Near-mirrors only (the same weight as the tight tolerance): a
+			// glossy lobe's one sample a frame, restarted wherever its taps
+			// all failed, was noise -- the lab's railing under yaw read 23%
+			// more error on its glossy floor, the reflected slats failing
+			// their taps every frame. Its trails are the screen reads' (the
+			// last frame's depth test) and the moving objects' (followed).
+			if (spec_why == 2 && (params.flags & FLAG_SPEC_DISOCC) != 0u) {
+				frames_s = min(frames_s, mix(frames_cap, 1.0, smoothstep(0.9, 1.0, virtual_weight)));
+			}
+			// FLAG_SPEC_OBJECTS: a mirror's image of an object that
+			// moved takes this frame's sample whole. Its ray is deterministic,
+			// so the sample is already clean, and the history followed to where
+			// the object was is last frame's image resampled: without a clamp
+			// its bilinear taps blended the gray box's two faces across the
+			// edge between them, a stair-step at the signal's resolution. A
+			// glossy lobe, one noisy sample a frame, keeps the followed history.
+			if (spec_mover) {
+				frames_s = min(frames_s, mix(frames_cap, 1.0, smoothstep(0.9, 1.0, virtual_weight)));
 			}
 #endif
 			// Never past 1: a restart below (the change mark, a borrow) can
@@ -938,6 +1199,62 @@ void main() {
 	if (any(isnan(moments)) || any(isinf(moments))) {
 		moments = vec4(0.0);
 	}
+#ifdef VALIDATE_DEPTH
+	// Why the young pixels are young (see cause_stats): which of the diffuse
+	// history's restarts a reveal-noise fix could reach. A pixel the borrow
+	// took and whose borrowed taps then failed counts as disoccluded, as the
+	// paint shows it.
+	if ((params.flags & FLAG_CAUSE_STATS) != 0u) {
+		bool young = frames_d < YOUNG_FRAMES;
+		uint cause = !young ? 0u : (paint_why == 1 ? 2u : (paint_why == 2 ? 3u : (paint_why == 3 ? 4u : (mark_restart ? 5u : 6u))));
+		uint n = subgroupAdd(1u);
+		uint n_young = subgroupAdd(young ? 1u : 0u);
+		uint n_off = subgroupAdd(cause == 2u ? 1u : 0u);
+		uint n_borrow = subgroupAdd(cause == 3u ? 1u : 0u);
+		uint n_disocc = subgroupAdd(cause == 4u ? 1u : 0u);
+		uint n_mark = subgroupAdd(cause == 5u ? 1u : 0u);
+		uint n_carried = subgroupAdd(cause == 6u ? 1u : 0u);
+		if (subgroupElect()) {
+			atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 0], n);
+			if (n_young > 0u) {
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 1], n_young);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 2], n_off);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 3], n_borrow);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 4], n_disocc);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 5], n_mark);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 6], n_carried);
+			}
+		}
+#ifdef HAS_DIRECTIONAL
+		// The reflection's history, over the pixels that fetch it at their
+		// virtual image (virtual_weight > 0): [8] those pixels, [9] their
+		// image off frame, [10] every virtual tap failed (the unvalidated
+		// fetch kept), [11] of those, still 8 frames or more after the
+		// mismatch restart (a kept ghost), [12] the mismatch restart past a
+		// half, [13] young (under 4 frames) after the update, [14] its hit on
+		// an object that moved (FLAG_SPEC_OBJECTS).
+		bool glossy = virtual_weight > 0.0 && virtual_view_depth > 0.0;
+		uint g = subgroupAdd(glossy ? 1u : 0u);
+		if (g > 0u) {
+			uint g_off = subgroupAdd(glossy && spec_why == 1 ? 1u : 0u);
+			uint g_fail = subgroupAdd(glossy && spec_why == 2 ? 1u : 0u);
+			uint g_ghost = subgroupAdd(glossy && spec_why == 2 && frames_s >= 8.0 ? 1u : 0u);
+			uint g_mismatch = subgroupAdd(glossy && spec_mismatch > 0.5 ? 1u : 0u);
+			uint g_young = subgroupAdd(glossy && frames_s < 4.0 ? 1u : 0u);
+			uint g_mover = subgroupAdd(glossy && spec_mover ? 1u : 0u);
+			if (subgroupElect()) {
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 8], g);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 9], g_off);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 10], g_fail);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 11], g_ghost);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 12], g_mismatch);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 13], g_young);
+				atomicAdd(cause_stats.words[YOUNG_CAUSE_WORD + 14], g_mover);
+			}
+		}
+#endif
+	}
+#endif
 #ifdef HAS_DIRECTIONAL
 	if (any(isnan(result_directional)) || any(isinf(result_directional))) {
 		result_directional = vec4(0.0, 0.0, 0.0, 1.0);
@@ -967,8 +1284,16 @@ void main() {
 		// depth tap failed, cyan a velocity-classified moving object; else
 		// the reflection's frames in red and the diffuse's in green, over 32.
 		result_specular = paint_why == 1 ? vec3(1.0, 0.0, 0.0) : (paint_why == 2 ? vec3(1.0, 1.0, 0.0) : (paint_why == 3 ? vec3(1.0, 0.0, 1.0) : (paint_why == 4 ? vec3(0.0, 1.0, 1.0) : vec3(frames_s / 32.0, frames_d / 32.0, 0.0))));
+		// Under FLAG_SPEC_OBJECTS: white where the reflection's hit is on an
+		// object that moved and its history was followed there.
+		if (spec_mover) {
+			result_specular = vec3(1.0);
+		}
 	}
 	imageStore(out_specular, pixel, vec4(result_specular, min(virtual_view_depth, 30000.0)));
+#ifdef VALIDATE_DEPTH
+	imageStore(out_spec_ident, pixel, uvec4(spec_ident));
+#endif
 #else
 	imageStore(out_specular, pixel, vec4(result_specular, 0.0));
 #endif

@@ -272,6 +272,7 @@ private:
 		bool skinned = false;
 		uint64_t skeleton_version = 0; // The skeleton's version the cards were captured with (skinned instances).
 		uint32_t last_seen_frame = 0;
+		Transform3D previous_transform; // The transform the frame before last_seen_frame (a second view in the same frame sees the same motion).
 		uint32_t captured_frame = 0;
 		uint32_t resized_frame = 0; // The last frame the distance density changed this set's size.
 		bool in_use = false;
@@ -600,6 +601,22 @@ public:
 		float read_texels = 0.0f;
 	};
 	ScaleStats get_scale_stats() const;
+	// The card sets whose transform changed since the frame before, as seen
+	// this frame (the GI temporal pass follows their images in a mirror,
+	// GODOT_GI_SPEC_OBJECTS): the set, which the gather's reflection rays
+	// name at their hits, and where a point on the object now was the frame
+	// before.
+	struct Mover {
+		uint32_t set = INVALID_ID;
+		Transform3D previous_from_current;
+	};
+	static constexpr uint32_t MAX_MOVERS = 32;
+	const LocalVector<Mover> &get_movers() const { return movers; }
+
+private:
+	LocalVector<Mover> movers;
+
+public:
 	// The relight-at-read-mip knobs (plan section 92), shared with the gather
 	// that makes the requests: GODOT_CARD_RELIGHT_LOD is the coarsest level a
 	// read may request its tile at (3; 0: every tile at full density, the
