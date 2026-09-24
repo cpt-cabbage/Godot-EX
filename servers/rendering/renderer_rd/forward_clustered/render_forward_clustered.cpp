@@ -2440,6 +2440,7 @@ void RenderForwardClustered::_update_ray_tracing_backend() {
 		raytracing->set_surface_cache_enabled(use_rt_gi && use_surface_cache, surface_cache_settings, use_surface_cache_mirror);
 		raytracing->set_hit_shading(use_rt_gi && use_surface_cache ? rt_gi_hit_shading : 0, &hit_material_resolver);
 		raytracing->set_planar_mirrors(use_rt_gi_planar_mirrors);
+		raytracing->set_dfg_lut(dfg_lut.texture);
 	}
 }
 

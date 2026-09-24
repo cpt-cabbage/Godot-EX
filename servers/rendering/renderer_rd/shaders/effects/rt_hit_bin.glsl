@@ -64,6 +64,12 @@ results;
 layout(set = 1, binding = 0, rgba16f) uniform restrict image2D raw_ambient;
 layout(set = 1, binding = 1, rgba16f) uniform restrict image2D raw_reflection;
 layout(set = 1, binding = 2, rgba16f) uniform restrict image2D raw_directional;
+// The gather's ray records for the neighbourhood reuse (record_rays; see
+// stochastic_gi_reuse.glsl): a deferred hit's radiance goes in its slot too.
+layout(set = 1, binding = 3, std430) restrict buffer GiReuseRays {
+	uvec4 data[];
+}
+reuse_rays;
 #endif
 
 layout(push_constant, std430) uniform Params {
@@ -74,6 +80,10 @@ layout(push_constant, std430) uniform Params {
 	float luma_r; // The working colour space's luminance weights (ColorManagement).
 	float luma_g;
 	float luma_b;
+	uint record_rays; // Nonzero: fill the deferred hits into the gather's ray records (GODOT_GI_REUSE).
+	uint pad0;
+	uint pad1;
+	uint pad2;
 }
 params;
 
@@ -146,6 +156,12 @@ void main() {
 		// over that many.
 		float inv_rays = 1.0 / float(((r.w >> RT_HIT_RESULT_RAYS_SHIFT) & 3u) + 1u);
 		vec3 radiance = max(rt_hit_unpack_radiance(r.xy), vec3(0.0));
+		if (params.record_rays != 0u) {
+			uvec4 rec = reuse_rays.data[base + s];
+			rec.x = packHalf2x16(radiance.rg);
+			rec.y = packHalf2x16(vec2(radiance.b, unpackHalf2x16(rec.y).y));
+			reuse_rays.data[base + s] = rec;
+		}
 		if ((r.w & RT_HIT_RESULT_MIRROR) != 0u) {
 			reflection += radiance;
 			any_mirror = true;

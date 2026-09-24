@@ -163,6 +163,8 @@ params;
 #define FLAG_SRAD_PREV_DEPTH 8388608u // GODOT_GI_SRAD_PREV_DEPTH=0 reverts: a screen read is validated against last frame's depth where it reads last frame's colour.
 #define FLAG_SRAD_FOLD 2097152u // The screen texture is the diffuse target: a card hit's read adds the surface's specular energy from the G-buffer (see screen_radiance_boost).
 #define FLAG_TIER_STATS 262144u // Diagnostics (GODOT_GI_TIER_PRINT): count which tier answered each ray, and with how much light.
+#define FLAG_SPEC_VNDF 1048576u // The reflection ray samples GGX's visible normals (default; GODOT_GI_VNDF=0 reverts to the plain NDF).
+#define FLAG_REUSE_RECORD 131072u // Record every ray for the neighbourhood reuse (stochastic_gi_reuse.glsl, GODOT_GI_REUSE).
 #define FLAG_NO_REQUESTS 16777216u // Diagnostics (GODOT_GI_REQUESTS=0): the card reads ask for no relight.
 #define FLAG_ABLATE_RAYS 33554432u // Diagnostics (GODOT_GI_ABLATE=rays): the bounce rays are not traced (every one misses to the sky).
 #define FLAG_ABLATE_SPEC 67108864u // Diagnostics (GODOT_GI_ABLATE=spec): no reflection ray; the diffuse mean stands in for it.
@@ -600,6 +602,29 @@ layout(set = 1, binding = 12, r32ui) uniform restrict writeonly uimage2D out_spe
 #define SPEC_HIT_SCREEN (2u << 30u) // | the hit's screen uv, 15 bits each (y << 15 | x) over 32767.
 // History frames under which the gather spends the primary ray on it.
 #define FALLBACK_FRAMES 8.0
+
+#if !defined(GATHER_SETUP) && !defined(GATHER_TRACE)
+// Every ray this pixel traced, for the neighbourhood reuse
+// (FLAG_REUSE_RECORD; stochastic_gi_reuse.glsl reads them, the hit shading's
+// resolve fills in the deferred hits' radiance). One per ray slot, pixel
+// index * (ray_count + 1) + slot as the hit results number them: the
+// radiance as halves (x: r g, y: b and the hit distance), z the view-space
+// direction, w the flags and the moving lights' share (unorm 8 bits << 8).
+layout(set = 1, binding = 13, std430) restrict writeonly buffer GiReuseRays {
+	uvec4 data[];
+}
+reuse_rays;
+#define GI_REUSE_RAY_VALID 1u
+#define GI_REUSE_RAY_SPEC 2u // The reflection ray, traced (a valid reflection slot without it: skipped by the half-rate checkerboard).
+#define GI_REUSE_RAY_MIRROR 4u
+#define GI_REUSE_RAY_BELOW 8u // The GGX draw fell below the horizon; the mirror direction was traced in its place.
+#define GI_REUSE_RAY_COUNT_SHIFT 4u // The pixel's diffuse rays - 1.
+#define GI_REUSE_RAY_DYN_SHIFT 8u
+
+uvec4 gi_reuse_record(vec3 radiance, vec3 view_dir, float t_hit, uint flags) {
+	return uvec4(packHalf2x16(radiance.rg), packHalf2x16(vec2(radiance.b, min(t_hit, 65000.0))), rt_hit_pack_dir(view_dir), flags);
+}
+#endif
 
 #ifdef GATHER_SPLIT
 // The split's hand-over. Every pixel has GATHER_SLOTS ray records at fixed
@@ -2080,8 +2105,9 @@ vec3 gather_diffuse_dir(GatherPixel g, ivec2 pixel, uint r) {
 }
 
 // The reflection ray's direction: GGX half-vector sampling around the
-// mirror direction (the mirror direction itself for a mirror).
-vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel) {
+// mirror direction (the mirror direction itself for a mirror). below: the
+// draw fell under the horizon and the mirror direction stands in.
+vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel, out bool below) {
 	vec2 rnd = stbn_sample(pixel, 6u);
 	vec3 v = normalize(-g.rel_pos);
 	// (Measured and not kept: narrowing a young pixel's lobe toward the
@@ -2091,13 +2117,47 @@ vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel) {
 	// case and was still behind at stop + 16; a rough lobe's blur is
 	// what the eye expects there.)
 	float alpha = g.roughness * g.roughness;
-	float phi = rnd.x * 2.0 * M_PI;
-	float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
-	float st = sqrt(max(1.0 - ct * ct, 0.0));
-	vec3 h = normalize(basis_around(g.world_normal) * vec3(st * cos(phi), st * sin(phi), ct));
-	vec3 dir = g.mirror ? reflect(-v, g.world_normal) : reflect(-v, h);
-	if (dot(dir, g.world_normal) <= 1e-4) {
-		dir = reflect(-v, g.world_normal);
+	vec3 dir = reflect(-v, g.world_normal);
+	below = false;
+	if (!g.mirror) {
+		// The half vector's density: the plain NDF draws half vectors facing
+		// away from the view as often as toward it, so a grazing view's
+		// samples fall below the horizon or carry a weight the 1 / (4 v.h)
+		// turns unbounded; the visible normals (FLAG_SPEC_VNDF; Heitz 2018,
+		// drawn as Dupuy and Benyoub 2023's spherical cap) are the NDF seen
+		// from the view, so every half vector faces it and the BRDF weight
+		// the resolve applies is G / G1(v), at most 1 / G1(v) (section 105).
+		//
+		// A draw that still falls below the horizon has no light to return:
+		// the mirror direction is traced in its place (the ray is spent
+		// anyway) and below marks it, a zero in the weighted estimate.
+		// (Measured and not kept: redrawing it, up to four times. The
+		// estimate is then the mean over the lobe above the surface under
+		// the sampling density, one convention among three that each
+		// converged to a different level, none of them the BRDF-weighted
+		// mean the DFG multiply wants; section 105.)
+		float phi = rnd.x * 2.0 * M_PI;
+		vec3 h_local;
+		if (bool(params.flags & FLAG_SPEC_VNDF)) {
+			mat3 basis = basis_around(g.world_normal);
+			vec3 v_local = transpose(basis) * v;
+			v_local.z = max(v_local.z, 1e-4);
+			vec3 v_std = normalize(vec3(v_local.xy * alpha, v_local.z));
+			float z = (1.0 - rnd.y) * (1.0 + v_std.z) - v_std.z;
+			float sz = sqrt(clamp(1.0 - z * z, 0.0, 1.0));
+			vec3 h_std = vec3(sz * cos(phi), sz * sin(phi), z) + v_std;
+			h_local = vec3(h_std.xy * alpha, max(h_std.z, 0.0));
+		} else {
+			float ct = sqrt((1.0 - rnd.y) / (1.0 + (alpha * alpha - 1.0) * rnd.y));
+			float st = sqrt(max(1.0 - ct * ct, 0.0));
+			h_local = vec3(st * cos(phi), st * sin(phi), ct);
+		}
+		vec3 d = reflect(-v, normalize(basis_around(g.world_normal) * h_local));
+		if (dot(d, g.world_normal) > 1e-4) {
+			dir = d;
+		} else {
+			below = true;
+		}
 	}
 	return fold_above(dir, g.world_geo_normal);
 }
@@ -2152,7 +2212,8 @@ void setup_main() {
 				}
 			} else if (s < g.rays || (s == params.ray_count && g.spec_trace)) {
 				bool spec = s == params.ray_count;
-				vec3 dir = spec ? gather_reflection_dir(g, pixel) : gather_diffuse_dir(g, pixel, s);
+				bool below;
+				vec3 dir = spec ? gather_reflection_dir(g, pixel, below) : gather_diffuse_dir(g, pixel, s);
 				gather_records.data[record * 2u + 1u] = uvec4(floatBitsToUint(dir), 0u);
 				bool screen_hit = false;
 				vec3 hit_view;
@@ -2225,6 +2286,12 @@ void gather_main() {
 		// Sky: unoccluded, no directional bias.
 		imageStore(out_directional, pixel, vec4(0.0, 0.0, 0.0, 1.0));
 		imageStore(out_fallback, pixel, vec4(0.0));
+		if (bool(params.flags & FLAG_REUSE_RECORD)) {
+			uint reuse_base = uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u);
+			for (uint s = 0u; s <= params.ray_count; s++) {
+				reuse_rays.data[reuse_base + s] = uvec4(0u);
+			}
+		}
 		return;
 	}
 	ivec2 full_pixel = g.full_pixel;
@@ -2286,6 +2353,11 @@ void gather_main() {
 		vec3 radiance = max(trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 7u).r, t_hit), vec3(0.0));
 		irradiance += radiance;
 		irradiance_dyn += clamp(ray_dyn, vec3(0.0), radiance);
+		if (bool(params.flags & FLAG_REUSE_RECORD)) {
+			float dyn_share = clamp(luminance(clamp(ray_dyn, vec3(0.0), radiance)) / max(luminance(radiance), 1e-6), 0.0, 1.0);
+			uint flags = GI_REUSE_RAY_VALID | ((rays - 1u) << GI_REUSE_RAY_COUNT_SHIFT) | (uint(round(dyn_share * 255.0)) << GI_REUSE_RAY_DYN_SHIFT);
+			reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + r] = gi_reuse_record(radiance, view_dir, t_hit, flags);
+		}
 		moment += luminance(radiance) * dir;
 		// Only nearby geometry occludes: in an open scene nearly every ray
 		// hits something eventually, and counting those would report near
@@ -2369,11 +2441,13 @@ void gather_main() {
 		vec3 v = normalize(-rel_pos);
 		float alpha = roughness * roughness;
 		specular_cone_tan = mirror ? 0.0 : min(2.0 * alpha, params.card_cone_tan);
+		bool below;
 #ifdef GATHER_RESOLVE
 		gather_record = record_base + params.ray_count;
 		vec3 dir = uintBitsToFloat(gather_records.data[gather_record * 2u + 1u].xyz);
+		gather_reflection_dir(g, pixel, below);
 #else
-		vec3 dir = gather_reflection_dir(g, pixel);
+		vec3 dir = gather_reflection_dir(g, pixel, below);
 #endif
 		vec3 view_dir = transpose(world_basis) * dir;
 		float spec_t_hit;
@@ -2389,8 +2463,18 @@ void gather_main() {
 			float ndh = max(dot(world_normal, h_final), 0.0);
 			float vdh = max(dot(v, h_final), 1e-4);
 			float d = ndh * ndh * (alpha * alpha - 1.0) + 1.0;
-			float pdf = alpha * alpha / (M_PI * d * d) * ndh / (4.0 * vdh);
-			spec_ray = vec4(octahedron_encode(view_dir), max(pdf, 1e-6), min(spec_t_hit, 1e4));
+			float ndf = alpha * alpha / (M_PI * d * d);
+			float pdf = ndf * ndh / (4.0 * vdh);
+			if (bool(params.flags & FLAG_SPEC_VNDF)) {
+				// D(h) G1(v) / (4 n.v), G1 Smith's.
+				float ndv = max(dot(world_normal, v), 1e-4);
+				pdf = ndf / (2.0 * (ndv + sqrt(alpha * alpha + (1.0 - alpha * alpha) * ndv * ndv)));
+			}
+			// Negative where the draw fell below the horizon and the mirror
+			// direction stood in: a zero in the BRDF-weighted estimate
+			// (stochastic_reflection_resolve.glsl), nonzero for every test
+			// of whether the pixel traced.
+			spec_ray = vec4(octahedron_encode(view_dir), below ? -1.0 : max(pdf, 1e-6), min(spec_t_hit, 1e4));
 		}
 		float view_len = max(length(view_pos), 1e-4);
 		// A curved mirror's image is not at the hit distance behind it: a
@@ -2406,6 +2490,15 @@ void gather_main() {
 		float t_image = min(spec_t_hit, 1e4);
 		t_image /= (1.0 + 2.0 * curvature * t_image);
 		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
+		if (bool(params.flags & FLAG_REUSE_RECORD)) {
+			uint flags = GI_REUSE_RAY_VALID | GI_REUSE_RAY_SPEC | (mirror ? GI_REUSE_RAY_MIRROR : 0u) | (below ? GI_REUSE_RAY_BELOW : 0u);
+			reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + params.ray_count] = gi_reuse_record(max(reflection, vec3(0.0)), view_dir, spec_t_hit, flags);
+		}
+	} else if (bool(params.flags & FLAG_REUSE_RECORD)) {
+		// No reflection ray: skipped by the half-rate checkerboard (a rough
+		// pixel that reflects, valid without GI_REUSE_RAY_SPEC), or none.
+		bool skipped = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && roughness > 0.2 && !mirror;
+		reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + params.ray_count] = uvec4(0u, 0u, 0u, skipped ? GI_REUSE_RAY_VALID : 0u);
 	}
 
 	// Nothing non-finite leaves the gather: the temporal filter would keep

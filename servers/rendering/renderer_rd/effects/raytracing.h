@@ -42,6 +42,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_gi_reuse.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_reflection_resolve.glsl.gen.h"
@@ -528,6 +529,33 @@ private:
 	StochasticReflectionResolveShaderRD reflection_resolve_shader;
 	RID reflection_resolve_shader_version;
 	RID reflection_resolve_pipeline;
+	RID dfg_lut;
+
+	// The GI's rays reused across the neighbourhood before the temporal pass
+	// (GODOT_GI_REUSE; see the shader): the gather's ray records, a slot per
+	// ray as the hit results number them.
+	StochasticGiReuseShaderRD gi_reuse_shader;
+	RID gi_reuse_shader_version;
+	RID gi_reuse_pipeline;
+	RID gi_reuse_rays;
+	uint32_t gi_reuse_rays_capacity = 0;
+
+	struct GiReusePushConstant {
+		float view_from_ndc[16];
+		int32_t screen_size[2];
+		int32_t full_screen_size[2];
+		int32_t depth_scale;
+		uint32_t slots;
+		uint32_t ray_count;
+		uint32_t flags;
+		int32_t radius;
+		float rough_min;
+		float rough_full;
+		float jacobian_max;
+		float luma_weights[3];
+		float depth_tolerance;
+	};
+	static_assert(sizeof(GiReusePushConstant) == 128, "Must match stochastic_gi_reuse.glsl's push constant.");
 
 	struct ReflectionResolvePushConstant {
 		float view_from_ndc[16];
@@ -535,7 +563,8 @@ private:
 		int32_t depth_scale;
 		int32_t paint; // Diagnostics (GODOT_GI_SPEC_FILL_PAINT=1).
 		float rough_min;
-		float pad[3];
+		uint32_t flags; // 1: fill the skipped pixels, 2: BRDF-weight the samples, 4: they were drawn from the visible normals.
+		float pad[2];
 	};
 
 	struct StochasticDenoisePushConstant {
@@ -640,6 +669,8 @@ private:
 		uint32_t slots;
 		uint32_t ray_count;
 		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
+		uint32_t record_rays; // Fill the deferred hits into the ray records (GODOT_GI_REUSE).
+		uint32_t pad[3];
 	};
 
 	struct HitDispatchPushConstant {
@@ -735,7 +766,7 @@ private:
 	static uint32_t last_tier_rays;
 	static uint32_t last_hit_appended;
 	static uint32_t last_hit_slots;
-	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
+	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, RID p_reuse_rays, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
 
 public:
 	// Live quality settings for the stochastic pass, read from the project
@@ -776,6 +807,8 @@ public:
 	// in the scene, whose image lights every lighting pass evaluates. See
 	// RaytracingScene::find_mirror_planes.
 	void set_planar_mirrors(bool p_enabled) { scene.set_mirror_planes_enabled(p_enabled); }
+	// The scene shader's DFG LUT, for the reflection's BRDF weight (GODOT_GI_SPEC_WEIGHT).
+	void set_dfg_lut(RID p_lut) { dfg_lut = p_lut; }
 	// The mirrors as a pass reads them, in world space, or in view space
 	// given the view's transform. GODOT_GI_MIRROR="nx,ny,nz,w,F0,roughness,
 	// diffuse_share[,lx,ly,lz,energy,range][,debug]" overrides the scene's
