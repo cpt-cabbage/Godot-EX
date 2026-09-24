@@ -304,6 +304,7 @@ private:
 		DENOISE_FLAG_HAS_VELOCITY = 1, // A real velocity buffer is bound.
 		DENOISE_FLAG_HAS_META = 2, // Temporal: raw shading-confidence texture is bound.
 		DENOISE_FLAG_MODULATE_ANALYTIC = 4, // Spatial: multiply the analytic lighting back in.
+		DENOISE_FLAG_FALLBACK_COVERAGE = 8192, // Spatial (GI; GODOT_GI_FALLBACK_COVERAGE=0 reverts): the stand-in's trust scaled by its tent's covered share.
 		DENOISE_FLAG_FALLBACK_ALL = 32, // Spatial (GI, diagnostics): the cards' fallback at every pixel in place of the filtered GI.
 		DENOISE_FLAG_SPEC_NO_CHANGE = 64, // Temporal (GI, diagnostics): the reflection history is not restarted by the lighting-change mark.
 		DENOISE_FLAG_SPEC_NO_SMEAR = 128, // ... nor capped by the parallax smear.
@@ -483,7 +484,7 @@ private:
 		uint32_t hit_capacity; // Packets the hit shading has room for this frame.
 		float card_cone_tan; // Tangent of the diffuse rays' cone half-angle: the card mip a hit is read through follows the footprint at the hit distance.
 		float card_youth_lod; // The mip a hit reads a card texel relit once through (0 disables); halves per doubling of the texel's relights.
-		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS).
+		uint32_t fallback_parts; // Diagnostics (GODOT_GI_FALLBACK_PARTS, bits 0-2); bit 3 the coverage-weighted tent (GODOT_GI_FALLBACK_COVERAGE=0 clears it).
 		float pad_memory;
 		float luma_weights[4]; // The working colour space's luminance weights (ColorManagement), xyz.
 		float screen_radiance_extra[4]; // y: the firefly ceiling's ratio over the cache value (GODOT_GI_SRAD_RATIO); z: the allowance above it (GODOT_GI_SRAD_FLOOR); x, w unused.
