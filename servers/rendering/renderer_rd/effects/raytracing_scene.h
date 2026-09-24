@@ -55,6 +55,9 @@ class RaytracingScene {
 public:
 	static constexpr uint32_t HIT_MAX_MATERIALS = 2048;
 	static constexpr uint32_t HIT_INVALID = 0xFFFFFFFFu;
+	// rt_geometry_unpack.glsl's FLAG_DEFORM_ONLY: a skinned surface's
+	// positions, normals and tangents rewritten, nothing else.
+	static constexpr uint32_t HIT_UNPACK_DEFORM_ONLY = 512u;
 
 	// A material as the hit shading dispatches it: its shader's hit variant
 	// and its uniform set (null when the material has no uniforms).
@@ -176,6 +179,7 @@ private:
 		LocalVector<RID> decoded_buffers; // Decoded position buffers for compressed surfaces.
 		LocalVector<DecodeJob> decode_jobs; // Re-run per frame for deforming geometry.
 		uint32_t surface_mask = 0xFFFFFFFF; // Which surfaces this variant includes.
+		bool created = false; // _create_blas_for_mesh ran (the BLAS may still be null: no eligible surface).
 		bool built = false;
 		uint64_t built_deform_version = 0; // Skinned: the instance's deform version the BLAS and the hit pool were last built over.
 		// The hit shading's view of the BLAS: its geometries (the casting
@@ -194,9 +198,25 @@ private:
 	// overrides make that per instance, not per mesh.
 	HashMap<RID, LocalVector<MeshBlas>> blas_cache;
 
-	// Skinned / blend-shaped instances: one BLAS per mesh instance over its
-	// deformed vertex buffers, rebuilt on the frames the skinning ran.
-	HashMap<RID, MeshBlas> skinned_blas_cache;
+	// Skinned / blend-shaped instances: a BLAS per mesh instance and facing
+	// class over its deformed vertex buffers, refit on the frames the
+	// skinning ran. One entry held all classes before 2026-09-24: an
+	// instance with surfaces in two classes (a double-sided cape) freed and
+	// rebuilt it from scratch twice a frame. The slots sit inline so a
+	// pointer to one survives the map's inserts until the frame's refits.
+	static constexpr uint32_t FACING_CLASS_COUNT = 6;
+	struct SkinnedBlas {
+		MeshBlas classes[FACING_CLASS_COUNT];
+	};
+	HashMap<RID, SkinnedBlas> skinned_blas_cache;
+
+	// The frame's deformed work, run after the instance loop in one batch
+	// (see _refit_deformed): the BLASes to refit, and the hit pools'
+	// positions and normals to rewrite.
+	LocalVector<MeshBlas *> deform_refits;
+	LocalVector<MeshBlas *> deform_unpacks;
+	uint32_t deform_refit_count = 0; // Last frame's, for the state line.
+	uint32_t deform_refit_vertices = 0;
 
 	RID tlas;
 	uint32_t tlas_capacity = 0;
@@ -214,7 +234,8 @@ private:
 	// healing stale cache entries whose buffers were freed behind our back.
 	MeshBlas *_resolve_mesh_blas(RID p_mesh, uint32_t p_surface_mask);
 	// Same for a deforming instance's per-frame BLAS.
-	MeshBlas *_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask);
+	MeshBlas *_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask, uint32_t p_class);
+	void _refit_deformed();
 
 	// Hit shading: the gather defers the hits its cards cannot shade to
 	// their materials, run in compute (scene_hit_shade.glsl). The geometry
@@ -288,6 +309,7 @@ private:
 	void _build_hit_geometry(MeshBlas &r_entry, RID p_mesh, RID p_mesh_instance);
 	void _free_hit_geometry(MeshBlas &r_entry);
 	void _unpack_hit_geometry(MeshBlas &r_entry);
+	void _unpack_hit_geometry_jobs(const MeshBlas &r_entry, RD::ComputeListID p_list, uint32_t p_extra_flags);
 	uint32_t _hit_material_slot(const HitMaterial &p_material);
 
 public:
@@ -312,6 +334,8 @@ public:
 	// The scale of the frame's structures (the RT STATE scale line): live
 	// BLASes across the three caches, and the instances the last TLAS held.
 	uint32_t get_blas_count() const;
+	uint32_t get_deform_refit_count() const { return deform_refit_count; }
+	uint32_t get_deform_refit_vertices() const { return deform_refit_vertices; }
 	uint32_t get_tlas_instance_count() const { return tlas_instance_count; }
 
 	// The hit shading's inputs, as update() left them: the geometry records

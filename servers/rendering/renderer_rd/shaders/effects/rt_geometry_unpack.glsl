@@ -6,7 +6,7 @@
 
 // Unpacks one mesh surface into the hit shading's geometry pool: positions
 // (compressed or float), octahedral normals and tangents, uvs (compressed
-// against the surface's uv scale, or float) and colours, one eight-word
+// against the surface's uv scale, or float) and colors, one eight-word
 // vertex each, plus the triangle indices (the identity for a non-indexed
 // surface). The scene shader's vertex stage does the same decode per draw;
 // here it is done once per surface (per frame for a skinned one), so a ray
@@ -70,6 +70,11 @@ params;
 #define FLAG_HAS_COLOR 64u
 #define FLAG_INDEX_16 128u
 #define FLAG_HAS_INDEX 256u
+// A skinned surface re-unpacked after its skinning: the words the
+// deformation changes (position, normal, tangent), not the uvs, colors or
+// indices the first unpack wrote.
+#define FLAG_DEFORM_ONLY 512u
+#define DEFORM_WORDS 5u
 
 #define M_PI 3.14159265359
 
@@ -139,7 +144,8 @@ void main() {
 		w[6] = 0u;
 		w[7] = 0xFFFFFFFFu; // White.
 		uint ab = (i * params.attribute_stride) / 4u;
-		if ((params.flags & FLAG_HAS_UV) != 0u) {
+		uint attribute_flags = (params.flags & FLAG_DEFORM_ONLY) != 0u ? 0u : params.flags;
+		if ((attribute_flags & FLAG_HAS_UV) != 0u) {
 			uint ub = ab + params.uv_offset / 4u;
 			vec2 uv;
 			if ((params.flags & FLAG_COMPRESSED_ATTRIBUTES) != 0u) {
@@ -149,7 +155,7 @@ void main() {
 			}
 			w[5] = packHalf2x16(uv);
 		}
-		if ((params.flags & FLAG_HAS_UV2) != 0u) {
+		if ((attribute_flags & FLAG_HAS_UV2) != 0u) {
 			uint ub = ab + params.uv2_offset / 4u;
 			vec2 uv;
 			if ((params.flags & FLAG_COMPRESSED_ATTRIBUTES) != 0u) {
@@ -159,17 +165,18 @@ void main() {
 			}
 			w[6] = packHalf2x16(uv);
 		}
-		if ((params.flags & FLAG_HAS_COLOR) != 0u) {
+		if ((attribute_flags & FLAG_HAS_COLOR) != 0u) {
 			w[7] = attributes.data[ab + params.color_offset / 4u];
 		}
 
 		uint base = (params.vertex_base + i) * RT_HIT_VERTEX_WORDS;
-		for (uint k = 0u; k < RT_HIT_VERTEX_WORDS; k++) {
+		uint words = (params.flags & FLAG_DEFORM_ONLY) != 0u ? DEFORM_WORDS : RT_HIT_VERTEX_WORDS;
+		for (uint k = 0u; k < words; k++) {
 			vertex_pool.data[base + k] = w[k];
 		}
 	}
 
-	if (i < params.index_count) {
+	if (i < params.index_count && (params.flags & FLAG_DEFORM_ONLY) == 0u) {
 		uint index = i;
 		if ((params.flags & FLAG_HAS_INDEX) != 0u) {
 			if ((params.flags & FLAG_INDEX_16) != 0u) {

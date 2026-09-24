@@ -3457,7 +3457,7 @@ uint32_t Raytracing::last_hit_slots = 0;
 // handed the hit shader and the material slots they span, which tier
 // answered the gather's rays, and how the card atlas took the level's sets.
 String Raytracing::get_state_scale_line() const {
-	String line = vformat("RT STATE scale: blas %d tlas %d hit_packets %d hit_slots %d gather_rays %d", scene.get_blas_count(), scene.get_tlas_instance_count(), last_hit_appended, last_hit_slots, last_tier_rays);
+	String line = vformat("RT STATE scale: blas %d tlas %d refits %d refit_verts %d hit_packets %d hit_slots %d gather_rays %d", scene.get_blas_count(), scene.get_tlas_instance_count(), scene.get_deform_refit_count(), scene.get_deform_refit_vertices(), last_hit_appended, last_hit_slots, last_tier_rays);
 	const char *tiers[7] = { "screen", "card", "hit", "cascade", "probe", "sky", "none" };
 	for (int i = 0; i < 7; i++) {
 		line += vformat(" tier_%s %.1f", tiers[i], last_tier_share[i]);

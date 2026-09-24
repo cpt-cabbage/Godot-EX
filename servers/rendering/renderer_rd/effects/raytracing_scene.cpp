@@ -91,12 +91,14 @@ RaytracingScene::~RaytracingScene() {
 			}
 		}
 	}
-	for (const KeyValue<RID, MeshBlas> &E : skinned_blas_cache) {
-		if (E.value.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(E.value.blas)) {
-			RD::get_singleton()->free_rid(E.value.blas);
-		}
-		for (const RID &buffer : E.value.decoded_buffers) {
-			RD::get_singleton()->free_rid(buffer);
+	for (const KeyValue<RID, SkinnedBlas> &E : skinned_blas_cache) {
+		for (const MeshBlas &slot : E.value.classes) {
+			if (slot.blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(slot.blas)) {
+				RD::get_singleton()->free_rid(slot.blas);
+			}
+			for (const RID &buffer : slot.decoded_buffers) {
+				RD::get_singleton()->free_rid(buffer);
+			}
 		}
 	}
 	hit_vertex_pool.release();
@@ -151,6 +153,7 @@ void RaytracingScene::_create_blas_for_mesh(RID p_mesh, MeshBlas &r_entry, uint3
 	MeshStorage *mesh_storage = MeshStorage::get_singleton();
 
 	r_entry.surface_mask = p_surface_mask;
+	r_entry.created = true;
 
 	uint32_t surface_count = 0;
 	mesh_storage->mesh_get_surface_count_and_materials(p_mesh, surface_count);
@@ -470,30 +473,31 @@ RaytracingScene::MeshBlas *RaytracingScene::_resolve_mesh_blas(RID p_mesh, uint3
 	return &(*variants)[variants->size() - 1];
 }
 
-RaytracingScene::MeshBlas *RaytracingScene::_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask) {
+RaytracingScene::MeshBlas *RaytracingScene::_resolve_skinned_blas(RID p_mesh_instance, RID p_mesh, uint32_t p_surface_mask, uint32_t p_class) {
 	RD *rd = RD::get_singleton();
+	ERR_FAIL_UNSIGNED_INDEX_V(p_class, FACING_CLASS_COUNT, nullptr);
 
-	MeshBlas *entry = skinned_blas_cache.getptr(p_mesh_instance);
-	if (entry != nullptr) {
-		// Same self-heal as the mesh cache: the BLAS cascade-frees with the
-		// instance's (or mesh's) buffers; our decoded buffers do not.
-		bool stale = entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas);
-		if (stale || entry->surface_mask != p_surface_mask) {
-			if (entry->blas.is_valid() && rd->acceleration_structure_is_valid(entry->blas)) {
-				rd->free_rid(entry->blas);
-			}
-			for (const RID &buffer : entry->decoded_buffers) {
-				rd->free_rid(buffer);
-			}
-			_free_hit_geometry(*entry);
-			skinned_blas_cache.erase(p_mesh_instance);
-			entry = nullptr;
-		}
+	SkinnedBlas *set = skinned_blas_cache.getptr(p_mesh_instance);
+	if (set == nullptr) {
+		set = &skinned_blas_cache.insert(p_mesh_instance, SkinnedBlas())->value;
 	}
-	if (entry == nullptr) {
-		MeshBlas new_entry;
-		_create_blas_for_mesh(p_mesh, new_entry, p_surface_mask, p_mesh_instance);
-		entry = &skinned_blas_cache.insert(p_mesh_instance, new_entry)->value;
+	MeshBlas *entry = &set->classes[p_class];
+	// Same self-heal as the mesh cache: the BLAS cascade-frees with the
+	// instance's (or mesh's) buffers; our decoded buffers do not. A slot
+	// whose class changed its surfaces (a material override) starts over.
+	const bool stale = entry->blas.is_valid() && !rd->acceleration_structure_is_valid(entry->blas);
+	if (entry->created && (stale || entry->surface_mask != p_surface_mask)) {
+		if (entry->blas.is_valid() && rd->acceleration_structure_is_valid(entry->blas)) {
+			rd->free_rid(entry->blas);
+		}
+		for (const RID &buffer : entry->decoded_buffers) {
+			rd->free_rid(buffer);
+		}
+		_free_hit_geometry(*entry);
+		*entry = MeshBlas();
+	}
+	if (!entry->created) {
+		_create_blas_for_mesh(p_mesh, *entry, p_surface_mask, p_mesh_instance);
 	}
 	return entry;
 }
@@ -868,7 +872,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 		// flag and see them whole, as before).
 		const uint32_t alpha_tested = p_surface_cache != nullptr ? (casting_mask & inst->data->alpha_tested_shadow_surface_mask) : 0;
 		const uint32_t plain = casting_mask & ~double_sided & ~front_cull;
-		const FacingClass classes[6] = {
+		const FacingClass classes[FACING_CLASS_COUNT] = {
 			{ plain & ~alpha_tested, {} },
 			{ double_sided & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT },
 			{ front_cull & ~alpha_tested, RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT },
@@ -896,7 +900,8 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			print_line(vformat("TLAS inst %d: casting 0x%x double 0x%x front 0x%x alpha 0x%x layers 0x%x det %.3f aabb %s base %s %s", (int)i, casting_mask, double_sided, front_cull, alpha_tested, inst->layer_mask, inst->transform.basis.determinant(), inst->transformed_aabb, inst->data->base_type == RSE::INSTANCE_MULTIMESH ? "multimesh" : (inst->data->base_type == RSE::INSTANCE_PARTICLES ? "particles" : "mesh"), inst->mesh_instance.is_valid() ? "skinned" : ""));
 		}
 
-		for (const FacingClass &facing : classes) {
+		for (uint32_t class_index = 0; class_index < FACING_CLASS_COUNT; class_index++) {
+			const FacingClass &facing = classes[class_index];
 			const uint32_t surface_mask = facing.mask;
 			if (surface_mask == 0) {
 				continue;
@@ -910,7 +915,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			// still cost 4.3 ms of builds a frame on the bridge (2026-09-18).
 			bool deformed = false;
 			if (is_skinned) {
-				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask);
+				entry = _resolve_skinned_blas(inst->mesh_instance, mesh, surface_mask, class_index);
 				if (entry != nullptr) {
 					const uint64_t deform_version = mesh_storage->mesh_instance_get_deform_version(inst->mesh_instance);
 					deformed = !entry->built || deform_version != entry->built_deform_version;
@@ -923,14 +928,9 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 				continue;
 			}
 			if (deformed) {
-				for (const DecodeJob &job : entry->decode_jobs) {
-					_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
-				}
-				RENDER_TIMESTAMP("RT BLAS Build");
-				rd->draw_command_begin_label("RT BLAS Build");
-				rd->blas_build(entry->blas);
-				rd->draw_command_end_label();
-				entry->built = true;
+				// Refit after the loop with the frame's other deformed
+				// BLASes (_refit_deformed).
+				deform_refits.push_back(entry);
 			} else if (!entry->built) {
 				RENDER_TIMESTAMP("RT BLAS Build");
 				rd->draw_command_begin_label("RT BLAS Build");
@@ -947,8 +947,10 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 				if (entry->geometry_base == HIT_INVALID) {
 					_build_hit_geometry(*entry, mesh, is_skinned ? inst->mesh_instance : RID());
 				}
-				if (entry->geometry_base != HIT_INVALID && (!entry->unpacked || deformed)) {
+				if (entry->geometry_base != HIT_INVALID && !entry->unpacked) {
 					_unpack_hit_geometry(*entry);
+				} else if (entry->geometry_base != HIT_INVALID && deformed) {
+					deform_unpacks.push_back(entry);
 				}
 				if (entry->geometry_base != HIT_INVALID) {
 					material_base = hit_material_table.size();
@@ -1013,6 +1015,8 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 			}
 		}
 	}
+
+	_refit_deformed();
 
 	if (p_surface_cache != nullptr) {
 		p_surface_cache->end_frame();
@@ -1317,15 +1321,24 @@ void RaytracingScene::_free_hit_geometry(MeshBlas &r_entry) {
 
 void RaytracingScene::_unpack_hit_geometry(MeshBlas &r_entry) {
 	RD *rd = RD::get_singleton();
-	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	if (r_entry.unpack_jobs.is_empty() || hit_vertex_pool.buffer.is_null() || hit_index_pool.buffer.is_null()) {
 		return;
 	}
-	RID unpack_rid = hit_unpack_shader.version_get_shader(hit_unpack_shader_version, 0);
 	RENDER_TIMESTAMP("RT Hit Geometry Unpack");
 	rd->draw_command_begin_label("RT Hit Geometry Unpack");
 	RD::ComputeListID list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, hit_unpack_pipeline);
+	_unpack_hit_geometry_jobs(r_entry, list, 0);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+	r_entry.unpacked = true;
+}
+
+void RaytracingScene::_unpack_hit_geometry_jobs(const MeshBlas &r_entry, RD::ComputeListID p_list, uint32_t p_extra_flags) {
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RD::ComputeListID list = p_list;
+	RID unpack_rid = hit_unpack_shader.version_get_shader(hit_unpack_shader_version, 0);
 	for (const HitUnpackJob &job : r_entry.unpack_jobs) {
 		if (job.vertex_buffer.is_null()) {
 			continue;
@@ -1350,7 +1363,7 @@ void RaytracingScene::_unpack_hit_geometry(MeshBlas &r_entry) {
 		pc.uv_offset = job.uv_offset;
 		pc.uv2_offset = job.uv2_offset;
 		pc.color_offset = job.color_offset;
-		pc.flags = job.flags;
+		pc.flags = job.flags | p_extra_flags;
 		pc.vertex_base = job.vertex_base;
 		pc.index_base = job.index_base;
 		RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ job.vertex_buffer }));
@@ -1360,11 +1373,64 @@ void RaytracingScene::_unpack_hit_geometry(MeshBlas &r_entry) {
 		RD::Uniform u_ipool(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ hit_index_pool.buffer }));
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(unpack_rid, 0, u_vertices, u_attributes, u_indices, u_vpool, u_ipool), 0);
 		rd->compute_list_set_push_constant(list, &pc, sizeof(HitUnpackPushConstant));
-		rd->compute_list_dispatch_threads(list, MAX(job.vertex_count, job.index_count), 1, 1);
+		rd->compute_list_dispatch_threads(list, (p_extra_flags & HIT_UNPACK_DEFORM_ONLY) ? job.vertex_count : MAX(job.vertex_count, job.index_count), 1, 1);
 	}
-	rd->compute_list_end();
-	rd->draw_command_end_label();
-	r_entry.unpacked = true;
+}
+
+// The frame's deformed geometry, after the instance loop has found it all:
+// the compressed positions decoded, every BLAS refit under one label, and
+// the hit pools' positions, normals and tangents rewritten in one compute
+// list (the uvs, colors and indices a skinning does not change are left
+// as unpacked). Each instance did its own refit and full unpack inside the
+// loop before, interleaved, a label each: the TPS demo's five actors are 21
+// skinned BLASes (150k vertices), and the batch took ~0.85 ms off the
+// bridge's frame (section 111; under --gpu-profile, where every label ends
+// an encoder, the old form read 4.9 ms and the batch 0.64).
+void RaytracingScene::_refit_deformed() {
+	RD *rd = RD::get_singleton();
+	// Diagnostics (GODOT_RT_DEFORM_ABLATE=refit|unpack|all): skip the
+	// refits or the unpacks of what deformed (not a first build), to price
+	// each without trusting the labels' attribution.
+	static const String ablate = OS::get_singleton()->get_environment("GODOT_RT_DEFORM_ABLATE");
+	const bool skip_refit = ablate == "refit" || ablate == "all";
+	const bool skip_unpack = ablate == "unpack" || ablate == "all";
+
+	deform_refit_count = 0;
+	deform_refit_vertices = 0;
+	if (!deform_refits.is_empty()) {
+		for (MeshBlas *entry : deform_refits) {
+			for (const DecodeJob &job : entry->decode_jobs) {
+				_decode_compressed_positions(job.source, job.vertex_count, job.aabb, job.dest);
+			}
+		}
+		RENDER_TIMESTAMP("RT BLAS Refit");
+		rd->draw_command_begin_label("RT BLAS Refit");
+		for (MeshBlas *entry : deform_refits) {
+			if (skip_refit && entry->built) {
+				continue;
+			}
+			rd->blas_build(entry->blas);
+			entry->built = true;
+			deform_refit_count++;
+			for (const HitUnpackJob &job : entry->unpack_jobs) {
+				deform_refit_vertices += job.vertex_count;
+			}
+		}
+		rd->draw_command_end_label();
+	}
+	if (!deform_unpacks.is_empty() && !skip_unpack && hit_vertex_pool.buffer.is_valid() && hit_index_pool.buffer.is_valid()) {
+		RENDER_TIMESTAMP("RT Hit Geometry Unpack");
+		rd->draw_command_begin_label("RT Hit Geometry Unpack");
+		RD::ComputeListID list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, hit_unpack_pipeline);
+		for (const MeshBlas *entry : deform_unpacks) {
+			_unpack_hit_geometry_jobs(*entry, list, HIT_UNPACK_DEFORM_ONLY);
+		}
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+	}
+	deform_refits.clear();
+	deform_unpacks.clear();
 }
 
 uint32_t RaytracingScene::get_blas_count() const {
@@ -1372,7 +1438,11 @@ uint32_t RaytracingScene::get_blas_count() const {
 	for (const KeyValue<RID, LocalVector<MeshBlas>> &E : blas_cache) {
 		n += E.value.size();
 	}
-	n += skinned_blas_cache.size();
+	for (const KeyValue<RID, SkinnedBlas> &E : skinned_blas_cache) {
+		for (const MeshBlas &slot : E.value.classes) {
+			n += slot.blas.is_valid() ? 1 : 0;
+		}
+	}
 	n += particles_blas_cache.size();
 	return n;
 }
