@@ -940,6 +940,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 	// unshadowed rather than sample stale depth. Reflection probes render into
 	// their own pass with their own atlas and are never skipped.
 	scene_state.ubo.local_shadow_maps = (stochastic_owns_local_shadows && p_render_data->reflection_probe.is_null()) ? 0 : 1;
+	// The opaque pass's separate-specular outputs carry the merged colour and
+	// the GI's diffuse target (rt_diffuse_target_mrt, see _render_scene).
+	scene_state.ubo.rt_diffuse_target = (p_opaque_render_buffers && rt_diffuse_target_mrt) ? 1 : 0;
 	// The transparent pass, on those same frames, has nothing to sample for
 	// its shadows: the local atlas was skipped, and the sun's cascades were
 	// skipped too while its screen-space mask is keyed to the opaque depth.
@@ -3495,7 +3498,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;
 					if (gi_screen_radiance_base.is_valid()) {
-						screen_radiance = rb->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
+						screen_radiance = rb_data->diffuse_target_in_specular ? rb_data->get_specular() : rb->get_texture_slice(RB_SCOPE_SSLF, RB_LAST_FRAME, v, 0);
 					}
 					raytracing->process_rt_gi(rb, v, view_from_ndc, scene_data->get_cam_transform(), prev_ndc_from_world * world_from_ndc,
 							rb_data->get_normal_roughness(v), rb_data->get_gbuf_albedo(v), rb_data->get_gbuf_f0(v), velocity, screen_radiance, gi_cascades, gi_sky, scene_data->z_near, scene_data->z_far, gi_quality);
@@ -3567,6 +3570,21 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// Shadow pass can change the base uniform set samplers.
 	_update_render_base_uniform_set();
+
+	// The GI's diffuse target (rt_diffuse_screen_radiance) written by the
+	// opaque pass itself: its separate-specular outputs carry the merged
+	// colour and the diffuse part (the scene shader, rt_diffuse_target), the
+	// next frame's gather reads the latter where it lies, and the copy to the
+	// last-frame texture and the merge pass go (0.34 + 0.53 ms at the TPS
+	// bridge). Only where the specular is separate for this alone; the sky,
+	// drawn after the pass into the colour alone, is filled in behind it.
+	// GODOT_RT_DIFFUSE_MRT=0 keeps the copy and the merge.
+	static const bool diffuse_mrt_off = OS::get_singleton()->get_environment("GODOT_RT_DIFFUSE_MRT") == "0";
+	rt_diffuse_target_mrt = rt_diffuse_screen_radiance && !diffuse_mrt_off && !using_sss && !ce_needs_separate_specular && !using_ssr && raytracing != nullptr &&
+			rb->get_view_count() == 1 && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED && rb->get_can_be_storage();
+	if (rb_data.is_valid()) {
+		rb_data->diffuse_target_in_specular = rt_diffuse_target_mrt; // For the next frame's gather: this one's has run.
+	}
 
 	uint32_t opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
 
@@ -3712,21 +3730,28 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		}
 
-		if (rt_diffuse_screen_radiance) {
-			// The diffuse target, before the specular is mixed back: what
-			// the GI gather reads as last frame's radiance (see above).
-			RENDER_TIMESTAMP("Copy Diffuse Framebuffer (RT GI)");
-			_copy_framebuffer_to_ss_effects(rb, false, false);
-		}
+		if (rt_diffuse_target_mrt) {
+			// The opaque pass wrote the merged colour and the diffuse target
+			// (see above): the sky's pixels take the colour.
+			RENDER_TIMESTAMP("Diffuse Target Sky (RT GI)");
+			raytracing->fill_diffuse_target_sky(rb->get_depth_texture(), rb->get_internal_texture(), rb_data->get_specular(), rb->get_internal_size());
+		} else {
+			if (rt_diffuse_screen_radiance) {
+				// The diffuse target, before the specular is mixed back: what
+				// the GI gather reads as last frame's radiance (see above).
+				RENDER_TIMESTAMP("Copy Diffuse Framebuffer (RT GI)");
+				_copy_framebuffer_to_ss_effects(rb, false, false);
+			}
 
-		{
-			//just mix specular back
-			RENDER_TIMESTAMP("Merge Specular");
-			copy_effects->merge_specular(color_only_framebuffer, rb_data->get_specular(), !use_msaa ? RID() : rb->get_internal_texture(), RID(), p_render_data->scene_data->view_count);
+			{
+				//just mix specular back
+				RENDER_TIMESTAMP("Merge Specular");
+				copy_effects->merge_specular(color_only_framebuffer, rb_data->get_specular(), !use_msaa ? RID() : rb->get_internal_texture(), RID(), p_render_data->scene_data->view_count);
+			}
 		}
 	}
 
-	if (using_separate_specular && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
+	if (using_separate_specular && !rt_diffuse_target_mrt && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
 		// Canvas background mode does not clear the color buffer, but copies over it. If screen-space specular effects are enabled and the background is blank,
 		// this results in ghosting due to the separate specular buffer copy. Need to explicitly clear the specular buffer once we're done with it to fix it.
 		RENDER_TIMESTAMP("Clear Separate Specular (Canvas Background Mode)");

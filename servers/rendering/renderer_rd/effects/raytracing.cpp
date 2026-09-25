@@ -176,6 +176,14 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	}
 
 	{
+		Vector<String> sky_modes;
+		sky_modes.push_back("");
+		diffuse_target_sky_shader.initialize(sky_modes);
+		diffuse_target_sky_shader_version = diffuse_target_sky_shader.version_create();
+		diffuse_target_sky_pipeline = RD::get_singleton()->compute_pipeline_create(diffuse_target_sky_shader.version_get_shader(diffuse_target_sky_shader_version, 0));
+	}
+
+	{
 		Vector<String> upsample_modes;
 		upsample_modes.push_back("");
 		upsample_modes.push_back("\n#define USE_IMAGES\n");
@@ -301,6 +309,7 @@ Raytracing::~Raytracing() {
 	}
 	hit_bin_shader.version_free(hit_bin_shader_version);
 	denoise_guide_shader.version_free(denoise_guide_shader_version);
+	diffuse_target_sky_shader.version_free(diffuse_target_sky_shader_version);
 	composite_upsample_shader.version_free(composite_upsample_shader_version);
 	translucency_shader.version_free(translucency_shader_version);
 	RD::get_singleton()->free_rid(sampler);
@@ -1291,6 +1300,23 @@ bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint
 	rd->compute_list_end();
 	rd->draw_command_end_label();
 	return true;
+}
+
+void Raytracing::fill_diffuse_target_sky(RID p_depth, RID p_color, RID p_diffuse_target, Size2i p_size) {
+	RD *rd = RD::get_singleton();
+	const int32_t pc[4] = { p_size.x, p_size.y, 0, 0 };
+	RID shader_rid = diffuse_target_sky_shader.version_get_shader(diffuse_target_sky_shader_version, 0);
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_depth }));
+	RD::Uniform u_color(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, p_color }));
+	RD::Uniform u_target(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ p_diffuse_target }));
+	rd->draw_command_begin_label("Diffuse Target Sky (RT GI)");
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, diffuse_target_sky_pipeline);
+	rd->compute_list_bind_uniform_set(list, UniformSetCacheRD::get_singleton()->get_cache(shader_rid, 0, u_depth, u_color, u_target), 0);
+	rd->compute_list_set_push_constant(list, pc, sizeof(pc));
+	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
 }
 
 static const StringName &_composite_texture_name(int p_index) {

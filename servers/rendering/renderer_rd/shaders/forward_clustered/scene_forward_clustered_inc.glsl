@@ -367,8 +367,8 @@ struct ImplementationData {
 	uint rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
 
 	uint transparent_debug; // Profiling ablations for the transparent pass (RenderForwardClustered::TransparentAblate), zero otherwise.
-	uint pad_transparent_debug_0; // Scalars, not an array: std140 would stride an array by 16 bytes.
-	uint pad_transparent_debug_1;
+	uint rt_diffuse_target; // Nonzero: MODE_SEPARATE_SPECULAR's outputs carry the merged colour and the GI's diffuse target (the opaque pass; see scene_forward_clustered.glsl).
+	uint pad_transparent_debug_1; // Scalars, not an array: std140 would stride an array by 16 bytes.
 	uint pad_transparent_debug_2;
 
 	// The translucency lighting volume (Raytracing::process_translucency_volume):

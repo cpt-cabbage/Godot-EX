@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_temporal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_composite_upsample.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_denoise_guide.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_diffuse_target_sky.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
@@ -682,6 +683,11 @@ private:
 	};
 	bool _denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness);
 
+	// The diffuse target's sky pixels (rt_diffuse_target_sky.glsl, fill_diffuse_target_sky()).
+	RtDiffuseTargetSkyShaderRD diffuse_target_sky_shader;
+	RID diffuse_target_sky_shader_version;
+	RID diffuse_target_sky_pipeline;
+
 	// The composites' upsample (rt_composite_upsample.glsl, composite_upsample()):
 	// variant 1 carries the image lights.
 	RtCompositeUpsampleShaderRD composite_upsample_shader;
@@ -1036,6 +1042,12 @@ public:
 	// striding the full-resolution buffer (2.3 ms of the TPS bridge's
 	// opaque pass at 1080p).
 	RID get_denoise_guide_normal(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_scale) const;
+
+	// The GI's diffuse target where the opaque pass wrote it itself
+	// (RenderForwardClustered::rt_diffuse_target_mrt): its sky pixels, drawn
+	// after that pass into the colour alone, take the colour
+	// (rt_diffuse_target_sky.glsl).
+	void fill_diffuse_target_sky(RID p_depth, RID p_color, RID p_diffuse_target, Size2i p_size);
 
 	// The opaque pass's RT composites upsampled at full resolution in one
 	// compute pass (rt_composite_upsample.glsl), so the scene shader reads a
