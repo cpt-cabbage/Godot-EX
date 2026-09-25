@@ -1262,12 +1262,15 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	uint best_packed = 0u;
 	uint best_k = 0u;
 	float best_mismatch = 0.0;
-	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
-		vec3 axis, u, v;
-		card_basis(k, axis, u, v);
-		float facing = -dot(axis, local_dir);
+	// The facing cards in order, the first valid one the pick.
+	uvec3 order;
+	vec3 order_facing;
+	card_facing_order(local_dir, order, order_facing);
+	for (uint i = 0u; i < 3u; i++) {
+		uint k = i == 0u ? order.x : (i == 1u ? order.y : order.z);
+		float facing = i == 0u ? order_facing.x : (i == 1u ? order_facing.y : order_facing.z);
 		if (facing <= 0.0) {
-			continue;
+			break;
 		}
 		vec2 uv01;
 		float depth;
@@ -1313,13 +1316,12 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 		// Among the valid cards the one facing the ray most squarely wins.
 		// A pick weighing the depth mismatch against the facing moved
 		// nothing on the coarse-card leak it was built for (section 82).
-		if (facing > best_w) {
-			best_w = facing;
-			best_uv = uv01;
-			best_packed = packed;
-			best_k = k;
-			best_mismatch = abs(stored - depth) / tolerance;
-		}
+		best_w = facing;
+		best_uv = uv01;
+		best_packed = packed;
+		best_k = k;
+		best_mismatch = abs(stored - depth) / tolerance;
+		break;
 	}
 	if (best_w <= 0.0) {
 		if (fail_stats) {

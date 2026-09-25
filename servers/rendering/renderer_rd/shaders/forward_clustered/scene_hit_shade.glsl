@@ -430,12 +430,15 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	ivec2 best_texel = ivec2(0);
 	vec2 best_uv = vec2(0.0);
 	uint best_packed = 0u;
-	for (uint k = 0u; k < SURFACE_CACHE_CARDS; k++) {
-		vec3 axis, u, v;
-		card_basis(k, axis, u, v);
-		float facing = -dot(axis, local_dir);
+	// The facing cards in order, the first valid one the pick.
+	uvec3 order;
+	vec3 order_facing;
+	card_facing_order(local_dir, order, order_facing);
+	for (uint i = 0u; i < 3u; i++) {
+		uint k = i == 0u ? order.x : (i == 1u ? order.y : order.z);
+		float facing = i == 0u ? order_facing.x : (i == 1u ? order_facing.y : order_facing.z);
 		if (facing <= 0.0) {
-			continue;
+			break;
 		}
 		vec2 uv01;
 		float depth;
@@ -455,12 +458,11 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 		if (abs(stored - depth) > tolerance) {
 			continue;
 		}
-		if (facing > best_w) {
-			best_w = facing;
-			best_texel = texel;
-			best_uv = uv01;
-			best_packed = packed;
-		}
+		best_w = facing;
+		best_texel = texel;
+		best_uv = uv01;
+		best_packed = packed;
+		break;
 	}
 	if (best_w <= 0.0) {
 		return false;
