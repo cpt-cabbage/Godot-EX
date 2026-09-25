@@ -195,6 +195,7 @@ public:
 		float prev_length = 0.0f;
 		float prev_spread = 1.0f;
 		bool history_valid = false;
+		uint32_t frame = 0; // The frame_index it was last written: a history older than the last frame restarts.
 		bool parity = false;
 		bool ready = false; // Written this frame.
 		bool carries_indirect = false; // Its froxels traced bounce rays, so it holds the indirect light too.

@@ -3492,8 +3492,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					}
 					RID tv_cluster = current_cluster_builder->get_cluster_buffer_log().is_valid() ? current_cluster_builder->get_cluster_buffer_log() : current_cluster_builder->get_cluster_buffer();
 					float tv_z0 = current_cluster_builder->get_cluster_buffer_log().is_valid() ? current_cluster_builder->get_cluster_log_z0() : 0.0f;
+					// The volume only serves lit blended fragments: a frame whose
+					// transparent list holds none skips it (1.5 ms at the TPS
+					// bridge's low tier, 4 at the default size), and its history
+					// restarts when one comes back. GODOT_TV_ALWAYS=1 keeps it on.
+					static const bool tv_always = OS::get_singleton()->get_environment("GODOT_TV_ALWAYS") == "1";
+					bool tv_needed = tv_always;
+					for (uint32_t i = 0; i < alpha_overlay_from && !tv_needed; i++) {
+						const GeometryInstanceSurfaceDataCache *surf = render_list[RENDER_LIST_ALPHA].elements[i];
+						tv_needed = surf->shader != nullptr && !surf->shader->unshaded;
+					}
+					RendererRD::Raytracing::TranslucencyQuality tv_quality = translucency_quality;
+					tv_quality.enabled = tv_quality.enabled && tv_needed;
 					raytracing->process_translucency_volume(rb, v, scene_data->cam_projection, scene_data->get_cam_transform(), light_storage->get_omni_light_count(), light_storage->get_spot_light_count(), p_render_data->directional_light_count, tv_sun_mask,
-							tv_cluster, tv_z0, current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, translucency_quality);
+							tv_cluster, tv_z0, current_cluster_builder->get_cluster_size(), current_cluster_builder->get_max_cluster_elements(), scene_data->z_far, tv_quality);
 				}
 				if (run_rt_gi && gi_cascades.voxel_gi_ubo.is_valid()) {
 					RID screen_radiance;
