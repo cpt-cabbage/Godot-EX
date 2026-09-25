@@ -90,6 +90,29 @@ void card_basis(uint p_card, out vec3 r_axis, out vec3 r_u, out vec3 r_v) {
 	r_u = cross(r_v, r_axis);
 }
 
+// The cards a lookup along local_dir can read, most squarely facing first:
+// only one card of each axis pair faces the ray (the one whose axis opposes
+// it), by the direction's component along that axis. A lookup that keeps
+// the most squarely facing valid card visits them in this order and stops
+// at the first valid one: the same pick, one depth fetch for most lookups
+// instead of up to three. A facing of zero ends the list.
+void card_facing_order(vec3 local_dir, out uvec3 r_cards, out vec3 r_facing) {
+	r_facing = abs(local_dir);
+	r_cards = uvec3(local_dir.x < 0.0 ? 0u : 1u, local_dir.y < 0.0 ? 2u : 3u, local_dir.z < 0.0 ? 4u : 5u);
+	if (r_facing.y > r_facing.x) {
+		r_facing.xy = r_facing.yx;
+		r_cards.xy = r_cards.yx;
+	}
+	if (r_facing.z > r_facing.y) {
+		r_facing.yz = r_facing.zy;
+		r_cards.yz = r_cards.zy;
+	}
+	if (r_facing.y > r_facing.x) {
+		r_facing.xy = r_facing.yx;
+		r_cards.xy = r_cards.yx;
+	}
+}
+
 // The packed forms take the card's word read straight from the set buffer
 // (sets.data[set].cards[k]): indexing the copied struct's array with a loop
 // variable spills the whole record to thread-private memory.
