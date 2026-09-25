@@ -4194,6 +4194,17 @@ void fragment_shader(in SceneData scene_data) {
 	specular_buffer.rgb = specular_buffer.rgb * fog.a;
 #endif //!FOG_DISABLED
 
+	// The ray-traced GI's diffuse target, the opaque pass's own output
+	// (render_forward_clustered.cpp rt_diffuse_target_mrt): the colour takes
+	// both parts, merged as the merge pass would have (the alpha the diffuse
+	// part's), and the second output the diffuse part the next frame's
+	// gather reads, where the copy of the colour before the merge was.
+	if (implementation_data.rt_diffuse_target != 0u) {
+		vec4 diffuse_target = diffuse_buffer;
+		diffuse_buffer.rgb += specular_buffer.rgb;
+		specular_buffer = diffuse_target;
+	}
+
 #else //MODE_SEPARATE_SPECULAR
 
 	alpha *= scene_data.pass_alpha_multiplier;

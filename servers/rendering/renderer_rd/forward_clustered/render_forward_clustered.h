@@ -185,6 +185,11 @@ public:
 		RendererRD::MFXTemporalDenoisedContext *get_mfx_denoised_context() const { return mfx_denoised_context; }
 #endif
 
+		// The last opaque pass wrote the GI's diffuse target into the specular
+		// texture (RenderForwardClustered::rt_diffuse_target_mrt): the gather
+		// reads last frame's diffuse radiance there, not in the SSLF texture.
+		bool diffuse_target_in_specular = false;
+
 		RID get_color_only_fb();
 		RID get_color_pass_fb(uint32_t p_color_pass_flags);
 		RID get_depth_fb(DepthFrameBufferType p_type = DEPTH_FB);
@@ -378,7 +383,8 @@ private:
 			uint32_t rt_sun_caster_mask; // The traced directional light's 8-bit caster mask (0: it casts no shadow).
 
 			uint32_t transparent_debug; // TransparentAblate bits the shader reads (transparent pass only, profiling).
-			uint32_t pad_transparent_debug[3];
+			uint32_t rt_diffuse_target; // Nonzero: the separate-specular outputs carry the merged colour and the GI's diffuse target (opaque pass only; see _render_scene).
+			uint32_t pad_transparent_debug[2];
 
 			// The translucency lighting volume (transparent pass only): bit 0
 			// on, bit 1 the depth-pre-pass core too; its froxel mapping.
@@ -881,6 +887,9 @@ private:
 	// temporal passes (PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).
 	bool rt_velocity_current = false;
 	static bool _prepass_motion_enabled();
+	// The opaque pass's separate-specular outputs carry the merged colour and
+	// the GI's diffuse target this frame (_render_scene).
+	bool rt_diffuse_target_mrt = false;
 	bool use_rt_gi_half_res = true;
 	bool use_rt_gi_quarter_res = false;
 	bool use_rt_gi_half_rate_reflections = false;
