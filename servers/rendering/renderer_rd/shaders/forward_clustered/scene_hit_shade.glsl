@@ -1215,5 +1215,5 @@ void main() {
 	}
 
 	tier_stat(0u, radiance);
-	results.data[result_index] = uvec4(rt_hit_pack_radiance(radiance), rt_hit_pack_dir(dir), result_flags);
+	results.data[result_index] = uvec4(rt_hit_pack_radiance_normal(radiance, geo_normal), rt_hit_pack_dir(dir), result_flags);
 }

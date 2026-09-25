@@ -80,7 +80,7 @@ layout(push_constant, std430) uniform Params {
 	float luma_r; // The working colour space's luminance weights (ColorManagement).
 	float luma_g;
 	float luma_b;
-	uint record_rays; // Nonzero: fill the deferred hits into the gather's ray records (GODOT_GI_REUSE).
+	uint record_rays; // Nonzero: fill the deferred hits into the gather's ray records (GODOT_GI_REUSE); 2 with their normals (GODOT_GI_RESTIR).
 	uint pad0;
 	uint pad1;
 	uint pad2;
@@ -160,6 +160,13 @@ void main() {
 			uvec4 rec = reuse_rays.data[base + s];
 			rec.x = packHalf2x16(radiance.rg);
 			rec.y = packHalf2x16(vec2(radiance.b, unpackHalf2x16(rec.y).y));
+			// Under ReSTIR GI (record_rays 2), the hit's normal (the hit
+			// shader's geometric one; none from a discard, which read the
+			// probes): the record's high half, with its flag (GI_REUSE_RAY_NORMAL).
+			if (params.record_rays == 2u) {
+				uint n16 = r.y >> 16u;
+				rec.w = (rec.w & 0xFF7Fu) | (rt_hit_normal16_valid(n16) ? (128u | (n16 << 16u)) : 0u);
+			}
 			reuse_rays.data[base + s] = rec;
 		}
 		if ((r.w & RT_HIT_RESULT_MIRROR) != 0u) {

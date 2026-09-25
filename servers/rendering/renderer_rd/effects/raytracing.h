@@ -42,6 +42,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/rt_hit_bin.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_denoise.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_direct_lighting.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/stochastic_gi_restir.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_gi_reuse.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_indirect_gi.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/stochastic_light_list.glsl.gen.h"
@@ -236,6 +237,21 @@ public:
 		Size2i tiles;
 	};
 	LocalVector<LightListBuffers> light_lists; // Per view.
+
+	// ReSTIR GI's reservoirs (GODOT_GI_RESTIR; stochastic_gi_restir.glsl),
+	// four uvec4 a signal pixel, in three buffers that rotate: last frame's
+	// final (the temporal pass's history), this frame's temporal, this
+	// frame's spatial. Which of the two is the next frame's history is the
+	// mode's (the spatial fed back or not).
+	struct RestirBuffers {
+		RID buffers[3];
+		Size2i size;
+		uint32_t history = 0; // The buffer holding last frame's final reservoirs.
+		uint32_t frame = UINT32_MAX; // The frame they were written.
+		RID dup; // The duplication map over them (a float a pixel).
+		uint32_t dup_frame = UINT32_MAX; // The frame it was written.
+	};
+	LocalVector<RestirBuffers> gi_restir; // Per view.
 
 	virtual void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 	virtual void free_data() override;
@@ -543,6 +559,7 @@ private:
 	RID gi_reuse_pipeline;
 	RID gi_reuse_rays;
 	uint32_t gi_reuse_rays_capacity = 0;
+	bool gi_records_hit_normal = false; // ReSTIR GI: the records carry the hits' normals (the gather's FLAG_RECORD_HIT_NORMAL, the hit bin's record_rays 2).
 
 	struct GiReusePushConstant {
 		float view_from_ndc[16];
@@ -560,6 +577,32 @@ private:
 		float depth_tolerance;
 	};
 	static_assert(sizeof(GiReusePushConstant) == 128, "Must match stochastic_gi_reuse.glsl's push constant.");
+
+	// ReSTIR GI on the gather's diffuse rays (GODOT_GI_RESTIR; see the
+	// shader): a temporal kernel and a spatial one with a visibility ray.
+	StochasticGiRestirShaderRD gi_restir_shader;
+	RID gi_restir_shader_version;
+	RID gi_restir_temporal_pipeline;
+	RID gi_restir_spatial_pipeline;
+	RID gi_restir_dup_pipeline;
+
+	struct GiRestirPushConstant {
+		uint32_t flags;
+		uint32_t frame;
+		float m_cap;
+		float radius;
+		uint32_t neighbors;
+		float jacobian_max;
+		float depth_tolerance;
+		float normal_min;
+		float luma_weights[3];
+		float distant_t;
+		float footprint_c;
+		float pixel_angle;
+		int32_t dup_radius;
+		float dup_alpha;
+	};
+	static_assert(sizeof(GiRestirPushConstant) == 64, "Must match stochastic_gi_restir.glsl's push constant.");
 
 	struct ReflectionResolvePushConstant {
 		float view_from_ndc[16];
@@ -673,7 +716,7 @@ private:
 		uint32_t slots;
 		uint32_t ray_count;
 		float luma_weights[3]; // The working colour space's luminance weights (ColorManagement).
-		uint32_t record_rays; // Fill the deferred hits into the ray records (GODOT_GI_REUSE).
+		uint32_t record_rays; // Fill the deferred hits into the ray records (GODOT_GI_REUSE); 2 with their normals (GODOT_GI_RESTIR).
 		uint32_t pad[3];
 	};
 
@@ -770,6 +813,7 @@ private:
 	static uint32_t last_tier_rays;
 	static uint32_t last_hit_appended;
 	static uint32_t last_hit_slots;
+	void _process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size2i &p_size, uint32_t p_scale, const Projection &p_view_from_ndc, RID p_depth, RID p_normal_roughness, RID p_raw_ambient, RID p_raw_directional, RID p_raw_dyn, bool p_dyn_split, float p_z_far);
 	void _process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, RID p_reuse_rays, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale);
 
 public:

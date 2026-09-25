@@ -92,6 +92,28 @@ uvec2 rt_hit_pack_radiance(vec3 c) {
 	return uvec2(packHalf2x16(c.rg), packHalf2x16(vec2(c.b, 0.0)));
 }
 
+// A normal in 16 bits (octahedral, 8 bits a component), 0 for none: ReSTIR
+// GI's reconnection needs the cosine at the hit (stochastic_gi_restir.glsl);
+// a half-degree's precision is plenty for a cosine.
+uint rt_hit_pack_normal16(vec3 n) {
+	uvec2 q = uvec2(round(clamp(vec3_to_oct(n), vec2(0.0), vec2(1.0)) * 254.0)) + 1u;
+	return q.x | (q.y << 8u);
+}
+
+bool rt_hit_normal16_valid(uint w) {
+	return (w & 0xFFFFu) != 0u;
+}
+
+vec3 rt_hit_unpack_normal16(uint w) {
+	vec2 o = (vec2(float(w & 0xFFu), float((w >> 8u) & 0xFFu)) - 1.0) / 254.0;
+	return oct_to_vec3(o * 2.0 - 1.0);
+}
+
+// The hit shader's result with the hit's geometric normal in the spare half.
+uvec2 rt_hit_pack_radiance_normal(vec3 c, vec3 n) {
+	return uvec2(packHalf2x16(c.rg), (packHalf2x16(vec2(c.b, 0.0)) & 0xFFFFu) | (rt_hit_pack_normal16(n) << 16u));
+}
+
 vec3 rt_hit_unpack_radiance(uvec2 w) {
 	return vec3(unpackHalf2x16(w.x), unpackHalf2x16(w.y).x);
 }
