@@ -2580,6 +2580,101 @@ bool RenderForwardClustered::_prepass_motion_enabled() {
 	return enabled;
 }
 
+void RenderForwardClustered::_dump_oidn_aovs(RenderDataRD *p_render_data, bool p_color_pass_velocity) {
+	const String prefix = oidn_dump_prefix;
+	oidn_dump_prefix = String();
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	Ref<RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	// One view, no MSAA: the G-buffer and the colour are the single-sample
+	// images the upscaler would read.
+	if (rb_data.is_null() || !rb_data->has_gbuffer() || rb->get_view_count() != 1 || rb->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
+		WARN_PRINT_ONCE("RT dump: the OIDN images need one view, no MSAA and the prepass G-buffer (ray-traced lighting or GI on); not saved.");
+		return;
+	}
+	if (oidn_aovs == nullptr) {
+		oidn_aovs = memnew(RendererRD::OIDNAovs);
+	}
+	RenderSceneDataRD *scene_data = p_render_data->scene_data;
+
+	// This frame's motion vectors: the prepass's where it wrote them for the
+	// RT passes, else the colour pass's when an upscaler, TAA or a compositor
+	// effect had it write them; without either the pass takes the camera's.
+	RID velocity;
+	String velocity_source = "camera";
+	if (rt_velocity_current && raytracing && raytracing->get_velocity(rb).is_valid()) {
+		velocity = raytracing->get_velocity(rb);
+		velocity_source = "prepass";
+	} else if (p_color_pass_velocity && rb->has_velocity_buffer(false)) {
+		velocity = rb->get_velocity_buffer(false, 0);
+		velocity_source = "color_pass";
+	}
+
+	// The reprojection the RT passes build (the depth correction and both
+	// frames' jitter in the matrices).
+	Projection prev_correction;
+	prev_correction.set_depth_correction(true);
+	prev_correction.add_jitter_offset(scene_data->prev_taa_jitter);
+	const Projection world_from_view = Projection(scene_data->get_cam_transform());
+	const Projection view_from_ndc = scene_data->get_view_projection(0).inverse();
+	const Projection prev_ndc_from_world = prev_correction * scene_data->prev_view_projection[0] * Projection(scene_data->prev_cam_transform.affine_inverse());
+
+	RendererRD::OIDNAovs::Input in;
+	in.depth = rb->get_depth_texture(0);
+	in.normal_roughness = rb_data->get_normal_roughness(0);
+	in.gbuf_albedo = rb_data->get_gbuf_albedo(0);
+	in.gbuf_f0 = rb_data->get_gbuf_f0(0);
+	in.velocity = velocity;
+	in.color = rb->get_internal_texture(0);
+	in.dfg_lut = dfg_lut.texture;
+	in.view_from_ndc = view_from_ndc;
+	in.world_from_view = world_from_view;
+	in.prev_ndc_from_ndc = prev_ndc_from_world * world_from_view * view_from_ndc;
+	in.jitter_delta = (scene_data->prev_taa_jitter - scene_data->taa_jitter) * 0.5f;
+	in.z_near = scene_data->z_near;
+	in.z_far = scene_data->z_far;
+	oidn_aovs->process(rb, in);
+
+	// What an offline denoise needs beside the images: the clip range the
+	// depth is clamped to, the jitter (in input pixels as the upscalers take
+	// it: taa_jitter is the projection's offset in clip units), the camera,
+	// and where the motion came from.
+	auto array_of = [](const float *p_values, int p_count) {
+		Array a;
+		for (int i = 0; i < p_count; i++) {
+			a.push_back(p_values[i]);
+		}
+		return a;
+	};
+	auto pair = [](const Variant &p_x, const Variant &p_y) {
+		Array a;
+		a.push_back(p_x);
+		a.push_back(p_y);
+		return a;
+	};
+	float cam[16];
+	RendererRD::MaterialStorage::store_camera(world_from_view, cam);
+	float proj[16];
+	RendererRD::MaterialStorage::store_camera(scene_data->cam_projection, proj);
+	const Size2i internal = rb->get_internal_size();
+	const Vector2 jitter_px = scene_data->taa_jitter * Vector2(internal) * 0.5f;
+	Dictionary sidecar;
+	sidecar["frame"] = int64_t(Engine::get_singleton()->get_frames_drawn());
+	sidecar["internal_size"] = pair(internal.x, internal.y);
+	sidecar["target_size"] = pair(rb->get_target_size().x, rb->get_target_size().y);
+	sidecar["z_near"] = scene_data->z_near;
+	sidecar["z_far"] = scene_data->z_far;
+	sidecar["jitter_px"] = pair(jitter_px.x, jitter_px.y);
+	sidecar["taa_jitter_clip"] = pair(scene_data->taa_jitter.x, scene_data->taa_jitter.y);
+	sidecar["prev_taa_jitter_clip"] = pair(scene_data->prev_taa_jitter.x, scene_data->prev_taa_jitter.y);
+	sidecar["velocity_source"] = velocity_source;
+	sidecar["world_from_view"] = array_of(cam, 16);
+	sidecar["projection"] = array_of(proj, 16);
+	sidecar["orthogonal"] = scene_data->cam_orthogonal;
+	sidecar["layout"] = "color: linear rgb before the upscaler and tonemapper (tonemap exposure and auto exposure not applied); depth: linear view z in [z_near, z_far], z_far where no surface; normal: world rgb, a roughness; albedo: diffuse rgb, a 0 none / 1 lit / 2 unshaded; spec_albedo: rgb, a metallic; motion: previous minus current, pixels, unjittered";
+	oidn_aovs->save(rb, prefix, sidecar);
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -3423,7 +3518,15 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 			_request_ray_tracing_convergence(p_render_data, rb_data.ptr());
 			// The per-pass buffers of this frame to disk, when a harness asked
-			// (GODOT_RT_DUMP_NOW; a stall, dump frames only).
+			// (GODOT_RT_DUMP_NOW; a stall, dump frames only). The OIDN set
+			// needs the finished colour, so it keeps the prefix for later in
+			// the frame (_dump_oidn_aovs).
+			if (OS::get_singleton()->has_environment("GODOT_RT_DUMP_NOW")) {
+				const Vector<String> dump_set = OS::get_singleton()->get_environment("GODOT_RT_DUMP_SET").split(",", false);
+				if (dump_set.is_empty() || dump_set.has("oidn")) {
+					oidn_dump_prefix = OS::get_singleton()->get_environment("GODOT_RT_DUMP_NOW");
+				}
+			}
 			raytracing->dump_aovs(rb);
 			// GODOT_RT_STATE_PRINT=1: what this frame actually rendered with,
 			// printed whenever it changes. The run header of the harnesses
@@ -3796,6 +3899,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	{
 		RENDER_TIMESTAMP("Process Post Transparent Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, p_render_data);
+	}
+
+	if (!oidn_dump_prefix.is_empty()) {
+		_dump_oidn_aovs(p_render_data, using_taa || using_upscaling || ce_needs_motion_vectors);
 	}
 
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
@@ -7019,6 +7126,10 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (mfx_guides) {
 		memdelete(mfx_guides);
 		mfx_guides = nullptr;
+	}
+	if (oidn_aovs) {
+		memdelete(oidn_aovs);
+		oidn_aovs = nullptr;
 	}
 
 	if (motion_vectors_store) {

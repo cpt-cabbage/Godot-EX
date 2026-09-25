@@ -35,6 +35,7 @@
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
+#include "servers/rendering/renderer_rd/effects/oidn_aovs.h"
 #include "servers/rendering/renderer_rd/effects/raytracing.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
@@ -988,6 +989,13 @@ private:
 	RendererRD::MFXGuides *mfx_guides = nullptr;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
+	// AOV=oidn (GODOT_RT_DUMP_SET): a learned denoiser's inputs, taken on a
+	// dump frame after the transparent pass, before the upscaler. The pass
+	// is created on the first such frame; the prefix is the dump's, kept
+	// from the RT passes' dump earlier in the frame.
+	RendererRD::OIDNAovs *oidn_aovs = nullptr;
+	String oidn_dump_prefix;
+	void _dump_oidn_aovs(RenderDataRD *p_render_data, bool p_color_pass_velocity);
 
 	/* Cluster builder */
 
