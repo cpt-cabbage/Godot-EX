@@ -410,6 +410,12 @@ private:
 	RID light_setup_pipeline;
 	RID light_trace_pipeline;
 	RID light_resolve_pipeline;
+	RID light_landings_pipeline; // SC_LANDINGS: the dynamic lights' shared landings.
+	// The dynamic lights' landings every texel draws from (surface_cache_light.glsl
+	// trace_dynamic): dyn_pool_size per light, 32 bytes each, 0 when each
+	// texel traces its own light rays (GODOT_CARD_DYN_POOL=0).
+	RID dyn_landings_buffer;
+	uint32_t dyn_pool_size = 0;
 	RID split_count_buffer;
 	RID split_args_buffer;
 	RID split_requests_buffer;

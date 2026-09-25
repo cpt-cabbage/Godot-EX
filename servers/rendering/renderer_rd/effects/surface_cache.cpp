@@ -82,12 +82,14 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 		modes.push_back(octmap_define + "\n#define SC_SETUP\n");
 		modes.push_back(octmap_define + "\n#define SC_TRACE\n");
 		modes.push_back(octmap_define + "\n#define SC_RESOLVE\n");
+		modes.push_back(octmap_define + "\n#define SC_LANDINGS\n");
 		light_shader.initialize(modes);
 		light_shader_version = light_shader.version_create();
 		light_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 0));
 		light_setup_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 1));
 		light_trace_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 2));
 		light_resolve_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 3));
+		light_landings_pipeline = rd->compute_pipeline_create(light_shader.version_get_shader(light_shader_version, 4));
 	}
 
 	{
@@ -118,6 +120,17 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 	rd->buffer_clear(converge_buffer, 0, 20 * sizeof(uint32_t));
 	set_state_buffer = rd->storage_buffer_create(MAX_SETS * 2 * sizeof(uint32_t));
 	rd->buffer_clear(set_state_buffer, 0, MAX_SETS * 2 * sizeof(uint32_t));
+	// The dynamic lights' shared landings (surface_cache_light.glsl
+	// trace_dynamic): each texel's light-ray samples are draws from light
+	// rays traced once a frame, GODOT_CARD_DYN_POOL of them per light (1024;
+	// 0: each texel traces its own, the form before).
+	{
+		const String pool_env = OS::get_singleton()->get_environment("GODOT_CARD_DYN_POOL");
+		dyn_pool_size = pool_env.is_empty() ? 1024u : uint32_t(CLAMP(pool_env.to_int(), int64_t(0), int64_t(65536)));
+		const uint32_t landings = 8 * MAX(dyn_pool_size, 1u);
+		dyn_landings_buffer = rd->storage_buffer_create(landings * 2 * 4 * sizeof(uint32_t));
+		rd->buffer_clear(dyn_landings_buffer, 0, landings * 2 * 4 * sizeof(uint32_t));
+	}
 	dynamic_lights_buffer = rd->storage_buffer_create(sizeof(DynamicLightsBuffer));
 	rd->buffer_clear(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer));
 	projector_tables_buffer = rd->storage_buffer_create(8 * RendererRD::LightStorage::CARD_PROJECTOR_TABLE_FLOATS * sizeof(float));
@@ -133,7 +146,7 @@ SurfaceCache::SurfaceCache(const Settings &p_settings, bool p_sky_octmap_array) 
 SurfaceCache::~SurfaceCache() {
 	RD *rd = RD::get_singleton();
 	_free_atlases();
-	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, converge_buffer, set_state_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer, split_count_buffer, split_args_buffer, split_requests_buffer, split_headers_buffer, split_texels_buffer, split_records_buffer, split_dummy_buffer, split_rest_args_buffer }) {
+	for (RID rid : { requests_buffer, active_buffer, relit_buffer, dyn_stats_buffer, dyn_landings_buffer, converge_buffer, set_state_buffer, dynamic_lights_buffer, projector_tables_buffer, dispatch_buffer, params_ubo, instances_buffer, sets_buffer, set_lights_buffer, split_count_buffer, split_args_buffer, split_requests_buffer, split_headers_buffer, split_texels_buffer, split_records_buffer, split_dummy_buffer, split_rest_args_buffer }) {
 		if (rid.is_valid()) {
 			rd->free_rid(rid);
 		}
@@ -1294,6 +1307,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		}
 	}
 	dynamic_light_count = dyn.count;
+	dyn.pad[1] = dyn.count > 0 ? dyn_pool_size : 0u;
 	rd->buffer_update(dynamic_lights_buffer, 0, sizeof(DynamicLightsBuffer), &dyn);
 	// GODOT_CARD_DYN_RAYS_REST=n: the rays while no dynamic light moves
 	// (1): the history then has its whole window of relights to average.
@@ -1630,6 +1644,21 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	RD::Uniform l_mip_dirty(RD::UNIFORM_TYPE_STORAGE_BUFFER, 37, Vector<RID>({ mip_dirty_buffer }));
 	RD::Uniform l_set_state(RD::UNIFORM_TYPE_STORAGE_BUFFER, 38, Vector<RID>({ set_state_buffer }));
 	RD::Uniform l_specular(RD::UNIFORM_TYPE_TEXTURE, 39, Vector<RID>({ specular_atlas }));
+	RD::Uniform l_landings(RD::UNIFORM_TYPE_STORAGE_BUFFER, 36, Vector<RID>({ dyn_landings_buffer }));
+
+	// The dynamic lights' shared landings, before any texel draws from them.
+	const bool dyn_pool_active = dyn_pool_size > 0 && dynamic_light_count > 0 && params.dynamic_rays > 0 && (params.debug & 1) == 0;
+	if (dyn_pool_active) {
+		RENDER_TIMESTAMP("Surface Cache Dynamic Landings");
+		rd->draw_command_begin_label("Surface Cache Dynamic Landings");
+		RID landings_rid = light_shader.version_get_shader(light_shader_version, 4);
+		list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, light_landings_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(landings_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular, l_landings), 0);
+		rd->compute_list_dispatch(list, (dynamic_light_count * dyn_pool_size + 63) / 64, 1, 1);
+		rd->compute_list_end();
+		rd->draw_command_end_label();
+	}
 
 	RENDER_TIMESTAMP("Surface Cache Lighting");
 	rd->draw_command_begin_label("Surface Cache Lighting");
@@ -1680,7 +1709,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 
 		list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, light_setup_pipeline);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular, l_landings), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 1, s_count, s_args, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
 		rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 		rd->compute_list_end();
@@ -1690,7 +1719,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->draw_command_begin_label("Surface Cache Lighting Rays");
 		list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, light_trace_pipeline);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular, l_landings), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, s_count, s_args_dummy, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
 		rd->compute_list_dispatch_indirect(list, split_args_buffer, 0);
 		rd->compute_list_end();
@@ -1700,7 +1729,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		rd->draw_command_begin_label("Surface Cache Lighting Resolve");
 		list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, light_resolve_pipeline);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular, l_landings), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, s_count, s_args, s_requests, s_headers, s_texels, s_records, s_rest_args), 1);
 		rd->compute_list_dispatch_indirect(list, dispatch_buffer, 0);
 		rd->compute_list_end();
@@ -1714,7 +1743,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 	}
 	list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, light_pipeline);
-	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(light_rid, 0, l_tlas, l_sets, l_active, l_set_lights, l_omni, l_spot, l_dir, l_params, l_albedo, l_normal, l_emission, l_depth, l_lighting, l_sdfgi, l_lightprobe, l_occlusion, l_sampler, l_sky, l_instances, l_indirect, l_requests, l_change, l_grid, l_relit, l_indirect_dyn, l_stats, l_indirect_dyn2, l_dyn_lights, l_static, l_area, l_area_atlas, l_decal_atlas, l_projector_tables, l_indirect_dyn_filtered, l_indirect_filtered, l_converge, l_mip_dirty, l_set_state, l_specular, l_landings), 0);
 	rd->compute_list_dispatch_indirect(list, split_active ? split_rest_args_buffer : dispatch_buffer, 0);
 	rd->compute_list_end();
 	rd->draw_command_end_label();

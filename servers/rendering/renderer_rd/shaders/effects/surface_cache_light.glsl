@@ -409,6 +409,16 @@ layout(set = 0, binding = 27, std430) restrict readonly buffer DynamicLights {
 	LightData data[8];
 }
 dyn_lights;
+// The dynamic lights' landings, shared by every texel this frame (see
+// trace_dynamic; dyn_lights.pad1 of them per light, 0 when each texel
+// traces its own light rays): two uvec4 each, the landing's position and
+// area density (0: the light ray found no lit card face), then its
+// radiance from the light alone and its card's change (halves) and its
+// normal (octahedral, unorm16 x 2). The SC_LANDINGS kernel writes them.
+layout(set = 0, binding = 36, std430) restrict buffer DynLandings {
+	uvec4 data[];
+}
+dyn_landings;
 // Their bounces after the first, apart: the cosine rays' reading of both
 // histories at their hits (see trace_bounce); alpha its relights over 64.
 layout(set = 0, binding = 26, rgba16f) uniform restrict image2D indirect_dyn2_atlas;
@@ -1575,7 +1585,96 @@ void split_request(uint r, vec3 dir, uint k) {
 	split_records.data[split_thread * params.split.w + r] = uvec4(floatBitsToUint(dir), k);
 	split_ray_mask |= 1u << r;
 }
+// A shared dynamic landing's request (trace_dynamic): its index, not a direction.
+void split_request_landing(uint r, uint landing, uint k) {
+	split_records.data[split_thread * params.split.w + r] = uvec4(landing, 0u, 0u, k);
+	split_ray_mask |= 1u << r;
+}
 #endif
+
+// A light ray's direction: uniform over the spot's cone (or the sphere),
+// or by the cookie's table.
+vec3 dyn_direction(uint i, LightData ld, bool is_spot, vec3 axis, float r0, float r1, out float r_pdf_omega) {
+	float cone_cos = is_spot ? clamp(ld.cone_angle, -1.0, 0.9999) : -1.0;
+	r_pdf_omega = 1.0 / (2.0 * M_PI * (1.0 - cone_cos));
+	if (is_spot && cookie_table(i)) {
+		return cookie_sample(i, ld, axis, r0, r1, r_pdf_omega);
+	}
+	vec3 tng = abs(axis.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 b1 = normalize(cross(axis, tng));
+	vec3 b2 = cross(axis, b1);
+	float phi = r1 * 2.0 * M_PI;
+	float ct = 1.0 - r0 * (1.0 - cone_cos);
+	float st = sqrt(max(1.0 - ct * ct, 0.0));
+	return normalize(b1 * (st * cos(phi)) + b2 * (st * sin(phi)) + axis * ct);
+}
+
+// The landing a texel's sample sidx of light i draws from the shared pool:
+// uniform, with replacement, so a draw is distributed exactly as a light
+// ray of the texel's own would be (the same density pdf_area at its
+// landing, the same balance-heuristic weight against the cosine rays),
+// without the light ray, its layers through the holes and the card lookup
+// at the landing, which the pool paid once for every texel. Setup, trace
+// and resolve draw the same index.
+uint dyn_landing_index(ivec2 texel, uint i, uint sidx) {
+	uint m = dyn_lights.pad1;
+	uint h = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) ^ 0x2545F491u) + params.frame * 0x9E3779B9u + (i * 8u + sidx) * 0x85EBCA6Bu);
+	return i * m + h % m;
+}
+
+void trace_dynamic_pool(ivec2 texel, Texel t, uint k_tracer, float n_cosine, float n_light, inout vec3 dyn_sample, inout float landed, inout float change_total) {
+	bool ceiling = t.n_world.y < -0.7;
+	uint n_rays = uint(n_light);
+	float share = (1.0 / float(n_rays)) / float(dyn_lights.count);
+	for (uint i = 0u; i < dyn_lights.count; i++) {
+		LightData ld = dyn_lights.data[i];
+		if (ld.inv_radius <= 0.0 || dyn_lights.weights[i >> 2u][i & 3u] <= 0.0) {
+			continue;
+		}
+		for (uint sidx = 0u; sidx < n_rays; sidx++) {
+			uint j = dyn_landing_index(texel, i, sidx);
+			uvec4 d0 = dyn_landings.data[j * 2u];
+			float pdf_area = uintBitsToFloat(d0.w);
+			if (pdf_area <= 0.0) {
+				continue;
+			}
+			uvec4 d1 = dyn_landings.data[j * 2u + 1u];
+			vec3 p = uintBitsToFloat(d0.xyz);
+			vec3 n_p = oct_to_vec3(unpackUnorm2x16(d1.z) * 2.0 - 1.0);
+			vec2 rg = unpackHalf2x16(d1.x);
+			vec2 b_change = unpackHalf2x16(d1.y);
+			vec3 l_dyn = vec3(rg, b_change.x);
+			vec3 rel = p - t.origin;
+			float d = length(rel);
+			vec3 l = rel / max(d, 1e-4);
+			float cos_t = dot(t.n_world, l);
+			float cos_pt = dot(n_p, -l);
+#ifdef SC_SETUP
+			// Only a pair that faces each other asks for its connection: three
+			// of four draws do not (the trace kernel's threads, not its rays,
+			// were the cost), and the resolve takes an unasked one as blocked.
+			if (d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0) {
+				split_request_landing(SPLIT_DYN_SLOT(i, sidx), j, k_tracer);
+			}
+#else
+			dyn_stat(4u, ceiling && cos_t > 0.0);
+			dyn_stat(5u, ceiling && cos_t > 0.0 && cos_pt > 0.0);
+#ifdef SC_RESOLVE
+			bool connected = (split_record(SPLIT_DYN_SLOT(i, sidx)).x & SPLIT_CONNECTED) != 0u;
+#else
+			bool connected = d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0 && !occluded_opaque(t.origin, l, max(d - params.ray_bias, 0.0));
+#endif
+			if (d >= 1e-4 && cos_t > 0.0 && cos_pt > 0.0 && connected) {
+				dyn_stat(6u, ceiling);
+				float geom = cos_t * cos_pt / (d * d + 0.01);
+				dyn_sample += l_dyn * (geom / (M_PI * n_light * pdf_area + n_cosine * geom));
+				landed += share;
+				change_total = max(change_total, b_change.y - 0.25); // See trace_dynamic.
+			}
+#endif
+		}
+	}
+}
 
 void trace_dynamic(ivec2 texel, Texel t, uint k_tracer, float n_cosine, float n_light, out vec3 dyn_sample, out float landed, out float change_total) {
 	dyn_sample = vec3(0.0);
@@ -1584,6 +1683,10 @@ void trace_dynamic(ivec2 texel, Texel t, uint k_tracer, float n_cosine, float n_
 	bool ceiling = t.n_world.y < -0.7;
 	uint n_rays = uint(n_light);
 	if (dyn_lights.count == 0u || n_rays == 0u || (params.debug & 1u) != 0u) {
+		return;
+	}
+	if (dyn_lights.pad1 != 0u) {
+		trace_dynamic_pool(texel, t, k_tracer, n_cosine, n_light, dyn_sample, landed, change_total);
 		return;
 	}
 	uint h = pcg_hash(uint(texel.x) + pcg_hash(uint(texel.y) ^ 0x2545F491u));
@@ -2983,6 +3086,88 @@ void setup_main() {
 }
 #endif
 
+#ifdef SC_LANDINGS
+// The dynamic lights' shared landings (see trace_dynamic): per light
+// dyn_lights.pad1 light rays, their directions an R2 sequence over the
+// cone offset per frame and light, each through the holes to the lit card
+// face it lands on, stored with the light's radiance there and its area
+// density.
+void landings_main() {
+	uint g = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+	uint m = dyn_lights.pad1;
+	uint i = g / max(m, 1u);
+	if (m == 0u || i >= dyn_lights.count) {
+		return;
+	}
+	uint s = g - i * m;
+	uvec4 d0 = uvec4(0u);
+	uvec4 d1 = uvec4(0u);
+	LightData ld = dyn_lights.data[i];
+	float weight = dyn_lights.weights[i >> 2u][i & 3u];
+	if (ld.inv_radius > 0.0 && weight > 0.0) {
+		bool is_spot = ld.pad > 0.5;
+		vec3 pos = ld.position;
+		float range = 1.0 / ld.inv_radius;
+		vec3 axis = is_spot ? normalize(ld.direction) : vec3(0.0, 0.0, 1.0);
+		uint h = pcg_hash(params.frame * 0x9E3779B9u + i * 0x85EBCA6Bu);
+		float r0 = fract(hash_to_float(h) + float(s) * 0.7548776662);
+		float r1 = fract(hash_to_float(pcg_hash(h)) + float(s) * 0.5698402910);
+		float pdf_omega;
+		vec3 dir = dyn_direction(i, ld, is_spot, axis, r0, r1, pdf_omega);
+		if (pdf_omega > 0.0) {
+			dyn_stat(0u, false);
+			float d_lp = 0.0;
+			vec3 p = pos;
+			vec3 unused_radiance;
+			uint hit_set = SURFACE_CACHE_INVALID;
+			float unused_change;
+			float hit_change_total = 0.0;
+			vec3 n_p = axis;
+			vec3 albedo_p = vec3(0.0);
+			ivec2 texel_p = ivec2(0);
+			bool landed_on_card = false;
+			rayQueryEXT rq;
+			vec3 ray_origin = pos;
+			float d_base = 0.0;
+			for (uint layer = 0u; layer < 4u; layer++) {
+				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, range - d_base);
+				while (rayQueryProceedEXT(rq)) {
+				}
+				if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+					break;
+				}
+				d_lp = d_base + rayQueryGetIntersectionTEXT(rq, true);
+				p = pos + dir * d_lp;
+				landed_on_card = card_lookup(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), p, dir, unused_radiance, hit_set, unused_change, hit_change_total, n_p, albedo_p, texel_p);
+				if (landed_on_card || card_reject != 3u) {
+					break;
+				}
+				landed_on_card = false;
+				d_base = d_lp + params.ray_bias;
+				ray_origin = pos + dir * d_base;
+			}
+			if (d_lp > 0.0) {
+				dyn_stat(1u, false);
+			}
+			if (landed_on_card) {
+				dyn_stat(2u, false);
+			}
+			float cos_pl = dot(n_p, -dir);
+			if (landed_on_card && cos_pl > 0.0 && d_lp >= 1e-4) {
+				dyn_stat(3u, false);
+				float unused_geom;
+				vec3 l_dyn = albedo_p * light_contribution_world(ld, is_spot, pos, axis, p, n_p, unused_geom) * weight;
+				float pdf_area = pdf_omega * cos_pl / (d_lp * d_lp);
+				d0 = uvec4(floatBitsToUint(p), floatBitsToUint(pdf_area));
+				d1 = uvec4(packHalf2x16(l_dyn.rg), packHalf2x16(vec2(l_dyn.b, hit_change_total)), packUnorm2x16(vec3_to_oct(n_p)), 0u);
+			}
+		}
+	}
+	dyn_landings.data[g * 2u] = d0;
+	dyn_landings.data[g * 2u + 1u] = d1;
+}
+#endif
+
 #ifdef SC_TRACE
 // The trace kernel: one request, one ray (a layered one through holes, and
 // a dynamic landing's connection after it), the answer into the header's
@@ -3023,6 +3208,27 @@ void trace_main() {
 	uvec4 frame = split_texels.data[thread * 8u + req.w * 2u];
 	vec3 texel_origin = uintBitsToFloat(frame.xyz);
 	bool dynamic = r > params.split.y;
+	if (dynamic && dyn_lights.pad1 != 0u) {
+		// A shared landing (see trace_dynamic): its connection alone, where
+		// the texel and the landing face each other.
+		uint j = req.x;
+		uvec4 d0 = dyn_landings.data[j * 2u];
+		uvec4 answer = uvec4(0u);
+		if (uintBitsToFloat(d0.w) > 0.0) {
+			vec3 p = uintBitsToFloat(d0.xyz);
+			vec3 n_p = oct_to_vec3(unpackUnorm2x16(dyn_landings.data[j * 2u + 1u].z) * 2.0 - 1.0);
+			vec3 rel = p - texel_origin;
+			float d = length(rel);
+			vec3 l = rel / max(d, 1e-4);
+			vec3 n = oct_to_vec3(unpackUnorm2x16(frame.w) * 2.0 - 1.0);
+			answer.x = SPLIT_HIT;
+			if (d >= 1e-4 && dot(n, l) > 0.0 && dot(n_p, -l) > 0.0 && !occluded_opaque(texel_origin, l, max(d - params.ray_bias, 0.0))) {
+				answer.x |= SPLIT_CONNECTED;
+			}
+		}
+		split_records.data[record] = answer;
+		return;
+	}
 	vec3 pos = texel_origin;
 	float range = 1e4;
 	if (dynamic) {
@@ -3073,6 +3279,8 @@ void main() {
 	setup_main();
 #elif defined(SC_TRACE)
 	trace_main();
+#elif defined(SC_LANDINGS)
+	landings_main();
 #else
 	light_main();
 #endif
