@@ -568,6 +568,15 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 	const uint64_t key = _material_key(p_instance);
 	bool needs_capture = !s->captured && !s->pending_capture;
 	bool d_box_changed = false;
+	// A skinned set's periodic recapture (its pose, below) only while a ray
+	// read its cards lately (read_frames, the requests' stamps): each one is
+	// six material passes, ~1 ms a frame for the TPS demo's live actors, and
+	// a character no ray reads needs no fresh pose. Read again, it is
+	// recaptured within a few frames. GODOT_CARD_SKIN_READ=0 recaptures
+	// every period.
+	static const bool skin_read_gate = OS::get_singleton()->get_environment("GODOT_CARD_SKIN_READ") != "0";
+	const bool skin_period_due = frame - s->captured_frame >= settings.skinned_recapture_period &&
+			(!skin_read_gate || (set_index < read_frames.size() && read_frames[set_index] != 0 && frame - read_frames[set_index] <= 2 * settings.skinned_recapture_period));
 	if (s->captured || s->pending_capture) {
 		if (key != s->material_key) {
 			needs_capture = true;
@@ -577,14 +586,14 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 		float extent = MAX(local_aabb.get_longest_axis_size(), 1e-4f);
 		// A skinned instance's box moves with its pose every frame; its
 		// recapture is the pose's, on the period below, not the box's.
-		if (d.x + d.y + d.z > extent * 0.02f && (!p_skinned || !s->captured || frame - s->captured_frame >= settings.skinned_recapture_period)) {
+		if (d.x + d.y + d.z > extent * 0.02f && (!p_skinned || !s->captured || skin_period_due)) {
 			needs_capture = true;
 			d_box_changed = true;
 		}
 		// A skinned instance is recaptured when its pose has changed since
 		// the capture, at most once per recapture period: a running animation
 		// refreshes on the period, an idle one never.
-		if (p_skinned && s->captured && p_skeleton_version != s->skeleton_version && frame - s->captured_frame >= settings.skinned_recapture_period) {
+		if (p_skinned && s->captured && p_skeleton_version != s->skeleton_version && skin_period_due) {
 			needs_capture = true;
 		}
 	}
