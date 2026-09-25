@@ -3511,6 +3511,12 @@ void Raytracing::process_translucency_volume(Ref<RenderSceneBuffersRD> p_render_
 		st.size = size;
 		st.history_valid = false;
 	}
+	// Frames without a lit blended surface skip the volume (the caller
+	// disables it): its history is then as old as the gap, and restarts.
+	if (st.frame + 1 != rb_state->frame_index) {
+		st.history_valid = false;
+	}
+	st.frame = rb_state->frame_index;
 	if (st.ubo.is_null()) {
 		st.ubo = rd->uniform_buffer_create(sizeof(TranslucencyParamsUBO));
 	}
