@@ -235,6 +235,16 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	gi_reuse_shader_version = gi_reuse_shader.version_create();
 	gi_reuse_pipeline = RD::get_singleton()->compute_pipeline_create(gi_reuse_shader.version_get_shader(gi_reuse_shader_version, 0));
 
+	Vector<String> gi_restir_modes;
+	gi_restir_modes.push_back("\n#define RESTIR_TEMPORAL\n");
+	gi_restir_modes.push_back("\n#define RESTIR_SPATIAL\n");
+	gi_restir_modes.push_back("\n#define RESTIR_DUP\n");
+	gi_restir_shader.initialize(gi_restir_modes);
+	gi_restir_shader_version = gi_restir_shader.version_create();
+	gi_restir_temporal_pipeline = RD::get_singleton()->compute_pipeline_create(gi_restir_shader.version_get_shader(gi_restir_shader_version, 0));
+	gi_restir_spatial_pipeline = RD::get_singleton()->compute_pipeline_create(gi_restir_shader.version_get_shader(gi_restir_shader_version, 1));
+	gi_restir_dup_pipeline = RD::get_singleton()->compute_pipeline_create(gi_restir_shader.version_get_shader(gi_restir_shader_version, 2));
+
 	RD::SamplerState sampler_state;
 	sampler = RD::get_singleton()->sampler_create(sampler_state);
 
@@ -319,6 +329,7 @@ Raytracing::~Raytracing() {
 	stochastic_denoise_shader.version_free(stochastic_denoise_shader_version);
 	reflection_resolve_shader.version_free(reflection_resolve_shader_version);
 	gi_reuse_shader.version_free(gi_reuse_shader_version);
+	gi_restir_shader.version_free(gi_restir_shader_version);
 	light_list_shader.version_free(light_list_shader_version);
 }
 
@@ -389,6 +400,17 @@ void RenderBuffersRT::free_data() {
 		}
 	}
 	reproject_history.clear();
+	for (const RestirBuffers &r : gi_restir) {
+		for (const RID &buffer : r.buffers) {
+			if (buffer.is_valid()) {
+				rd->free_rid(buffer);
+			}
+		}
+		if (r.dup.is_valid()) {
+			rd->free_rid(r.dup);
+		}
+	}
+	gi_restir.clear();
 	for (const LightListBuffers &lists : light_lists) {
 		for (const RID &buffer : lists.buffers) {
 			if (buffer.is_valid()) {
@@ -2445,8 +2467,15 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	// GODOT_GI_REUSE_JACOBIAN (the distance ratio's clamp, 4; 0 reuses the
 	// neighbours' directions as they are).
 	static const String reuse_env = OS::get_singleton()->get_environment("GODOT_GI_REUSE");
-	const uint32_t reuse_flags = reuse_env == "0" ? 0u : (reuse_env == "spec" ? 2u : (reuse_env == "diffuse" ? 1u : 3u));
-	if (reuse_flags != 0) {
+	// ReSTIR GI on the diffuse rays (plan R2, stochastic_gi_restir.glsl), in
+	// place of the reuse's diffuse half: GODOT_GI_RESTIR=t (temporal only),
+	// ts or 1 (temporal and spatial; the temporal reservoirs are the next
+	// frame's history), tsf (the spatial ones are). Off by default.
+	static const String restir_env = OS::get_singleton()->get_environment("GODOT_GI_RESTIR");
+	static const uint32_t restir_mode = restir_env == "t" ? 1u : ((restir_env == "ts" || restir_env == "1") ? 2u : (restir_env == "tsf" ? 3u : 0u));
+	const uint32_t reuse_flags = (reuse_env == "0" ? 0u : (reuse_env == "spec" ? 2u : (reuse_env == "diffuse" ? 1u : 3u))) & (restir_mode != 0 ? ~1u : ~0u);
+	const bool record_rays = reuse_flags != 0 || restir_mode != 0;
+	if (record_rays) {
 		const uint32_t records = uint32_t(size.x) * uint32_t(size.y) * (params.ray_count + 1);
 		if (gi_reuse_rays.is_null() || records > gi_reuse_rays_capacity) {
 			if (gi_reuse_rays.is_valid()) {
@@ -2457,7 +2486,11 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			rd->buffer_clear(gi_reuse_rays, 0, gi_reuse_rays_capacity * 4 * sizeof(uint32_t));
 		}
 		params.flags |= 131072; // FLAG_REUSE_RECORD
+		if (restir_mode != 0) {
+			params.flags |= 1073741824; // FLAG_RECORD_HIT_NORMAL
+		}
 	}
+	gi_records_hit_normal = restir_mode != 0;
 	rd->buffer_update(rb_state->rt_gi_params_ubos[p_view], 0, sizeof(RtGiParamsUBO), &params);
 
 	RID shader_rid = rt_gi_shader.version_get_shader(rt_gi_shader_version, 0);
@@ -2588,7 +2621,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RD::Uniform u_out_spec_hit(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ spec_hit }));
 	RD::Uniform u_out_ambient_dyn(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ dyn_split ? raw_dyn : rt_gi_dummy_image }));
 	RD::Uniform u_out_fallback_dyn(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ dyn_split ? raw_fallback_dyn : rt_gi_dummy_image }));
-	RD::Uniform u_reuse_rays(RD::UNIFORM_TYPE_STORAGE_BUFFER, 13, Vector<RID>({ reuse_flags != 0 ? gi_reuse_rays : rt_gi_dummy_rw_buffer }));
+	RD::Uniform u_reuse_rays(RD::UNIFORM_TYPE_STORAGE_BUFFER, 13, Vector<RID>({ record_rays ? gi_reuse_rays : rt_gi_dummy_rw_buffer }));
 
 	if (calibrate || tier_stats) {
 		rd->buffer_clear(calibration.buffer, 0, 424);
@@ -2681,7 +2714,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_end_label();
 	}
 	if (hit_shading) {
-		_process_hit_shading(p_render_buffers, p_view, p_world_from_view, p_view_from_ndc, p_reproject, depth, (p_quality.screen_radiance && p_screen_radiance.is_valid()) ? p_screen_radiance : RID(), size, params.ray_count, raw_ambient, raw_reflection, raw_directional, reuse_flags != 0 ? gi_reuse_rays : RID(), p_cascades, p_sky, p_quality, params.probe_scale);
+		_process_hit_shading(p_render_buffers, p_view, p_world_from_view, p_view_from_ndc, p_reproject, depth, (p_quality.screen_radiance && p_screen_radiance.is_valid()) ? p_screen_radiance : RID(), size, params.ray_count, raw_ambient, raw_reflection, raw_directional, record_rays ? gi_reuse_rays : RID(), p_cascades, p_sky, p_quality, params.probe_scale);
+	}
+	if (restir_mode != 0) {
+		_process_gi_restir(p_view, restir_mode, size, depth_scale, p_view_from_ndc, depth, p_normal_roughness, raw_ambient, raw_directional, raw_dyn, dyn_split, p_z_far);
 	}
 	if (reuse_flags != 0) {
 		static const int64_t reuse_radius = OS::get_singleton()->get_environment("GODOT_GI_REUSE_RADIUS") == "" ? 1 : OS::get_singleton()->get_environment("GODOT_GI_REUSE_RADIUS").to_int();
@@ -3056,6 +3092,140 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 
 /* Hit shading */
 
+// ReSTIR GI's two kernels over the gather's ray records (see
+// stochastic_gi_restir.glsl), after the hit shading filled the deferred hits
+// in and before the temporal pass.
+void Raytracing::_process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size2i &p_size, uint32_t p_scale, const Projection &p_view_from_ndc, RID p_depth, RID p_normal_roughness, RID p_raw_ambient, RID p_raw_directional, RID p_raw_dyn, bool p_dyn_split, float p_z_far) {
+	RenderingDevice *rd = RD::get_singleton();
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	while (rb_state->gi_restir.size() <= p_view) {
+		rb_state->gi_restir.push_back(RenderBuffersRT::RestirBuffers());
+	}
+	RenderBuffersRT::RestirBuffers &state = rb_state->gi_restir[p_view];
+	const uint32_t pixels = uint32_t(p_size.x) * uint32_t(p_size.y);
+	const uint32_t bytes = pixels * 4 * 4 * sizeof(uint32_t);
+	bool history = true;
+	if (state.size != p_size || state.buffers[0].is_null()) {
+		for (RID &buffer : state.buffers) {
+			if (buffer.is_valid()) {
+				rd->free_rid(buffer);
+			}
+			buffer = rd->storage_buffer_create(bytes);
+			rd->buffer_clear(buffer, 0, bytes);
+		}
+		if (state.dup.is_valid()) {
+			rd->free_rid(state.dup);
+		}
+		state.dup = rd->storage_buffer_create(pixels * sizeof(float));
+		rd->buffer_clear(state.dup, 0, pixels * sizeof(float));
+		state.size = p_size;
+		history = false;
+	}
+	// A gap (the pass off for a frame, another viewport's size) is no history.
+	history = history && state.frame != UINT32_MAX && state.frame + 1 == rb_state->frame_index;
+	const uint32_t temporal_index = (state.history + 1) % 3;
+	const uint32_t spatial_index = (state.history + 2) % 3;
+
+	// The papers' parameters by default (ReSTIR PT Enhanced, section 7): a
+	// temporal cap of 20, lowered by the duplication map (c_min 1, alpha
+	// 0.1, a 17 x 17 window at full resolution); three spatial neighbors
+	// from a Gaussian of sigma 16 full-resolution pixels (the R = 30 disk's
+	// mean distance); the footprint test at c = 0.02. The knobs:
+	// GODOT_GI_RESTIR_MCAP, _K, _RADIUS (full-resolution pixels: the disk's
+	// radius, sigma = 0.532 R), _DISK=1 (a disk, not a Gaussian), _C (0 off
+	// the test: every sample with a normal reconnects), _HITCOS=0 (no cosine
+	// at the hit: the first build), _DUP=0, _DUP_ALPHA, _VIS=0 (no
+	// visibility rays), _OUT=pick, _JACOBIAN (a clamp, diagnostics),
+	// _RAW=1 (the own rays' mean through the chain: the null test).
+	static const float m_cap = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_MCAP") == "" ? 20.0f : float(OS::get_singleton()->get_environment("GODOT_GI_RESTIR_MCAP").to_float());
+	static const int64_t neighbors = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_K") == "" ? 3 : OS::get_singleton()->get_environment("GODOT_GI_RESTIR_K").to_int();
+	static const float radius_full = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_RADIUS") == "" ? 30.0f : float(OS::get_singleton()->get_environment("GODOT_GI_RESTIR_RADIUS").to_float());
+	static const bool disk = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_DISK") == "1";
+	static const float footprint_c = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_C") == "" ? 0.02f : float(OS::get_singleton()->get_environment("GODOT_GI_RESTIR_C").to_float());
+	static const bool hit_cos = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_HITCOS") != "0";
+	static const bool dup = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_DUP") != "0";
+	static const float dup_alpha = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_DUP_ALPHA") == "" ? 0.1f : float(OS::get_singleton()->get_environment("GODOT_GI_RESTIR_DUP_ALPHA").to_float());
+	static const bool visibility = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_VIS") != "0";
+	static const float jacobian = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_JACOBIAN") == "" ? 0.0f : float(OS::get_singleton()->get_environment("GODOT_GI_RESTIR_JACOBIAN").to_float());
+	static const bool output_raw = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_RAW") == "1";
+	static const bool output_pick = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_OUT") == "pick";
+	static const bool target_radiance = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_TARGET") == "radiance";
+	static const bool paint = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_PAINT") == "1";
+	static const bool reconnect_history = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_IDENTITY") == "0";
+	static const bool init_own = OS::get_singleton()->get_environment("GODOT_GI_RESTIR_INIT") == "own";
+	const float scale = float(MAX(p_scale, 1u));
+
+	GiRestirPushConstant push = {};
+	push.flags = (history ? 1u : 0u) | (p_dyn_split ? 2u : 0u) | (visibility ? 4u : 0u) | (output_raw ? 8u : 0u) | (output_pick ? 0u : 16u) | (dup ? 32u : 0u) | (disk ? 0u : 64u) | (footprint_c > 0.0f ? 128u : 0u) | (hit_cos ? 256u : 0u) | (dup && history && state.dup_frame + 1 == rb_state->frame_index ? 512u : 0u) | (target_radiance ? 2048u : 0u) | (paint ? 4096u : 0u) | (reconnect_history ? 8192u : 0u) | (init_own ? 0u : 16384u);
+	push.frame = rb_state->frame_index;
+	push.m_cap = MAX(m_cap, 0.0f);
+	push.radius = MAX((disk ? radius_full : 0.532f * radius_full) / scale, 1.0f);
+	push.neighbors = p_mode >= 2 ? uint32_t(CLAMP(neighbors, int64_t(0), int64_t(16))) : 0u;
+	push.jacobian_max = jacobian >= 1.0f ? jacobian : 0.0f;
+	push.depth_tolerance = 0.05f;
+	push.normal_min = 0.9f;
+	_set_luma_weights(push.luma_weights);
+	push.distant_t = MIN(p_z_far * 4.0f, 4000.0f);
+	push.footprint_c = MAX(footprint_c, 0.0f);
+	// A signal pixel's angle: the inverse projection's y scale is tan(fov / 2).
+	push.pixel_angle = 2.0f * Math::abs(p_view_from_ndc.columns[1][1]) / float(MAX(p_size.y, 1));
+	push.dup_radius = int32_t(MAX(Math::round(8.0f / scale), 1.0f));
+	push.dup_alpha = MAX(dup_alpha, 1e-3f);
+
+	RID ubo = rb_state->rt_gi_params_ubos[p_view];
+	RID temporal_rid = gi_restir_shader.version_get_shader(gi_restir_shader_version, 0);
+	RID spatial_rid = gi_restir_shader.version_get_shader(gi_restir_shader_version, 1);
+	RID dup_rid = gi_restir_shader.version_get_shader(gi_restir_shader_version, 2);
+	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 0, Vector<RID>({ ubo }));
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, p_depth }));
+	RD::Uniform u_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
+	RD::Uniform u_rays(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ gi_reuse_rays }));
+	RD::Uniform u_dup(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, Vector<RID>({ state.dup }));
+	RD::Uniform u_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ p_raw_ambient }));
+
+	RENDER_TIMESTAMP("RT GI ReSTIR");
+	rd->draw_command_begin_label("RT GI ReSTIR");
+	{
+		RD::Uniform u_in(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ state.buffers[state.history] }));
+		RD::Uniform u_out(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ state.buffers[temporal_index] }));
+		RD::ComputeListID list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, gi_restir_temporal_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(temporal_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_out, u_dup), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(temporal_rid, 1, u_ambient), 1);
+		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
+		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+		rd->compute_list_end();
+	}
+	{
+		RD::Uniform u_in(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ state.buffers[temporal_index] }));
+		RD::Uniform u_out(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, Vector<RID>({ state.buffers[spatial_index] }));
+		RD::Uniform u_tlas(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ scene.get_tlas() }));
+		RD::Uniform u_directional(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ p_raw_directional }));
+		RD::Uniform u_dyn(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ p_dyn_split ? p_raw_dyn : rt_gi_dummy_image }));
+		RD::ComputeListID list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, gi_restir_spatial_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(spatial_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_out, u_tlas), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(spatial_rid, 1, u_ambient, u_directional, u_dyn), 1);
+		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
+		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+		rd->compute_list_end();
+	}
+	state.history = p_mode == 3 ? spatial_index : temporal_index;
+	if (dup) {
+		// The duplication map over what the next frame's temporal pass reads.
+		RD::Uniform u_in(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ state.buffers[state.history] }));
+		RD::ComputeListID list = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(list, gi_restir_dup_pipeline);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(dup_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_dup), 0);
+		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
+		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+		rd->compute_list_end();
+		state.dup_frame = rb_state->frame_index;
+	}
+	rd->draw_command_end_label();
+	state.frame = rb_state->frame_index;
+}
+
 void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Transform3D &p_world_from_view, const Projection &p_view_from_ndc, const Projection &p_reproject, RID p_depth, RID p_screen_radiance, const Size2i &p_size, uint32_t p_ray_count, RID p_raw_ambient, RID p_raw_reflection, RID p_raw_directional, RID p_reuse_rays, const GiCascades &p_cascades, const GiSky &p_sky, const GiQuality &p_quality, float p_probe_scale) {
 	RD *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
@@ -3151,7 +3321,7 @@ void Raytracing::_process_hit_shading(Ref<RenderSceneBuffersRD> p_render_buffers
 	bin.capacity = hit_packet_capacity;
 	bin.slots = slots;
 	bin.ray_count = p_ray_count;
-	bin.record_rays = p_reuse_rays.is_valid() ? 1u : 0u;
+	bin.record_rays = p_reuse_rays.is_valid() ? (gi_records_hit_normal ? 2u : 1u) : 0u;
 
 	RD::Uniform b_counts(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ hit_counts }));
 	RD::Uniform b_offsets(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ hit_offsets }));

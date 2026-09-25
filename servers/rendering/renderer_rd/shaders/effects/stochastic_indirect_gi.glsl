@@ -172,6 +172,7 @@ params;
 #define FLAG_ABLATE_CARDS 134217728u // Diagnostics (GODOT_GI_ABLATE=cards): no hit reads a card (the probes, or the hit packets).
 #define FLAG_DYN_SPLIT 536870912u // The moving lights' term apart (GODOT_GI_DYN_SPLIT, section 88): out_ambient_dyn carries it with its own change mark, the temporal pass accumulates it as a history of its own, and out_ambient's mark is the static lights' alone.
 #define FLAG_SPEC_HALF_RATE 268435456u // The rough reflection ray on a checkerboard that alternates each frame; the resolve fills the rest from the traced neighbors (raytraced_gi/quality/half_rate_reflections).
+#define FLAG_RECORD_HIT_NORMAL 1073741824u // The ray records carry each diffuse hit's normal: ReSTIR GI's reconnection (GODOT_GI_RESTIR) and nothing else, a card-normal or G-buffer fetch a ray.
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -432,6 +433,12 @@ bool calibrate_pixel = false;
 #define TIER_SRC_NONE 6u
 #define TIER_SRC_UNSET 7u
 uint trace_source = TIER_SRC_UNSET;
+// The last trace's hit normal (world), for the ray records (FLAG_RECORD_HIT_NORMAL:
+// ReSTIR GI reconnects at the hit and needs its cosine). Zero where none is
+// known: a probe answer, a planar mirror's continuation (its radiance came
+// by the mirror, not from the hit), a deferred hit (the hit shader fills it).
+vec3 ray_hit_normal = vec3(0.0);
+bool want_hit_normal = false;
 bool boost_from_screen = false;
 
 #define SDFGI_OCT_SIZE 6
@@ -620,6 +627,8 @@ reuse_rays;
 #define GI_REUSE_RAY_MIRROR 4u
 #define GI_REUSE_RAY_BELOW 8u // The GGX draw fell below the horizon; the mirror direction was traced in its place.
 #define GI_REUSE_RAY_COUNT_SHIFT 4u // The pixel's diffuse rays - 1.
+#define GI_REUSE_RAY_MISS 64u // The ray met nothing (its hit distance is the AO range's stand-in): a direction, for ReSTIR GI (stochastic_gi_restir.glsl).
+#define GI_REUSE_RAY_NORMAL 128u // The hit's normal is in the high half (rt_hit_pack_normal16): ReSTIR GI's reconnection Jacobian.
 #define GI_REUSE_RAY_DYN_SHIFT 8u
 
 uvec4 gi_reuse_record(vec3 radiance, vec3 view_dir, float t_hit, uint flags) {
@@ -1417,6 +1426,13 @@ bool surface_cache_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir
 	} else {
 		pixel_change = max(pixel_change, texel_change);
 	}
+	if (want_hit_normal) {
+		ivec2 tn = card_origin_packed(best_packed) + clamp(ivec2(best_uv * best_dims), ivec2(0), ivec2(best_dims) - ivec2(1));
+		vec3 nc = normalize(texelFetch(card_normal_atlas, tn, 0).rgb * 2.0 - 1.0);
+		vec3 n_axis, nu, nv;
+		card_basis(best_k, n_axis, nu, nv);
+		ray_hit_normal = normalize(mat3(s.world_from_local) * (nu * nc.x + nv * nc.y + n_axis * nc.z));
+	}
 	card_atlas_texel = atlas_texel;
 	card_atlas_origin = card_origin_packed(best_packed);
 	card_lookup_confidence = best_w * (1.0 - best_mismatch * best_mismatch);
@@ -1618,6 +1634,11 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 		mat3 world_basis = mat3(params.world_from_view);
 		vec3 rel_hit = world_basis * hit_view;
 		r_hit_distance = length(hit_view - view_origin);
+		if (want_hit_normal) {
+			vec4 hit_ndc = params.ndc_from_view * vec4(hit_view, 1.0);
+			ivec2 hit_px = clamp(ivec2((hit_ndc.xy / hit_ndc.w * 0.5 + 0.5) * vec2(params.full_screen_size)), ivec2(0), params.full_screen_size - 1);
+			ray_hit_normal = normalize(world_basis * nr_normal(texelFetch(normal_roughness_texture, hit_px, 0)));
+		}
 		if (hit_specular) {
 			vec4 hit_ndc = params.ndc_from_view * vec4(hit_view, 1.0);
 			uvec2 q = uvec2(clamp((hit_ndc.xy / hit_ndc.w) * 0.5 + 0.5, vec2(0.0), vec2(1.0)) * 32767.0 + 0.5);
@@ -1684,6 +1705,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 			uint hit_plane = mirror_path ? mirror_at(world_hit) : MAX_MIRROR_PLANES;
 			if (hit_plane < MAX_MIRROR_PLANES) {
 				spec_hit_id = 0u; // The image is the continuation's.
+				want_hit_normal = false; // Nor is the radiance the hit's: no reconnection (restored per ray in main).
 				// A planar mirror: the ray reads the mirror's diffuse card,
 				// reflects and goes on, weighted by the Fresnel at the
 				// bounce, through up to MIRROR_BOUNCES_MAX mirrors (a ray off
@@ -1869,6 +1891,7 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 // keeps its own counts (RT_HIT_COUNT_TIERS).
 vec3 trace_radiance(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir, vec3 view_origin, vec3 view_dir, float jitter, out float r_hit_distance) {
 	trace_source = TIER_SRC_UNSET;
+	ray_hit_normal = vec3(0.0);
 	boost_from_screen = false;
 	boost_source = SPEC_SRC_OTHER;
 	cache_tier = CACHE_TIER_PROBE;
@@ -2348,6 +2371,7 @@ void gather_main() {
 		float t_hit;
 		hit_slot = r;
 		ray_dyn = vec3(0.0);
+		want_hit_normal = bool(params.flags & FLAG_RECORD_HIT_NORMAL);
 		// Clamped non-negative: half-float caches and the screen radiance
 		// boost can return a small negative, and the |moment| <= luminance
 		// bound the reconstruction relies on only holds for positive radiance.
@@ -2356,7 +2380,10 @@ void gather_main() {
 		irradiance_dyn += clamp(ray_dyn, vec3(0.0), radiance);
 		if (bool(params.flags & FLAG_REUSE_RECORD)) {
 			float dyn_share = clamp(luminance(clamp(ray_dyn, vec3(0.0), radiance)) / max(luminance(radiance), 1e-6), 0.0, 1.0);
-			uint flags = GI_REUSE_RAY_VALID | ((rays - 1u) << GI_REUSE_RAY_COUNT_SHIFT) | (uint(round(dyn_share * 255.0)) << GI_REUSE_RAY_DYN_SHIFT);
+			uint flags = GI_REUSE_RAY_VALID | ((rays - 1u) << GI_REUSE_RAY_COUNT_SHIFT) | (uint(round(dyn_share * 255.0)) << GI_REUSE_RAY_DYN_SHIFT) | (trace_source == TIER_SRC_SKY ? GI_REUSE_RAY_MISS : 0u);
+			if (want_hit_normal && dot(ray_hit_normal, ray_hit_normal) > 0.5) {
+				flags |= GI_REUSE_RAY_NORMAL | (rt_hit_pack_normal16(ray_hit_normal) << 16u);
+			}
 			reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + r] = gi_reuse_record(radiance, view_dir, t_hit, flags);
 		}
 		moment += luminance(radiance) * dir;
@@ -2365,6 +2392,7 @@ void gather_main() {
 		// total occlusion everywhere.
 		visibility += clamp(t_hit * params.inv_ao_range, 0.0, 1.0);
 	}
+	want_hit_normal = false; // The diffuse rays only (the reflection and the stand-in's lookups do not record one).
 	float inv_rays = 1.0 / float(rays);
 	irradiance *= inv_rays;
 	irradiance_dyn *= inv_rays;
