@@ -1795,7 +1795,7 @@ void JoltPhysicsServer3D::joint_set_solver_position_iterations(RID p_joint, int 
 	return joint->set_solver_position_iterations(p_value);
 }
 
-float JoltPhysicsServer3D::pin_joint_get_applied_force(RID p_joint) {
+float JoltPhysicsServer3D::pin_joint_get_applied_force(RID p_joint) const {
 	JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
 	ERR_FAIL_NULL_V(joint, 0.0f);
 
