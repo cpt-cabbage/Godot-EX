@@ -2025,7 +2025,7 @@ void JoltPhysicsServer3D::generic_6dof_joint_set_jolt_flag(RID p_joint, Vector3:
 	return g6dof_joint->set_jolt_flag(p_axis, p_flag, p_enabled);
 }
 
-float JoltPhysicsServer3D::generic_6dof_joint_get_applied_force(RID p_joint) {
+float JoltPhysicsServer3D::generic_6dof_joint_get_applied_force(RID p_joint) const {
 	JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
 	ERR_FAIL_NULL_V(joint, 0.0f);
 
@@ -2035,7 +2035,7 @@ float JoltPhysicsServer3D::generic_6dof_joint_get_applied_force(RID p_joint) {
 	return g6dof_joint->get_applied_force();
 }
 
-float JoltPhysicsServer3D::generic_6dof_joint_get_applied_torque(RID p_joint) {
+float JoltPhysicsServer3D::generic_6dof_joint_get_applied_torque(RID p_joint) const {
 	JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
 	ERR_FAIL_NULL_V(joint, 0.0f);
 
