@@ -65,6 +65,10 @@ JPH::Constraint *JoltGeneric6DOFJoint3D::_build_6dof(JPH::Body *p_jolt_body_a, J
 
 		if (!limit_enabled[axis] || lower > upper) {
 			constraint_settings.MakeFreeAxis((JoltAxis)axis);
+		} else if (use_cone_swing && (axis == AXIS_ANGULAR_Y || axis == AXIS_ANGULAR_Z)) {
+			// Jolt's cone only takes limits symmetric around zero, so use the wider side as the half-angle.
+			const double half_angle = MAX(Math::abs(lower), Math::abs(upper));
+			constraint_settings.SetLimitedAxis((JoltAxis)axis, (float)-half_angle, (float)half_angle);
 		} else {
 			constraint_settings.SetLimitedAxis((JoltAxis)axis, (float)lower, (float)upper);
 		}
@@ -77,7 +81,7 @@ JPH::Constraint *JoltGeneric6DOFJoint3D::_build_6dof(JPH::Body *p_jolt_body_a, J
 	constraint_settings.mPosition2 = to_jolt_r(p_shifted_ref_b.origin);
 	constraint_settings.mAxisX2 = to_jolt(p_shifted_ref_b.basis.get_column(Vector3::AXIS_X));
 	constraint_settings.mAxisY2 = to_jolt(p_shifted_ref_b.basis.get_column(Vector3::AXIS_Y));
-	constraint_settings.mSwingType = JPH::ESwingType::Pyramid;
+	constraint_settings.mSwingType = use_cone_swing ? JPH::ESwingType::Cone : JPH::ESwingType::Pyramid;
 
 	if (p_jolt_body_a == nullptr) {
 		return constraint_settings.Create(JPH::Body::sFixedToWorld, *p_jolt_body_b);
@@ -676,6 +680,16 @@ void JoltGeneric6DOFJoint3D::set_jolt_flag(Axis p_axis, JoltFlag p_flag, bool p_
 			ERR_FAIL_MSG(vformat("Unhandled flag: '%d'. This should not happen. Please report this.", p_flag));
 		} break;
 	}
+}
+
+void JoltGeneric6DOFJoint3D::set_use_cone_swing(bool p_enabled) {
+	if (use_cone_swing == p_enabled) {
+		return;
+	}
+
+	use_cone_swing = p_enabled;
+
+	_limits_changed();
 }
 
 float JoltGeneric6DOFJoint3D::get_applied_force() const {
