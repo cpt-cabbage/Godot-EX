@@ -53,6 +53,75 @@
 #include "spaces/jolt_space_3d.h"
 #include "spaces/jolt_temp_allocator.h"
 
+#include "core/object/class_db.h"
+
+void JoltPhysicsServer3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("joint_get_enabled", "joint"), &JoltPhysicsServer3D::joint_get_enabled);
+	ClassDB::bind_method(D_METHOD("joint_set_enabled", "joint", "enabled"), &JoltPhysicsServer3D::joint_set_enabled);
+
+	ClassDB::bind_method(D_METHOD("joint_get_solver_velocity_iterations", "joint"), &JoltPhysicsServer3D::joint_get_solver_velocity_iterations);
+	ClassDB::bind_method(D_METHOD("joint_set_solver_velocity_iterations", "joint", "iterations"), &JoltPhysicsServer3D::joint_set_solver_velocity_iterations);
+	ClassDB::bind_method(D_METHOD("joint_get_solver_position_iterations", "joint"), &JoltPhysicsServer3D::joint_get_solver_position_iterations);
+	ClassDB::bind_method(D_METHOD("joint_set_solver_position_iterations", "joint", "iterations"), &JoltPhysicsServer3D::joint_set_solver_position_iterations);
+
+	ClassDB::bind_method(D_METHOD("hinge_joint_get_jolt_param", "joint", "param"), &JoltPhysicsServer3D::hinge_joint_get_jolt_param);
+	ClassDB::bind_method(D_METHOD("hinge_joint_set_jolt_param", "joint", "param", "value"), &JoltPhysicsServer3D::hinge_joint_set_jolt_param);
+	ClassDB::bind_method(D_METHOD("hinge_joint_get_jolt_flag", "joint", "flag"), &JoltPhysicsServer3D::hinge_joint_get_jolt_flag);
+	ClassDB::bind_method(D_METHOD("hinge_joint_set_jolt_flag", "joint", "flag", "enabled"), &JoltPhysicsServer3D::hinge_joint_set_jolt_flag);
+
+	ClassDB::bind_method(D_METHOD("slider_joint_get_jolt_param", "joint", "param"), &JoltPhysicsServer3D::slider_joint_get_jolt_param);
+	ClassDB::bind_method(D_METHOD("slider_joint_set_jolt_param", "joint", "param", "value"), &JoltPhysicsServer3D::slider_joint_set_jolt_param);
+	ClassDB::bind_method(D_METHOD("slider_joint_get_jolt_flag", "joint", "flag"), &JoltPhysicsServer3D::slider_joint_get_jolt_flag);
+	ClassDB::bind_method(D_METHOD("slider_joint_set_jolt_flag", "joint", "flag", "enabled"), &JoltPhysicsServer3D::slider_joint_set_jolt_flag);
+
+	ClassDB::bind_method(D_METHOD("cone_twist_joint_get_jolt_param", "joint", "param"), &JoltPhysicsServer3D::cone_twist_joint_get_jolt_param);
+	ClassDB::bind_method(D_METHOD("cone_twist_joint_set_jolt_param", "joint", "param", "value"), &JoltPhysicsServer3D::cone_twist_joint_set_jolt_param);
+	ClassDB::bind_method(D_METHOD("cone_twist_joint_get_jolt_flag", "joint", "flag"), &JoltPhysicsServer3D::cone_twist_joint_get_jolt_flag);
+	ClassDB::bind_method(D_METHOD("cone_twist_joint_set_jolt_flag", "joint", "flag", "enabled"), &JoltPhysicsServer3D::cone_twist_joint_set_jolt_flag);
+
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_get_jolt_param", "joint", "axis", "param"), &JoltPhysicsServer3D::generic_6dof_joint_get_jolt_param);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_jolt_param", "joint", "axis", "param", "value"), &JoltPhysicsServer3D::generic_6dof_joint_set_jolt_param);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_get_jolt_flag", "joint", "axis", "flag"), &JoltPhysicsServer3D::generic_6dof_joint_get_jolt_flag);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_jolt_flag", "joint", "axis", "flag", "enabled"), &JoltPhysicsServer3D::generic_6dof_joint_set_jolt_flag);
+
+	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_DAMPING);
+	BIND_ENUM_CONSTANT(HINGE_JOINT_MOTOR_MAX_TORQUE);
+
+	BIND_ENUM_CONSTANT(HINGE_JOINT_FLAG_USE_LIMIT_SPRING);
+
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_LIMIT_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_LIMIT_SPRING_DAMPING);
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_MOTOR_TARGET_VELOCITY);
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_MOTOR_MAX_FORCE);
+
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_FLAG_USE_LIMIT);
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_FLAG_USE_LIMIT_SPRING);
+	BIND_ENUM_CONSTANT(SLIDER_JOINT_FLAG_ENABLE_MOTOR);
+
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_SWING_MOTOR_TARGET_VELOCITY_Y);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_SWING_MOTOR_TARGET_VELOCITY_Z);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_TWIST_MOTOR_TARGET_VELOCITY);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_SWING_MOTOR_MAX_TORQUE);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_TWIST_MOTOR_MAX_TORQUE);
+
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_FLAG_USE_SWING_LIMIT);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_FLAG_USE_TWIST_LIMIT);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_FLAG_ENABLE_SWING_MOTOR);
+	BIND_ENUM_CONSTANT(CONE_TWIST_JOINT_FLAG_ENABLE_TWIST_MOTOR);
+
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_LINEAR_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_LINEAR_LIMIT_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_LINEAR_LIMIT_SPRING_DAMPING);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_ANGULAR_SPRING_FREQUENCY);
+
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT_SPRING);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_MASS_NORMALIZED);
+	BIND_ENUM_CONSTANT(G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_MASS_NORMALIZED);
+}
+
 JoltPhysicsServer3D::JoltPhysicsServer3D(bool p_on_separate_thread) :
 		on_separate_thread(p_on_separate_thread) {
 	singleton = this;
