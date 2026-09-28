@@ -230,6 +230,7 @@ static int converter_max_line_length = 100000;
 HashMap<Main::CLIScope, Vector<String>> forwardable_cli_arguments;
 #endif
 static bool single_threaded_scene = false;
+static int worker_threads_override = -2; // --worker-threads; -2 is unset.
 
 // Display
 
@@ -607,6 +608,7 @@ void Main::print_help(const char *p_binary) {
 #if defined(DEBUG_ENABLED) || defined(TOOLS_ENABLED)
 	print_help_option("--remote-debug <uri>", "Remote debug (<protocol>://<host/IP>[:<port>], e.g. tcp://127.0.0.1:6007).\n");
 #endif
+	print_help_option("--worker-threads <n>", "Override the project setting threading/worker_pool/max_threads (e.g. to run several processes side by side).\n");
 	print_help_option("--single-threaded-scene", "Force scene tree to run in single-threaded mode. Sub-thread groups are disabled and run on the main thread.\n");
 #ifdef DEBUG_ENABLED
 	print_help_option("--debug-collisions", "Show collision shapes when running the scene.\n", CLI_OPTION_AVAILABILITY_TEMPLATE_DEBUG);
@@ -1568,6 +1570,14 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 			}
 		} else if (arg == "--single-threaded-scene") {
 			single_threaded_scene = true;
+		} else if (arg == "--worker-threads") {
+			if (N) {
+				worker_threads_override = N->get().to_int();
+				N = N->next();
+			} else {
+				OS::get_singleton()->print("Missing worker thread count argument, aborting.\n");
+				goto error;
+			}
 		} else if (arg == "--build-solutions") { // Build the scripting solution such C#
 
 			auto_build_solutions = true;
@@ -2112,7 +2122,7 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		if (editor || project_manager) {
 			WorkerThreadPool::get_singleton()->init(-1, 0.75);
 		} else {
-			int worker_threads = GLOBAL_GET("threading/worker_pool/max_threads");
+			int worker_threads = worker_threads_override != -2 ? worker_threads_override : int(GLOBAL_GET("threading/worker_pool/max_threads"));
 			float low_priority_ratio = GLOBAL_GET("threading/worker_pool/low_priority_thread_ratio");
 			WorkerThreadPool::get_singleton()->init(worker_threads, low_priority_ratio);
 		}
