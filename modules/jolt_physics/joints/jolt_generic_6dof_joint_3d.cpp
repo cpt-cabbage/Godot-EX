@@ -179,7 +179,7 @@ void JoltGeneric6DOFJoint3D::_update_spring_parameters(int p_axis) {
 		motor_settings.mSpringSettings.mMode = JPH::ESpringMode::FrequencyAndDamping;
 		motor_settings.mSpringSettings.mFrequency = (float)spring_frequency[p_axis];
 	} else {
-		motor_settings.mSpringSettings.mMode = JPH::ESpringMode::StiffnessAndDamping;
+		motor_settings.mSpringSettings.mMode = spring_mass_normalized[p_axis] ? JPH::ESpringMode::MassNormalizedStiffnessAndDamping : JPH::ESpringMode::StiffnessAndDamping;
 		motor_settings.mSpringSettings.mStiffness = (float)spring_stiffness[p_axis];
 	}
 
@@ -635,6 +635,12 @@ bool JoltGeneric6DOFJoint3D::get_jolt_flag(Axis p_axis, JoltFlag p_flag) const {
 		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY: {
 			return spring_use_frequency[axis_ang];
 		}
+		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_MASS_NORMALIZED: {
+			return spring_mass_normalized[axis_lin];
+		}
+		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_MASS_NORMALIZED: {
+			return spring_mass_normalized[axis_ang];
+		}
 		default: {
 			ERR_FAIL_V_MSG(false, vformat("Unhandled flag: '%d'. This should not happen. Please report this.", p_flag));
 		}
@@ -656,6 +662,14 @@ void JoltGeneric6DOFJoint3D::set_jolt_flag(Axis p_axis, JoltFlag p_flag, bool p_
 		} break;
 		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY: {
 			spring_use_frequency[axis_ang] = p_enabled;
+			_spring_parameters_changed(axis_ang);
+		} break;
+		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_MASS_NORMALIZED: {
+			spring_mass_normalized[axis_lin] = p_enabled;
+			_spring_parameters_changed(axis_lin);
+		} break;
+		case JoltPhysicsServer3D::G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_MASS_NORMALIZED: {
+			spring_mass_normalized[axis_ang] = p_enabled;
 			_spring_parameters_changed(axis_ang);
 		} break;
 		default: {
