@@ -10,8 +10,9 @@
 # _physics_process on tick N and its start on tick N+1 when both ticks fall in
 # the same process frame: that gap contains PhysicsServer3D.end_sync() +
 # step() (the Jolt update) + sync() + flush_queries() and the scene-tree
-# dispatch, and nothing else. Ticks are batched per frame by Engine.max_fps = 10
-# (or --fixed-fps 10 on the command line).
+# dispatch, and nothing else. Ticks are batched per frame by Engine.max_fps
+# (--bench-fps, default 30, so 2/4/8 ticks per frame at 60/120/240 Hz) or by
+# --fixed-fps on the command line.
 extends "res://tests/drive_test.gd"
 
 const N_BODIES := 15
@@ -55,8 +56,9 @@ func _ready() -> void:
 	saved_tps = Engine.physics_ticks_per_second
 	saved_max_fps = Engine.max_fps
 	saved_max_steps = Engine.max_physics_steps_per_frame
-	Engine.max_fps = 10
+	Engine.max_fps = int(options.get("bench-fps", 30))
 	Engine.max_physics_steps_per_frame = 1000
+	cases = filter_cases(cases)
 	log_line("chain_bench: %d cases, %d bodies, %d drives, %d measured ticks each" % [cases.size(), N_BODIES, N_BODIES - 1, MEASURE_TICKS])
 	_next_case.call_deferred()
 
@@ -168,7 +170,7 @@ func _finish_case() -> void:
 		var target := _target_for(i, t_last) if bool(cur["driven"]) else Quaternion.IDENTITY
 		max_err = maxf(max_err, quat_error_deg(rel.get_rotation_quaternion(), target))
 	var budget_us := 1.0e6 / float(tps)
-	var passed := (not non_finite) and step_samples.size() >= MEASURE_TICKS / 2
+	var passed := (not non_finite) and step_samples.size() >= MEASURE_TICKS / 4
 	var cname := String(cur["name"])
 	var detail := "step_us mean=%.1f p50=%.1f p95=%.1f max=%.1f (n=%d, frames=%d) | script_us(14 targets) mean=%.1f | TIME_PHYSICS_PROCESS max-step-in-last-second max_us=%.1f | active_objects=%d islands=%d | tick budget %.0f us -> load %.2f%% | max joint err at end %.2f deg | non_finite=%s" % [
 		s_mean, s_p50, s_p95, s_max, step_samples.size(), frames_seen, scr_mean, mon_max, int(active), int(islands), budget_us, 100.0 * s_mean / budget_us, max_err, non_finite]

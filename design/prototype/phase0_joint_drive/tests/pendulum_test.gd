@@ -15,7 +15,10 @@
 #   cap_*            static 45 deg target with a 2 Nm cap (below the 3.5 Nm
 #                    gravity torque at 45 deg) versus a 1000 Nm cap
 #   stiff_*          k = 1e6 Nm/rad with zero damping at 60 and 120 Hz
-#   sleep_wake       body allowed to sleep, target held then stepped
+#   sleep_wake_*     body allowed to sleep, target held then stepped; one case
+#                    re-sends the unchanged target every tick (INFO: the joint
+#                    wakes its bodies on every set, so they never sleep), the
+#                    other sends only on change and checks the wake-up
 extends "res://tests/drive_test.gd"
 
 const BAR_LEN := 1.0
@@ -46,7 +49,7 @@ var all_pass := true
 
 func _ready() -> void:
 	saved_tps = Engine.physics_ticks_per_second
-	cases = _build_cases()
+	cases = filter_cases(_build_cases())
 	log_line("pendulum: %d cases" % cases.size())
 	_next_case.call_deferred()
 
@@ -58,6 +61,7 @@ func _build_cases() -> Array:
 		"duration_s": 6.0, "eval_from_s": 2.0, "feedforward": 0.0,
 		"can_sleep": false, "gravity_scale": 1.0, "body_angular_damp": 0.0,
 		"step_at_s": 3.0, "pass_mean_deg": 3.0, "pass_max_deg": 6.0, "check": "track",
+		"send_mode": "every_tick", "informational": false,
 	}
 	var out: Array = []
 	out.append(_case(base, {"name": "sine_120hz_spring"}))
@@ -73,8 +77,10 @@ func _build_cases() -> Array:
 		"mode": "static", "duration_s": 3.0, "eval_from_s": 2.0, "check": "stiff", "pass_max_deg": 2.0}))
 	out.append(_case(base, {"name": "stiff_1e6_c0_120hz", "tps": 120, "k": 1.0e6, "c": 0.0, "tau": 1.0e12,
 		"mode": "static", "duration_s": 3.0, "eval_from_s": 2.0, "check": "stiff", "pass_max_deg": 2.0}))
-	out.append(_case(base, {"name": "sleep_wake_120hz", "mode": "step", "can_sleep": true,
-		"duration_s": 5.0, "eval_from_s": 4.0, "check": "wake"}))
+	out.append(_case(base, {"name": "sleep_wake_120hz_send_on_change", "mode": "step", "can_sleep": true,
+		"duration_s": 6.0, "eval_from_s": 5.0, "check": "wake", "send_mode": "on_change"}))
+	out.append(_case(base, {"name": "sleep_wake_120hz_send_every_tick", "mode": "step", "can_sleep": true,
+		"duration_s": 6.0, "eval_from_s": 5.0, "check": "wake", "informational": true}))
 	return out
 
 
@@ -189,7 +195,8 @@ func _physics_process(_delta: float) -> void:
 		slept_before_step = bar.sleeping
 	var target_deg: float = _target_deg(t)
 	var q_target := Quaternion(AXIS, deg_to_rad(target_deg))
-	joint.set_angular_target_rotation(q_target)
+	if String(cur["send_mode"]) == "every_tick" or not have_prev or q_target != prev_target:
+		joint.set_angular_target_rotation(q_target)
 	var ff: float = float(cur["feedforward"])
 	if ff != 0.0:
 		joint.set_param_z(Generic6DOFJoint3D.PARAM_ANGULAR_MOTOR_TARGET_VELOCITY, ff * _target_rate(t))
@@ -240,13 +247,14 @@ func _finish_case() -> void:
 			detail = "sleeping_before_step=%s mean_err_after=%.3f max_err_after=%.3f deg (pass if mean<%.1f)" % [
 				slept_before_step, mean_err, max_err, cur["pass_mean_deg"]]
 	var cname := String(cur["name"])
-	print("RESULT pendulum/%s %s tps=%d k=%.0f c=%.0f tau=%.1f mode=%s ff=%+.0f | %s" % [
-		cname, "PASS" if passed else "FAIL", tps, cur["k"], cur["c"], cur["tau"], cur["mode"], cur["feedforward"], detail])
+	var info: bool = bool(cur["informational"])
+	print("RESULT pendulum/%s %s tps=%d k=%.0f c=%.0f tau=%.1f mode=%s ff=%+.0f send=%s | %s" % [
+		cname, verdict(passed, info), tps, cur["k"], cur["c"], cur["tau"], cur["mode"], cur["feedforward"], cur["send_mode"], detail])
 	if joint != null:
 		log_line("  joint.has_target_rotation()=%s get_angular_target_rotation()=%s last_target=%s" % [
 			joint.has_target_rotation(), joint.get_angular_target_rotation(), prev_target])
-	case_results.append({"name": cname, "passed": passed, "mean_err": mean_err, "max_err": max_err, "detail": detail})
-	if not passed:
+	case_results.append({"name": cname, "passed": passed or info, "verdict": verdict(passed, info), "mean_err": mean_err, "max_err": max_err, "detail": detail})
+	if not passed and not info:
 		all_pass = false
 	emit_csv("pendulum_" + cname, "tick,time_s,target_deg,actual_deg,error_deg,angvel_rad_s", rows, int(tps / 10))
 	_next_case.call_deferred()

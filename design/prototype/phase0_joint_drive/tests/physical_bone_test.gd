@@ -10,6 +10,17 @@
 # through the node's joint_constraints/<axis>/angular_spring_* properties so it
 # survives PhysicalBone3D::_reload_joint(); a readback through the server
 # confirms the same RID sees those settings.
+#
+# Under Jolt a server-created joint does NOT disable collisions between its two
+# bodies (JoltJoint3D::collision_disabled defaults to false and
+# PhysicalBone3D::_reload_joint() never calls joint_disable_collisions_between_bodies,
+# unlike the Joint3D nodes). The default cases therefore call
+# PhysicsServer3D.joint_disable_collisions_between_bodies(rid, true); the
+# *_colliding INFO case leaves it off to show the bone bodies fighting the drive.
+#
+# Skeleton3D restores the pre-modifier poses after each update, so the pose the
+# simulator writes back is only observable inside the skeleton_updated signal;
+# the test samples it there.
 extends "res://tests/drive_test.gd"
 
 const BAR_LEN := 1.0
@@ -39,18 +50,26 @@ var have_prev := false
 var case_results: Array = []
 var all_pass := true
 var chain_ok := false
+var skel_pose_deg_in_signal := NAN
+var skel_pose_signal_count := 0
 
 
 func _ready() -> void:
 	saved_tps = Engine.physics_ticks_per_second
-	cases = [
+	cases = filter_cases([
 		{"name": "pb_sine_120hz", "tps": 120, "k": 2000.0, "c": 50.0, "tau": 1000.0, "mode": "sine",
 			"amp_deg": 45.0, "freq_hz": 0.25, "duration_s": 6.0, "eval_from_s": 2.0, "body_angular_damp": 0.0,
-			"check": "track", "pass_mean_deg": 3.0, "pass_max_deg": 6.0},
+			"check": "track", "pass_mean_deg": 3.0, "pass_max_deg": 6.0, "collision_exception": true, "informational": false},
 		{"name": "pb_cap_2Nm_static45_120hz", "tps": 120, "k": 2000.0, "c": 50.0, "tau": 2.0, "mode": "static",
 			"amp_deg": 45.0, "freq_hz": 0.0, "duration_s": 6.0, "eval_from_s": 5.0, "body_angular_damp": 3.0,
-			"check": "cap", "pass_mean_deg": 3.0, "pass_max_deg": 6.0},
-	]
+			"check": "cap", "pass_mean_deg": 3.0, "pass_max_deg": 6.0, "collision_exception": true, "informational": false},
+		{"name": "pb_sine_120hz_colliding", "tps": 120, "k": 2000.0, "c": 50.0, "tau": 1000.0, "mode": "sine",
+			"amp_deg": 45.0, "freq_hz": 0.25, "duration_s": 6.0, "eval_from_s": 2.0, "body_angular_damp": 0.0,
+			"check": "track", "pass_mean_deg": 3.0, "pass_max_deg": 6.0, "collision_exception": false, "informational": true},
+		{"name": "pb_cap_2Nm_static45_120hz_colliding", "tps": 120, "k": 2000.0, "c": 50.0, "tau": 2.0, "mode": "static",
+			"amp_deg": 45.0, "freq_hz": 0.0, "duration_s": 6.0, "eval_from_s": 5.0, "body_angular_damp": 3.0,
+			"check": "cap", "pass_mean_deg": 3.0, "pass_max_deg": 6.0, "collision_exception": false, "informational": true},
+	])
 	log_line("physical_bone: %d cases" % cases.size())
 	_next_case.call_deferred()
 
@@ -115,9 +134,17 @@ func _build_rig() -> void:
 	simulator.physical_bones_start_simulation(bones)
 
 	joint_rid = pb_child.get_joint_rid()
+	if bool(cur["collision_exception"]):
+		PhysicsServer3D.joint_disable_collisions_between_bodies(joint_rid, true)
 	for axis in [Vector3.AXIS_X, Vector3.AXIS_Y, Vector3.AXIS_Z]:
 		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_DRIVE_TORQUE_LIMIT, float(cur["tau"]))
+	skeleton.skeleton_updated.connect(_on_skeleton_updated)
 	_report_chain()
+
+
+func _on_skeleton_updated() -> void:
+	skel_pose_signal_count += 1
+	skel_pose_deg_in_signal = angle_about_axis_deg(skeleton.get_bone_global_pose(child_bone).basis, AXIS)
 
 
 func _report_chain() -> void:
@@ -135,8 +162,9 @@ func _report_chain() -> void:
 			PhysicsServer3D.generic_6dof_joint_get_param(joint_rid, Vector3.AXIS_Z, PhysicsServer3D.G6DOF_JOINT_ANGULAR_SPRING_DAMPING),
 			PhysicsServer3D.generic_6dof_joint_get_param(joint_rid, Vector3.AXIS_Z, PhysicsServer3D.G6DOF_JOINT_ANGULAR_DRIVE_TORQUE_LIMIT),
 			PhysicsServer3D.generic_6dof_joint_get_flag(joint_rid, Vector3.AXIS_Z, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_ANGULAR_LIMIT)])
-	log_line("physical_bone bodies: root at %s child at %s (child rest origin %s)" % [
-		pb_root.global_transform.origin, pb_child.global_transform.origin, skeleton.get_bone_global_pose(child_bone).origin])
+	log_line("physical_bone bodies: root at %s child at %s (child rest origin %s) | joint_is_disabled_collisions_between_bodies=%s child.get_collision_exceptions()=%s" % [
+		pb_root.global_transform.origin, pb_child.global_transform.origin, skeleton.get_bone_global_pose(child_bone).origin,
+		PhysicsServer3D.joint_is_disabled_collisions_between_bodies(joint_rid), pb_child.get_collision_exceptions().map(func(n): return n.name)])
 
 
 func _target_deg(t: float) -> float:
@@ -198,12 +226,14 @@ func _finish_case() -> void:
 		detail = "chain_ok=%s mean_actual=%.3f deg, analytic=%.3f deg (cap %.1f Nm vs %.2f Nm gravity torque), dev=%.3f (pass if <3)" % [
 			chain_ok, mean_actual, expected, tau, needed, dev]
 	var readback: Quaternion = PhysicsServer3D.generic_6dof_joint_get_angular_target_rotation(joint_rid)
-	var bone_pose_deg: float = angle_about_axis_deg(skeleton.get_bone_global_pose(child_bone).basis, AXIS)
+	var bone_pose_deg_outside: float = angle_about_axis_deg(skeleton.get_bone_global_pose(child_bone).basis, AXIS)
 	var cname := String(cur["name"])
-	print("RESULT physical_bone/%s %s tps=%d k=%.0f c=%.0f tau=%.1f mode=%s | %s | server target readback=%s (last set %s) | skeleton child bone global pose angle=%.3f deg vs body %.3f deg" % [
-		cname, "PASS" if passed else "FAIL", tps, cur["k"], cur["c"], cur["tau"], cur["mode"], detail, readback, prev_target, bone_pose_deg, a_list[a_list.size() - 1] if a_list.size() > 0 else NAN])
-	case_results.append({"name": cname, "passed": passed, "mean_err": mean_err, "max_err": max_err, "detail": detail})
-	if not passed:
+	var info: bool = bool(cur["informational"])
+	print("RESULT physical_bone/%s %s tps=%d k=%.0f c=%.0f tau=%.1f mode=%s collision_exception=%s | %s | server target readback=%s (last set %s) | skeleton child bone angle: inside skeleton_updated=%.3f deg (%d signals), outside=%.3f deg, body=%.3f deg" % [
+		cname, verdict(passed, info), tps, cur["k"], cur["c"], cur["tau"], cur["mode"], cur["collision_exception"], detail, readback, prev_target,
+		skel_pose_deg_in_signal, skel_pose_signal_count, bone_pose_deg_outside, a_list[a_list.size() - 1] if a_list.size() > 0 else NAN])
+	case_results.append({"name": cname, "passed": passed or info, "verdict": verdict(passed, info), "mean_err": mean_err, "max_err": max_err, "detail": detail})
+	if not passed and not info:
 		all_pass = false
 	emit_csv("physical_bone_" + cname, "tick,time_s,target_deg,actual_deg,error_deg,angvel_rad_s", rows, int(tps / 10))
 	_next_case.call_deferred()
@@ -227,5 +257,7 @@ func _next_case() -> void:
 	max_abs_angvel = 0.0
 	have_prev = false
 	chain_ok = false
+	skel_pose_deg_in_signal = NAN
+	skel_pose_signal_count = 0
 	_build_rig()
 	log_line("physical_bone case %d/%d: %s (tps=%d)" % [case_index + 1, cases.size(), cur["name"], cur["tps"]])

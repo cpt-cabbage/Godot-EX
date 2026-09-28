@@ -6,6 +6,8 @@
 # --test   comma-separated subset of: pendulum, physical_bone, chain_bench (default: all)
 # --csv    how much of each per-tick CSV to print (default sparse = 10 rows per simulated second)
 # --out    directory that receives the full per-tick CSV files (optional)
+# --cases  comma-separated substrings; only cases whose name contains one run
+# --bench-fps  frames per second the chain benchmark batches ticks into (default 30)
 extends Node3D
 
 const TEST_SCRIPTS := {
@@ -124,7 +126,7 @@ func _finish() -> void:
 	for r in results:
 		print("SUMMARY %s %s" % [r["name"], "PASS" if r["passed"] else "FAIL"])
 		for c in r.get("cases", []):
-			print("SUMMARY   %-32s %s  %s" % [c["name"], "PASS" if c["passed"] else "FAIL", c.get("detail", "")])
+			print("SUMMARY   %-40s %s  %s" % [c["name"], c.get("verdict", "PASS" if c["passed"] else "FAIL"), c.get("detail", "")])
 		if not r["passed"]:
 			all_pass = false
 	print("SUMMARY END overall=%s wall=%.1fs" % ["PASS" if all_pass else "FAIL", (Time.get_ticks_usec() - start_usec) / 1.0e6])
