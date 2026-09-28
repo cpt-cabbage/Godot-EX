@@ -1685,7 +1685,25 @@ bool JoltPhysicsServer3D::is_flushing_queries() const {
 }
 
 int JoltPhysicsServer3D::get_process_info(PS3DE::ProcessInfo p_process_info) {
-	return 0;
+	int result = 0;
+
+	for (const JoltSpace3D *space : active_spaces) {
+		switch (p_process_info) {
+			case PS3DE::INFO_ACTIVE_OBJECTS: {
+				const JPH::PhysicsSystem &physics_system = space->get_physics_system();
+				result += (int)physics_system.GetNumActiveBodies(JPH::EBodyType::RigidBody);
+				result += (int)physics_system.GetNumActiveBodies(JPH::EBodyType::SoftBody);
+			} break;
+			case PS3DE::INFO_COLLISION_PAIRS: {
+				result += space->get_contact_manifold_count();
+			} break;
+			case PS3DE::INFO_ISLAND_COUNT: {
+				// Jolt keeps its island builder private to `JPH::PhysicsSystem`, so there is nothing to report.
+			} break;
+		}
+	}
+
+	return result;
 }
 
 void JoltPhysicsServer3D::free_space(JoltSpace3D *p_space) {

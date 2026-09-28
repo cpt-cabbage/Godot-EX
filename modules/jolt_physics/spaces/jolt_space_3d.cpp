@@ -299,6 +299,10 @@ void JoltSpace3D::set_param(PS3DE::SpaceParameter p_param, double p_value) {
 	}
 }
 
+int JoltSpace3D::get_contact_manifold_count() const {
+	return contact_listener->get_manifold_count();
+}
+
 JPH::BodyInterface &JoltSpace3D::get_body_iface() {
 	return physics_system->GetBodyInterfaceNoLock();
 }
