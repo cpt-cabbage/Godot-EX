@@ -16,7 +16,7 @@ Results from the 2026-09-27 run on this fork are written up in
 - A Godot build with the Jolt module and the quaternion-target API, i.e. this
   fork (4.8-dev, `modules/jolt_physics`, Jolt 5.6.0) or an upstream build that
   includes godotengine/godot PR #118997 (merged 2026-06-23, milestone 4.8).
-  Godot 4.5/4.6 have Jolt but not `set_angular_target_rotation`; the runner's
+  Releases before 4.8 have Jolt but not `set_angular_target_rotation`; the runner's
   API-presence table at the top of the output tells you immediately.
 - Either an **editor** build (`target=editor`; `--path` always works) or an
   **export template** built with `disable_path_overrides=no` (the default
