@@ -83,6 +83,8 @@ void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_jolt_param", "joint", "axis", "param", "value"), &JoltPhysicsServer3D::generic_6dof_joint_set_jolt_param);
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_get_jolt_flag", "joint", "axis", "flag"), &JoltPhysicsServer3D::generic_6dof_joint_get_jolt_flag);
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_jolt_flag", "joint", "axis", "flag", "enabled"), &JoltPhysicsServer3D::generic_6dof_joint_set_jolt_flag);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_is_using_cone_swing", "joint"), &JoltPhysicsServer3D::generic_6dof_joint_is_using_cone_swing);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_use_cone_swing", "joint", "enabled"), &JoltPhysicsServer3D::generic_6dof_joint_set_use_cone_swing);
 
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_FREQUENCY);
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_DAMPING);
@@ -2110,6 +2112,26 @@ void JoltPhysicsServer3D::generic_6dof_joint_set_jolt_flag(RID p_joint, Vector3:
 	JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<JoltGeneric6DOFJoint3D *>(joint);
 
 	return g6dof_joint->set_jolt_flag(p_axis, p_flag, p_enabled);
+}
+
+bool JoltPhysicsServer3D::generic_6dof_joint_is_using_cone_swing(RID p_joint) const {
+	const JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
+	ERR_FAIL_NULL_V(joint, false);
+
+	ERR_FAIL_COND_V(joint->get_type() != PS3DE::JOINT_TYPE_6DOF, false);
+	const JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<const JoltGeneric6DOFJoint3D *>(joint);
+
+	return g6dof_joint->is_using_cone_swing();
+}
+
+void JoltPhysicsServer3D::generic_6dof_joint_set_use_cone_swing(RID p_joint, bool p_enabled) {
+	JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
+	ERR_FAIL_NULL(joint);
+
+	ERR_FAIL_COND(joint->get_type() != PS3DE::JOINT_TYPE_6DOF);
+	JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<JoltGeneric6DOFJoint3D *>(joint);
+
+	g6dof_joint->set_use_cone_swing(p_enabled);
 }
 
 float JoltPhysicsServer3D::generic_6dof_joint_get_applied_force(RID p_joint) const {

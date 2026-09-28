@@ -86,6 +86,8 @@ class JoltGeneric6DOFJoint3D final : public JoltJoint3D {
 	bool spring_use_frequency[AXIS_COUNT] = {};
 	bool spring_mass_normalized[AXIS_COUNT] = {};
 
+	bool use_cone_swing = false;
+
 	JPH::Constraint *_build_6dof(JPH::Body *p_jolt_body_a, JPH::Body *p_jolt_body_b, const Transform3D &p_shifted_ref_a, const Transform3D &p_shifted_ref_b) const;
 
 	void _update_limit_spring_parameters(int p_axis);
@@ -125,6 +127,9 @@ public:
 
 	bool get_jolt_flag(Axis p_axis, JoltFlag p_flag) const;
 	void set_jolt_flag(Axis p_axis, JoltFlag p_flag, bool p_enabled);
+
+	bool is_using_cone_swing() const { return use_cone_swing; }
+	void set_use_cone_swing(bool p_enabled);
 
 	float get_applied_force() const;
 	float get_applied_torque() const;

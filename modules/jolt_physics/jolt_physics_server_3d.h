@@ -501,6 +501,9 @@ public:
 
 	bool generic_6dof_joint_get_jolt_flag(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisFlagJolt p_flag) const;
 	void generic_6dof_joint_set_jolt_flag(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisFlagJolt p_flag, bool p_enabled);
+
+	bool generic_6dof_joint_is_using_cone_swing(RID p_joint) const;
+	void generic_6dof_joint_set_use_cone_swing(RID p_joint, bool p_enabled);
 };
 
 VARIANT_ENUM_CAST(JoltPhysicsServer3D::HingeJointParamJolt)

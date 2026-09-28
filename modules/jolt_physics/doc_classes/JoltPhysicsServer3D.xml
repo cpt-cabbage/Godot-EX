@@ -63,6 +63,13 @@
 				Returns the value of the given Jolt-specific parameter on the given axis of the 6DOF joint.
 			</description>
 		</method>
+		<method name="generic_6dof_joint_is_using_cone_swing" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<description>
+				Returns [code]true[/code] if the 6DOF joint limits its swing (the Y and Z angular axes) with a cone instead of a pyramid. See [method generic_6dof_joint_set_use_cone_swing].
+			</description>
+		</method>
 		<method name="generic_6dof_joint_set_jolt_flag">
 			<return type="void" />
 			<param index="0" name="joint" type="RID" />
@@ -81,6 +88,15 @@
 			<param index="3" name="value" type="float" />
 			<description>
 				Sets the value of the given Jolt-specific parameter on the given axis of the 6DOF joint.
+			</description>
+		</method>
+		<method name="generic_6dof_joint_set_use_cone_swing">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="enabled" type="bool" />
+			<description>
+				If [param enabled] is [code]true[/code], the 6DOF joint limits its swing (rotation about the Y and Z angular axes) with an elliptic cone instead of the default pyramid, which is how shoulders and hips are usually limited: a diagonal swing is stopped at the same angle as a swing about either axis, instead of reaching further. The twist (X) limit is unchanged.
+				The cone is symmetric around zero, so each swing axis uses the larger of the magnitudes of its lower and upper angular limits as its half-angle. Changing this rebuilds the joint.
 			</description>
 		</method>
 		<method name="hinge_joint_get_jolt_flag" qualifiers="const">
