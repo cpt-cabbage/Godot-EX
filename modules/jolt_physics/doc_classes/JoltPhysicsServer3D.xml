@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="JoltPhysicsServer3D" inherits="PhysicsServer3D" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Jolt-specific extension of [PhysicsServer3D].
+	</brief_description>
+	<description>
+		The Jolt Physics server, reachable through this singleton when [member ProjectSettings.physics/3d/physics_engine] is [code]"Jolt Physics"[/code]. The [PhysicsServer3D] singleton is a thread-safety wrapper that only forwards the common API, so the Jolt-only joint settings below are reached here, on the same joint [RID]s ([method Joint3D.get_rid], [method PhysicalBone3D.get_joint_rid]).
+		[b]Note:[/b] These methods call the server directly. With [member ProjectSettings.physics/3d/run_on_separate_thread] enabled, only call them while the physics thread is not stepping.
+		[b]Note:[/b] Settings made here are not stored on the joint nodes. Anything that rebuilds a node's joint (for example changing a [PhysicalBone3D] joint property) creates a new joint without them.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="cone_twist_joint_get_jolt_flag" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.ConeTwistJointFlagJolt" />
+			<description>
+				Returns the value of the given Jolt-specific flag of the cone-twist joint.
+			</description>
+		</method>
+		<method name="cone_twist_joint_get_jolt_param" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.ConeTwistJointParamJolt" />
+			<description>
+				Returns the value of the given Jolt-specific parameter of the cone-twist joint.
+			</description>
+		</method>
+		<method name="cone_twist_joint_set_jolt_flag">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.ConeTwistJointFlagJolt" />
+			<param index="2" name="enabled" type="bool" />
+			<description>
+				Sets the value of the given Jolt-specific flag of the cone-twist joint.
+			</description>
+		</method>
+		<method name="cone_twist_joint_set_jolt_param">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.ConeTwistJointParamJolt" />
+			<param index="2" name="value" type="float" />
+			<description>
+				Sets the value of the given Jolt-specific parameter of the cone-twist joint.
+			</description>
+		</method>
+		<method name="generic_6dof_joint_get_jolt_flag" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="axis" type="int" enum="Vector3.Axis" />
+			<param index="2" name="flag" type="int" enum="JoltPhysicsServer3D.G6DOFJointAxisFlagJolt" />
+			<description>
+				Returns the value of the given Jolt-specific flag on the given axis of the 6DOF joint.
+			</description>
+		</method>
+		<method name="generic_6dof_joint_get_jolt_param" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="axis" type="int" enum="Vector3.Axis" />
+			<param index="2" name="param" type="int" enum="JoltPhysicsServer3D.G6DOFJointAxisParamJolt" />
+			<description>
+				Returns the value of the given Jolt-specific parameter on the given axis of the 6DOF joint.
+			</description>
+		</method>
+		<method name="generic_6dof_joint_set_jolt_flag">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="axis" type="int" enum="Vector3.Axis" />
+			<param index="2" name="flag" type="int" enum="JoltPhysicsServer3D.G6DOFJointAxisFlagJolt" />
+			<param index="3" name="enabled" type="bool" />
+			<description>
+				Sets the value of the given Jolt-specific flag on the given axis of the 6DOF joint.
+			</description>
+		</method>
+		<method name="generic_6dof_joint_set_jolt_param">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="axis" type="int" enum="Vector3.Axis" />
+			<param index="2" name="param" type="int" enum="JoltPhysicsServer3D.G6DOFJointAxisParamJolt" />
+			<param index="3" name="value" type="float" />
+			<description>
+				Sets the value of the given Jolt-specific parameter on the given axis of the 6DOF joint.
+			</description>
+		</method>
+		<method name="hinge_joint_get_jolt_flag" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.HingeJointFlagJolt" />
+			<description>
+				Returns the value of the given Jolt-specific flag of the hinge joint.
+			</description>
+		</method>
+		<method name="hinge_joint_get_jolt_param" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.HingeJointParamJolt" />
+			<description>
+				Returns the value of the given Jolt-specific parameter of the hinge joint.
+			</description>
+		</method>
+		<method name="hinge_joint_set_jolt_flag">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.HingeJointFlagJolt" />
+			<param index="2" name="enabled" type="bool" />
+			<description>
+				Sets the value of the given Jolt-specific flag of the hinge joint.
+			</description>
+		</method>
+		<method name="hinge_joint_set_jolt_param">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.HingeJointParamJolt" />
+			<param index="2" name="value" type="float" />
+			<description>
+				Sets the value of the given Jolt-specific parameter of the hinge joint.
+			</description>
+		</method>
+		<method name="joint_get_enabled" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<description>
+				Returns [code]true[/code] if the joint is enabled.
+			</description>
+		</method>
+		<method name="joint_get_solver_position_iterations">
+			<return type="int" />
+			<param index="0" name="joint" type="RID" />
+			<description>
+				Returns the position iteration override of the joint, or [code]0[/code] if it uses [member ProjectSettings.physics/jolt_physics_3d/simulation/position_steps].
+			</description>
+		</method>
+		<method name="joint_get_solver_velocity_iterations">
+			<return type="int" />
+			<param index="0" name="joint" type="RID" />
+			<description>
+				Returns the velocity iteration override of the joint, or [code]0[/code] if it uses [member ProjectSettings.physics/jolt_physics_3d/simulation/velocity_steps].
+			</description>
+		</method>
+		<method name="joint_set_enabled">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="enabled" type="bool" />
+			<description>
+				Enables or disables the joint. A disabled joint stays in the space but applies no constraint.
+			</description>
+		</method>
+		<method name="joint_set_solver_position_iterations">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="iterations" type="int" />
+			<description>
+				Overrides the number of position iterations for the island that contains this joint. Jolt uses the largest override among the island's constraints. [code]0[/code] restores [member ProjectSettings.physics/jolt_physics_3d/simulation/position_steps].
+			</description>
+		</method>
+		<method name="joint_set_solver_velocity_iterations">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="iterations" type="int" />
+			<description>
+				Overrides the number of velocity iterations for the island that contains this joint. Jolt uses the largest override among the island's constraints. [code]0[/code] restores [member ProjectSettings.physics/jolt_physics_3d/simulation/velocity_steps].
+			</description>
+		</method>
+		<method name="slider_joint_get_jolt_flag" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.SliderJointFlagJolt" />
+			<description>
+				Returns the value of the given Jolt-specific flag of the slider joint.
+			</description>
+		</method>
+		<method name="slider_joint_get_jolt_param" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.SliderJointParamJolt" />
+			<description>
+				Returns the value of the given Jolt-specific parameter of the slider joint.
+			</description>
+		</method>
+		<method name="slider_joint_set_jolt_flag">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="flag" type="int" enum="JoltPhysicsServer3D.SliderJointFlagJolt" />
+			<param index="2" name="enabled" type="bool" />
+			<description>
+				Sets the value of the given Jolt-specific flag of the slider joint.
+			</description>
+		</method>
+		<method name="slider_joint_set_jolt_param">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="param" type="int" enum="JoltPhysicsServer3D.SliderJointParamJolt" />
+			<param index="2" name="value" type="float" />
+			<description>
+				Sets the value of the given Jolt-specific parameter of the slider joint.
+			</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="HINGE_JOINT_LIMIT_SPRING_FREQUENCY" value="100" enum="HingeJointParamJolt">
+			Frequency of the soft limit spring, in Hz, used when [constant HINGE_JOINT_FLAG_USE_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="HINGE_JOINT_LIMIT_SPRING_DAMPING" value="101" enum="HingeJointParamJolt">
+			Damping ratio of the soft limit spring, used when [constant HINGE_JOINT_FLAG_USE_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="HINGE_JOINT_MOTOR_MAX_TORQUE" value="102" enum="HingeJointParamJolt">
+			Maximum torque the motor can apply, in N·m.
+		</constant>
+		<constant name="HINGE_JOINT_FLAG_USE_LIMIT_SPRING" value="100" enum="HingeJointFlagJolt">
+			Makes the angular limits soft, with the spring set by [constant HINGE_JOINT_LIMIT_SPRING_FREQUENCY] and [constant HINGE_JOINT_LIMIT_SPRING_DAMPING].
+		</constant>
+		<constant name="SLIDER_JOINT_LIMIT_SPRING_FREQUENCY" value="100" enum="SliderJointParamJolt">
+			Frequency of the soft limit spring, in Hz, used when [constant SLIDER_JOINT_FLAG_USE_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="SLIDER_JOINT_LIMIT_SPRING_DAMPING" value="101" enum="SliderJointParamJolt">
+			Damping ratio of the soft limit spring, used when [constant SLIDER_JOINT_FLAG_USE_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="SLIDER_JOINT_MOTOR_TARGET_VELOCITY" value="102" enum="SliderJointParamJolt">
+			Target velocity of the motor, in m/s.
+		</constant>
+		<constant name="SLIDER_JOINT_MOTOR_MAX_FORCE" value="103" enum="SliderJointParamJolt">
+			Maximum force the motor can apply, in N.
+		</constant>
+		<constant name="SLIDER_JOINT_FLAG_USE_LIMIT" value="100" enum="SliderJointFlagJolt">
+			Enables the linear limits.
+		</constant>
+		<constant name="SLIDER_JOINT_FLAG_USE_LIMIT_SPRING" value="101" enum="SliderJointFlagJolt">
+			Makes the linear limits soft, with the spring set by [constant SLIDER_JOINT_LIMIT_SPRING_FREQUENCY] and [constant SLIDER_JOINT_LIMIT_SPRING_DAMPING].
+		</constant>
+		<constant name="SLIDER_JOINT_FLAG_ENABLE_MOTOR" value="102" enum="SliderJointFlagJolt">
+			Enables the motor.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_SWING_MOTOR_TARGET_VELOCITY_Y" value="100" enum="ConeTwistJointParamJolt">
+			Target velocity of the swing motor around the Y axis, in rad/s.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_SWING_MOTOR_TARGET_VELOCITY_Z" value="101" enum="ConeTwistJointParamJolt">
+			Target velocity of the swing motor around the Z axis, in rad/s.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_TWIST_MOTOR_TARGET_VELOCITY" value="102" enum="ConeTwistJointParamJolt">
+			Target velocity of the twist motor, in rad/s.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_SWING_MOTOR_MAX_TORQUE" value="103" enum="ConeTwistJointParamJolt">
+			Maximum torque the swing motor can apply, in N·m.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_TWIST_MOTOR_MAX_TORQUE" value="104" enum="ConeTwistJointParamJolt">
+			Maximum torque the twist motor can apply, in N·m.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_FLAG_USE_SWING_LIMIT" value="100" enum="ConeTwistJointFlagJolt">
+			Enables the swing limit.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_FLAG_USE_TWIST_LIMIT" value="101" enum="ConeTwistJointFlagJolt">
+			Enables the twist limit.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_FLAG_ENABLE_SWING_MOTOR" value="102" enum="ConeTwistJointFlagJolt">
+			Enables the swing motor.
+		</constant>
+		<constant name="CONE_TWIST_JOINT_FLAG_ENABLE_TWIST_MOTOR" value="103" enum="ConeTwistJointFlagJolt">
+			Enables the twist motor.
+		</constant>
+		<constant name="G6DOF_JOINT_LINEAR_SPRING_FREQUENCY" value="100" enum="G6DOFJointAxisParamJolt">
+			Frequency of the linear spring, in Hz, used instead of its stiffness when [constant G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_FREQUENCY] is enabled.
+		</constant>
+		<constant name="G6DOF_JOINT_LINEAR_LIMIT_SPRING_FREQUENCY" value="101" enum="G6DOFJointAxisParamJolt">
+			Frequency of the soft linear limit spring, in Hz, used when [constant G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="G6DOF_JOINT_LINEAR_LIMIT_SPRING_DAMPING" value="102" enum="G6DOFJointAxisParamJolt">
+			Damping ratio of the soft linear limit spring, used when [constant G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT_SPRING] is enabled.
+		</constant>
+		<constant name="G6DOF_JOINT_ANGULAR_SPRING_FREQUENCY" value="103" enum="G6DOFJointAxisParamJolt">
+			Frequency of the angular spring, in Hz, used instead of its stiffness when [constant G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY] is enabled.
+		</constant>
+		<constant name="G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT_SPRING" value="100" enum="G6DOFJointAxisFlagJolt">
+			Makes the linear limits soft, with the spring set by [constant G6DOF_JOINT_LINEAR_LIMIT_SPRING_FREQUENCY] and [constant G6DOF_JOINT_LINEAR_LIMIT_SPRING_DAMPING].
+		</constant>
+		<constant name="G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_FREQUENCY" value="101" enum="G6DOFJointAxisFlagJolt">
+			Drives the linear spring by frequency and damping ratio ([constant G6DOF_JOINT_LINEAR_SPRING_FREQUENCY], [constant PhysicsServer3D.G6DOF_JOINT_LINEAR_SPRING_DAMPING]) instead of stiffness and damping. Takes precedence over [constant G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_MASS_NORMALIZED].
+		</constant>
+		<constant name="G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY" value="102" enum="G6DOFJointAxisFlagJolt">
+			Drives the angular spring by frequency and damping ratio ([constant G6DOF_JOINT_ANGULAR_SPRING_FREQUENCY], [constant PhysicsServer3D.G6DOF_JOINT_ANGULAR_SPRING_DAMPING]) instead of stiffness and damping. Takes precedence over [constant G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_MASS_NORMALIZED].
+		</constant>
+		<constant name="G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_MASS_NORMALIZED" value="103" enum="G6DOFJointAxisFlagJolt">
+			Interprets the linear spring's stiffness and damping as divided by the effective mass, in 1/s² and 1/s (Jolt's [code]MassNormalizedStiffnessAndDamping[/code] mode), so the same values give the same response on bodies of any mass. Ignored while [constant G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING_FREQUENCY] is enabled.
+		</constant>
+		<constant name="G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_MASS_NORMALIZED" value="104" enum="G6DOFJointAxisFlagJolt">
+			Interprets the angular spring's stiffness and damping as divided by the effective inertia, in 1/s² and 1/s (Jolt's [code]MassNormalizedStiffnessAndDamping[/code] mode), so the same values give the same response on bodies of any inertia. Ignored while [constant G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING_FREQUENCY] is enabled.
+		</constant>
+	</constants>
+</class>

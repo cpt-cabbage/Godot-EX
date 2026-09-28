@@ -34,8 +34,10 @@
 #include "jolt_physics_server_3d.h"
 #include "jolt_project_settings.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
 #include "servers/physics_3d/physics_server_3d_manager.h"
 #include "servers/physics_3d/physics_server_3d_wrap_mt.h"
 
@@ -48,6 +50,10 @@ PhysicsServer3D *create_jolt_physics_server() {
 
 	JoltPhysicsServer3D *physics_server = memnew(JoltPhysicsServer3D(run_on_separate_thread));
 
+	// The PhysicsServer3D singleton is the thread wrapper, which only forwards the common API, so the
+	// Jolt-specific methods are reached through a singleton of their own.
+	Engine::get_singleton()->add_singleton(Engine::Singleton("JoltPhysicsServer3D", physics_server, "JoltPhysicsServer3D"));
+
 	return memnew(PhysicsServer3DWrapMT(physics_server, run_on_separate_thread));
 }
 
@@ -57,6 +63,7 @@ void initialize_jolt_physics_module(ModuleInitializationLevel p_level) {
 	}
 
 	jolt_initialize();
+	GDREGISTER_ABSTRACT_CLASS(JoltPhysicsServer3D);
 	PhysicsServer3DManager::get_singleton()->register_server(PhysicsServer3DManager::JOLT_PHYSICS_NAME, callable_mp_static(&create_jolt_physics_server));
 	JoltProjectSettings::register_settings();
 }
@@ -64,6 +71,10 @@ void initialize_jolt_physics_module(ModuleInitializationLevel p_level) {
 void uninitialize_jolt_physics_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SERVERS) {
 		return;
+	}
+
+	if (Engine::get_singleton()->has_singleton("JoltPhysicsServer3D")) {
+		Engine::get_singleton()->remove_singleton("JoltPhysicsServer3D");
 	}
 
 	jolt_deinitialize();
