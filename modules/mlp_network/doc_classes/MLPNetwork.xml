@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="MLPNetwork" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A small dense neural network evaluated on the CPU.
+	</brief_description>
+	<description>
+		An optional input normalisation followed by fully connected layers, each with an activation. Meant for control policies queried at tens of hertz, such as a physics character's learned locomotion, where a scripting language is too slow and a tensor runtime is more than needed. Load the weights of a trained network with [method add_layer], one layer at a time from the input, then call [method forward].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_layer">
+			<return type="void" />
+			<param index="0" name="weights" type="PackedFloat32Array" />
+			<param index="1" name="bias" type="PackedFloat32Array" />
+			<param index="2" name="inputs" type="int" />
+			<param index="3" name="activation" type="int" enum="MLPNetwork.Activation" />
+			<description>
+				Appends a fully connected layer. [param weights] is row-major, one row of [param inputs] values per output; the number of outputs is the size of [param bias]. [param inputs] must match the previous layer's outputs.
+			</description>
+		</method>
+		<method name="clear">
+			<return type="void" />
+			<description>
+				Removes every layer and the input normalisation.
+			</description>
+		</method>
+		<method name="forward">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="input" type="PackedFloat32Array" />
+			<description>
+				Evaluates the network on [param input], which must have [method get_input_size] values, and returns the last layer's outputs.
+			</description>
+		</method>
+		<method name="get_input_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the first layer's number of inputs, or [code]0[/code] without layers.
+			</description>
+		</method>
+		<method name="get_layer_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of layers.
+			</description>
+		</method>
+		<method name="get_output_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the last layer's number of outputs, or [code]0[/code] without layers.
+			</description>
+		</method>
+		<method name="set_input_normalization">
+			<return type="void" />
+			<param index="0" name="mean" type="PackedFloat32Array" />
+			<param index="1" name="inv_std" type="PackedFloat32Array" />
+			<param index="2" name="clip" type="float" />
+			<description>
+				Normalises each input as [code](x - mean) * inv_std[/code] before the first layer, then clamps it to [code][-clip, clip][/code] if [param clip] is positive.
+			</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="ACTIVATION_NONE" value="0" enum="Activation">
+			No activation (a linear layer).
+		</constant>
+		<constant name="ACTIVATION_RELU" value="1" enum="Activation">
+			[code]max(x, 0)[/code].
+		</constant>
+		<constant name="ACTIVATION_ELU" value="2" enum="Activation">
+			[code]x[/code] for positive [code]x[/code], otherwise [code]exp(x) - 1[/code].
+		</constant>
+		<constant name="ACTIVATION_TANH" value="3" enum="Activation">
+			[code]tanh(x)[/code].
+		</constant>
+	</constants>
+</class>
