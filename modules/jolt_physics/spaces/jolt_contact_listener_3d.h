@@ -43,6 +43,8 @@
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/SoftBody/SoftBodyContactListener.h>
 
+#include <atomic>
+
 class JoltArea3D;
 class JoltBody3D;
 class JoltShapedObject3D;
@@ -108,6 +110,8 @@ class JoltContactListener3D final
 
 	JoltSpace3D *space = nullptr;
 
+	std::atomic_int manifold_count = 0;
+
 #ifdef DEBUG_ENABLED
 	PackedVector3Array debug_contacts;
 	std::atomic_int debug_contact_count = 0;
@@ -156,6 +160,8 @@ public:
 
 	void pre_step();
 	void post_step();
+
+	int get_manifold_count() const { return manifold_count.load(std::memory_order_acquire); }
 
 #ifdef DEBUG_ENABLED
 	const PackedVector3Array &get_debug_contacts() const { return debug_contacts; }
