@@ -16,6 +16,26 @@ func out_dir() -> String:
 	return String(options.get("out", ""))
 
 
+# --cases=a,b keeps only cases whose name contains one of the substrings.
+func filter_cases(all_cases: Array) -> Array:
+	if not options.has("cases"):
+		return all_cases
+	var wanted: PackedStringArray = String(options["cases"]).split(",", false)
+	var out: Array = []
+	for c in all_cases:
+		for w in wanted:
+			if String(c["name"]).contains(w):
+				out.append(c)
+				break
+	return out
+
+
+static func verdict(passed: bool, informational: bool) -> String:
+	if informational:
+		return "INFO"
+	return "PASS" if passed else "FAIL"
+
+
 func log_line(s: String) -> void:
 	print("[phase0] " + s)
 
