@@ -418,7 +418,7 @@ Vec3 Quat::InverseRotate(Vec3Arg inValue) const
 Vec3 Quat::RotateAxisX() const
 {
 	// This is *this * Vec3::sAxisX() written out:
-	JPH_ASSERT(IsNormalized());
+	JPH_ASSERT(IsNormalized(2.0e-5f));
 	Vec4 t = mValue + mValue;
 	return Vec3(t.SplatX() * mValue + (t.SplatW() * mValue.Swizzle<SWIZZLE_W, SWIZZLE_Z, SWIZZLE_Y, SWIZZLE_X>()).FlipSign<1, 1, -1, 1>() - Vec4(1, 0, 0, 0));
 }
@@ -426,7 +426,7 @@ Vec3 Quat::RotateAxisX() const
 Vec3 Quat::RotateAxisY() const
 {
 	// This is *this * Vec3::sAxisY() written out:
-	JPH_ASSERT(IsNormalized());
+	JPH_ASSERT(IsNormalized(2.0e-5f));
 	Vec4 t = mValue + mValue;
 	return Vec3(t.SplatY() * mValue + (t.SplatW() * mValue.Swizzle<SWIZZLE_Z, SWIZZLE_W, SWIZZLE_X, SWIZZLE_Y>()).FlipSign<-1, 1, 1, 1>() - Vec4(0, 1, 0, 0));
 }
@@ -434,7 +434,7 @@ Vec3 Quat::RotateAxisY() const
 Vec3 Quat::RotateAxisZ() const
 {
 	// This is *this * Vec3::sAxisZ() written out:
-	JPH_ASSERT(IsNormalized());
+	JPH_ASSERT(IsNormalized(2.0e-5f));
 	Vec4 t = mValue + mValue;
 	return Vec3(t.SplatZ() * mValue + (t.SplatW() * mValue.Swizzle<SWIZZLE_Y, SWIZZLE_X, SWIZZLE_W, SWIZZLE_Z>()).FlipSign<1, -1, 1, 1>() - Vec4(0, 0, 1, 0));
 }

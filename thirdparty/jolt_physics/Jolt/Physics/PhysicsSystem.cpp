@@ -211,9 +211,16 @@ EPhysicsUpdateError PhysicsSystem::Update(float inDeltaTime, int inCollisionStep
 	mBodyManager.ResetSimulationStats();
 #endif
 
-	// Calculate ratio between current and previous frame delta time to scale initial constraint forces
+	// Calculate ratio between current and previous frame delta time to scale initial constraint forces.
+	// Note that scaling of the impulses works perfectly for a system in equilibrium. When a body is falling on another body, it will receive
+	// a large impulse to stop the body. In the next step, a much smaller impulse needs to be applied to counter gravity.
+	// This means that warm starting will initially give the body on top a much higher impulse that it needs.
+	// If you scale that impulse up because the delta time ratio >> 1 then the body will get such a large velocity that the solver
+	// cannot correct it anymore. We therefore clamp the ratio to ensure that the solver can still correct the excess velocity.
+	// Note that this will make a stack in equilibrium less stable when there are large delta time differences between steps.
+	// See: https://github.com/jrouwe/JoltPhysics/discussions/2129#discussioncomment-18525044
 	float step_delta_time = inDeltaTime / inCollisionSteps;
-	float warm_start_impulse_ratio = mPreviousStepDeltaTime > 0.0f? step_delta_time / mPreviousStepDeltaTime : 0.0f;
+	float warm_start_impulse_ratio = mPreviousStepDeltaTime > 0.0f? min(step_delta_time / mPreviousStepDeltaTime, 4.0f) : 0.0f;
 	mPreviousStepDeltaTime = step_delta_time;
 
 	// Create the context used for passing information between jobs
@@ -1496,15 +1503,11 @@ void PhysicsSystem::JobSolveVelocityConstraints(PhysicsUpdateContext *ioContext,
 			// Convert indices to offsets so that we lose one indirection in the solver. We couldn't do this earlier as we need constraint indices to build islands.
 			mContactManager.ConstraintIdxToConstraintOffset(contacts_begin, contacts_end);
 
-			// Sorting is costly but needed for a deterministic simulation, allow the user to turn this off
-			if (mPhysicsSettings.mDeterministicSimulation)
-			{
-				// Sort constraints to give a deterministic simulation
-				ConstraintManager::sSortConstraints(active_constraints, constraints_begin, constraints_end);
+			// Sort constraints to give a deterministic simulation
+			ConstraintManager::sSortConstraints(active_constraints, constraints_begin, constraints_end);
 
-				// Sort contacts to give a deterministic simulation
-				mContactManager.SortContacts(contacts_begin, contacts_end);
-			}
+			// Sort contacts to give a deterministic simulation
+			mContactManager.SortContacts(contacts_begin, contacts_end);
 
 			// Split up large islands
 		#ifdef JPH_TRACK_SIMULATION_STATS
@@ -1590,12 +1593,6 @@ void PhysicsSystem::JobIntegrateVelocity(const PhysicsUpdateContext *ioContext, 
 	float delta_time = ioContext->mStepDeltaTime;
 	const BodyID *active_bodies = mBodyManager.GetActiveBodiesUnsafe(EBodyType::RigidBody);
 	uint32 num_active_bodies = mBodyManager.GetNumActiveBodies(EBodyType::RigidBody);
-	uint32 num_active_bodies_after_find_collisions = ioStep->mActiveBodyReadIdx;
-
-	// We can move bodies that are not part of an island. In this case we need to notify the broadphase of the movement.
-	static constexpr int cBodiesBatch = 64;
-	BodyID *bodies_to_update_bounds = (BodyID *)JPH_STACK_ALLOC(cBodiesBatch * sizeof(BodyID));
-	int num_bodies_to_update_bounds = 0;
 
 	for (;;)
 	{
@@ -1681,22 +1678,6 @@ void PhysicsSystem::JobIntegrateVelocity(const PhysicsUpdateContext *ioContext, 
 				// Move the body now
 				body.AddPositionStep(delta_pos);
 
-				// If the body was activated due to an earlier CCD step it will have an index in the active
-				// body list that it higher than the highest one we processed during FindCollisions
-				// which means it hasn't been assigned an island and will not be updated by an island
-				// this means that we need to update its bounds manually
-				if (mp->GetIndexInActiveBodiesInternal() >= num_active_bodies_after_find_collisions)
-				{
-					body.CalculateWorldSpaceBoundsInternal();
-					bodies_to_update_bounds[num_bodies_to_update_bounds++] = body.GetID();
-					if (num_bodies_to_update_bounds == cBodiesBatch)
-					{
-						// Buffer full, flush now
-						mBroadPhase->NotifyBodiesAABBChanged(bodies_to_update_bounds, num_bodies_to_update_bounds, false);
-						num_bodies_to_update_bounds = 0;
-					}
-				}
-
 				// We did not create a CCD body
 				ioStep->mActiveBodyToCCDBody[active_body_idx] = -1;
 			}
@@ -1704,10 +1685,6 @@ void PhysicsSystem::JobIntegrateVelocity(const PhysicsUpdateContext *ioContext, 
 			active_body_idx++;
 		}
 	}
-
-	// Notify change bounds on requested bodies
-	if (num_bodies_to_update_bounds > 0)
-		mBroadPhase->NotifyBodiesAABBChanged(bodies_to_update_bounds, num_bodies_to_update_bounds, false);
 }
 
 void PhysicsSystem::JobPostIntegrateVelocity(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep) const
@@ -2194,7 +2171,6 @@ void PhysicsSystem::JobResolveCCDContacts(PhysicsUpdateContext *ioContext, Physi
 	BodyManager::GrantActiveBodiesAccess grant_active(true, false);
 #endif
 
-	uint32 num_active_bodies_after_find_collisions = ioStep->mActiveBodyReadIdx;
 	TempAllocator *temp_allocator = ioContext->mTempAllocator;
 
 	// Check if there's anything to do
@@ -2232,10 +2208,6 @@ void PhysicsSystem::JobResolveCCDContacts(PhysicsUpdateContext *ioContext, Physi
 		static constexpr int cBodiesBatch = 64;
 		BodyID *bodies_to_activate = (BodyID *)JPH_STACK_ALLOC(cBodiesBatch * sizeof(BodyID));
 		int num_bodies_to_activate = 0;
-
-		// We can move bodies that are not part of an island. In this case we need to notify the broadphase of the movement.
-		BodyID *bodies_to_update_bounds = (BodyID *)JPH_STACK_ALLOC(cBodiesBatch * sizeof(BodyID));
-		int num_bodies_to_update_bounds = 0;
 
 		for (uint i = 0; i < num_ccd_bodies; ++i)
 		{
@@ -2410,31 +2382,11 @@ void PhysicsSystem::JobResolveCCDContacts(PhysicsUpdateContext *ioContext, Physi
 
 			// Update body position
 			body1.AddPositionStep(ccd_body->mDeltaPosition * ccd_body->mFractionPlusSlop);
-
-			// If the body was activated due to an earlier CCD step it will have an index in the active
-			// body list that it higher than the highest one we processed during FindCollisions
-			// which means it hasn't been assigned an island and will not be updated by an island
-			// this means that we need to update its bounds manually
-			if (body_mp->GetIndexInActiveBodiesInternal() >= num_active_bodies_after_find_collisions)
-			{
-				body1.CalculateWorldSpaceBoundsInternal();
-				bodies_to_update_bounds[num_bodies_to_update_bounds++] = body1.GetID();
-				if (num_bodies_to_update_bounds == cBodiesBatch)
-				{
-					// Buffer full, flush now
-					mBroadPhase->NotifyBodiesAABBChanged(bodies_to_update_bounds, num_bodies_to_update_bounds, false);
-					num_bodies_to_update_bounds = 0;
-				}
-			}
 		}
 
 		// Activate the requested bodies
 		if (num_bodies_to_activate > 0)
 			mBodyManager.ActivateBodies(bodies_to_activate, num_bodies_to_activate);
-
-		// Notify change bounds on requested bodies
-		if (num_bodies_to_update_bounds > 0)
-			mBroadPhase->NotifyBodiesAABBChanged(bodies_to_update_bounds, num_bodies_to_update_bounds, false);
 	}
 
 	// Ensure we free the CCD bodies array now, will not call the destructor!
@@ -2558,7 +2510,7 @@ void PhysicsSystem::CheckSleepAndUpdateBounds(uint32 inIslandIndex, const Physic
 		}
 	}
 
-	// Notify broadphase of changed objects (find ccd contacts can do linear casts in the next step, so we need to do this every step)
+	// Notify broadphase of changed objects
 	// Note: Shuffles the BodyID's around!!!
 	mBroadPhase->NotifyBodiesAABBChanged(bodies_begin, int(bodies_end - bodies_begin), false);
 }
