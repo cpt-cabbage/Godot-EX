@@ -553,17 +553,13 @@ Patches:
 ## jolt_physics
 
 - Upstream: https://github.com/jrouwe/JoltPhysics
-- Version: 5.6.0 (e77f175595e64cb44218cc9d9d56fc365ad0e36a, 2026)
+- Version: 5.6.1-dev (5830c342b90fa087f118aa0f086d541a4950b1d9, 2026)
 - License: MIT
 
 Files extracted from upstream source:
 
 - All files in `Jolt/`, except `Jolt/Jolt.cmake`, any files dependent on `ENABLE_OBJECT_STREAM` as seen in `Jolt/Jolt.cmake` and the `Jolt/Physics/Hair/`, `Jolt/Compute/` and `Jolt/Shaders/` folders.
 - `LICENSE`
-
-Patches:
-
-- `0001-backport-upstream-commit-63f2f57.patch` (GH-121974)
 
 
 ## libbacktrace
