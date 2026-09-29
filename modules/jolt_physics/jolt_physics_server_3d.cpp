@@ -51,9 +51,15 @@
 #include "spaces/jolt_job_system.h"
 #include "spaces/jolt_physics_direct_space_state_3d.h"
 #include "spaces/jolt_space_3d.h"
+#include "misc/jolt_type_conversions.h"
+#include "spaces/jolt_broad_phase_layer.h"
 #include "spaces/jolt_temp_allocator.h"
 
 #include "core/object/class_db.h"
+
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 
 void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("joint_get_enabled", "joint"), &JoltPhysicsServer3D::joint_get_enabled);
@@ -85,6 +91,8 @@ void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_jolt_flag", "joint", "axis", "flag", "enabled"), &JoltPhysicsServer3D::generic_6dof_joint_set_jolt_flag);
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_is_using_cone_swing", "joint"), &JoltPhysicsServer3D::generic_6dof_joint_is_using_cone_swing);
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_set_use_cone_swing", "joint", "enabled"), &JoltPhysicsServer3D::generic_6dof_joint_set_use_cone_swing);
+
+	ClassDB::bind_method(D_METHOD("space_cast_static_ground", "space", "from", "length", "collision_mask"), &JoltPhysicsServer3D::space_cast_static_ground);
 
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_FREQUENCY);
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_DAMPING);
@@ -2152,4 +2160,59 @@ float JoltPhysicsServer3D::generic_6dof_joint_get_applied_torque(RID p_joint) co
 	JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<JoltGeneric6DOFJoint3D *>(joint);
 
 	return g6dof_joint->get_applied_torque();
+}
+
+namespace {
+
+// The static broad phase layers only, and object layers whose collision layer is in the mask.
+class JoltStaticGroundFilter final : public JPH::BroadPhaseLayerFilter, public JPH::ObjectLayerFilter {
+	const JoltSpace3D &space;
+	uint32_t collision_mask = 0;
+
+public:
+	JoltStaticGroundFilter(const JoltSpace3D &p_space, uint32_t p_collision_mask) :
+			space(p_space), collision_mask(p_collision_mask) {}
+
+	virtual bool ShouldCollide(JPH::BroadPhaseLayer p_broad_phase_layer) const override {
+		return p_broad_phase_layer == JoltBroadPhaseLayer::BODY_STATIC || p_broad_phase_layer == JoltBroadPhaseLayer::BODY_STATIC_BIG;
+	}
+
+	virtual bool ShouldCollide(JPH::ObjectLayer p_object_layer) const override {
+		JPH::BroadPhaseLayer broad_phase_layer = JoltBroadPhaseLayer::BODY_STATIC;
+		uint32_t collision_layer = 0;
+		uint32_t mask = 0;
+		space.map_from_object_layer(p_object_layer, broad_phase_layer, collision_layer, mask);
+		return (collision_mask & collision_layer) != 0;
+	}
+};
+
+} // namespace
+
+PackedFloat32Array JoltPhysicsServer3D::space_cast_static_ground(RID p_space, const PackedVector3Array &p_from, float p_length, uint32_t p_collision_mask) {
+	PackedFloat32Array heights;
+	JoltSpace3D *space = get_space(p_space);
+	ERR_FAIL_NULL_V(space, heights);
+	ERR_FAIL_COND_V_MSG(space->is_stepping(), heights, "space_cast_static_ground must not be called while the physics space is being stepped.");
+
+	space->flush_pending_objects();
+
+	const JoltStaticGroundFilter filter(*space, p_collision_mask);
+	const JPH::BodyFilter body_filter;
+	// As intersect_ray's defaults: a ray starting inside a convex shape does not hit it; back faces do.
+	JPH::RayCastSettings settings;
+	settings.mTreatConvexAsSolid = false;
+	settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
+	const JPH::Vec3 down(0.0f, -p_length, 0.0f);
+	const JPH::NarrowPhaseQuery &query = space->get_narrow_phase_query();
+
+	heights.resize(p_from.size());
+	float *out = heights.ptrw();
+	const Vector3 *from = p_from.ptr();
+	for (int i = 0; i < p_from.size(); i++) {
+		const JPH::RRayCast ray(to_jolt_r(from[i]), down);
+		JPH::ClosestHitCollisionCollector<JPH::CastRayCollector> collector;
+		query.CastRay(ray, settings, collector, filter, filter, body_filter);
+		out[i] = collector.HadHit() ? (float)ray.GetPointOnRay(collector.mHit.mFraction).GetY() : NAN;
+	}
+	return heights;
 }

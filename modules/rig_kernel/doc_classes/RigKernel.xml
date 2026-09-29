@@ -169,6 +169,13 @@
 				Sets how far above the pelvis the height scan's rays start (default 1.0). A ray starting inside a body does not hit it, so a wall taller than this reads as the ground at its foot; set it above the tallest wall the scan should see.
 			</description>
 		</method>
+		<method name="set_static_ground">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>
+				When enabled (default off), the ground probes consider static bodies only and the height scan's rays go to the physics server in one batch (Godot-EX's [code]JoltPhysicsServer3D.space_cast_static_ground[/code]; with another physics server, the general ray). Faster where the ground is all static, as on a training server; in a game a dynamic body can be ground.
+			</description>
+		</method>
 		<method name="update">
 			<return type="void" />
 			<description>

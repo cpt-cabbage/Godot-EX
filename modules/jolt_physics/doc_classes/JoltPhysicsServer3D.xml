@@ -212,6 +212,16 @@
 				Sets the value of the given Jolt-specific parameter of the slider joint.
 			</description>
 		</method>
+		<method name="space_cast_static_ground">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="space" type="RID" />
+			<param index="1" name="from" type="PackedVector3Array" />
+			<param index="2" name="length" type="float" />
+			<param index="3" name="collision_mask" type="int" />
+			<description>
+				Casts a ray from each point in [param from] straight down [param length] meters against the static bodies in [param space] whose collision layer is in [param collision_mask], and returns the height of each first hit ([code]NAN[/code] without one). A ray starting inside a convex shape does not hit it; triangles are hit from either side. Skips the dynamic bodies and the hit's normal and shape, for many ground probes per step (a learned controller's height scan, [code]RigKernel[/code]).
+			</description>
+		</method>
 	</methods>
 	<constants>
 		<constant name="HINGE_JOINT_LIMIT_SPRING_FREQUENCY" value="100" enum="HingeJointParamJolt">

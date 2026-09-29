@@ -504,6 +504,12 @@ public:
 
 	bool generic_6dof_joint_is_using_cone_swing(RID p_joint) const;
 	void generic_6dof_joint_set_use_cone_swing(RID p_joint, bool p_enabled);
+
+	// Godot-EX: the height of the first static body under each point, by a ray from the point straight
+	// down p_length (NAN without a hit): a batch of ground probes for a learned controller's height scan
+	// (RigKernel). Only static bodies on p_collision_mask are considered, which skips the dynamic
+	// bodies' broad phase tree, the hit's normal and shape index.
+	PackedFloat32Array space_cast_static_ground(RID p_space, const PackedVector3Array &p_from, float p_length, uint32_t p_collision_mask);
 };
 
 VARIANT_ENUM_CAST(JoltPhysicsServer3D::HingeJointParamJolt)
