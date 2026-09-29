@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="RigKernel" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		The per-step state reading and drive-target writing of a learned controller for a physics rig.
+	</brief_description>
+	<description>
+		Does, in native code, the work a learned controller repeats every control step on a ragdoll of rigid bodies joined by 6DOF joints with angular drives: reads every body's transform and velocities from the [PhysicsServer3D] once ([method update]), builds the policy's observation ([method observation]) and a motion prior's features ([method features]) from that state, casts rays for the ground under the body ([method ground]), reports foot contacts ([method contact]), and writes an action to the joints' drive targets ([method write_targets]).
+		Configure it once with [method set_bodies], [method set_pelvis_head], one [method add_drive] per actuated joint in action order (which also defines the observed joints), [method set_contacts], [method set_keypoints], [method set_scan] and [method set_ground_mask]. Rotations are expressed as rotation vectors (axis times angle) of a child body relative to its parent, and the heading frame is the pelvis's yaw about world up with +Z forward.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_drive">
+			<return type="void" />
+			<param index="0" name="joint" type="RID" />
+			<param index="1" name="body" type="int" />
+			<param index="2" name="axes" type="PackedInt32Array" />
+			<param index="3" name="nominal" type="Vector3" />
+			<param index="4" name="scale" type="Vector3" />
+			<param index="5" name="lo" type="Vector3" />
+			<param index="6" name="hi" type="Vector3" />
+			<description>
+				Adds an actuated joint: the 6DOF [param joint] whose child is [param body]. Each of its [param axes] (0, 1, 2 for x, y, z) takes one action value [code]a[/code], and the drive target's rotation vector is [code]nominal + scale * clamp(a, -1, 1)[/code] on those axes, clamped per component to [param lo] and [param hi]. The observation and features report the joint's rotation on the same axes.
+			</description>
+		</method>
+		<method name="contact" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="side" type="int" />
+			<description>
+				Returns whether any of the left ([param side] 0) or right (1) contact bodies touches something that is not one of the rig's bodies. The bodies need contact reporting enabled.
+			</description>
+		</method>
+		<method name="features" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="pelvis_prev" type="Transform3D" />
+			<param index="1" name="ground_y" type="float" />
+			<param index="2" name="fps" type="float" />
+			<description>
+				Returns motion-prior features of the state read by [method update]: the pelvis's height over [param ground_y]; its y and z axes in the heading frame; its linear and angular velocity in the heading frame by finite difference from [param pelvis_prev] at [param fps]; the driven joints' rotations on their axes; and the keypoints relative to the pelvis in the heading frame.
+			</description>
+		</method>
+		<method name="get_action_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of action values, the total of the drives' axes.
+			</description>
+		</method>
+		<method name="get_angular_velocity" qualifiers="const">
+			<return type="Vector3" />
+			<param index="0" name="body" type="int" />
+			<description>
+				Returns the angular velocity of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="get_center_of_mass" qualifiers="const">
+			<return type="Vector3" />
+			<description>
+				Returns the rig's center of mass read by [method update].
+			</description>
+		</method>
+		<method name="get_center_of_mass_velocity" qualifiers="const">
+			<return type="Vector3" />
+			<description>
+				Returns the velocity of the rig's center of mass read by [method update].
+			</description>
+		</method>
+		<method name="get_heading" qualifiers="const">
+			<return type="Basis" />
+			<description>
+				Returns the heading frame read by [method update]: the pelvis's yaw about world up, +Z forward.
+			</description>
+		</method>
+		<method name="get_linear_velocity" qualifiers="const">
+			<return type="Vector3" />
+			<param index="0" name="body" type="int" />
+			<description>
+				Returns the linear velocity of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="get_transform" qualifiers="const">
+			<return type="Transform3D" />
+			<param index="0" name="body" type="int" />
+			<description>
+				Returns the transform of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="ground" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector3" />
+			<description>
+				Returns the height of the first surface on the ground mask below [param point] (a ray from 1 m above it to 4 m below), or 1 m below the point if there is none.
+			</description>
+		</method>
+		<method name="heading_of" qualifiers="static">
+			<return type="Basis" />
+			<param index="0" name="basis" type="Basis" />
+			<description>
+				Returns the yaw of [param basis] about world up as a basis whose +Z is the basis's +Z projected on the horizontal plane.
+			</description>
+		</method>
+		<method name="observation" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="action" type="PackedFloat32Array" />
+			<param index="1" name="command" type="Vector3" />
+			<param index="2" name="scan" type="bool" />
+			<description>
+				Returns the policy's observation of the state read by [method update]: gravity and the pelvis's angular velocity in the pelvis frame; the center of mass's velocity in the heading frame and its height over the ground; the driven joints' rotations, then their angular velocities relative to their parents (times 0.1); [param action]; [param command]; the left and right contacts; and, if [param scan], the ground's height at the scan points in the heading frame relative to the ground under the center of mass.
+			</description>
+		</method>
+		<method name="rotation_vector" qualifiers="static">
+			<return type="Vector3" />
+			<param index="0" name="basis" type="Basis" />
+			<description>
+				Returns the rotation of [param basis] as a rotation vector (axis times angle, the angle in [code][0, PI][/code]).
+			</description>
+		</method>
+		<method name="set_bodies">
+			<return type="void" />
+			<param index="0" name="bodies" type="RID[]" />
+			<param index="1" name="masses" type="PackedFloat32Array" />
+			<param index="2" name="parents" type="PackedInt32Array" />
+			<description>
+				Sets the rig's rigid bodies, their masses, and each one's parent index ([code]-1[/code] for the root). Body indices in the other methods refer to this order.
+			</description>
+		</method>
+		<method name="set_contacts">
+			<return type="void" />
+			<param index="0" name="left" type="PackedInt32Array" />
+			<param index="1" name="right" type="PackedInt32Array" />
+			<description>
+				Sets the bodies whose contacts make the left and right contact of [method contact].
+			</description>
+		</method>
+		<method name="set_ground_mask">
+			<return type="void" />
+			<param index="0" name="mask" type="int" />
+			<description>
+				Sets the collision mask of [method ground]'s rays.
+			</description>
+		</method>
+		<method name="set_keypoints">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<param index="1" name="offsets" type="PackedVector3Array" />
+			<description>
+				Sets the points [method features] reports relative to the pelvis: each an offset in a body's frame.
+			</description>
+		</method>
+		<method name="set_pelvis_head">
+			<return type="void" />
+			<param index="0" name="pelvis" type="int" />
+			<param index="1" name="head" type="int" />
+			<description>
+				Sets which bodies are the pelvis (the heading frame's and the observation's reference) and the head.
+			</description>
+		</method>
+		<method name="set_scan">
+			<return type="void" />
+			<param index="0" name="x" type="PackedFloat32Array" />
+			<param index="1" name="z" type="PackedFloat32Array" />
+			<description>
+				Sets the height scan's grid in the heading frame: lateral offsets [param x] and forward offsets [param z]; the observation lists it row by row of [param z].
+			</description>
+		</method>
+		<method name="update">
+			<return type="void" />
+			<description>
+				Reads every body's transform and velocities from the physics server, and computes the center of mass and heading frame. Call it once per control step, after the physics steps, before the queries.
+			</description>
+		</method>
+		<method name="write_targets" qualifiers="const">
+			<return type="void" />
+			<param index="0" name="action" type="PackedFloat32Array" />
+			<description>
+				Writes [param action] to the drives' target rotations (see [method add_drive]).
+			</description>
+		</method>
+	</methods>
+</class>
