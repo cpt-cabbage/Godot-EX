@@ -148,7 +148,8 @@ thirdparty_sources = [thirdparty_dir + file for file in thirdparty_sources]
 env_jolt.Prepend(CPPPATH=[thirdparty_dir])
 
 if env.dev_build:
-    env_jolt.Append(CPPDEFINES=["JPH_ENABLE_ASSERTS"])
+    # Jolt 5.6.1 no longer defines JPH_DEBUG itself when NDEBUG is not defined.
+    env_jolt.Append(CPPDEFINES=["JPH_ENABLE_ASSERTS", "JPH_DEBUG"])
 
 if env.editor_build:
     env_jolt.Append(CPPDEFINES=["JPH_DEBUG_RENDERER"])
