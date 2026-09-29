@@ -45,7 +45,7 @@
 //
 // Setup, once: set_bodies() (rigid bodies, masses, parent indices), set_pelvis_head(), add_drive()
 // per actuated joint in action order (which also defines the observed joints), set_contacts(),
-// set_keypoints(), set_scan() and set_ground_mask(). Each step: update(), then any of the queries.
+// set_keypoints(), set_scan() (and set_scan_height()) and set_ground_mask(). Each step: update(), then any of the queries.
 class RigKernel : public RefCounted {
 	GDCLASS(RigKernel, RefCounted);
 
@@ -74,6 +74,7 @@ class RigKernel : public RefCounted {
 	Vector<float> scan_x;
 	Vector<float> scan_z;
 	uint32_t ground_mask = 1;
+	float scan_height = 1.0f;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -83,6 +84,7 @@ class RigKernel : public RefCounted {
 	Basis heading;
 
 	bool _touches_world(int p_body) const;
+	float _ground_from(const Vector3 &p_point, float p_up) const;
 
 protected:
 	static void _bind_methods();
@@ -98,6 +100,7 @@ public:
 	void set_keypoints(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets);
 	void set_scan(const PackedFloat32Array &p_x, const PackedFloat32Array &p_z);
 	void set_ground_mask(int p_mask) { ground_mask = p_mask; }
+	void set_scan_height(float p_height) { scan_height = p_height; }
 	int get_action_size() const { return action_size; }
 
 	void update();
