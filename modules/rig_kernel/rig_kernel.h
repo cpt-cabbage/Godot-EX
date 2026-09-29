@@ -45,7 +45,7 @@
 //
 // Setup, once: set_bodies() (rigid bodies, masses, parent indices), set_pelvis_head(), add_drive()
 // per actuated joint in action order (which also defines the observed joints), set_contacts(),
-// set_keypoints(), set_scan() (and set_scan_height()) and set_ground_mask(). Each step: update(), then any of the queries.
+// set_keypoints(), set_scan() (and set_scan_height()), set_ground_mask() (and set_static_ground()). Each step: update(), then any of the queries.
 class RigKernel : public RefCounted {
 	GDCLASS(RigKernel, RefCounted);
 
@@ -75,6 +75,10 @@ class RigKernel : public RefCounted {
 	Vector<float> scan_z;
 	uint32_t ground_mask = 1;
 	float scan_height = 1.0f;
+	// Ground probes against static bodies only, batched through JoltPhysicsServer3D's
+	// space_cast_static_ground (a training server's terrain is all static; in the game a dynamic body
+	// may be ground). Without Jolt, the general ray.
+	bool static_ground = false;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -85,6 +89,7 @@ class RigKernel : public RefCounted {
 
 	bool _touches_world(int p_body) const;
 	float _ground_from(const Vector3 &p_point, float p_up) const;
+	bool _static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const;
 
 protected:
 	static void _bind_methods();
@@ -101,6 +106,7 @@ public:
 	void set_scan(const PackedFloat32Array &p_x, const PackedFloat32Array &p_z);
 	void set_ground_mask(int p_mask) { ground_mask = p_mask; }
 	void set_scan_height(float p_height) { scan_height = p_height; }
+	void set_static_ground(bool p_enabled) { static_ground = p_enabled; }
 	int get_action_size() const { return action_size; }
 
 	void update();

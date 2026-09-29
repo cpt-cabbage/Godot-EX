@@ -30,6 +30,8 @@
 
 #include "rig_kernel.h"
 
+#include "core/config/engine.h"
+
 #include "core/object/class_db.h"
 #include "servers/physics_3d/direct_states/physics_direct_body_state_3d.h"
 #include "servers/physics_3d/direct_states/physics_direct_space_state_3d.h"
@@ -170,9 +172,41 @@ float RigKernel::ground(const Vector3 &p_point) const {
 	return _ground_from(p_point, 1.0f);
 }
 
+// With static_ground, each point's ground by JoltPhysicsServer3D's batched static probe (the same ray
+// as _ground_from's); false without that server method, and the caller casts its own.
+bool RigKernel::_static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const {
+	if (!static_ground || bodies.is_empty()) {
+		return false;
+	}
+	// Godot-EX's Jolt server, an engine singleton of its own (PhysicsServer3D's singleton is the
+	// thread-safety wrapper, which forwards only the common API).
+	static const StringName jolt("JoltPhysicsServer3D");
+	static const StringName method("space_cast_static_ground");
+	Object *js = Engine::get_singleton()->has_singleton(jolt) ? Engine::get_singleton()->get_singleton_object(jolt) : nullptr;
+	if (js == nullptr || !js->has_method(method)) {
+		return false;
+	}
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	PackedVector3Array from;
+	from.resize(p_points.size());
+	for (int i = 0; i < p_points.size(); i++) {
+		from.write[i] = p_points[i] + Vector3(0, p_up, 0);
+	}
+	const PackedFloat32Array h = js->call(method, ps->body_get_space(bodies[pelvis]), from, p_up + 4.0f, ground_mask);
+	ERR_FAIL_COND_V(h.size() != p_points.size(), false);
+	for (int i = 0; i < h.size(); i++) {
+		r_heights[i] = Math::is_nan(h[i]) ? p_points[i].y - 1.0f : h[i];
+	}
+	return true;
+}
+
 // The first hit of a ray from p_up above the point to 4 m below it; without one, 1 m below the point.
 float RigKernel::_ground_from(const Vector3 &p_point, float p_up) const {
 	ERR_FAIL_COND_V(bodies.is_empty(), p_point.y - 1.0f);
+	float h = 0.0f;
+	if (_static_ground_batch(PackedVector3Array({ p_point }), p_up, &h)) {
+		return h;
+	}
 	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
 	PhysicsDirectSpaceState3D *space = ps->space_get_direct_state(ps->body_get_space(bodies[pelvis]));
 	ERR_FAIL_NULL_V(space, p_point.y - 1.0f);
@@ -222,10 +256,19 @@ PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, co
 	o[k++] = contact(0) ? 1.0f : 0.0f;
 	o[k++] = contact(1) ? 1.0f : 0.0f;
 	if (p_scan) {
+		PackedVector3Array points;
 		for (int iz = 0; iz < scan_z.size(); iz++) {
 			for (int ix = 0; ix < scan_x.size(); ix++) {
-				const Vector3 q = pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz]));
-				o[k++] = _ground_from(q, scan_height) - g_com;
+				points.push_back(pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz])));
+			}
+		}
+		if (_static_ground_batch(points, scan_height, o + k)) {
+			for (int i = 0; i < points.size(); i++) {
+				o[k++] -= g_com;
+			}
+		} else {
+			for (int i = 0; i < points.size(); i++) {
+				o[k++] = _ground_from(points[i], scan_height) - g_com;
 			}
 		}
 	}
@@ -299,6 +342,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_scan", "x", "z"), &RigKernel::set_scan);
 	ClassDB::bind_method(D_METHOD("set_ground_mask", "mask"), &RigKernel::set_ground_mask);
 	ClassDB::bind_method(D_METHOD("set_scan_height", "height"), &RigKernel::set_scan_height);
+	ClassDB::bind_method(D_METHOD("set_static_ground", "enabled"), &RigKernel::set_static_ground);
 	ClassDB::bind_method(D_METHOD("get_action_size"), &RigKernel::get_action_size);
 	ClassDB::bind_method(D_METHOD("update"), &RigKernel::update);
 	ClassDB::bind_method(D_METHOD("get_transform", "body"), &RigKernel::get_transform);
