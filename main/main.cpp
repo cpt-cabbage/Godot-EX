@@ -1548,6 +1548,14 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 				OS::get_singleton()->print("Missing render thread mode argument, aborting.\n");
 				goto error;
 			}
+		} else if (arg == "--worker-threads") { // Outside TOOLS_ENABLED: export templates run training servers side by side too.
+			if (N) {
+				worker_threads_override = N->get().to_int();
+				N = N->next();
+			} else {
+				OS::get_singleton()->print("Missing worker thread count argument, aborting.\n");
+				goto error;
+			}
 #ifdef TOOLS_ENABLED
 		} else if (arg == "-e" || arg == "--editor") { // starts editor
 
@@ -1570,14 +1578,6 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 			}
 		} else if (arg == "--single-threaded-scene") {
 			single_threaded_scene = true;
-		} else if (arg == "--worker-threads") {
-			if (N) {
-				worker_threads_override = N->get().to_int();
-				N = N->next();
-			} else {
-				OS::get_singleton()->print("Missing worker thread count argument, aborting.\n");
-				goto error;
-			}
 		} else if (arg == "--build-solutions") { // Build the scripting solution such C#
 
 			auto_build_solutions = true;
