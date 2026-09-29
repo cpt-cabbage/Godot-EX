@@ -162,6 +162,13 @@
 				Sets the height scan's grid in the heading frame: lateral offsets [param x] and forward offsets [param z]; the observation lists it row by row of [param z].
 			</description>
 		</method>
+		<method name="set_scan_height">
+			<return type="void" />
+			<param index="0" name="height" type="float" />
+			<description>
+				Sets how far above the pelvis the height scan's rays start (default 1.0). A ray starting inside a body does not hit it, so a wall taller than this reads as the ground at its foot; set it above the tallest wall the scan should see.
+			</description>
+		</method>
 		<method name="update">
 			<return type="void" />
 			<description>

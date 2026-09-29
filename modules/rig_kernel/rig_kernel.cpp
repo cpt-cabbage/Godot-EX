@@ -167,12 +167,17 @@ bool RigKernel::contact(int p_side) const {
 }
 
 float RigKernel::ground(const Vector3 &p_point) const {
+	return _ground_from(p_point, 1.0f);
+}
+
+// The first hit of a ray from p_up above the point to 4 m below it; without one, 1 m below the point.
+float RigKernel::_ground_from(const Vector3 &p_point, float p_up) const {
 	ERR_FAIL_COND_V(bodies.is_empty(), p_point.y - 1.0f);
 	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
 	PhysicsDirectSpaceState3D *space = ps->space_get_direct_state(ps->body_get_space(bodies[pelvis]));
 	ERR_FAIL_NULL_V(space, p_point.y - 1.0f);
 	PS3DT::RayParameters ray;
-	ray.from = p_point + Vector3(0, 1, 0);
+	ray.from = p_point + Vector3(0, p_up, 0);
 	ray.to = p_point - Vector3(0, 4, 0);
 	ray.collision_mask = ground_mask;
 	PS3DT::RayResult hit;
@@ -220,7 +225,7 @@ PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, co
 		for (int iz = 0; iz < scan_z.size(); iz++) {
 			for (int ix = 0; ix < scan_x.size(); ix++) {
 				const Vector3 q = pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz]));
-				o[k++] = ground(q) - g_com;
+				o[k++] = _ground_from(q, scan_height) - g_com;
 			}
 		}
 	}
@@ -293,6 +298,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_keypoints", "bodies", "offsets"), &RigKernel::set_keypoints);
 	ClassDB::bind_method(D_METHOD("set_scan", "x", "z"), &RigKernel::set_scan);
 	ClassDB::bind_method(D_METHOD("set_ground_mask", "mask"), &RigKernel::set_ground_mask);
+	ClassDB::bind_method(D_METHOD("set_scan_height", "height"), &RigKernel::set_scan_height);
 	ClassDB::bind_method(D_METHOD("get_action_size"), &RigKernel::get_action_size);
 	ClassDB::bind_method(D_METHOD("update"), &RigKernel::update);
 	ClassDB::bind_method(D_METHOD("get_transform", "body"), &RigKernel::get_transform);
