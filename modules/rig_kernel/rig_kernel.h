@@ -33,6 +33,7 @@
 #include "core/math/basis.h"
 #include "core/math/transform_3d.h"
 #include "core/object/ref_counted.h"
+#include "ground_data.h"
 #include "core/templates/hash_set.h"
 #include "core/variant/typed_array.h"
 
@@ -45,7 +46,8 @@
 //
 // Setup, once: set_bodies() (rigid bodies, masses, parent indices), set_pelvis_head(), add_drive()
 // per actuated joint in action order (which also defines the observed joints), set_contacts(),
-// set_keypoints(), set_scan() (and set_scan_height()), set_ground_mask() (and set_static_ground()). Each step: update(), then any of the queries.
+// set_keypoints(), set_scan() (and set_scan_height()), set_ground_mask() (and set_static_ground() or
+// set_ground_data()). Each step: update(), then any of the queries.
 class RigKernel : public RefCounted {
 	GDCLASS(RigKernel, RefCounted);
 
@@ -73,12 +75,16 @@ class RigKernel : public RefCounted {
 	Vector<Vector3> key_offsets;
 	Vector<float> scan_x;
 	Vector<float> scan_z;
+	Vector<Vector2> scan_points; // when set, the scan's points (x across, z ahead in the heading frame) in place of the x by z grid
 	uint32_t ground_mask = 1;
 	float scan_height = 1.0f;
 	// Ground probes against static bodies only, batched through JoltPhysicsServer3D's
 	// space_cast_static_ground (a training server's terrain is all static; in the game a dynamic body
 	// may be ground). Without Jolt, the general ray.
 	bool static_ground = false;
+	// The ground as data (GroundData: a training terrain's height field and props), read in place of
+	// every ray while it is set and enabled: the same rays, ~20x cheaper than Jolt's probe.
+	Ref<GroundData> ground_data;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -104,9 +110,13 @@ public:
 	void set_contacts(const PackedInt32Array &p_left, const PackedInt32Array &p_right);
 	void set_keypoints(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets);
 	void set_scan(const PackedFloat32Array &p_x, const PackedFloat32Array &p_z);
+	void set_scan_points(const PackedVector2Array &p_points);
+	int get_scan_size() const { return scan_points.is_empty() ? scan_x.size() * scan_z.size() : scan_points.size(); }
 	void set_ground_mask(int p_mask) { ground_mask = p_mask; }
 	void set_scan_height(float p_height) { scan_height = p_height; }
 	void set_static_ground(bool p_enabled) { static_ground = p_enabled; }
+	void set_ground_data(const Ref<GroundData> &p_data) { ground_data = p_data; }
+	Ref<GroundData> get_ground_data() const { return ground_data; }
 	int get_action_size() const { return action_size; }
 
 	void update();

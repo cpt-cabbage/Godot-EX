@@ -64,6 +64,12 @@
 				Returns the velocity of the rig's center of mass read by [method update].
 			</description>
 		</method>
+		<method name="get_ground_data" qualifiers="const">
+			<return type="GroundData" />
+			<description>
+				Returns the ground data set by [method set_ground_data].
+			</description>
+		</method>
 		<method name="get_heading" qualifiers="const">
 			<return type="Basis" />
 			<description>
@@ -75,6 +81,12 @@
 			<param index="0" name="body" type="int" />
 			<description>
 				Returns the linear velocity of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="get_scan_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of the height scan's points.
 			</description>
 		</method>
 		<method name="get_transform" qualifiers="const">
@@ -131,6 +143,13 @@
 				Sets the bodies whose contacts make the left and right contact of [method contact].
 			</description>
 		</method>
+		<method name="set_ground_data">
+			<return type="void" />
+			<param index="0" name="data" type="GroundData" />
+			<description>
+				Reads the ground from [param data] in place of every ray while it is set and enabled.
+			</description>
+		</method>
 		<method name="set_ground_mask">
 			<return type="void" />
 			<param index="0" name="mask" type="int" />
@@ -167,6 +186,13 @@
 			<param index="0" name="height" type="float" />
 			<description>
 				Sets how far above the pelvis the height scan's rays start (default 1.0). A ray starting inside a body does not hit it, so a wall taller than this reads as the ground at its foot; set it above the tallest wall the scan should see.
+			</description>
+		</method>
+		<method name="set_scan_points">
+			<return type="void" />
+			<param index="0" name="points" type="PackedVector2Array" />
+			<description>
+				Sets the height scan's points (x across, y ahead in the heading frame) in place of [method set_scan]'s grid.
 			</description>
 		</method>
 		<method name="set_static_ground">

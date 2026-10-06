@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GroundData" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A static ground as data (a height field and box and cylinder props) for casting rays straight down without the physics engine.
+	</brief_description>
+	<description>
+		Holds what a training terrain's static ground is made of, so a [RigKernel]'s ground probes and height scan can read it instead of casting rays in the physics engine. The rays are Jolt's: straight down for a length, the first surface met; a shape the ray starts inside is not hit; the height field's cells are split as Godot's Jolt module splits them. The caller must build the same shapes into the physics.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_box">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="half_extents" type="Vector3" />
+			<description>
+				Adds a box prop with the given transform and half extents.
+			</description>
+		</method>
+		<method name="add_cylinder">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="radius" type="float" />
+			<param index="2" name="height" type="float" />
+			<description>
+				Adds a cylinder prop (its axis the transform's Y) with the given radius and height.
+			</description>
+		</method>
+		<method name="cast_down" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="from" type="Vector3" />
+			<param index="1" name="length" type="float" />
+			<description>
+				Returns the height of the first surface straight down from [param from] within [param length], or NaN when there is none.
+			</description>
+		</method>
+		<method name="cast_down_batch" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="from" type="PackedVector3Array" />
+			<param index="1" name="length" type="float" />
+			<description>
+				[method cast_down] for each point.
+			</description>
+		</method>
+		<method name="clear_props">
+			<return type="void" />
+			<description>
+				Removes every prop.
+			</description>
+		</method>
+		<method name="get_prop_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of props.
+			</description>
+		</method>
+		<method name="is_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns whether a [RigKernel] reads this data.
+			</description>
+		</method>
+		<method name="nearest_trunks" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="count" type="int" />
+			<param index="2" name="range" type="float" />
+			<description>
+				Returns the [param count] nearest trunks (upright cylinders at least 1 m tall) within [param range] of [param xform]'s origin, nearest first, in its frame: x, z, radius and 1 for each, zeros past the last one found.
+			</description>
+		</method>
+		<method name="set_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>
+				Sets whether a [RigKernel] reads this data (off while the terrain is off the physics world).
+			</description>
+		</method>
+		<method name="set_height_field">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="depth" type="int" />
+			<param index="3" name="heights" type="PackedFloat32Array" />
+			<description>
+				Sets the height field: a [HeightMapShape3D]'s width, depth and heights, and its collision shape's global transform (a scale and a translation).
+			</description>
+		</method>
+		<method name="set_height_field_transform">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<description>
+				Sets the height field's transform alone (its scale changed).
+			</description>
+		</method>
+	</methods>
+</class>
