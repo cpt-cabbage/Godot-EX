@@ -2751,6 +2751,9 @@
 			[b]Note:[/b] Collision margins in Jolt do not add any extra size to the shape. Instead the shape is first shrunk by the margin and then expanded by the same amount, resulting in a shape with rounded corners.
 			[b]Note:[/b] Setting this value too close to [code]0.0[/code] may also negatively affect the accuracy of the collision detection with convex shapes.
 		</member>
+		<member name="physics/jolt_physics_3d/collisions/height_map_back_face_collision" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], bodies collide with the back faces of a [HeightMapShape3D], as with Godot Physics: a thin shape pushed more than half its thickness into the ground can be pushed out through the underside and held against it. If [code]false[/code], a height map is one-sided, as Jolt's height fields are by default.
+		</member>
 		<member name="physics/jolt_physics_3d/joints/world_node" type="int" setter="" getter="" default="0">
 			Which of the two nodes bound by a joint should represent the world when one of the two is omitted, as either [member Joint3D.node_a] or [member Joint3D.node_b]. This can be thought of as having the omitted node be a [StaticBody3D] at the joint's position. Joint limits are more easily expressed when [member Joint3D.node_a] represents the world.
 			[b]Note:[/b] In Godot Physics, only [member Joint3D.node_b] can represent the world.
