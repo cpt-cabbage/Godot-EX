@@ -1170,8 +1170,15 @@ OS_MacOS_NSApp::OS_MacOS_NSApp(const char *p_execpath, int p_argc, char **p_argv
 	// Implicitly create shared NSApplication instance.
 	[GodotApplication sharedApplication];
 
-	// In case we are unbundled, make us a proper UI application.
-	[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+	// In case we are unbundled, make us a proper UI application; with --background (before any "--"),
+	// an accessory one: no Dock icon, never activated, its windows shown without taking focus (Godot-EX:
+	// filming processes side by side while the user works).
+	bool background = false;
+	for (int i = 1; i < p_argc && strcmp(p_argv[i], "--") != 0; i++) {
+		background = background || strcmp(p_argv[i], "--background") == 0;
+	}
+	GodotApp.backgroundLaunch = background;
+	[NSApp setActivationPolicy:background ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
 
 	// Menu bar setup must go between sharedApplication above and
 	// finishLaunching below, in order to properly emulate the behavior

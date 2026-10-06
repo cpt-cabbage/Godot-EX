@@ -245,6 +245,7 @@ static bool init_fullscreen = false;
 static bool init_maximized = false;
 static bool init_windowed = false;
 static bool init_always_on_top = false;
+static bool init_background = false; // --background (Godot-EX)
 static bool init_use_custom_pos = false;
 static bool init_use_custom_screen = false;
 static Vector2 init_custom_pos;
@@ -576,6 +577,7 @@ void Main::print_help(const char *p_binary) {
 	print_help_option("-m, --maximized", "Request a maximized window.\n");
 	print_help_option("-w, --windowed", "Request windowed mode.\n");
 	print_help_option("-t, --always-on-top", "Request an always-on-top window.\n");
+	print_help_option("--background", "Request a main window that does not take focus (macOS: an accessory app, never activated).\n");
 	print_help_option("--resolution <W>x<H>", "Request window resolution.\n");
 	print_help_option("--position <X>,<Y>", "Request window position.\n");
 	print_help_option("--screen <N>", "Request window screen.\n");
@@ -1385,6 +1387,9 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		} else if (arg == "-t" || arg == "--always-on-top") { // force always-on-top window
 
 			init_always_on_top = true;
+		} else if (arg == "--background") { // a main window that does not take focus (Godot-EX)
+
+			init_background = true;
 		} else if (arg == "--resolution") { // force resolution
 
 			if (N) {
@@ -3313,6 +3318,10 @@ Error Main::setup2(bool p_show_boot_logo) {
 			if (bool(GLOBAL_GET("display/window/size/transparent"))) {
 				window_flags |= DisplayServerEnums::WINDOW_FLAG_TRANSPARENT_BIT;
 			}
+		}
+
+		if (init_background) {
+			window_flags |= DisplayServerEnums::WINDOW_FLAG_NO_FOCUS_BIT;
 		}
 
 #ifdef TOOLS_ENABLED

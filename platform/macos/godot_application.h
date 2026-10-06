@@ -41,6 +41,7 @@
 extern "C" GodotApplication *GodotApp;
 
 @property(readonly, nonatomic) GodotApplicationDelegate *godotDelegate;
+@property(assign, nonatomic) BOOL backgroundLaunch; // --background: never activated (an accessory app)
 
 - (GodotApplication *)init;
 
