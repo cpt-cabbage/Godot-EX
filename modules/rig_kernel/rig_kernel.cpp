@@ -235,7 +235,7 @@ float RigKernel::_ground_from(const Vector3 &p_point, float p_up) const {
 
 PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, const Vector3 &p_command, bool p_scan) const {
 	ERR_FAIL_COND_V_MSG(p_action.size() != action_size, PackedFloat32Array(), vformat("Expected %d action values, got %d.", action_size, p_action.size()));
-	const int n = 10 + 3 * action_size + 5 + (p_scan ? get_scan_size() : 0);
+	const int n = 10 + 3 * action_size + 5 + (p_scan ? get_scan_size() + get_water_size() : 0);
 	PackedFloat32Array out;
 	out.resize(n);
 	float *o = out.ptrw();
@@ -292,8 +292,37 @@ PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, co
 				o[k++] = _ground_from(points[i], scan_height) - g_com;
 			}
 		}
+		if (!water_points.is_empty()) {
+			const int scan_start = k - points.size();
+			const bool wet = water_data.is_valid() && water_data->has_water_field();
+			float s;
+			Vector2 f;
+			for (const int i : water_points) {
+				ERR_FAIL_INDEX_V(i, points.size(), out);
+				const Vector3 &q = points[i];
+				o[k++] = wet && water_data->water_sample(q.x, q.z, s, f) ? MAX(s - (o[scan_start + i] + g_com), 0.0f) : 0.0f;
+			}
+			if (wet && water_data->water_sample(com.x, com.z, s, f) && s > g_com) {
+				const Vector3 fl = heading.xform_inv(Vector3(f.x, 0.0f, f.y));
+				o[k++] = s - g_com;
+				o[k++] = fl.x;
+				o[k++] = fl.z;
+			} else {
+				o[k++] = 0.0f;
+				o[k++] = 0.0f;
+				o[k++] = 0.0f;
+			}
+		}
 	}
 	return out;
+}
+
+void RigKernel::set_water(const Ref<GroundData> &p_data, const PackedInt32Array &p_points) {
+	water_data = p_data;
+	water_points.resize(p_points.size());
+	for (int i = 0; i < p_points.size(); i++) {
+		water_points.write[i] = p_points[i];
+	}
 }
 
 PackedFloat32Array RigKernel::features(const Transform3D &p_pelvis_prev, float p_ground_y, float p_fps) const {
@@ -369,6 +398,9 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_ground_data", "data"), &RigKernel::set_ground_data);
 	ClassDB::bind_method(D_METHOD("get_ground_data"), &RigKernel::get_ground_data);
 	ClassDB::bind_method(D_METHOD("get_action_size"), &RigKernel::get_action_size);
+	ClassDB::bind_method(D_METHOD("set_water", "data", "points"), &RigKernel::set_water);
+	ClassDB::bind_method(D_METHOD("get_water_data"), &RigKernel::get_water_data);
+	ClassDB::bind_method(D_METHOD("get_water_size"), &RigKernel::get_water_size);
 	ClassDB::bind_method(D_METHOD("update"), &RigKernel::update);
 	ClassDB::bind_method(D_METHOD("get_transform", "body"), &RigKernel::get_transform);
 	ClassDB::bind_method(D_METHOD("get_linear_velocity", "body"), &RigKernel::get_linear_velocity);

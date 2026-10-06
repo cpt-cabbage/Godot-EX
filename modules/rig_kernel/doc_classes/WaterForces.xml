@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="WaterForces" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Buoyancy and drag on a rig's rigid bodies from a [GroundData]'s water field, applied before each physics tick.
+	</brief_description>
+	<description>
+		Each body is its collision primitive (a box, a capsule or a sphere in the body's frame) with a volume of its own. From the water at its centre: the submerged share (the surface through the shape's vertical extent), buoyancy (density times gravity times volume times the share, up, at the submerged part's centre), quadratic drag against the velocity relative to the flow (the shape's area across it, times the share; at most what stops the relative motion within the tick) and a spin drag across the long axis. Forces go through the physics server's per-step force.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_box">
+			<return type="void" />
+			<param index="0" name="body" type="RID" />
+			<param index="1" name="volume" type="float" />
+			<param index="2" name="center" type="Vector3" />
+			<param index="3" name="half_extents" type="Vector3" />
+			<description>
+				Adds a body as a box centred at [param center] in its frame.
+			</description>
+		</method>
+		<method name="add_capsule">
+			<return type="void" />
+			<param index="0" name="body" type="RID" />
+			<param index="1" name="volume" type="float" />
+			<param index="2" name="center" type="Vector3" />
+			<param index="3" name="axis" type="int" />
+			<param index="4" name="radius" type="float" />
+			<param index="5" name="height" type="float" />
+			<description>
+				Adds a body as a capsule along its frame's [param axis] (0, 1 or 2), [param height] its total height.
+			</description>
+		</method>
+		<method name="add_sphere">
+			<return type="void" />
+			<param index="0" name="body" type="RID" />
+			<param index="1" name="volume" type="float" />
+			<param index="2" name="center" type="Vector3" />
+			<param index="3" name="radius" type="float" />
+			<description>
+				Adds a body as a sphere.
+			</description>
+		</method>
+		<method name="apply">
+			<return type="float" />
+			<param index="0" name="water" type="GroundData" />
+			<description>
+				Applies the water's forces for the coming physics tick and returns the submerged share of the bodies' volume (0 out of the water, after one look at the field around the first body).
+			</description>
+		</method>
+		<method name="clear">
+			<return type="void" />
+			<description>
+				Removes every body.
+			</description>
+		</method>
+		<method name="get_body_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of bodies.
+			</description>
+		</method>
+		<method name="get_submerged" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the last [method apply]'s submerged share.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="density" type="float" setter="set_density" getter="get_density" default="1000.0">
+			The water's density (kg/m^3).
+		</member>
+		<member name="drag" type="float" setter="set_drag" getter="get_drag" default="1.0">
+			The drag coefficient.
+		</member>
+		<member name="gravity" type="float" setter="set_gravity" getter="get_gravity" default="9.8">
+			Gravity's magnitude (m/s^2) for buoyancy.
+		</member>
+		<member name="reach" type="float" setter="set_reach" getter="get_reach" default="1.6">
+			The distance from the first body to any part of the rig, for the early out.
+		</member>
+		<member name="spin_drag" type="float" setter="set_spin_drag" getter="get_spin_drag" default="1.0">
+			The spin drag's coefficient.
+		</member>
+	</members>
+</class>

@@ -48,10 +48,22 @@
 				Removes every prop.
 			</description>
 		</method>
+		<method name="clear_water">
+			<return type="void" />
+			<description>
+				Removes the water field.
+			</description>
+		</method>
 		<method name="get_prop_count" qualifiers="const">
 			<return type="int" />
 			<description>
 				Returns the number of props.
+			</description>
+		</method>
+		<method name="has_water_field" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns whether a water field is set.
 			</description>
 		</method>
 		<method name="is_enabled" qualifiers="const">
@@ -91,6 +103,40 @@
 			<param index="0" name="xform" type="Transform3D" />
 			<description>
 				Sets the height field's transform alone (its scale changed).
+			</description>
+		</method>
+		<method name="set_water_field">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="depth" type="int" />
+			<param index="3" name="surface" type="PackedFloat32Array" />
+			<param index="4" name="flow" type="PackedVector2Array" />
+			<description>
+				Sets a water field: the surface's height (NaN where dry) and its flow (x, z) at a [param width] by [param depth] grid of samples, placed as a height field's are by [param xform] (a scale and a translation; its Y scale multiplies the heights). The field is to reach past the shore by a cell's diagonal or more: a cell with a dry corner is dry. Read by [WaterForces] and by a [RigKernel]'s water inputs ([method RigKernel.set_water]).
+			</description>
+		</method>
+		<method name="set_water_transform">
+			<return type="void" />
+			<param index="0" name="xform" type="Transform3D" />
+			<param index="1" name="flow_scale" type="float" />
+			<description>
+				Places the water field by [param xform] and scales its flow by [param flow_scale].
+			</description>
+		</method>
+		<method name="water_at" qualifiers="const">
+			<return type="Vector3" />
+			<param index="0" name="point" type="Vector3" />
+			<description>
+				Returns the water at [param point]'s x and z: the surface's height (NaN where dry) and the flow's x and z, bilinear over the field's cell.
+			</description>
+		</method>
+		<method name="water_top_near" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector3" />
+			<param index="1" name="radius" type="float" />
+			<description>
+				Returns the highest surface over the field's samples within [param radius] of [param point] in x and z, or -INF.
 			</description>
 		</method>
 	</methods>
