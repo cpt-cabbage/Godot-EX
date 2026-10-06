@@ -96,6 +96,18 @@
 				Returns the transform of body [param body] read by [method update].
 			</description>
 		</method>
+		<method name="get_water_data" qualifiers="const">
+			<return type="GroundData" />
+			<description>
+				Returns the water inputs' data.
+			</description>
+		</method>
+		<method name="get_water_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of water inputs (the points' and 3), or 0.
+			</description>
+		</method>
 		<method name="ground" qualifiers="const">
 			<return type="float" />
 			<param index="0" name="point" type="Vector3" />
@@ -200,6 +212,14 @@
 			<param index="0" name="enabled" type="bool" />
 			<description>
 				When enabled (default off), the ground probes consider static bodies only and the height scan's rays go to the physics server in one batch (Godot-EX's [code]JoltPhysicsServer3D.space_cast_static_ground[/code]; with another physics server, the general ray). Faster where the ground is all static, as on a training server; in a game a dynamic body can be ground.
+			</description>
+		</method>
+		<method name="set_water">
+			<return type="void" />
+			<param index="0" name="data" type="GroundData" />
+			<param index="1" name="points" type="PackedInt32Array" />
+			<description>
+				Appends the water inputs to a scanned observation: the water's depth over the scan's ground at the scan points [param points] (0 where dry), its depth at the center of mass and its flow there in the heading frame (x, z), from [param data]'s water field (zeros without one).
 			</description>
 		</method>
 		<method name="update">

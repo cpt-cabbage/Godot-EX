@@ -230,6 +230,97 @@ PackedFloat32Array GroundData::cast_down_batch(const PackedVector3Array &p_from,
 	return out;
 }
 
+void GroundData::set_water_field(const Transform3D &p_xform, int p_width, int p_depth, const PackedFloat32Array &p_surface, const PackedVector2Array &p_flow) {
+	ERR_FAIL_COND_MSG(p_width < 2 || p_depth < 2 || p_surface.size() != p_width * p_depth || p_flow.size() != p_width * p_depth, "The water field must be at least 2 x 2, its surface and flow width x depth.");
+	water_width = p_width;
+	water_depth = p_depth;
+	water_surface.resize(p_surface.size());
+	water_flow.resize(p_flow.size());
+	for (int i = 0; i < p_surface.size(); i++) {
+		water_surface[i] = p_surface[i];
+		water_flow[i] = p_flow[i];
+	}
+	has_water = true;
+	set_water_transform(p_xform, water_flow_scale);
+}
+
+void GroundData::set_water_transform(const Transform3D &p_xform, float p_flow_scale) {
+	const Basis &b = p_xform.basis;
+	ERR_FAIL_COND_MSG(!Math::is_zero_approx(b.rows[0][1]) || !Math::is_zero_approx(b.rows[0][2]) || !Math::is_zero_approx(b.rows[1][0]) || !Math::is_zero_approx(b.rows[1][2]) || !Math::is_zero_approx(b.rows[2][0]) || !Math::is_zero_approx(b.rows[2][1]),
+			"The water field's transform must be a scale and a translation (no rotation).");
+	water_xform = p_xform;
+	water_flow_scale = p_flow_scale;
+}
+
+void GroundData::clear_water() {
+	has_water = false;
+	water_surface.clear();
+	water_flow.clear();
+}
+
+bool GroundData::water_sample(float p_x, float p_z, float &r_surface, Vector2 &r_flow) const {
+	r_surface = Math::NaN;
+	r_flow = Vector2();
+	if (!has_water || !enabled) {
+		return false;
+	}
+	const Basis &b = water_xform.basis;
+	const Vector3 &o = water_xform.origin;
+	const float fx = (p_x - o.x) / b.rows[0][0] + 0.5f * (water_width - 1);
+	const float fz = (p_z - o.z) / b.rows[2][2] + 0.5f * (water_depth - 1);
+	if (fx < 0.0f || fz < 0.0f || fx > water_width - 1 || fz > water_depth - 1) {
+		return false;
+	}
+	const int ix = MIN(int(fx), water_width - 2);
+	const int iz = MIN(int(fz), water_depth - 2);
+	const float a = fx - ix;
+	const float c = fz - iz;
+	const int idx[4] = { iz * water_width + ix, iz * water_width + ix + 1, (iz + 1) * water_width + ix, (iz + 1) * water_width + ix + 1 };
+	const float wt[4] = { (1.0f - a) * (1.0f - c), a * (1.0f - c), (1.0f - a) * c, a * c };
+	float h = 0.0f;
+	Vector2 f;
+	for (int i = 0; i < 4; i++) {
+		const float s = water_surface[idx[i]];
+		if (Math::is_nan(s)) {
+			return false; // a cell with a dry corner is dry: the field reaches past the shore
+		}
+		h += wt[i] * s;
+		f += wt[i] * water_flow[idx[i]];
+	}
+	r_surface = o.y + b.rows[1][1] * h;
+	r_flow = water_flow_scale * f;
+	return true;
+}
+
+Vector3 GroundData::water_at(const Vector3 &p_point) const {
+	float s;
+	Vector2 f;
+	water_sample(p_point.x, p_point.z, s, f);
+	return Vector3(s, f.x, f.y);
+}
+
+float GroundData::water_top_near(const Vector3 &p_point, float p_radius) const {
+	if (!has_water || !enabled) {
+		return -Math::INF;
+	}
+	const Basis &b = water_xform.basis;
+	const Vector3 &o = water_xform.origin;
+	const int x0 = MAX(int(Math::floor((p_point.x - p_radius - o.x) / b.rows[0][0] + 0.5f * (water_width - 1))), 0);
+	const int x1 = MIN(int(Math::ceil((p_point.x + p_radius - o.x) / b.rows[0][0] + 0.5f * (water_width - 1))), water_width - 1);
+	const int z0 = MAX(int(Math::floor((p_point.z - p_radius - o.z) / b.rows[2][2] + 0.5f * (water_depth - 1))), 0);
+	const int z1 = MIN(int(Math::ceil((p_point.z + p_radius - o.z) / b.rows[2][2] + 0.5f * (water_depth - 1))), water_depth - 1);
+	float top = -Math::INF;
+	for (int z = z0; z <= z1; z++) {
+		for (int x = x0; x <= x1; x++) {
+			const float s = water_surface[z * water_width + x];
+			if (!Math::is_nan(s)) {
+				top = MAX(top, o.y + b.rows[1][1] * s);
+			}
+		}
+	}
+	return top;
+}
+
 PackedFloat32Array GroundData::nearest_trunks(const Transform3D &p_xform, int p_count, float p_range) const {
 	PackedFloat32Array out;
 	out.resize(4 * p_count);
@@ -293,5 +384,11 @@ void GroundData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("add_cylinder", "xform", "radius", "height"), &GroundData::add_cylinder);
 	ClassDB::bind_method(D_METHOD("get_prop_count"), &GroundData::get_prop_count);
 	ClassDB::bind_method(D_METHOD("cast_down", "from", "length"), &GroundData::cast_down);
+	ClassDB::bind_method(D_METHOD("set_water_field", "xform", "width", "depth", "surface", "flow"), &GroundData::set_water_field);
+	ClassDB::bind_method(D_METHOD("set_water_transform", "xform", "flow_scale"), &GroundData::set_water_transform);
+	ClassDB::bind_method(D_METHOD("clear_water"), &GroundData::clear_water);
+	ClassDB::bind_method(D_METHOD("has_water_field"), &GroundData::has_water_field);
+	ClassDB::bind_method(D_METHOD("water_at", "point"), &GroundData::water_at);
+	ClassDB::bind_method(D_METHOD("water_top_near", "point", "radius"), &GroundData::water_top_near);
 	ClassDB::bind_method(D_METHOD("cast_down_batch", "from", "length"), &GroundData::cast_down_batch);
 }

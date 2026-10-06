@@ -85,6 +85,11 @@ class RigKernel : public RefCounted {
 	// The ground as data (GroundData: a training terrain's height field and props), read in place of
 	// every ray while it is set and enabled: the same rays, ~20x cheaper than Jolt's probe.
 	Ref<GroundData> ground_data;
+	// The water inputs (design/v2_recipe.md item 9), appended to a scanned observation while water_points
+	// is set: the water's depth over the ground at those of the scan's points (0 where dry), at the COM,
+	// and the flow at the COM in the heading frame (x, z); the water from water_data's field.
+	Ref<GroundData> water_data;
+	Vector<int> water_points;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -118,6 +123,9 @@ public:
 	void set_ground_data(const Ref<GroundData> &p_data) { ground_data = p_data; }
 	Ref<GroundData> get_ground_data() const { return ground_data; }
 	int get_action_size() const { return action_size; }
+	void set_water(const Ref<GroundData> &p_data, const PackedInt32Array &p_points);
+	Ref<GroundData> get_water_data() const { return water_data; }
+	int get_water_size() const { return water_points.is_empty() ? 0 : water_points.size() + 3; }
 
 	void update();
 	Transform3D get_transform(int p_body) const;
