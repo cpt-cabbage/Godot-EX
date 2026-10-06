@@ -110,6 +110,14 @@ void RigKernel::set_keypoints(const PackedInt32Array &p_bodies, const PackedVect
 void RigKernel::set_scan(const PackedFloat32Array &p_x, const PackedFloat32Array &p_z) {
 	scan_x = p_x;
 	scan_z = p_z;
+	scan_points.clear();
+}
+
+void RigKernel::set_scan_points(const PackedVector2Array &p_points) {
+	scan_points.resize(p_points.size());
+	for (int i = 0; i < p_points.size(); i++) {
+		scan_points.write[i] = p_points[i];
+	}
 }
 
 void RigKernel::update() {
@@ -175,6 +183,13 @@ float RigKernel::ground(const Vector3 &p_point) const {
 // With static_ground, each point's ground by JoltPhysicsServer3D's batched static probe (the same ray
 // as _ground_from's); false without that server method, and the caller casts its own.
 bool RigKernel::_static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const {
+	if (ground_data.is_valid() && ground_data->is_enabled()) {
+		for (int i = 0; i < p_points.size(); i++) {
+			const float h = ground_data->cast_down(p_points[i] + Vector3(0, p_up, 0), p_up + 4.0f);
+			r_heights[i] = Math::is_nan(h) ? p_points[i].y - 1.0f : h;
+		}
+		return true;
+	}
 	if (!static_ground || bodies.is_empty()) {
 		return false;
 	}
@@ -220,7 +235,7 @@ float RigKernel::_ground_from(const Vector3 &p_point, float p_up) const {
 
 PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, const Vector3 &p_command, bool p_scan) const {
 	ERR_FAIL_COND_V_MSG(p_action.size() != action_size, PackedFloat32Array(), vformat("Expected %d action values, got %d.", action_size, p_action.size()));
-	const int n = 10 + 3 * action_size + 5 + (p_scan ? scan_x.size() * scan_z.size() : 0);
+	const int n = 10 + 3 * action_size + 5 + (p_scan ? get_scan_size() : 0);
 	PackedFloat32Array out;
 	out.resize(n);
 	float *o = out.ptrw();
@@ -257,9 +272,15 @@ PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, co
 	o[k++] = contact(1) ? 1.0f : 0.0f;
 	if (p_scan) {
 		PackedVector3Array points;
-		for (int iz = 0; iz < scan_z.size(); iz++) {
-			for (int ix = 0; ix < scan_x.size(); ix++) {
-				points.push_back(pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz])));
+		if (!scan_points.is_empty()) {
+			for (const Vector2 &q : scan_points) {
+				points.push_back(pt.origin + heading.xform(Vector3(q.x, 0, q.y)));
+			}
+		} else {
+			for (int iz = 0; iz < scan_z.size(); iz++) {
+				for (int ix = 0; ix < scan_x.size(); ix++) {
+					points.push_back(pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz])));
+				}
 			}
 		}
 		if (_static_ground_batch(points, scan_height, o + k)) {
@@ -340,9 +361,13 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_contacts", "left", "right"), &RigKernel::set_contacts);
 	ClassDB::bind_method(D_METHOD("set_keypoints", "bodies", "offsets"), &RigKernel::set_keypoints);
 	ClassDB::bind_method(D_METHOD("set_scan", "x", "z"), &RigKernel::set_scan);
+	ClassDB::bind_method(D_METHOD("set_scan_points", "points"), &RigKernel::set_scan_points);
+	ClassDB::bind_method(D_METHOD("get_scan_size"), &RigKernel::get_scan_size);
 	ClassDB::bind_method(D_METHOD("set_ground_mask", "mask"), &RigKernel::set_ground_mask);
 	ClassDB::bind_method(D_METHOD("set_scan_height", "height"), &RigKernel::set_scan_height);
 	ClassDB::bind_method(D_METHOD("set_static_ground", "enabled"), &RigKernel::set_static_ground);
+	ClassDB::bind_method(D_METHOD("set_ground_data", "data"), &RigKernel::set_ground_data);
+	ClassDB::bind_method(D_METHOD("get_ground_data"), &RigKernel::get_ground_data);
 	ClassDB::bind_method(D_METHOD("get_action_size"), &RigKernel::get_action_size);
 	ClassDB::bind_method(D_METHOD("update"), &RigKernel::update);
 	ClassDB::bind_method(D_METHOD("get_transform", "body"), &RigKernel::get_transform);
