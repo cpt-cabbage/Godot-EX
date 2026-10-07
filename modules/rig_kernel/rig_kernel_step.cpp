@@ -104,6 +104,8 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("still_w", rc.still_w);
 	f("slip_w", rc.slip_w);
 	f("slip_free", rc.slip_free);
+	f("turn_cycle_yaw", rc.turn_cycle_yaw);
+	f("turn_tap", rc.turn_tap);
 	i("push_gate", rc.push_gate);
 	i("switch_gate", rc.switch_gate);
 	i("kneel_steps", rc.kneel_steps);
@@ -164,6 +166,8 @@ void RigKernel::reset_terms(double p_wy_mean, const PackedFloat32Array &p_featur
 		air[k] = 0.0;
 		lift_at[k] = Vector3();
 	}
+	land_yaw[0] = NAN;
+	land_yaw[1] = NAN;
 	kneel = 0;
 	propped = 0;
 	path = 0.0;
@@ -342,8 +346,18 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 					} else {
 						pay = al >= rc.air_stride ? MAX(pay, 0.0) : 0.0;
 					}
+				} else if (turning && cvl < 0.3) {
+					// A pivot: a step when the heading turned turn_cycle_yaw since this foot's last landing.
+					const double yaw = Math::atan2(double(h.get_column(2).x), double(h.get_column(2).z));
+					const double dyaw = Math::is_nan(land_yaw[k]) ? 1e9 : Math::abs(Math::wrapf(yaw - land_yaw[k], -Math::PI, Math::PI));
+					if (dyaw < rc.turn_cycle_yaw) {
+						pay = MIN(pay, 0.0) - rc.turn_tap;
+					}
 				} else if (pay > 0.0 && double(Vector2(d.x, d.z).length()) < rc.air_stride) {
 					pay = 0.0;
+				}
+				if (k < 2) {
+					land_yaw[k] = Math::atan2(double(h.get_column(2).x), double(h.get_column(2).z));
 				}
 				r += cvl >= 0.3 || turning ? pay : MIN(pay, 0.0);
 				air[k] = 0.0;
