@@ -55,6 +55,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	};
 	b("air_reward", rc.air_reward);
 	b("air_climb", rc.air_climb);
+	b("slip", rc.slip);
 	b("senses", rc.senses);
 	b("scramble_rhythm", rc.scramble_rhythm);
 	b("ankle_human", rc.ankle_human);
@@ -101,6 +102,8 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("hand_reach", rc.hand_reach);
 	f("hand", rc.hand);
 	f("still_w", rc.still_w);
+	f("slip_w", rc.slip_w);
+	f("slip_free", rc.slip_free);
 	i("push_gate", rc.push_gate);
 	i("switch_gate", rc.switch_gate);
 	i("kneel_steps", rc.kneel_steps);
@@ -146,6 +149,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	ints("hands_r", rc.hands[1]);
 	ints("prop_bodies", rc.prop_bodies);
 	ints("still_bodies", rc.still_bodies);
+	ints("slip_bodies", rc.slip_bodies);
 	ints("soles", rc.soles);
 	rc.water_data = d.has("water_data") ? Ref<GroundData>(d["water_data"]) : Ref<GroundData>();
 	for (const int x : { rc.torso, rc.foot[0], rc.foot[1], rc.toes[0], rc.toes[1], rc.lowerarm[0], rc.lowerarm[1], rc.air_limbs[0], rc.air_limbs[1], rc.air_limbs[2], rc.air_limbs[3] }) {
@@ -419,6 +423,14 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			w2 += ang_vel[bi].length_squared();
 		}
 		r -= rc.still_w * w2;
+	}
+	// The feet's slip.
+	if (rc.slip && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
+		double sl = 0.0;
+		for (const int bi : rc.slip_bodies) {
+			sl += _slip_body(bi, rc.slip_free);
+		}
+		r -= rc.slip_w * sl;
 	}
 	double da = 0.0;
 	for (int j = 0; j < p_action.size() && j < p_prev_action.size(); j++) {
