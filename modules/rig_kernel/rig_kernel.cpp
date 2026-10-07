@@ -136,6 +136,10 @@ void RigKernel::update() {
 	com = m > 0.0f ? p / m : Vector3();
 	com_vel = m > 0.0f ? v / m : Vector3();
 	heading = heading_of(xform[pelvis].basis);
+	for (const int b : sensed) {
+		touch_friction.write[b] = _world_friction(b);
+		touch.write[b] = Math::is_nan(touch_friction[b]) ? 0 : 1;
+	}
 }
 
 Transform3D RigKernel::get_transform(int p_body) const {
@@ -166,10 +170,35 @@ bool RigKernel::_touches_world(int p_body) const {
 	return false;
 }
 
+// The friction of the first collider outside the rig body p_body touches, NaN when none (as the
+// reward's script reads it: its first contact's collider's body friction).
+float RigKernel::_world_friction(int p_body) const {
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	PhysicsDirectBodyState3D *state = ps->body_get_direct_state(bodies[p_body]);
+	if (state == nullptr) {
+		return Math::NaN;
+	}
+	for (int i = 0; i < state->get_contact_count(); i++) {
+		const RID collider = state->get_contact_collider(i);
+		if (!body_set.has(collider)) {
+			return ps->body_get_param(collider, PS3DE::BODY_PARAM_FRICTION);
+		}
+	}
+	return Math::NaN;
+}
+
+// Whether p_body touches the world: update()'s read when it is sensed, else the physics server's now.
+bool RigKernel::_touches(int p_body) const {
+	if (p_body < touch.size() && touch[p_body] >= 0) {
+		return touch[p_body] == 1;
+	}
+	return _touches_world(p_body);
+}
+
 bool RigKernel::contact(int p_side) const {
 	const Vector<int> &list = p_side == 0 ? contacts_left : contacts_right;
 	for (int b : list) {
-		if (b >= 0 && b < bodies.size() && _touches_world(b)) {
+		if (b >= 0 && b < bodies.size() && _touches(b)) {
 			return true;
 		}
 	}
@@ -381,6 +410,206 @@ void RigKernel::write_targets(const PackedFloat32Array &p_action) const {
 	}
 }
 
+// The reward's terms. Each is its script's (ProjectEX's learn/amp_env.gd) on update()'s state, held to it
+// by a parity test (tests/kernel_check.gd): the script's float32 vectors kept as vectors, its scalars in
+// double.
+
+void RigKernel::set_sensed(const PackedInt32Array &p_bodies) {
+	sensed.clear();
+	touch.resize(bodies.size());
+	touch_friction.resize(bodies.size());
+	for (int i = 0; i < bodies.size(); i++) {
+		touch.write[i] = -1;
+		touch_friction.write[i] = Math::NaN;
+	}
+	for (int i = 0; i < p_bodies.size(); i++) {
+		ERR_CONTINUE(p_bodies[i] < 0 || p_bodies[i] >= bodies.size());
+		sensed.push_back(p_bodies[i]);
+		touch.write[p_bodies[i]] = 0;
+	}
+}
+
+bool RigKernel::touches(int p_body) const {
+	ERR_FAIL_INDEX_V(p_body, bodies.size(), false);
+	return _touches(p_body);
+}
+
+bool RigKernel::touches_any(const PackedInt32Array &p_bodies) const {
+	for (int i = 0; i < p_bodies.size(); i++) {
+		if (touches(p_bodies[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The first of p_bodies touching the world: its collider's friction; NaN when none touches.
+float RigKernel::contact_friction(const PackedInt32Array &p_bodies) const {
+	for (int i = 0; i < p_bodies.size(); i++) {
+		const int b = p_bodies[i];
+		ERR_CONTINUE(b < 0 || b >= bodies.size());
+		const float f = b < touch.size() && touch[b] >= 0 ? touch_friction[b] : _world_friction(b);
+		if (!Math::is_nan(f)) {
+			return f;
+		}
+	}
+	return Math::NaN;
+}
+
+double RigKernel::angular_speed_squared(const PackedInt32Array &p_bodies) const {
+	double sum = 0.0;
+	for (int i = 0; i < p_bodies.size(); i++) {
+		ERR_CONTINUE(p_bodies[i] < 0 || p_bodies[i] >= bodies.size());
+		sum += ang_vel[p_bodies[i]].length_squared();
+	}
+	return sum;
+}
+
+// p_bodies: the left lower leg and foot, the right's; p_actions: each foot's pitch in the action;
+// p_gains: the drive's stiffness and damping, its torque cap, the nominal pitch, the action's scale on it,
+// people's peak ankle torque.
+void RigKernel::set_ankles(const PackedInt32Array &p_bodies, const PackedInt32Array &p_actions, const PackedFloat64Array &p_gains) {
+	ERR_FAIL_COND(p_bodies.size() != 4 || p_actions.size() != 2 || p_gains.size() != 6);
+	for (int k = 0; k < 2; k++) {
+		ERR_FAIL_INDEX(p_bodies[2 * k], bodies.size());
+		ERR_FAIL_INDEX(p_bodies[2 * k + 1], bodies.size());
+		ankle_lower[k] = p_bodies[2 * k];
+		ankle_foot[k] = p_bodies[2 * k + 1];
+		ankle_action[k] = p_actions[k];
+	}
+	ankle_kp = p_gains[0];
+	ankle_kd = p_gains[1];
+	ankle_cap = p_gains[2];
+	ankle_nominal = p_gains[3];
+	ankle_scale = p_gains[4];
+	ankle_human = p_gains[5];
+}
+
+// Both ankles' pitch torque (the drive's, from the action's target, the angle and the rate) past people's
+// peak, each as a share of the rest of its cap; with p_push_only only while it does positive work.
+double RigKernel::ankle_excess(const PackedFloat32Array &p_action, bool p_push_only) const {
+	ERR_FAIL_COND_V_MSG(ankle_lower[0] < 0, 0.0, "set_ankles() first.");
+	double e = 0.0;
+	for (int k = 0; k < 2; k++) {
+		ERR_FAIL_INDEX_V(ankle_action[k], p_action.size(), 0.0);
+		const Basis li = xform[ankle_lower[k]].basis.inverse();
+		const double angle = rotation_vector(li * xform[ankle_foot[k]].basis).x;
+		const double rate = li.xform(ang_vel[ankle_foot[k]] - ang_vel[ankle_lower[k]]).x;
+		const double target = ankle_nominal + ankle_scale * CLAMP(double(p_action[ankle_action[k]]), -1.0, 1.0);
+		const double t = CLAMP(ankle_kp * (target - angle) - ankle_kd * rate, -ankle_cap, ankle_cap);
+		if (p_push_only && t * rate <= 0.0) {
+			continue;
+		}
+		e += MAX(Math::abs(t) - ankle_human, 0.0) / MAX(ankle_cap - ankle_human, 1.0);
+	}
+	return e;
+}
+
+void RigKernel::set_knees(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets) {
+	ERR_FAIL_COND(p_bodies.size() != p_offsets.size());
+	knee_bodies.clear();
+	knee_offsets.clear();
+	for (int i = 0; i < p_bodies.size(); i++) {
+		ERR_FAIL_INDEX(p_bodies[i], bodies.size());
+		knee_bodies.push_back(p_bodies[i]);
+		knee_offsets.push_back(p_offsets[i]);
+	}
+}
+
+// Whether a knee is down: its joint within p_height of the ground under it (ground()), where the terrain's
+// slope there is at most p_max_degrees.
+bool RigKernel::knee_down(double p_height, double p_max_degrees) const {
+	for (int i = 0; i < knee_bodies.size(); i++) {
+		const Vector3 k = xform[knee_bodies[i]].xform(knee_offsets[i]);
+		const double g = ground(k);
+		if (double(k.y) - g >= p_height) {
+			continue;
+		}
+		if (terrain.is_valid()) {
+			const Vector3 o = terrain->get_origin();
+			const double slope = terrain->fall_line(Vector2(double(k.x) - o.x, double(k.z) - o.z)).length();
+			if (Math::rad_to_deg(Math::atan(slope)) > p_max_degrees) {
+				continue;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+void RigKernel::set_soles(const PackedVector3Array &p_heel, const PackedVector3Array &p_toe, float p_lift, float p_probe, float p_edge_on) {
+	heel_corners.clear();
+	toe_corners.clear();
+	for (int i = 0; i < p_heel.size(); i++) {
+		heel_corners.push_back(p_heel[i]);
+	}
+	for (int i = 0; i < p_toe.size(); i++) {
+		toe_corners.push_back(p_toe[i]);
+	}
+	sole_lift = p_lift;
+	sole_probe = p_probe;
+	edge_on = p_edge_on;
+}
+
+double RigKernel::_terrain_ground(const Vector3 &p_point) const {
+	return terrain.is_valid() ? terrain->ground_at(p_point) : 0.0;
+}
+
+// Whether a foot stands over a prop's edge: some of its sole's corners over a prop (the ground data's
+// first surface down from sole_lift over the corner more than edge_on over the terrain's ground), some not.
+bool RigKernel::on_edge(int p_foot, int p_toes) const {
+	ERR_FAIL_INDEX_V(p_foot, bodies.size(), false);
+	ERR_FAIL_INDEX_V(p_toes, bodies.size(), false);
+	return sole_on_edge(xform[p_foot], xform[p_toes]);
+}
+
+// on_edge() for a foot and its toes at these transforms.
+bool RigKernel::sole_on_edge(const Transform3D &p_foot, const Transform3D &p_toes) const {
+	ERR_FAIL_COND_V_MSG(ground_data.is_null(), false, "on_edge() reads the ground data.");
+	int on = 0;
+	const int n = heel_corners.size() + toe_corners.size();
+	for (int i = 0; i < n; i++) {
+		const bool heel = i < heel_corners.size();
+		const Vector3 p = (heel ? p_foot : p_toes).xform(heel ? heel_corners[i] : toe_corners[i - heel_corners.size()]) + Vector3(0, sole_lift, 0);
+		const float surface = ground_data->cast_down(p, sole_probe);
+		if (!Math::is_nan(surface) && double(surface) - _terrain_ground(p) > double(edge_on)) {
+			on++;
+		}
+	}
+	return on > 0 && on < n;
+}
+
+void RigKernel::set_legs(const PackedInt32Array &p_bodies) {
+	legs.clear();
+	for (int i = 0; i < p_bodies.size(); i++) {
+		ERR_FAIL_INDEX(p_bodies[i], bodies.size());
+		legs.push_back(p_bodies[i]);
+	}
+}
+
+// Undergrowth's drag: each leg body under p_height over the terrain's ground (every one without a terrain)
+// gets a constant force p_coefficient times its horizontal velocity, the others none. The physics server's
+// state now (a snag may have changed a velocity since update()).
+void RigKernel::leg_drag(double p_coefficient, double p_height) const {
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	for (const int b : legs) {
+		Vector3 f;
+		const Transform3D t = ps->body_get_state(bodies[b], PS3DE::BODY_STATE_TRANSFORM);
+		if (terrain.is_null() || double(t.origin.y) - _terrain_ground(t.origin) < p_height) {
+			const Vector3 v = ps->body_get_state(bodies[b], PS3DE::BODY_STATE_LINEAR_VELOCITY);
+			f = Vector3(v.x, 0.0f, v.z) * real_t(p_coefficient);
+		}
+		ps->body_set_constant_force(bodies[b], f);
+	}
+}
+
+void RigKernel::clear_leg_drag() const {
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	for (const int b : legs) {
+		ps->body_set_constant_force(bodies[b], Vector3());
+	}
+}
+
 void RigKernel::_bind_methods() {
 	ClassDB::bind_static_method("RigKernel", D_METHOD("rotation_vector", "basis"), &RigKernel::rotation_vector);
 	ClassDB::bind_static_method("RigKernel", D_METHOD("heading_of", "basis"), &RigKernel::heading_of);
@@ -413,4 +642,21 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("observation", "action", "command", "scan"), &RigKernel::observation);
 	ClassDB::bind_method(D_METHOD("features", "pelvis_prev", "ground_y", "fps"), &RigKernel::features);
 	ClassDB::bind_method(D_METHOD("write_targets", "action"), &RigKernel::write_targets);
+	ClassDB::bind_method(D_METHOD("set_terrain", "field"), &RigKernel::set_terrain);
+	ClassDB::bind_method(D_METHOD("get_terrain"), &RigKernel::get_terrain);
+	ClassDB::bind_method(D_METHOD("set_sensed", "bodies"), &RigKernel::set_sensed);
+	ClassDB::bind_method(D_METHOD("touches", "body"), &RigKernel::touches);
+	ClassDB::bind_method(D_METHOD("touches_any", "bodies"), &RigKernel::touches_any);
+	ClassDB::bind_method(D_METHOD("contact_friction", "bodies"), &RigKernel::contact_friction);
+	ClassDB::bind_method(D_METHOD("angular_speed_squared", "bodies"), &RigKernel::angular_speed_squared);
+	ClassDB::bind_method(D_METHOD("set_ankles", "bodies", "actions", "gains"), &RigKernel::set_ankles);
+	ClassDB::bind_method(D_METHOD("ankle_excess", "action", "push_only"), &RigKernel::ankle_excess);
+	ClassDB::bind_method(D_METHOD("set_knees", "bodies", "offsets"), &RigKernel::set_knees);
+	ClassDB::bind_method(D_METHOD("knee_down", "height", "max_degrees"), &RigKernel::knee_down);
+	ClassDB::bind_method(D_METHOD("set_soles", "heel", "toe", "lift", "probe", "edge_on"), &RigKernel::set_soles);
+	ClassDB::bind_method(D_METHOD("on_edge", "foot", "toes"), &RigKernel::on_edge);
+	ClassDB::bind_method(D_METHOD("sole_on_edge", "foot", "toes"), &RigKernel::sole_on_edge);
+	ClassDB::bind_method(D_METHOD("set_legs", "bodies"), &RigKernel::set_legs);
+	ClassDB::bind_method(D_METHOD("leg_drag", "coefficient", "height"), &RigKernel::leg_drag);
+	ClassDB::bind_method(D_METHOD("clear_leg_drag"), &RigKernel::clear_leg_drag);
 }
