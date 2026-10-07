@@ -32,6 +32,7 @@
 
 #include "ground_data.h"
 #include "rig_kernel.h"
+#include "terrain_field.h"
 #include "water_forces.h"
 
 #include "core/object/class_db.h"
@@ -42,6 +43,7 @@ void initialize_rig_kernel_module(ModuleInitializationLevel p_level) {
 	}
 	GDREGISTER_CLASS(GroundData);
 	GDREGISTER_CLASS(RigKernel);
+	GDREGISTER_CLASS(TerrainField);
 	GDREGISTER_CLASS(WaterForces);
 }
 
