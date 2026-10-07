@@ -659,4 +659,15 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_legs", "bodies"), &RigKernel::set_legs);
 	ClassDB::bind_method(D_METHOD("leg_drag", "coefficient", "height"), &RigKernel::leg_drag);
 	ClassDB::bind_method(D_METHOD("clear_leg_drag"), &RigKernel::clear_leg_drag);
+	ClassDB::bind_method(D_METHOD("set_reward_config", "config"), &RigKernel::set_reward_config);
+	ClassDB::bind_method(D_METHOD("reset_terms", "wy_mean", "features", "pelvis_prev", "g_pelvis"), &RigKernel::reset_terms);
+	ClassDB::bind_method(D_METHOD("reward_step", "command", "style", "steps", "push_at", "trip_at", "switch_at", "scramble_cap", "action", "prev_action"), &RigKernel::reward_step);
+	ClassDB::bind_method(D_METHOD("get_amp_pair"), &RigKernel::get_amp_pair);
+	ClassDB::bind_method(D_METHOD("observation_full", "action", "command", "style", "strength"), &RigKernel::observation_full);
+	ClassDB::bind_method(D_METHOD("get_path"), &RigKernel::get_path);
+	ClassDB::bind_method(D_METHOD("get_asked"), &RigKernel::get_asked);
+	ClassDB::bind_method(D_METHOD("get_along"), &RigKernel::get_along);
+	ClassDB::bind_method(D_METHOD("get_edges"), &RigKernel::get_edges);
+	ClassDB::bind_method(D_METHOD("get_wy_mean"), &RigKernel::get_wy_mean);
+	ClassDB::bind_method(D_METHOD("get_ground_mu"), &RigKernel::get_ground_mu);
 }

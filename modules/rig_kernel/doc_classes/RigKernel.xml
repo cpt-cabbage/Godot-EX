@@ -74,11 +74,29 @@
 				Returns the number of action values, the total of the drives' axes.
 			</description>
 		</method>
+		<method name="get_along" qualifiers="const">
+			<return type="float" />
+			<description>
+				The distance made along the commanded velocity this episode ([method reward_step]).
+			</description>
+		</method>
+		<method name="get_amp_pair" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<description>
+				The last [method reward_step]'s motion-prior transition: the features before and after, the command, the style's code and the history.
+			</description>
+		</method>
 		<method name="get_angular_velocity" qualifiers="const">
 			<return type="Vector3" />
 			<param index="0" name="body" type="int" />
 			<description>
 				Returns the angular velocity of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="get_asked" qualifiers="const">
+			<return type="float" />
+			<description>
+				The distance the commands asked for this episode ([method reward_step]).
 			</description>
 		</method>
 		<method name="get_center_of_mass" qualifiers="const">
@@ -93,10 +111,22 @@
 				Returns the velocity of the rig's center of mass read by [method update].
 			</description>
 		</method>
+		<method name="get_edges" qualifiers="const">
+			<return type="int" />
+			<description>
+				The steps this episode with a foot over a prop's edge ([method reward_step]).
+			</description>
+		</method>
 		<method name="get_ground_data" qualifiers="const">
 			<return type="GroundData" />
 			<description>
 				Returns the ground data set by [method set_ground_data].
+			</description>
+		</method>
+		<method name="get_ground_mu" qualifiers="const">
+			<return type="float" />
+			<description>
+				The friction of what a foot last touched ([method observation_full]).
 			</description>
 		</method>
 		<method name="get_heading" qualifiers="const">
@@ -110,6 +140,12 @@
 			<param index="0" name="body" type="int" />
 			<description>
 				Returns the linear velocity of body [param body] read by [method update].
+			</description>
+		</method>
+		<method name="get_path" qualifiers="const">
+			<return type="float" />
+			<description>
+				The distance walked this episode, the centre of mass's horizontal speed integrated ([method reward_step]).
 			</description>
 		</method>
 		<method name="get_scan_size" qualifiers="const">
@@ -141,6 +177,12 @@
 			<return type="int" />
 			<description>
 				Returns the number of water inputs (the points' and 3), or 0.
+			</description>
+		</method>
+		<method name="get_wy_mean" qualifiers="const">
+			<return type="float" />
+			<description>
+				The pelvis's yaw rate, averaged over a quarter second ([method reward_step]).
 			</description>
 		</method>
 		<method name="ground" qualifiers="const">
@@ -182,12 +224,47 @@
 				Returns the policy's observation of the state read by [method update]: gravity and the pelvis's angular velocity in the pelvis frame; the center of mass's velocity in the heading frame and its height over the ground; the driven joints' rotations, then their angular velocities relative to their parents (times 0.1); [param action]; [param command]; the left and right contacts; and, if [param scan], the ground's height at the scan points in the heading frame relative to the ground under the center of mass.
 			</description>
 		</method>
+		<method name="observation_full">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="action" type="PackedFloat32Array" />
+			<param index="1" name="command" type="Vector3" />
+			<param index="2" name="style" type="int" />
+			<param index="3" name="strength" type="float" />
+			<description>
+				The whole observation of a training step: [method observation] (with the scan when configured), the nearest trunks, the senses (each hand's contact, the friction of what a foot last touched), the [param style]'s code and log [param strength]. Needs [method set_reward_config].
+			</description>
+		</method>
 		<method name="on_edge" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="foot" type="int" />
 			<param index="1" name="toes" type="int" />
 			<description>
 				Whether the foot [param foot] with its toes [param toes] stands over a prop's edge: [method sole_on_edge] with their transforms at [method update].
+			</description>
+		</method>
+		<method name="reset_terms">
+			<return type="void" />
+			<param index="0" name="wy_mean" type="float" />
+			<param index="1" name="features" type="PackedFloat32Array" />
+			<param index="2" name="pelvis_prev" type="Transform3D" />
+			<param index="3" name="g_pelvis" type="float" />
+			<description>
+				Resets the episode's state for [method reward_step]: the yaw rate's mean, the air times, the counts and distances, the ground's friction, the motion prior's last [param features] (and their history), the pelvis's last transform and the ground under it.
+			</description>
+		</method>
+		<method name="reward_step">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="command" type="Vector3" />
+			<param index="1" name="style" type="int" />
+			<param index="2" name="steps" type="int" />
+			<param index="3" name="push_at" type="int" />
+			<param index="4" name="trip_at" type="int" />
+			<param index="5" name="switch_at" type="int" />
+			<param index="6" name="scramble_cap" type="float" />
+			<param index="7" name="action" type="PackedFloat32Array" />
+			<param index="8" name="prev_action" type="PackedFloat32Array" />
+			<description>
+				A training step after the physics, as ProjectEX's [code]amp_env.gd[/code] computes it but for what draws random numbers or changes the command: [method update], the motion prior's transition ([method get_amp_pair]), the task reward (tracking, air time, the ankles, the lean, the split stance, the hands' support, edges, standing still, the action's change; zero off balance), off balance, down (a fall), the water's depth, out of bounds, the blocker distance, the style gate, then 15 values of info. Updates the episode's state (see [method reset_terms]). Needs [method set_reward_config].
 			</description>
 		</method>
 		<method name="rotation_vector" qualifiers="static">
@@ -266,6 +343,13 @@
 			<param index="1" name="head" type="int" />
 			<description>
 				Sets which bodies are the pelvis (the heading frame's and the observation's reference) and the head.
+			</description>
+		</method>
+		<method name="set_reward_config">
+			<return type="void" />
+			<param index="0" name="config" type="Dictionary" />
+			<description>
+				Configures [method reward_step] and [method observation_full]: the reward's flags, its constants and the bodies it reads, by name (ProjectEX's [code]amp_env.gd[/code] [code]_bind_terms[/code] gives them all).
 			</description>
 		</method>
 		<method name="set_scan">

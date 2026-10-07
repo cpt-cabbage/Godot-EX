@@ -49,7 +49,8 @@
 // per actuated joint in action order (which also defines the observed joints), set_contacts(),
 // set_keypoints(), set_scan() (and set_scan_height()), set_ground_mask() (and set_static_ground() or
 // set_ground_data()); for the reward's terms set_terrain(), set_sensed(), set_ankles(), set_knees(),
-// set_soles() and set_legs(). Each step: update(), then any of the queries.
+// set_soles() and set_legs(); for a training server's whole step set_reward_config() (reward_step(),
+// observation_full(), reset_terms() at an episode's start). Each step: update(), then any of the queries.
 class RigKernel : public RefCounted {
 	GDCLASS(RigKernel, RefCounted);
 
@@ -126,6 +127,68 @@ class RigKernel : public RefCounted {
 	// The legs' bodies (leg_drag).
 	Vector<int> legs;
 
+	// The whole step's reward (reward_step, set_reward_config): ProjectEX's amp_env.gd reward() and
+	// _finish() but for what draws random numbers or changes the command (the script's). Its constants
+	// and flags (the script's, by name), the bodies it reads, and the episode's state.
+	struct RewardConfig {
+		bool ready = false;
+		// flags
+		bool air_reward = false, air_climb = false, senses = false, scramble_rhythm = false;
+		bool ankle_human = false, ankle_push = false, lean_climb = false, stance_split = false;
+		bool terrain_features = false, props = false, water = false, flat = false;
+		double split_plant = 0.0, hand_support = 0.0, edge_cost = 0.0;
+		int scramble = 2;
+		int style_dim = 0;
+		int strength_dim = 0;
+		int trunks = 0;
+		double trunk_range = 6.0;
+		bool scan = false;
+		// constants
+		double fps = 40.0, run_speed = 2.5;
+		double air_climb_s = 0.15, air_climb_grade = 0.3, air_t = 0.25, air_max = 0.45, air_t_walk = 0.35, air_max_walk = 0.6;
+		double air_w = 10.0, air_stride = 0.15, scramble_stride = 0.25, ankle_w = 0.5;
+		double lean_k = 0.7, lean_w = 0.3, lean_tol = 8.0;
+		Vector2 lean_grade = Vector2(8, 15);
+		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
+		Vector2 split_grade = Vector2(15, 30);
+		Vector2 hand_grade = Vector2(30, 38);
+		double hand_touch = 0.06, hand_reach = 0.9, hand = 0.2;
+		double still_w = 0.03;
+		int push_gate = 40, switch_gate = 40, kneel_steps = 20, prop_steps = 20;
+		double scramble_off_com = 0.4, scramble_off_head = 0.6, scramble_off = 0.259;
+		double off_com = 0.55, off_head = 0.9, off_tilt = 0.5;
+		double down_head = 0.5, down_com = 0.35, kneel_h = 0.12, kneel_grade = 30.0;
+		double style_tilt = 0.819, style_floor = 0.3;
+		Vector2 wade_style = Vector2(0.3, 1.0);
+		Vector2 style_grade = Vector2(10, 35);
+		// AMP: the features' pelvis vertical velocity and feet heights' indices, the history's offsets
+		int f_vy = 8, f_foot_y0 = 37, f_foot_y1 = 40;
+		Vector<int> history;
+		// bodies
+		int torso = -1, foot[2] = { -1, -1 }, toes[2] = { -1, -1 }, lowerarm[2] = { -1, -1 };
+		int air_limbs[4] = { -1, -1, -1, -1 };
+		Vector<int> hands[2];
+		Vector<int> prop_bodies;
+		Vector<int> still_bodies;
+		Vector<int> soles; // senses' feet and toes, in order
+		Ref<GroundData> water_data;
+	};
+	RewardConfig rc;
+	// The episode's state.
+	double wy_mean = 0.0;
+	double air[4] = { 0, 0, 0, 0 };
+	Vector3 lift_at[4];
+	int kneel = 0;
+	int propped = 0;
+	double path = 0.0, asked = 0.0, along = 0.0;
+	int edges = 0;
+	float ground_mu = 1.0f;
+	Transform3D pelvis_prev;
+	double g_pelvis = 0.0;
+	Vector<float> f_prev;
+	Vector<Vector<float>> f_hist; // oldest first
+	PackedFloat32Array amp_pair;
+
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
 	Vector<Vector3> ang_vel;
@@ -137,6 +200,11 @@ class RigKernel : public RefCounted {
 	bool _touches(int p_body) const;
 	float _world_friction(int p_body) const;
 	double _terrain_ground(const Vector3 &p_point) const;
+	Vector2 _rel(const Vector3 &p_point) const;
+	double _ground_g(const Vector3 &p_point) const;
+	void _amp(const Vector3 &p_command, int p_style, const Transform3D &p_pelvis);
+	double _style_weight(const Vector3 &p_point, int p_style, double p_depth) const;
+	double _water_depth(const Vector3 &p_point, double p_ground) const;
 	float _ground_from(const Vector3 &p_point, float p_up) const;
 	bool _static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const;
 
@@ -197,4 +265,17 @@ public:
 	void set_legs(const PackedInt32Array &p_bodies);
 	void leg_drag(double p_coefficient, double p_height) const;
 	void clear_leg_drag() const;
+
+	// The whole step (reward_step): see the class reference.
+	void set_reward_config(const Dictionary &p_config);
+	void reset_terms(double p_wy_mean, const PackedFloat32Array &p_features, const Transform3D &p_pelvis_prev, double p_g_pelvis);
+	PackedFloat32Array reward_step(const Vector3 &p_command, int p_style, int p_steps, int p_push_at, int p_trip_at, int p_switch_at, float p_scramble_cap, const PackedFloat32Array &p_action, const PackedFloat32Array &p_prev_action);
+	PackedFloat32Array get_amp_pair() const { return amp_pair; }
+	PackedFloat32Array observation_full(const PackedFloat32Array &p_action, const Vector3 &p_command, int p_style, double p_strength);
+	double get_path() const { return path; }
+	double get_asked() const { return asked; }
+	double get_along() const { return along; }
+	int get_edges() const { return edges; }
+	double get_wy_mean() const { return wy_mean; }
+	float get_ground_mu() const { return ground_mu; }
 };
