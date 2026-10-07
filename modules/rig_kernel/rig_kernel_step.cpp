@@ -104,6 +104,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("still_w", rc.still_w);
 	f("slip_w", rc.slip_w);
 	f("slip_free", rc.slip_free);
+	f("slip_cap", rc.slip_cap);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("push_gate", rc.push_gate);
@@ -445,7 +446,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	if (rc.slip && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
 		double sl = 0.0;
 		for (const int bi : rc.slip_bodies) {
-			sl += _slip_body(bi, rc.slip_free);
+			sl += _slip_body(bi, rc.slip_free, rc.slip_cap);
 		}
 		r -= rc.slip_w * sl;
 	}

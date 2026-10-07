@@ -147,7 +147,7 @@ class RigKernel : public RefCounted {
 		double fps = 40.0, run_speed = 2.5;
 		double air_climb_s = 0.15, air_climb_grade = 0.3, air_descent_grade = 0.3, air_t = 0.25, air_max = 0.45, air_t_walk = 0.35, air_max_walk = 0.6;
 		double air_w = 10.0, air_stride = 0.15, scramble_stride = 0.25, ankle_w = 0.5;
-		double slip_w = 1.0, slip_free = 0.25;
+		double slip_w = 1.0, slip_free = 0.25, slip_cap = 0.25;
 		double turn_cycle_yaw = 0.8, turn_tap = 0.5;
 		double lean_k = 0.7, lean_w = 0.3, lean_tol = 8.0;
 		Vector2 lean_grade = Vector2(8, 15);
@@ -202,7 +202,7 @@ class RigKernel : public RefCounted {
 
 	bool _touches_world(int p_body) const;
 	bool _touches(int p_body) const;
-	double _slip_body(int p_body, double p_free) const;
+	double _slip_body(int p_body, double p_free, double p_cap) const;
 	float _world_friction(int p_body) const;
 	double _terrain_ground(const Vector3 &p_point) const;
 	Vector2 _rel(const Vector3 &p_point) const;
@@ -260,7 +260,7 @@ public:
 	bool touches_any(const PackedInt32Array &p_bodies) const;
 	float contact_friction(const PackedInt32Array &p_bodies) const;
 	double angular_speed_squared(const PackedInt32Array &p_bodies) const;
-	double slip(const PackedInt32Array &p_bodies, double p_free) const;
+	double slip(const PackedInt32Array &p_bodies, double p_free, double p_cap) const;
 	void set_ankles(const PackedInt32Array &p_bodies, const PackedInt32Array &p_actions, const PackedFloat64Array &p_gains);
 	double ankle_excess(const PackedFloat32Array &p_action, bool p_push_only) const;
 	void set_knees(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets);

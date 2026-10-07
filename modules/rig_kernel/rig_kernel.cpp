@@ -465,20 +465,21 @@ double RigKernel::angular_speed_squared(const PackedInt32Array &p_bodies) const 
 	return sum;
 }
 
-// A body's slip: touching the world, its horizontal speed past p_free (ProjectEX's amp_env.gd slip_script).
-double RigKernel::_slip_body(int p_body, double p_free) const {
+// A body's slip: touching the world, its horizontal speed past p_free up to p_cap (ProjectEX's amp_env.gd
+// slip_script).
+double RigKernel::_slip_body(int p_body, double p_free, double p_cap) const {
 	if (p_body < 0 || p_body >= lin_vel.size() || !_touches(p_body)) {
 		return 0.0;
 	}
 	const Vector3 &v = lin_vel[p_body];
-	return MAX(double(Vector2(v.x, v.z).length()) - p_free, 0.0);
+	return MIN(MAX(double(Vector2(v.x, v.z).length()) - p_free, 0.0), p_cap);
 }
 
-double RigKernel::slip(const PackedInt32Array &p_bodies, double p_free) const {
+double RigKernel::slip(const PackedInt32Array &p_bodies, double p_free, double p_cap) const {
 	double sum = 0.0;
 	for (int i = 0; i < p_bodies.size(); i++) {
 		ERR_CONTINUE(p_bodies[i] < 0 || p_bodies[i] >= bodies.size());
-		sum += _slip_body(p_bodies[i], p_free);
+		sum += _slip_body(p_bodies[i], p_free, p_cap);
 	}
 	return sum;
 }
@@ -667,7 +668,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("touches_any", "bodies"), &RigKernel::touches_any);
 	ClassDB::bind_method(D_METHOD("contact_friction", "bodies"), &RigKernel::contact_friction);
 	ClassDB::bind_method(D_METHOD("angular_speed_squared", "bodies"), &RigKernel::angular_speed_squared);
-	ClassDB::bind_method(D_METHOD("slip", "bodies", "free"), &RigKernel::slip);
+	ClassDB::bind_method(D_METHOD("slip", "bodies", "free", "cap"), &RigKernel::slip);
 	ClassDB::bind_method(D_METHOD("set_ankles", "bodies", "actions", "gains"), &RigKernel::set_ankles);
 	ClassDB::bind_method(D_METHOD("ankle_excess", "action", "push_only"), &RigKernel::ankle_excess);
 	ClassDB::bind_method(D_METHOD("set_knees", "bodies", "offsets"), &RigKernel::set_knees);
