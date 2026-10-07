@@ -34,6 +34,7 @@
 #include "core/math/transform_3d.h"
 #include "core/object/ref_counted.h"
 #include "ground_data.h"
+#include "terrain_field.h"
 #include "core/templates/hash_set.h"
 #include "core/variant/typed_array.h"
 
@@ -47,7 +48,8 @@
 // Setup, once: set_bodies() (rigid bodies, masses, parent indices), set_pelvis_head(), add_drive()
 // per actuated joint in action order (which also defines the observed joints), set_contacts(),
 // set_keypoints(), set_scan() (and set_scan_height()), set_ground_mask() (and set_static_ground() or
-// set_ground_data()). Each step: update(), then any of the queries.
+// set_ground_data()); for the reward's terms set_terrain(), set_sensed(), set_ankles(), set_knees(),
+// set_soles() and set_legs(). Each step: update(), then any of the queries.
 class RigKernel : public RefCounted {
 	GDCLASS(RigKernel, RefCounted);
 
@@ -91,6 +93,39 @@ class RigKernel : public RefCounted {
 	Ref<GroundData> water_data;
 	Vector<int> water_points;
 
+	// The reward's terms (a training server's reward read these in script: most of its step). The
+	// training terrain's function (TerrainField: the ground under a point, its fall line), as the reward's
+	// script reads it; without one, the ground is ground()'s and the terrain flat.
+	Ref<TerrainField> terrain;
+	// The bodies whose contacts update() reads (their reporting on): whether each touches anything outside
+	// the rig, and the friction of the first such collider (NaN without).
+	Vector<int> sensed;
+	Vector<int8_t> touch; // per body: -1 not sensed, 0 or 1
+	Vector<float> touch_friction;
+	// The ankles' torque (ankle_excess): the lower leg and foot bodies, left then right, each foot's
+	// pitch action index, the drive's gains, cap, nominal pitch and action scale, people's peak torque.
+	int ankle_lower[2] = { -1, -1 };
+	int ankle_foot[2] = { -1, -1 };
+	int ankle_action[2] = { -1, -1 };
+	double ankle_kp = 0.0;
+	double ankle_kd = 0.0;
+	double ankle_cap = 0.0;
+	double ankle_nominal = 0.0;
+	double ankle_scale = 0.0;
+	double ankle_human = 0.0;
+	// The knees (knee_down): each lower leg and its knee joint's point in the body's frame.
+	Vector<int> knee_bodies;
+	Vector<Vector3> knee_offsets;
+	// A sole's corners (on_edge): the heel's in the foot's frame, the toe's in the toes', and the lift the
+	// probe starts over them, its length, the height over the ground a corner is on a prop.
+	Vector<Vector3> heel_corners;
+	Vector<Vector3> toe_corners;
+	float sole_lift = 0.25f;
+	float sole_probe = 1.0f;
+	float edge_on = 0.03f;
+	// The legs' bodies (leg_drag).
+	Vector<int> legs;
+
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
 	Vector<Vector3> ang_vel;
@@ -99,6 +134,9 @@ class RigKernel : public RefCounted {
 	Basis heading;
 
 	bool _touches_world(int p_body) const;
+	bool _touches(int p_body) const;
+	float _world_friction(int p_body) const;
+	double _terrain_ground(const Vector3 &p_point) const;
 	float _ground_from(const Vector3 &p_point, float p_up) const;
 	bool _static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const;
 
@@ -140,4 +178,23 @@ public:
 	PackedFloat32Array observation(const PackedFloat32Array &p_action, const Vector3 &p_command, bool p_scan) const;
 	PackedFloat32Array features(const Transform3D &p_pelvis_prev, float p_ground_y, float p_fps) const;
 	void write_targets(const PackedFloat32Array &p_action) const;
+
+	// The reward's terms.
+	void set_terrain(const Ref<TerrainField> &p_field) { terrain = p_field; }
+	Ref<TerrainField> get_terrain() const { return terrain; }
+	void set_sensed(const PackedInt32Array &p_bodies);
+	bool touches(int p_body) const;
+	bool touches_any(const PackedInt32Array &p_bodies) const;
+	float contact_friction(const PackedInt32Array &p_bodies) const;
+	double angular_speed_squared(const PackedInt32Array &p_bodies) const;
+	void set_ankles(const PackedInt32Array &p_bodies, const PackedInt32Array &p_actions, const PackedFloat64Array &p_gains);
+	double ankle_excess(const PackedFloat32Array &p_action, bool p_push_only) const;
+	void set_knees(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets);
+	bool knee_down(double p_height, double p_max_degrees) const;
+	void set_soles(const PackedVector3Array &p_heel, const PackedVector3Array &p_toe, float p_lift, float p_probe, float p_edge_on);
+	bool on_edge(int p_foot, int p_toes) const;
+	bool sole_on_edge(const Transform3D &p_foot, const Transform3D &p_toes) const;
+	void set_legs(const PackedInt32Array &p_bodies);
+	void leg_drag(double p_coefficient, double p_height) const;
+	void clear_leg_drag() const;
 };

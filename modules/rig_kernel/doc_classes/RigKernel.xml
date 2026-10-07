@@ -6,6 +6,7 @@
 	<description>
 		Does, in native code, the work a learned controller repeats every control step on a ragdoll of rigid bodies joined by 6DOF joints with angular drives: reads every body's transform and velocities from the [PhysicsServer3D] once ([method update]), builds the policy's observation ([method observation]) and a motion prior's features ([method features]) from that state, casts rays for the ground under the body ([method ground]), reports foot contacts ([method contact]), and writes an action to the joints' drive targets ([method write_targets]).
 		Configure it once with [method set_bodies], [method set_pelvis_head], one [method add_drive] per actuated joint in action order (which also defines the observed joints), [method set_contacts], [method set_keypoints], [method set_scan] and [method set_ground_mask]. Rotations are expressed as rotation vectors (axis times angle) of a child body relative to its parent, and the heading frame is the pelvis's yaw about world up with +Z forward.
+		For a training server's reward, it also computes terms over the same state: contacts read once a step ([method set_sensed]), the ankles' excess torque ([method ankle_excess]), a knee down ([method knee_down]), a sole over a prop's edge ([method on_edge]), undergrowth's drag on the legs ([method leg_drag]) and the legs' angular speed ([method angular_speed_squared]), reading the terrain's function ([TerrainField], [method set_terrain]) and its [GroundData].
 	</description>
 	<tutorials>
 	</tutorials>
@@ -23,11 +24,39 @@
 				Adds an actuated joint: the 6DOF [param joint] whose child is [param body]. Each of its [param axes] (0, 1, 2 for x, y, z) takes one action value [code]a[/code], and the drive target's rotation vector is [code]nominal + scale * clamp(a, -1, 1)[/code] on those axes, clamped per component to [param lo] and [param hi]. The observation and features report the joint's rotation on the same axes.
 			</description>
 		</method>
+		<method name="angular_speed_squared" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<description>
+				The sum of the squared angular speeds of [param bodies] at [method update].
+			</description>
+		</method>
+		<method name="ankle_excess" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="action" type="PackedFloat32Array" />
+			<param index="1" name="push_only" type="bool" />
+			<description>
+				The ankles' pitch torque past people's peak, each as a share of the rest of its cap, summed: from each foot's drive target (its nominal pitch plus the action's value, clamped to [code][-1, 1][/code], times the scale), its angle and rate relative to the lower leg, the drive's stiffness and damping, clamped to the cap. With [param push_only], only an ankle doing positive work counts. Needs [method set_ankles].
+			</description>
+		</method>
+		<method name="clear_leg_drag" qualifiers="const">
+			<return type="void" />
+			<description>
+				Sets no constant force on the leg bodies (see [method leg_drag]).
+			</description>
+		</method>
 		<method name="contact" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="side" type="int" />
 			<description>
 				Returns whether any of the left ([param side] 0) or right (1) contact bodies touches something that is not one of the rig's bodies. The bodies need contact reporting enabled.
+			</description>
+		</method>
+		<method name="contact_friction" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<description>
+				The friction of the collider outside the rig touched by the first of [param bodies] that touches one, or NaN when none does. Sensed bodies are read at [method update] (see [method set_sensed]), others now.
 			</description>
 		</method>
 		<method name="features" qualifiers="const">
@@ -89,6 +118,12 @@
 				Returns the number of the height scan's points.
 			</description>
 		</method>
+		<method name="get_terrain" qualifiers="const">
+			<return type="TerrainField" />
+			<description>
+				The terrain's function the reward's terms read (see [method set_terrain]).
+			</description>
+		</method>
 		<method name="get_transform" qualifiers="const">
 			<return type="Transform3D" />
 			<param index="0" name="body" type="int" />
@@ -122,6 +157,22 @@
 				Returns the yaw of [param basis] about world up as a basis whose +Z is the basis's +Z projected on the horizontal plane.
 			</description>
 		</method>
+		<method name="knee_down" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="height" type="float" />
+			<param index="1" name="max_degrees" type="float" />
+			<description>
+				Whether a knee is down: a knee joint (see [method set_knees]) less than [param height] over the ground under it ([method ground]), where the terrain's slope there is at most [param max_degrees] (any slope without a terrain).
+			</description>
+		</method>
+		<method name="leg_drag" qualifiers="const">
+			<return type="void" />
+			<param index="0" name="coefficient" type="float" />
+			<param index="1" name="height" type="float" />
+			<description>
+				Undergrowth's drag: each leg body (see [method set_legs]) under [param height] over the terrain's ground (every one without a terrain) gets a constant force of [param coefficient] times its horizontal velocity, the others none. Reads the physics server's state now, not [method update]'s.
+			</description>
+		</method>
 		<method name="observation" qualifiers="const">
 			<return type="PackedFloat32Array" />
 			<param index="0" name="action" type="PackedFloat32Array" />
@@ -131,11 +182,28 @@
 				Returns the policy's observation of the state read by [method update]: gravity and the pelvis's angular velocity in the pelvis frame; the center of mass's velocity in the heading frame and its height over the ground; the driven joints' rotations, then their angular velocities relative to their parents (times 0.1); [param action]; [param command]; the left and right contacts; and, if [param scan], the ground's height at the scan points in the heading frame relative to the ground under the center of mass.
 			</description>
 		</method>
+		<method name="on_edge" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="foot" type="int" />
+			<param index="1" name="toes" type="int" />
+			<description>
+				Whether the foot [param foot] with its toes [param toes] stands over a prop's edge: [method sole_on_edge] with their transforms at [method update].
+			</description>
+		</method>
 		<method name="rotation_vector" qualifiers="static">
 			<return type="Vector3" />
 			<param index="0" name="basis" type="Basis" />
 			<description>
 				Returns the rotation of [param basis] as a rotation vector (axis times angle, the angle in [code][0, PI][/code]).
+			</description>
+		</method>
+		<method name="set_ankles">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<param index="1" name="actions" type="PackedInt32Array" />
+			<param index="2" name="gains" type="PackedFloat64Array" />
+			<description>
+				Sets the ankles for [method ankle_excess]: [param bodies] the left lower leg and foot, then the right's; [param actions] each foot's pitch in the action; [param gains] the drive's stiffness, damping and torque cap, the nominal pitch, the action's scale on it, and people's peak ankle torque.
 			</description>
 		</method>
 		<method name="set_bodies">
@@ -177,6 +245,21 @@
 				Sets the points [method features] reports relative to the pelvis: each an offset in a body's frame.
 			</description>
 		</method>
+		<method name="set_knees">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<param index="1" name="offsets" type="PackedVector3Array" />
+			<description>
+				Sets the knees for [method knee_down]: each lower leg body and its knee joint's point in that body's frame.
+			</description>
+		</method>
+		<method name="set_legs">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<description>
+				Sets the leg bodies [method leg_drag] acts on.
+			</description>
+		</method>
 		<method name="set_pelvis_head">
 			<return type="void" />
 			<param index="0" name="pelvis" type="int" />
@@ -207,11 +290,36 @@
 				Sets the height scan's points (x across, y ahead in the heading frame) in place of [method set_scan]'s grid.
 			</description>
 		</method>
+		<method name="set_sensed">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<description>
+				Sets the bodies whose contacts [method update] reads (their contact reporting must be on): whether each touches anything outside the rig and that collider's friction, for [method contact], [method touches], [method touches_any] and [method contact_friction].
+			</description>
+		</method>
+		<method name="set_soles">
+			<return type="void" />
+			<param index="0" name="heel" type="PackedVector3Array" />
+			<param index="1" name="toe" type="PackedVector3Array" />
+			<param index="2" name="lift" type="float" />
+			<param index="3" name="probe" type="float" />
+			<param index="4" name="edge_on" type="float" />
+			<description>
+				Sets a sole for [method sole_on_edge]: the heel's corners in the foot's frame, the toe's in the toes', how far over a corner its probe starts ([param lift]), the probe's length, and how far over the terrain's ground a surface must be to count as a prop ([param edge_on]).
+			</description>
+		</method>
 		<method name="set_static_ground">
 			<return type="void" />
 			<param index="0" name="enabled" type="bool" />
 			<description>
 				When enabled (default off), the ground probes consider static bodies only and the height scan's rays go to the physics server in one batch (Godot-EX's [code]JoltPhysicsServer3D.space_cast_static_ground[/code]; with another physics server, the general ray). Faster where the ground is all static, as on a training server; in a game a dynamic body can be ground.
+			</description>
+		</method>
+		<method name="set_terrain">
+			<return type="void" />
+			<param index="0" name="field" type="TerrainField" />
+			<description>
+				Sets the training terrain's function the reward's terms read ([method knee_down], [method sole_on_edge], [method leg_drag]).
 			</description>
 		</method>
 		<method name="set_water">
@@ -220,6 +328,28 @@
 			<param index="1" name="points" type="PackedInt32Array" />
 			<description>
 				Appends the water inputs to a scanned observation: the water's depth over the scan's ground at the scan points [param points] (0 where dry), its depth at the center of mass and its flow there in the heading frame (x, z), from [param data]'s water field (zeros without one).
+			</description>
+		</method>
+		<method name="sole_on_edge" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="foot" type="Transform3D" />
+			<param index="1" name="toes" type="Transform3D" />
+			<description>
+				Whether a foot at [param foot] with its toes at [param toes] stands over a prop's edge: some of its sole's corners over a prop (the ground data's first surface down from over the corner more than [code]edge_on[/code] over the terrain's ground) and some not. Needs the ground data and [method set_soles].
+			</description>
+		</method>
+		<method name="touches" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="body" type="int" />
+			<description>
+				Whether [param body] touches anything outside the rig: at [method update] if sensed (see [method set_sensed]), else now.
+			</description>
+		</method>
+		<method name="touches_any" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<description>
+				Whether any of [param bodies] touches anything outside the rig (see [method touches]).
 			</description>
 		</method>
 		<method name="update">
