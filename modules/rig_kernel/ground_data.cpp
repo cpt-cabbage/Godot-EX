@@ -57,6 +57,8 @@ void GroundData::set_height_field_transform(const Transform3D &p_xform) {
 void GroundData::clear_props() {
 	props.clear();
 	buckets.clear();
+	trunk_buckets.clear();
+	trunk_reach = 0.0f;
 }
 
 void GroundData::_add_prop(const Prop &p_prop) {
@@ -71,6 +73,11 @@ void GroundData::_add_prop(const Prop &p_prop) {
 		for (int z = z0; z <= z1; z++) {
 			buckets[_bucket_key(x, z)].push_back(index);
 		}
+	}
+	if (p_prop.kind == Prop::CYLINDER && 2.0f * p_prop.size.y >= TRUNK_HEIGHT && Math::abs(p_prop.xform.basis.get_column(1).normalized().y) >= 0.866f) {
+		const Vector3 &c = p_prop.xform.origin;
+		trunk_buckets[_bucket_key(int(Math::floor(c.x / BUCKET)), int(Math::floor(c.z / BUCKET)))].push_back(index);
+		trunk_reach = MAX(trunk_reach, p_prop.size.x);
 	}
 }
 
@@ -328,30 +335,23 @@ PackedFloat32Array GroundData::nearest_trunks(const Transform3D &p_xform, int p_
 	for (int i = 0; i < out.size(); i++) {
 		o[i] = 0.0f;
 	}
-	// Candidates: the props in the buckets the range covers, each once.
+	// Candidates: the trunks whose centre is within the range and the largest radius (lying or leaning
+	// past 30 deg, a log, is not one: the scan shows it).
 	const Vector3 c = p_xform.origin;
-	const int x0 = int(Math::floor((c.x - p_range) / BUCKET));
-	const int x1 = int(Math::floor((c.x + p_range) / BUCKET));
-	const int z0 = int(Math::floor((c.z - p_range) / BUCKET));
-	const int z1 = int(Math::floor((c.z + p_range) / BUCKET));
+	const float reach = p_range + trunk_reach;
+	const int x0 = int(Math::floor((c.x - reach) / BUCKET));
+	const int x1 = int(Math::floor((c.x + reach) / BUCKET));
+	const int z0 = int(Math::floor((c.z - reach) / BUCKET));
+	const int z1 = int(Math::floor((c.z + reach) / BUCKET));
 	LocalVector<Pair<float, int>> found;
-	HashSet<int> seen;
 	for (int x = x0; x <= x1; x++) {
 		for (int z = z0; z <= z1; z++) {
-			const LocalVector<int> *cell = buckets.getptr(_bucket_key(x, z));
+			const LocalVector<int> *cell = trunk_buckets.getptr(_bucket_key(x, z));
 			if (cell == nullptr) {
 				continue;
 			}
 			for (const int i : *cell) {
 				const Prop &p = props[i];
-				if (p.kind != Prop::CYLINDER || 2.0f * p.size.y < TRUNK_HEIGHT || seen.has(i)) {
-					continue;
-				}
-				const Vector3 axis = p.xform.basis.get_column(1).normalized();
-				if (Math::abs(axis.y) < 0.866f) {
-					continue; // lying or leaning past 30 deg: a log, which the scan shows
-				}
-				seen.insert(i);
 				const Vector3 d = p.xform.origin - c;
 				const float dist = Vector2(d.x, d.z).length() - p.size.x; // to its surface
 				if (dist <= p_range) {
