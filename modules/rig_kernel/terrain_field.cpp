@@ -89,6 +89,25 @@ void TerrainField::add_stream(const Vector2 &p_point, const Vector2 &p_direction
 	waters.push_back(w);
 }
 
+void TerrainField::add_wall(const Vector2 &p_center, double p_yaw, double p_length) {
+	Wall w;
+	w.c = p_center;
+	w.dir = Vector2::from_angle(p_yaw);
+	w.length = p_length;
+	walls.push_back(w);
+}
+
+// terrain.gd wall_distance.
+double TerrainField::wall_distance(const Vector2 &p_point) const {
+	double d = Math::INF;
+	for (const Wall &w : walls) {
+		const Vector2 rel = p_point - w.c;
+		const double along = CLAMP(double(rel.dot(w.dir)), -0.5 * w.length, 0.5 * w.length);
+		d = MIN(d, double((rel - w.dir * along).length()) - 0.15);
+	}
+	return d;
+}
+
 // terrain.gd _raw (its float32 vectors kept where the script has them, its scalars in double).
 double TerrainField::_raw(double p_x, double p_z) const {
 	double h = plane.x * p_x + plane.y * p_z;
@@ -180,6 +199,11 @@ void TerrainField::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("add_pool", "center", "radius", "surface", "depth"), &TerrainField::add_pool);
 	ClassDB::bind_method(D_METHOD("add_stream", "point", "direction", "width", "depth", "amplitude", "wavelength", "t0", "step", "profile"), &TerrainField::add_stream);
 	ClassDB::bind_method(D_METHOD("clear_waters"), &TerrainField::clear_waters);
+	ClassDB::bind_method(D_METHOD("add_wall", "center", "yaw", "length"), &TerrainField::add_wall);
+	ClassDB::bind_method(D_METHOD("clear_walls"), &TerrainField::clear_walls);
+	ClassDB::bind_method(D_METHOD("set_bounds", "bounds"), &TerrainField::set_bounds);
+	ClassDB::bind_method(D_METHOD("get_bounds"), &TerrainField::get_bounds);
+	ClassDB::bind_method(D_METHOD("wall_distance", "point"), &TerrainField::wall_distance);
 	ClassDB::bind_method(D_METHOD("set_scale", "scale"), &TerrainField::set_scale);
 	ClassDB::bind_method(D_METHOD("get_scale"), &TerrainField::get_scale);
 	ClassDB::bind_method(D_METHOD("set_origin", "origin"), &TerrainField::set_origin);
