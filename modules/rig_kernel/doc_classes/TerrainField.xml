@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="TerrainField" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A training terrain's ground as its analytic function: a plane, a climb profile, noise hills and bumps, water beds carved, at a level's share.
+	</brief_description>
+	<description>
+		The height of a procedural training terrain at any point, computed from the terrain's description rather than sampled: a plane's grade, a mountain's climb profile along an uphill direction (linear between its samples) with a cross grade, two [Noise] layers (hills and bumps) with their amplitudes, minus the height at the origin, then each pool's and stream's bed carved (a bowl inside, a bank's smooth blend and a levee outside), all scaled by [method set_scale]. Coordinates are relative to the terrain's origin except in [method ground_at]. Scalars are computed in double precision and vectors in single, so a script computing the same function gets the same values.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_pool">
+			<return type="void" />
+			<param index="0" name="center" type="Vector2" />
+			<param index="1" name="radius" type="float" />
+			<param index="2" name="surface" type="float" />
+			<param index="3" name="depth" type="float" />
+			<description>
+				Adds a round pool: its [param center] (x, z), [param radius], its surface's height and its [param depth] at the middle, at the hard end. Inside, the bed is the lower of the ground and the bowl.
+			</description>
+		</method>
+		<method name="add_stream">
+			<return type="void" />
+			<param index="0" name="point" type="Vector2" />
+			<param index="1" name="direction" type="Vector2" />
+			<param index="2" name="width" type="float" />
+			<param index="3" name="depth" type="float" />
+			<param index="4" name="amplitude" type="float" />
+			<param index="5" name="wavelength" type="float" />
+			<param index="6" name="t0" type="float" />
+			<param index="7" name="step" type="float" />
+			<param index="8" name="profile" type="PackedFloat32Array" />
+			<description>
+				Adds a meandering stream through [param point] along [param direction] (a unit vector), [param width] wide and [param depth] deep at the middle, its line displaced across by [param amplitude] times the sine of the distance along it over [param wavelength] (times tau). Its surface along the line is [param profile], sampled every [param step] from [param t0] along it, linear between samples.
+			</description>
+		</method>
+		<method name="clear_waters">
+			<return type="void" />
+			<description>
+				Removes every pool and stream.
+			</description>
+		</method>
+		<method name="fall_line" qualifiers="const">
+			<return type="Vector2" />
+			<param index="0" name="point" type="Vector2" />
+			<description>
+				The uphill gradient at [param point]: the height's differences over [code]+-1[/code] in x and in z, halved (rise per metre).
+			</description>
+		</method>
+		<method name="get_origin" qualifiers="const">
+			<return type="Vector3" />
+			<description>
+				The world position of the terrain's origin (see [method set_origin]).
+			</description>
+		</method>
+		<method name="get_scale" qualifiers="const">
+			<return type="float" />
+			<description>
+				The level's share of the hard end (see [method set_scale]).
+			</description>
+		</method>
+		<method name="grade" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector2" />
+			<param index="1" name="direction" type="Vector2" />
+			<description>
+				The rise per metre along the unit [param direction] at [param point]: the height half a metre ahead less the height half a metre behind.
+			</description>
+		</method>
+		<method name="ground_at" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector3" />
+			<description>
+				The ground's world height under a world [param point]: the origin's height plus [method height] at the point relative to the origin.
+			</description>
+		</method>
+		<method name="hard" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="x" type="float" />
+			<param index="1" name="z" type="float" />
+			<description>
+				The height at ([param x], [param z]) at the hard end (scale 1), relative to the origin.
+			</description>
+		</method>
+		<method name="height" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="x" type="float" />
+			<param index="1" name="z" type="float" />
+			<description>
+				The height at ([param x], [param z]) at the current scale, relative to the origin.
+			</description>
+		</method>
+		<method name="heights" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="points" type="PackedVector2Array" />
+			<description>
+				[method height] at each point (x, z).
+			</description>
+		</method>
+		<method name="set_bumps">
+			<return type="void" />
+			<param index="0" name="noise" type="Noise" />
+			<param index="1" name="amplitude" type="float" />
+			<description>
+				Sets the small-scale noise layer and its amplitude (m).
+			</description>
+		</method>
+		<method name="set_hills">
+			<return type="void" />
+			<param index="0" name="noise" type="Noise" />
+			<param index="1" name="amplitude" type="float" />
+			<description>
+				Sets the large-scale noise layer and its amplitude (m).
+			</description>
+		</method>
+		<method name="set_macro">
+			<return type="void" />
+			<param index="0" name="heights" type="PackedFloat32Array" />
+			<param index="1" name="half" type="float" />
+			<param index="2" name="step" type="float" />
+			<param index="3" name="up" type="Vector2" />
+			<param index="4" name="cross" type="float" />
+			<description>
+				Sets a mountain's climb: [param heights] along the unit [param up] direction, one every [param step] from [code]-half[/code], linear between them and held past the ends, plus [param cross] times the distance across [param up].
+			</description>
+		</method>
+		<method name="set_origin">
+			<return type="void" />
+			<param index="0" name="origin" type="Vector3" />
+			<description>
+				Sets the world position of the terrain's origin, for [method ground_at].
+			</description>
+		</method>
+		<method name="set_plane">
+			<return type="void" />
+			<param index="0" name="grade" type="Vector2" />
+			<description>
+				Sets a plane's grade (rise per metre along x and z).
+			</description>
+		</method>
+		<method name="set_raw0">
+			<return type="void" />
+			<param index="0" name="raw0" type="float" />
+			<description>
+				Sets the uncarved height at the origin, subtracted from every height so the origin is at 0 before carving.
+			</description>
+		</method>
+		<method name="set_scale">
+			<return type="void" />
+			<param index="0" name="scale" type="float" />
+			<description>
+				Sets the level's share of the hard end, multiplying every height.
+			</description>
+		</method>
+		<method name="set_water_shape">
+			<return type="void" />
+			<param index="0" name="bank" type="float" />
+			<param index="1" name="levee" type="float" />
+			<param index="2" name="levee_top" type="float" />
+			<description>
+				Sets the water's banks: the [param bank]'s width over which the bed blends into the ground, the [param levee]'s rise over the surface at the edge, and the distance past the edge where the levee starts to fall away.
+			</description>
+		</method>
+		<method name="slope" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector2" />
+			<description>
+				The steepest rise per metre at [param point]: the length of [method fall_line].
+			</description>
+		</method>
+	</methods>
+</class>
