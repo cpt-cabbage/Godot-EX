@@ -145,7 +145,7 @@ class RigKernel : public RefCounted {
 		bool scan = false;
 		// constants
 		double fps = 40.0, run_speed = 2.5;
-		double air_climb_s = 0.15, air_climb_grade = 0.3, air_t = 0.25, air_max = 0.45, air_t_walk = 0.35, air_max_walk = 0.6;
+		double air_climb_s = 0.15, air_climb_grade = 0.3, air_descent_grade = 0.3, air_t = 0.25, air_max = 0.45, air_t_walk = 0.35, air_max_walk = 0.6;
 		double air_w = 10.0, air_stride = 0.15, scramble_stride = 0.25, ankle_w = 0.5;
 		double lean_k = 0.7, lean_w = 0.3, lean_tol = 8.0;
 		Vector2 lean_grade = Vector2(8, 15);

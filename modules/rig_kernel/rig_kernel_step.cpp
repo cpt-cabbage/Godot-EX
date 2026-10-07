@@ -78,6 +78,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("run_speed", rc.run_speed);
 	f("air_climb_s", rc.air_climb_s);
 	f("air_climb_grade", rc.air_climb_grade);
+	f("air_descent_grade", rc.air_descent_grade);
 	f("air_t", rc.air_t);
 	f("air_max", rc.air_max);
 	f("air_t_walk", rc.air_t_walk);
@@ -296,12 +297,14 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	}
 	// The air time.
 	if (rc.air_reward) {
-		double lift = 0.0;
+		double lift = 0.0; // s added to both thresholds uphill
+		double ease = 0.0; // downhill, the walk's thresholds' way back to the base ones (amp_env.gd AIR_DESCENT_GRADE)
 		if (rc.air_climb && terrain.is_valid() && cvl >= 0.3 && !scramble) {
 			const Vector3 d = h.xform(Vector3(c.y, 0.0f, c.x));
 			const Vector2 dir = Vector2(d.x, d.z).normalized();
 			const double g = terrain->grade(_rel(com_p), dir);
 			lift = rc.air_climb_s * CLAMP(g / rc.air_climb_grade, 0.0, 1.0);
+			ease = CLAMP(-g / rc.air_descent_grade, 0.0, 1.0);
 		}
 		bool sides[4] = { lc, rcn, false, false };
 		int n_sides = 2;
@@ -322,8 +325,8 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 				air[k] += 1.0 / rc.fps;
 			} else if (air[k] > 0.0) {
 				const bool walk = !scramble && cvl >= 0.3;
-				const double t0 = walk ? rc.air_t_walk : rc.air_t;
-				const double t1 = walk ? rc.air_max_walk : rc.air_max;
+				const double t0 = walk ? rc.air_t_walk - ease * (rc.air_t_walk - rc.air_t) : rc.air_t;
+				const double t1 = walk ? rc.air_max_walk - ease * (rc.air_max_walk - rc.air_max) : rc.air_max;
 				double pay = rc.air_w * (MIN(air[k], t1 + lift) - t0 - lift);
 				const Vector3 d = xform[rc.air_limbs[k]].origin - lift_at[k];
 				if (scramble) {
