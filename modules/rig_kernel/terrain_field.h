@@ -78,6 +78,13 @@ class TerrainField : public RefCounted {
 	double levee = 0.15;
 	double levee_top = 2.0;
 	LocalVector<Water> waters;
+	struct Wall {
+		Vector2 c;
+		Vector2 dir;
+		double length = 0.0;
+	};
+	LocalVector<Wall> walls; // (wall_distance: a wall's centre line, 0.3 m thick)
+	double bounds = Math::INF;
 	double scale = 1.0;
 	Vector3 origin;
 
@@ -97,6 +104,12 @@ public:
 	void add_pool(const Vector2 &p_center, double p_radius, double p_surface, double p_depth);
 	void add_stream(const Vector2 &p_point, const Vector2 &p_direction, double p_width, double p_depth, double p_amplitude, double p_wavelength, double p_t0, double p_step, const PackedFloat32Array &p_profile);
 	void clear_waters() { waters.clear(); }
+	void add_wall(const Vector2 &p_center, double p_yaw, double p_length);
+	void clear_walls() { walls.clear(); }
+	void set_bounds(double p_bounds) { bounds = p_bounds; }
+	double get_bounds() const { return bounds; }
+	// The horizontal distance from p_point to the nearest wall's face (its centre line less 0.15 m), INF without.
+	double wall_distance(const Vector2 &p_point) const;
 	void set_scale(double p_scale) { scale = p_scale; }
 	double get_scale() const { return scale; }
 	void set_origin(const Vector3 &p_origin) { origin = p_origin; }

@@ -34,6 +34,21 @@
 				Adds a meandering stream through [param point] along [param direction] (a unit vector), [param width] wide and [param depth] deep at the middle, its line displaced across by [param amplitude] times the sine of the distance along it over [param wavelength] (times tau). Its surface along the line is [param profile], sampled every [param step] from [param t0] along it, linear between samples.
 			</description>
 		</method>
+		<method name="add_wall">
+			<return type="void" />
+			<param index="0" name="center" type="Vector2" />
+			<param index="1" name="yaw" type="float" />
+			<param index="2" name="length" type="float" />
+			<description>
+				Adds a wall for [method wall_distance]: its centre (x, z), its yaw and its length.
+			</description>
+		</method>
+		<method name="clear_walls">
+			<return type="void" />
+			<description>
+				Removes every wall.
+			</description>
+		</method>
 		<method name="clear_waters">
 			<return type="void" />
 			<description>
@@ -45,6 +60,12 @@
 			<param index="0" name="point" type="Vector2" />
 			<description>
 				The uphill gradient at [param point]: the height's differences over [code]+-1[/code] in x and in z, halved (rise per metre).
+			</description>
+		</method>
+		<method name="get_bounds" qualifiers="const">
+			<return type="float" />
+			<description>
+				The distance from the origin past which a rig is out of bounds (see [method set_bounds]).
 			</description>
 		</method>
 		<method name="get_origin" qualifiers="const">
@@ -95,6 +116,13 @@
 			<param index="0" name="points" type="PackedVector2Array" />
 			<description>
 				[method height] at each point (x, z).
+			</description>
+		</method>
+		<method name="set_bounds">
+			<return type="void" />
+			<param index="0" name="bounds" type="float" />
+			<description>
+				Sets the distance from the origin past which a rig is out of bounds (the reward's, [method RigKernel.reward_step]).
 			</description>
 		</method>
 		<method name="set_bumps">
@@ -166,6 +194,13 @@
 			<param index="0" name="point" type="Vector2" />
 			<description>
 				The steepest rise per metre at [param point]: the length of [method fall_line].
+			</description>
+		</method>
+		<method name="wall_distance" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector2" />
+			<description>
+				The horizontal distance from [param point] (relative to the origin) to the nearest wall's face (its centre line less 0.15 m), or INF without walls.
 			</description>
 		</method>
 	</methods>
