@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="PolicySampler" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A learned policy's actions sampled for a batch of observations: normalised, through a multilayer perceptron, with Gaussian noise.
+	</brief_description>
+	<description>
+		Samples a stochastic policy where the environments run: each observation normalised by running statistics ([code](x - mean) / sqrt(var + 1e-8)[/code], clamped to [code]+-10[/code]), a multilayer perceptron with ELU between its layers (computed as [code]exp(min(x, 0)) - 1 + max(x, 0)[/code]) giving each action's mean, noise of a learned standard deviation, and each sample's log-probability. The arithmetic is single-precision, as PyTorch's on the CPU; on macOS the layers' matrix products run on Accelerate. A training server uses it to sample its rigs' actions from weights sent once an iteration instead of a round trip to the trainer every step.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_input_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				The first layer's inputs (the observation's size).
+			</description>
+		</method>
+		<method name="get_output_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				The last layer's outputs (the action's size).
+			</description>
+		</method>
+		<method name="mean_actions">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="obs" type="PackedFloat32Array" />
+			<param index="1" name="rows" type="int" />
+			<description>
+				The actions' means for [param rows] observations given row by row in [param obs].
+			</description>
+		</method>
+		<method name="sample">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="obs" type="PackedFloat32Array" />
+			<param index="1" name="rows" type="int" />
+			<description>
+				Sampled actions for [param rows] observations ([param rows] times the action size, row by row), followed by each row's log-probability under the Gaussian.
+			</description>
+		</method>
+		<method name="set_layers">
+			<return type="void" />
+			<param index="0" name="shapes" type="PackedInt32Array" />
+			<param index="1" name="parameters" type="PackedFloat32Array" />
+			<description>
+				Sets the layers: [param shapes] holds each layer's inputs and outputs in order, [param parameters] each layer's weight (outputs by inputs, row by row, as PyTorch's [code]nn.Linear[/code]) then its bias, in order.
+			</description>
+		</method>
+		<method name="set_log_std">
+			<return type="void" />
+			<param index="0" name="log_std" type="PackedFloat32Array" />
+			<description>
+				Sets the noise's log standard deviation, one per action.
+			</description>
+		</method>
+		<method name="set_normalizer">
+			<return type="void" />
+			<param index="0" name="mean" type="PackedFloat32Array" />
+			<param index="1" name="var" type="PackedFloat32Array" />
+			<description>
+				Sets the observation normaliser's running mean and variance.
+			</description>
+		</method>
+		<method name="set_seed">
+			<return type="void" />
+			<param index="0" name="seed" type="int" />
+			<description>
+				Seeds the noise's generator.
+			</description>
+		</method>
+	</methods>
+</class>

@@ -31,6 +31,7 @@
 #include "register_types.h"
 
 #include "ground_data.h"
+#include "policy_sampler.h"
 #include "rig_kernel.h"
 #include "terrain_field.h"
 #include "water_forces.h"
@@ -42,6 +43,7 @@ void initialize_rig_kernel_module(ModuleInitializationLevel p_level) {
 		return;
 	}
 	GDREGISTER_CLASS(GroundData);
+	GDREGISTER_CLASS(PolicySampler);
 	GDREGISTER_CLASS(RigKernel);
 	GDREGISTER_CLASS(TerrainField);
 	GDREGISTER_CLASS(WaterForces);

@@ -6,3 +6,6 @@ Import("env_modules")
 
 env_rig_kernel = env_modules.Clone()
 env_rig_kernel.add_source_files(env.modules_sources, "*.cpp")
+
+if env["platform"] == "macos":
+    env.Append(LINKFLAGS=["-framework", "Accelerate"])  # PolicySampler's matrix products
