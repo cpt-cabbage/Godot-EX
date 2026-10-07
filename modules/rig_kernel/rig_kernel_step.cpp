@@ -356,6 +356,9 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 				} else if (pay > 0.0 && double(Vector2(d.x, d.z).length()) < rc.air_stride) {
 					pay = 0.0;
 				}
+				if (!scramble) {
+					pay *= 1.0 - ease; // downhill the term fades out (amp_env.gd AIR_DESCENT_GRADE)
+				}
 				if (k < 2) {
 					land_yaw[k] = Math::atan2(double(h.get_column(2).x), double(h.get_column(2).z));
 				}
