@@ -69,6 +69,10 @@ class GroundData : public RefCounted {
 	LocalVector<Prop> props;
 	HashMap<int64_t, LocalVector<int>> buckets; // prop indices by BUCKET-sized cell of their bounds in x and z
 	static constexpr float BUCKET = 2.0f;
+	// The trunks (nearest_trunks' props) by the BUCKET-sized cell of their centre, each once, and the
+	// largest's radius: the search visits the trunks alone (among a terrain's thousands of rocks).
+	HashMap<int64_t, LocalVector<int>> trunk_buckets;
+	float trunk_reach = 0.0f;
 
 	// Water (design/v2_recipe.md item 9): a surface's height and its flow (x, z) at a grid's samples, NaN
 	// where dry, placed by water_xform (a scale and a translation; its y scale multiplies the heights)
