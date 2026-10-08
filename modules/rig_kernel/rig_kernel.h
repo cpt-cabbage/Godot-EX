@@ -194,6 +194,9 @@ class RigKernel : public RefCounted {
 	Vector<float> f_prev;
 	Vector<Vector<float>> f_hist; // oldest first
 	PackedFloat32Array amp_pair;
+	// reward_step's terms this step (get_step_terms; amp_env.gd log_terms, TERM_NAMES): tracking, run double support,
+	// walk flight, air, ankle, lean, split, hands, edge, still, slip, action rate; then the grade along the command.
+	PackedFloat32Array step_terms;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -279,6 +282,7 @@ public:
 	void reset_terms(double p_wy_mean, const PackedFloat32Array &p_features, const Transform3D &p_pelvis_prev, double p_g_pelvis);
 	PackedFloat32Array reward_step(const Vector3 &p_command, int p_style, int p_steps, int p_push_at, int p_trip_at, int p_switch_at, float p_scramble_cap, const PackedFloat32Array &p_action, const PackedFloat32Array &p_prev_action);
 	PackedFloat32Array get_amp_pair() const { return amp_pair; }
+	PackedFloat32Array get_step_terms() const { return step_terms; }
 	PackedFloat32Array observation_full(const PackedFloat32Array &p_action, const Vector3 &p_command, int p_style, double p_strength);
 	double get_path() const { return path; }
 	double get_asked() const { return asked; }
