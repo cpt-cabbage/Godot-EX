@@ -195,7 +195,8 @@ class RigKernel : public RefCounted {
 	Vector<Vector<float>> f_hist; // oldest first
 	PackedFloat32Array amp_pair;
 	// reward_step's terms this step (get_step_terms; amp_env.gd log_terms, TERM_NAMES): tracking, run double support,
-	// walk flight, air, ankle, lean, split, hands, edge, still, slip, action rate; then the grade along the command.
+	// walk flight, air, ankle, lean, split, hands, edge, still, slip, action rate; then the grade along the command and
+	// the fall's cause (0 none, 1 down, 2 kneeling, 3 propped).
 	PackedFloat32Array step_terms;
 
 	Vector<Transform3D> xform;
