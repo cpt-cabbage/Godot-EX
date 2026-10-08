@@ -58,6 +58,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	b("slip", rc.slip);
 	b("walk_contact", rc.walk_contact);
 	b("descent_crouch", rc.descent_crouch);
+	b("descent_lean", rc.descent_lean);
 	b("senses", rc.senses);
 	b("scramble_rhythm", rc.scramble_rhythm);
 	b("ankle_human", rc.ankle_human);
@@ -111,6 +112,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("slip_cap", rc.slip_cap);
 	f("walk_flight_w", rc.walk_flight_w);
 	f("crouch_w", rc.crouch_w);
+	f("descent_lean_k", rc.descent_lean_k);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -438,6 +440,22 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 				const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
 				r += rc.crouch_w * w * pay / n * prog;
 			}
+		}
+	}
+	// The trunk on a steep descent (amp_env.gd descent_lean): the lean term's mirror downhill, the trunk's lean toward
+	// the heading paid near descent_lean_k * deg within lean_tol, times the progress along the command (counted with
+	// the lean in the terms' log).
+	if (rc.descent_lean && terrain.is_valid() && cvl >= 0.3 && !scramble) {
+		const Vector3 d = h.xform(Vector3(cv.x, 0.0f, cv.y));
+		const Vector2 dir = Vector2(d.x, d.z).normalized();
+		const double deg = -Math::rad_to_deg(Math::atan(terrain->grade(_rel(com_p), dir)));
+		const double w = CLAMP((deg - rc.crouch_grade.x) / (rc.crouch_grade.y - rc.crouch_grade.x), 0.0, 1.0);
+		if (w > 0.0) {
+			const Vector3 up = xform[rc.torso].basis.get_column(1);
+			const double lean = Math::rad_to_deg(Math::asin(CLAMP(double(up.dot(Vector3(dir.x, 0.0f, dir.y))), -1.0, 1.0)));
+			const double e = (lean - rc.descent_lean_k * deg) / rc.lean_tol;
+			const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
+			r += rc.lean_w * w * Math::exp(-e * e) * prog;
 		}
 	}
 	mark(5, r);
