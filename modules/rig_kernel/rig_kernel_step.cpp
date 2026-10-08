@@ -107,6 +107,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("slip_cap", rc.slip_cap);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
+	i("brush_steps", rc.brush_steps);
 	i("push_gate", rc.push_gate);
 	i("switch_gate", rc.switch_gate);
 	i("kneel_steps", rc.kneel_steps);
@@ -165,6 +166,7 @@ void RigKernel::reset_terms(double p_wy_mean, const PackedFloat32Array &p_featur
 	wy_mean = p_wy_mean;
 	for (int k = 0; k < 4; k++) {
 		air[k] = 0.0;
+		brush[k] = 0;
 		lift_at[k] = Vector3();
 	}
 	land_yaw[0] = NAN;
@@ -332,7 +334,11 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 					lift_at[k] = xform[rc.air_limbs[k]].origin;
 				}
 				air[k] += 1.0 / rc.fps;
+				brush[k] = 0; // a brush shorter than brush_steps: the swing goes on
+			} else if (air[k] > 0.0 && brush[k] < rc.brush_steps) {
+				brush[k]++; // in contact: a brush until it holds past brush_steps, then a landing
 			} else if (air[k] > 0.0) {
+				brush[k] = 0;
 				const bool walk = !scramble && cvl >= 0.3;
 				const double t0 = walk ? rc.air_t_walk - ease * (rc.air_t_walk - rc.air_t) : rc.air_t;
 				const double t1 = walk ? rc.air_max_walk - ease * (rc.air_max_walk - rc.air_max) : rc.air_max;

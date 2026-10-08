@@ -149,6 +149,7 @@ class RigKernel : public RefCounted {
 		double air_w = 10.0, air_stride = 0.15, scramble_stride = 0.25, ankle_w = 0.5;
 		double slip_w = 1.0, slip_free = 0.25, slip_cap = 0.25;
 		double turn_cycle_yaw = 0.8, turn_tap = 0.5;
+		int brush_steps = 2;
 		double lean_k = 0.7, lean_w = 0.3, lean_tol = 8.0;
 		Vector2 lean_grade = Vector2(8, 15);
 		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
@@ -180,6 +181,7 @@ class RigKernel : public RefCounted {
 	// The episode's state.
 	double wy_mean = 0.0;
 	double air[4] = { 0, 0, 0, 0 };
+	int brush[4] = { 0, 0, 0, 0 }; // control steps each limb has been in contact since its swing (a landing past brush_steps)
 	Vector3 lift_at[4];
 	double land_yaw[2] = { NAN, NAN }; // the heading's yaw at each foot's last landing (a pivot's steps)
 	int kneel = 0;
