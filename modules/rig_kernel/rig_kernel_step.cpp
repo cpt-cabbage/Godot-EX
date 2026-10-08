@@ -294,9 +294,9 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	const Vector2 cv(c.y, c.x);
 	const double cvl = cv.length();
 	// The terms, each section's change of r (get_step_terms; the log's per-context means, train.py --log_terms).
-	step_terms.resize(13);
+	step_terms.resize(14);
 	float *st = step_terms.ptrw();
-	for (int k = 0; k < 13; k++) {
+	for (int k = 0; k < 14; k++) {
 		st[k] = 0.0f;
 	}
 	double r_mark = 0.0;
@@ -506,6 +506,8 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	}
 	propped = prop ? propped + 1 : 0;
 	down = down || propped >= rc.prop_steps;
+	// The fall's cause this step (get_step_terms' last value): 1 down (the head or the COM low), 2 kneeling, 3 propped.
+	st[13] = (head_y < rc.down_head || com_h < rc.down_com) ? 1.0f : (kneel >= rc.kneel_steps ? 2.0f : (propped >= rc.prop_steps ? 3.0f : 0.0f));
 	double depth = 0.0;
 	if (rc.water) {
 		depth = _water_depth(com_p, g_com);
