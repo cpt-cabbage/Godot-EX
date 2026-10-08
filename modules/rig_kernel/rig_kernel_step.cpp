@@ -434,7 +434,9 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 				n++;
 			}
 			if (n > 0) {
-				r += rc.crouch_w * w * pay / n;
+				// In proportion to the progress along the command (a crouched stand earns nothing).
+				const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
+				r += rc.crouch_w * w * pay / n * prog;
 			}
 		}
 	}
