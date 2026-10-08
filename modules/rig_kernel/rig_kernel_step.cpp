@@ -119,6 +119,13 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("stride_min", rc.stride_min);
 	f("stride_w", rc.stride_w);
 	f("stride_cost_max", rc.stride_cost_max);
+	b("stride_constraint", rc.stride_constraint);
+	b("effort", rc.effort);
+	b("zmp", rc.zmp);
+	f("zmp_w", rc.zmp_w);
+	f("zmp_sigma", rc.zmp_sigma);
+	f("gravity", rc.gravity);
+	v2("zmp_grade", rc.zmp_grade);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -192,6 +199,7 @@ void RigKernel::reset_terms(double p_wy_mean, const PackedFloat32Array &p_featur
 	along = 0.0;
 	edges = 0;
 	ground_mu = 1.0f;
+	com_prev_ok = false;
 	pelvis_prev = p_pelvis_prev;
 	g_pelvis = p_g_pelvis;
 	f_prev.resize(p_features.size());
@@ -273,6 +281,26 @@ double RigKernel::_water_depth(const Vector3 &p_point, double p_ground) const {
 	return Math::is_nan(w.x) ? 0.0 : MAX(double(w.x) - p_ground, 0.0);
 }
 
+// amp_env.gd _zmp_reward's core: the support anchor (the feet weighted by contact, a little of each), the support
+// plane through it with the terrain's normal there, the apparent force g - a_com from the COM, and where its ray
+// meets the plane; exp(-distance / sigma), 0 when the ray leaves the plane.
+double RigKernel::_zmp(const Vector3 &p_com, const Vector3 &p_acc, bool p_lc, bool p_rc) const {
+	const double e = 0.05;
+	const double wl = (p_lc ? 1.0 : 0.0) + e;
+	const double wr = (p_rc ? 1.0 : 0.0) + e;
+	const Vector3 sa = (xform[rc.foot[0]].origin * real_t(wl) + xform[rc.foot[1]].origin * real_t(wr)) / real_t(wl + wr);
+	const Vector2 g = terrain->fall_line(_rel(sa));
+	const Vector3 n = Vector3(-g.x, 1.0f, -g.y).normalized();
+	const Vector3 f = Vector3(0.0f, -real_t(rc.gravity), 0.0f) - p_acc;
+	const double fn = f.dot(n);
+	if (fn <= 1e-6) {
+		return 0.0;
+	}
+	const double t = double((sa - p_com).dot(n)) / fn;
+	const Vector3 zmp = p_com + f * real_t(t);
+	return Math::exp(-double((zmp - sa).length()) / rc.zmp_sigma);
+}
+
 // amp_env.gd _style_weight.
 double RigKernel::_style_weight(const Vector3 &p_point, int p_style, double p_depth) const {
 	const double wade = 1.0 - (1.0 - rc.style_floor) * CLAMP((p_depth - rc.wade_style.x) / (rc.wade_style.y - rc.wade_style.x), 0.0, 1.0);
@@ -306,9 +334,9 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	const Vector2 cv(c.y, c.x);
 	const double cvl = cv.length();
 	// The terms, each section's change of r (get_step_terms; the log's per-context means, train.py --log_terms).
-	step_terms.resize(14);
+	step_terms.resize(17);
 	float *st = step_terms.ptrw();
-	for (int k = 0; k < 14; k++) {
+	for (int k = 0; k < 17; k++) {
 		st[k] = 0.0f;
 	}
 	double r_mark = 0.0;
@@ -410,7 +438,11 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 						const double cap = MAX(rc.stride_min, rc.stride_cap * cvl);
 						if (along > cap) {
 							const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
-							r -= MIN(rc.stride_w * (along - cap), rc.stride_cost_max) * w * prog;
+							const double sc = MIN(rc.stride_w * (along - cap), rc.stride_cost_max) * w * prog;
+							st[16] += float(sc); // reported either way (train.py's stride constraint reads it)
+							if (!rc.stride_constraint) {
+								r -= sc;
+							}
 						}
 					}
 				}
@@ -576,9 +608,25 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	}
 	r -= 0.01 * da;
 	mark(11, r);
+	// HumoSlope's balance prior (amp_env.gd zmp_w, _zmp_reward): the zero-moment point on the inclined support plane
+	// near the support anchor (the stance feet, weighted by contact), faded in with the slope under the COM.
+	const Vector3 acc = com_prev_ok ? (com_v - com_vel_prev) * real_t(rc.fps) : Vector3();
+	com_vel_prev = com_v;
+	com_prev_ok = true;
+	if (rc.zmp && terrain.is_valid() && !scramble && (lc || rcn)) {
+		const double deg = Math::rad_to_deg(Math::atan(terrain->slope(_rel(com_p))));
+		const double w = CLAMP((deg - rc.zmp_grade.x) / (rc.zmp_grade.y - rc.zmp_grade.x), 0.0, 1.0);
+		if (w > 0.0) {
+			r += rc.zmp_w * w * _zmp(com_p, acc, lc, rcn);
+		}
+	}
+	mark(12, r);
 	if (terrain.is_valid()) { // the context: the grade along the command (the heading when standing), rise per metre
 		const Vector3 d = h.xform(cvl >= 0.3 ? Vector3(c.y, 0.0f, c.x) : Vector3(0.0f, 0.0f, 1.0f));
-		st[12] = float(terrain->grade(_rel(com_p), Vector2(d.x, d.z).normalized()));
+		st[13] = float(terrain->grade(_rel(com_p), Vector2(d.x, d.z).normalized()));
+	}
+	if (rc.effort) {
+		st[15] = float(effort(p_action));
 	}
 	// Off balance, down.
 	const double com_h = double(com_p.y) - g_com;
@@ -595,7 +643,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	propped = prop ? propped + 1 : 0;
 	down = down || propped >= rc.prop_steps;
 	// The fall's cause this step (get_step_terms' last value): 1 down (the head or the COM low), 2 kneeling, 3 propped.
-	st[13] = (head_y < rc.down_head || com_h < rc.down_com) ? 1.0f : (kneel >= rc.kneel_steps ? 2.0f : (propped >= rc.prop_steps ? 3.0f : 0.0f));
+	st[14] = (head_y < rc.down_head || com_h < rc.down_com) ? 1.0f : (kneel >= rc.kneel_steps ? 2.0f : (propped >= rc.prop_steps ? 3.0f : 0.0f));
 	double depth = 0.0;
 	if (rc.water) {
 		depth = _water_depth(com_p, g_com);

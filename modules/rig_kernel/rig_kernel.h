@@ -157,6 +157,11 @@ class RigKernel : public RefCounted {
 		double descent_over = 0.0;
 		bool progress_bounded = false; // the progress term a triangle past the command (amp_env.gd progress_bounded)
 		double stride_cap = 0.0, stride_min = 0.8, stride_w = 1.0, stride_cost_max = 0.5; // the stride cap downhill (amp_env.gd stride_cap)
+		bool stride_constraint = false; // the stride cost reported (step_terms' stride_x), not subtracted: train.py's multiplier applies it (amp_env.gd stride_constraint)
+		bool effort = false; // the joints' mechanical power each step (step_terms' effort): every drive's PD torque estimate, as ankle_excess's, times the joint's rate, summed (amp_env.gd effort; train.py --effort)
+		bool zmp = false; // HumoSlope's balance prior (amp_env.gd zmp_w, _zmp_reward): the zero-moment point on the inclined support plane near the support anchor
+		double zmp_w = 0.2, zmp_sigma = 0.15, gravity = 9.8;
+		Vector2 zmp_grade = Vector2(15, 25);
 		Vector2 crouch_grade = Vector2(15, 25), crouch_knee = Vector2(0.3, 0.8);
 		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
 		Vector2 split_grade = Vector2(15, 30);
@@ -201,9 +206,16 @@ class RigKernel : public RefCounted {
 	Vector<Vector<float>> f_hist; // oldest first
 	PackedFloat32Array amp_pair;
 	// reward_step's terms this step (get_step_terms; amp_env.gd log_terms, TERM_NAMES): tracking, run double support,
-	// walk flight, air, ankle, lean, split, hands, edge, still, slip, action rate; then the grade along the command and
-	// the fall's cause (0 none, 1 down, 2 kneeling, 3 propped).
+	// walk flight, air, ankle, lean, split, hands, edge, still, slip, action rate, the ZMP balance prior; then the grade
+	// along the command, the fall's cause (0 none, 1 down, 2 kneeling, 3 propped), the effort (W) and the stride cost
+	// (reported whether or not subtracted).
 	PackedFloat32Array step_terms;
+	// Every drive's gains and torque cap at k = 1 (set_drive_gains, in drive order) and the episode's strength k
+	// (set_strength), for effort()'s torque estimate.
+	Vector<double> drive_kp, drive_kd, drive_cap;
+	double strength = 1.0;
+	Vector3 com_vel_prev; // the step before's COM velocity (the ZMP's apparent force); none at an episode's start
+	bool com_prev_ok = false;
 
 	Vector<Transform3D> xform;
 	Vector<Vector3> lin_vel;
@@ -222,6 +234,7 @@ class RigKernel : public RefCounted {
 	void _amp(const Vector3 &p_command, int p_style, const Transform3D &p_pelvis);
 	double _style_weight(const Vector3 &p_point, int p_style, double p_depth) const;
 	double _water_depth(const Vector3 &p_point, double p_ground) const;
+	double _zmp(const Vector3 &p_com, const Vector3 &p_acc, bool p_lc, bool p_rc) const;
 	float _ground_from(const Vector3 &p_point, float p_up) const;
 	bool _static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const;
 
@@ -283,6 +296,10 @@ public:
 	void set_legs(const PackedInt32Array &p_bodies);
 	void leg_drag(double p_coefficient, double p_height) const;
 	void clear_leg_drag() const;
+	void set_drive_gains(const PackedFloat64Array &p_kp, const PackedFloat64Array &p_kd, const PackedFloat64Array &p_cap);
+	void set_strength(double p_k) { strength = p_k; }
+	double get_strength() const { return strength; }
+	double effort(const PackedFloat32Array &p_action) const;
 
 	// The whole step (reward_step): see the class reference.
 	void set_reward_config(const Dictionary &p_config);
