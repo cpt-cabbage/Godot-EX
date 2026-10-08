@@ -56,6 +56,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	b("air_reward", rc.air_reward);
 	b("air_climb", rc.air_climb);
 	b("slip", rc.slip);
+	b("walk_contact", rc.walk_contact);
 	b("senses", rc.senses);
 	b("scramble_rhythm", rc.scramble_rhythm);
 	b("ankle_human", rc.ankle_human);
@@ -105,6 +106,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("slip_w", rc.slip_w);
 	f("slip_free", rc.slip_free);
 	f("slip_cap", rc.slip_cap);
+	f("walk_flight_w", rc.walk_flight_w);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -305,6 +307,10 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	}
 	if (c.x >= rc.run_speed && lc && rcn) {
 		r -= 0.5;
+	}
+	// A walk keeps a foot down (amp_env.gd walk_contact): asked for a walk and moving, both feet off the ground cost.
+	if (rc.walk_contact && c.x < rc.run_speed && cvl >= 0.3 && !scramble && !lc && !rcn && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
+		r -= rc.walk_flight_w;
 	}
 	// The air time.
 	if (rc.air_reward) {
