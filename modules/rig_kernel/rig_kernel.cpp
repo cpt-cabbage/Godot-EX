@@ -629,6 +629,48 @@ void RigKernel::clear_leg_drag() const {
 	}
 }
 
+// Every drive's gains and torque cap at k = 1 (amp_env.gd GAINS and cap_of, in ACT_DOFS order).
+void RigKernel::set_drive_gains(const PackedFloat64Array &p_kp, const PackedFloat64Array &p_kd, const PackedFloat64Array &p_cap) {
+	ERR_FAIL_COND_MSG(p_kp.size() != drives.size() || p_kd.size() != drives.size() || p_cap.size() != drives.size(), "One kp, kd and cap per drive.");
+	drive_kp.clear();
+	drive_kd.clear();
+	drive_cap.clear();
+	for (int i = 0; i < drives.size(); i++) {
+		drive_kp.push_back(p_kp[i]);
+		drive_kd.push_back(p_kd[i]);
+		drive_cap.push_back(p_cap[i]);
+	}
+}
+
+// The joints' mechanical power (W): every drive's PD torque estimate, kp (target - angle) - kd rate within its cap
+// times the episode's strength (ankle_excess's estimate, over every driven axis; the targets as write_targets writes
+// them), times the joint's rate, its magnitude summed (amp_env.gd _effort_script).
+double RigKernel::effort(const PackedFloat32Array &p_action) const {
+	ERR_FAIL_COND_V_MSG(drive_kp.size() != drives.size(), 0.0, "set_drive_gains() first.");
+	ERR_FAIL_COND_V(p_action.size() != action_size, 0.0);
+	double e = 0.0;
+	int k = 0;
+	for (int i = 0; i < drives.size(); i++) {
+		const Drive &d = drives[i];
+		const int parent = parents[d.body];
+		const Basis pi = xform[parent].basis.inverse();
+		const Vector3 rv = rotation_vector(pi * xform[d.body].basis);
+		const Vector3 rel = pi.xform(ang_vel[d.body] - ang_vel[parent]);
+		Vector3 t = d.nominal;
+		for (int axis : d.axes) {
+			t[axis] += d.scale[axis] * CLAMP(p_action[k], -1.0f, 1.0f);
+			k++;
+		}
+		t = t.clamp(d.lo, d.hi);
+		const double cap = drive_cap[i] * strength;
+		for (int axis : d.axes) {
+			const double tau = CLAMP(drive_kp[i] * (double(t[axis]) - double(rv[axis])) - drive_kd[i] * double(rel[axis]), -cap, cap);
+			e += Math::abs(tau * double(rel[axis]));
+		}
+	}
+	return e;
+}
+
 void RigKernel::_bind_methods() {
 	ClassDB::bind_static_method("RigKernel", D_METHOD("rotation_vector", "basis"), &RigKernel::rotation_vector);
 	ClassDB::bind_static_method("RigKernel", D_METHOD("heading_of", "basis"), &RigKernel::heading_of);
@@ -679,6 +721,10 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_legs", "bodies"), &RigKernel::set_legs);
 	ClassDB::bind_method(D_METHOD("leg_drag", "coefficient", "height"), &RigKernel::leg_drag);
 	ClassDB::bind_method(D_METHOD("clear_leg_drag"), &RigKernel::clear_leg_drag);
+	ClassDB::bind_method(D_METHOD("set_drive_gains", "kp", "kd", "cap"), &RigKernel::set_drive_gains);
+	ClassDB::bind_method(D_METHOD("set_strength", "k"), &RigKernel::set_strength);
+	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
+	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
 	ClassDB::bind_method(D_METHOD("set_reward_config", "config"), &RigKernel::set_reward_config);
 	ClassDB::bind_method(D_METHOD("reset_terms", "wy_mean", "features", "pelvis_prev", "g_pelvis"), &RigKernel::reset_terms);
 	ClassDB::bind_method(D_METHOD("reward_step", "command", "style", "steps", "push_at", "trip_at", "switch_at", "scramble_cap", "action", "prev_action"), &RigKernel::reward_step);
