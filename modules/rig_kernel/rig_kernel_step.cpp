@@ -114,6 +114,11 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("crouch_w", rc.crouch_w);
 	f("descent_lean_k", rc.descent_lean_k);
 	f("descent_over", rc.descent_over);
+	b("progress_bounded", rc.progress_bounded);
+	f("stride_cap", rc.stride_cap);
+	f("stride_min", rc.stride_min);
+	f("stride_w", rc.stride_w);
+	f("stride_cost_max", rc.stride_cost_max);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -318,7 +323,9 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		r += 0.2 * CLAMP(wy_mean / c.z, -1.0, 1.0);
 	}
 	if (cvl >= 0.3) {
-		r += 0.2 * CLAMP(double(Vector2(v.x, v.z).dot(cv)) / double(cv.length_squared()), -1.0, 1.0);
+		// The progress along the command; progress_bounded: a triangle past it, 1 at the command, 0 at twice it.
+		const double p = double(Vector2(v.x, v.z).dot(cv)) / double(cv.length_squared());
+		r += 0.2 * (rc.progress_bounded && p > 1.0 ? MAX(2.0 - p, 0.0) : CLAMP(p, -1.0, 1.0));
 	}
 	mark(0, r);
 	if (c.x >= rc.run_speed && lc && rcn) {
@@ -389,6 +396,23 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 				}
 				if (!scramble) {
 					pay *= 1.0 - ease; // downhill the term fades out (amp_env.gd AIR_DESCENT_GRADE)
+				}
+				// The stride cap downhill (amp_env.gd stride_cap, _stride_cost): at a foot's landing walking down past
+				// crouch_grade along the command, its travel along the command's way since it lifted over stride_cap s of the
+				// commanded speed (at least stride_min) costs stride_w per metre, at most stride_cost_max, times the progress.
+				if (k < 2 && rc.stride_cap > 0.0 && terrain.is_valid() && !scramble && cvl >= 0.3) {
+					const Vector3 way = h.xform(Vector3(cv.x, 0.0f, cv.y));
+					const Vector2 dir = Vector2(way.x, way.z).normalized();
+					const double deg = -Math::rad_to_deg(Math::atan(terrain->grade(_rel(com_p), dir)));
+					const double w = CLAMP((deg - rc.crouch_grade.x) / (rc.crouch_grade.y - rc.crouch_grade.x), 0.0, 1.0);
+					if (w > 0.0) {
+						const double along = double(Vector2(d.x, d.z).dot(dir));
+						const double cap = MAX(rc.stride_min, rc.stride_cap * cvl);
+						if (along > cap) {
+							const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
+							r -= MIN(rc.stride_w * (along - cap), rc.stride_cost_max) * w * prog;
+						}
+					}
 				}
 				if (k < 2) {
 					land_yaw[k] = Math::atan2(double(h.get_column(2).x), double(h.get_column(2).z));
