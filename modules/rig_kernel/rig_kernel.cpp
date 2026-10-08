@@ -683,6 +683,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("reset_terms", "wy_mean", "features", "pelvis_prev", "g_pelvis"), &RigKernel::reset_terms);
 	ClassDB::bind_method(D_METHOD("reward_step", "command", "style", "steps", "push_at", "trip_at", "switch_at", "scramble_cap", "action", "prev_action"), &RigKernel::reward_step);
 	ClassDB::bind_method(D_METHOD("get_amp_pair"), &RigKernel::get_amp_pair);
+	ClassDB::bind_method(D_METHOD("get_step_terms"), &RigKernel::get_step_terms);
 	ClassDB::bind_method(D_METHOD("observation_full", "action", "command", "style", "strength"), &RigKernel::observation_full);
 	ClassDB::bind_method(D_METHOD("get_path"), &RigKernel::get_path);
 	ClassDB::bind_method(D_METHOD("get_asked"), &RigKernel::get_asked);

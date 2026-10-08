@@ -293,6 +293,14 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	const Vector3 &c = p_command;
 	const Vector2 cv(c.y, c.x);
 	const double cvl = cv.length();
+	// The terms, each section's change of r (get_step_terms; the log's per-context means, train.py --log_terms).
+	step_terms.resize(13);
+	float *st = step_terms.ptrw();
+	for (int k = 0; k < 13; k++) {
+		st[k] = 0.0f;
+	}
+	double r_mark = 0.0;
+	auto mark = [&](int k, double r_now) { st[k] = float(r_now - r_mark); r_mark = r_now; };
 	// Tracking.
 	const double tol = 0.2 + 0.15 * cvl;
 	double r = 0.6 * Math::exp(-((double(v.z) - c.x) * (double(v.z) - c.x) + (double(v.x) - c.y) * (double(v.x) - c.y)) / (tol * tol));
@@ -305,13 +313,16 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 	if (cvl >= 0.3) {
 		r += 0.2 * CLAMP(double(Vector2(v.x, v.z).dot(cv)) / double(cv.length_squared()), -1.0, 1.0);
 	}
+	mark(0, r);
 	if (c.x >= rc.run_speed && lc && rcn) {
 		r -= 0.5;
 	}
+	mark(1, r);
 	// A walk keeps a foot down (amp_env.gd walk_contact): asked for a walk and moving, both feet off the ground cost.
 	if (rc.walk_contact && c.x < rc.run_speed && cvl >= 0.3 && !scramble && !lc && !rcn && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
 		r -= rc.walk_flight_w;
 	}
+	mark(2, r);
 	// The air time.
 	if (rc.air_reward) {
 		double lift = 0.0; // s added to both thresholds uphill
@@ -380,9 +391,11 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			}
 		}
 	}
+	mark(3, r);
 	if (rc.ankle_human) {
 		r -= rc.ankle_w * ankle_excess(p_action, rc.ankle_push);
 	}
+	mark(4, r);
 	// The lean into a climb.
 	if (rc.lean_climb && terrain.is_valid() && cvl >= 0.3 && !scramble) {
 		const Vector3 d = h.xform(Vector3(cv.x, 0.0f, cv.y));
@@ -396,6 +409,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			r += rc.lean_w * w * Math::exp(-e * e);
 		}
 	}
+	mark(5, r);
 	// The split stance standing on a slope.
 	if (rc.stance_split && terrain.is_valid() && cvl < 0.3 && Math::abs(double(c.z)) < 0.3) {
 		const Vector2 g = terrain->fall_line(_rel(com_p));
@@ -414,6 +428,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			}
 		}
 	}
+	mark(6, r);
 	// The hands' support on steep ground.
 	if (rc.hand_support > 0.0 && terrain.is_valid()) {
 		const Vector2 g = terrain->fall_line(_rel(com_p));
@@ -433,6 +448,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			r += w * rc.hand_support * reach;
 		}
 	}
+	mark(7, r);
 	// A foot over an edge.
 	if (rc.edge_cost > 0.0 && rc.props) {
 		int n = 0;
@@ -446,6 +462,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			edges++;
 		}
 	}
+	mark(8, r);
 	// Standing still.
 	if (!scramble && cvl < 0.3 && Math::abs(double(c.z)) < 0.3 && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
 		double w2 = 0.0;
@@ -454,6 +471,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		}
 		r -= rc.still_w * w2;
 	}
+	mark(9, r);
 	// The feet's slip.
 	if (rc.slip && p_steps - p_push_at >= rc.push_gate && p_steps - p_trip_at >= rc.push_gate) {
 		double sl = 0.0;
@@ -462,12 +480,18 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		}
 		r -= rc.slip_w * sl;
 	}
+	mark(10, r);
 	double da = 0.0;
 	for (int j = 0; j < p_action.size() && j < p_prev_action.size(); j++) {
 		const double x = double(p_action[j]) - double(p_prev_action[j]);
 		da += x * x;
 	}
 	r -= 0.01 * da;
+	mark(11, r);
+	if (terrain.is_valid()) { // the context: the grade along the command (the heading when standing), rise per metre
+		const Vector3 d = h.xform(cvl >= 0.3 ? Vector3(c.y, 0.0f, c.x) : Vector3(0.0f, 0.0f, 1.0f));
+		st[12] = float(terrain->grade(_rel(com_p), Vector2(d.x, d.z).normalized()));
+	}
 	// Off balance, down.
 	const double com_h = double(com_p.y) - g_com;
 	const double tilt = pt.basis.get_column(1).y;
