@@ -460,7 +460,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		}
 	}
 	// Overspeed on a steep descent (amp_env.gd descent_over): the COM's speed along the command over the commanded
-	// costs descent_over per m/s, faded in over crouch_grade (counted with the tracking in the terms' log).
+	// costs descent_over per m/s, faded in over crouch_grade (counted with the lean in the terms' log).
 	if (rc.descent_over > 0.0 && terrain.is_valid() && cvl >= 0.3 && !scramble) {
 		const Vector3 d = h.xform(Vector3(cv.x, 0.0f, cv.y));
 		const Vector2 dir = Vector2(d.x, d.z).normalized();
