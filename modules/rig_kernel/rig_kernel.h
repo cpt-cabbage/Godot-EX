@@ -154,6 +154,7 @@ class RigKernel : public RefCounted {
 		Vector2 lean_grade = Vector2(8, 15);
 		double crouch_w = 0.3;
 		double descent_lean_k = 0.0;
+		double descent_over = 0.0;
 		Vector2 crouch_grade = Vector2(15, 25), crouch_knee = Vector2(0.3, 0.8);
 		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
 		Vector2 split_grade = Vector2(15, 30);

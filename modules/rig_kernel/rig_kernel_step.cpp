@@ -113,6 +113,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("walk_flight_w", rc.walk_flight_w);
 	f("crouch_w", rc.crouch_w);
 	f("descent_lean_k", rc.descent_lean_k);
+	f("descent_over", rc.descent_over);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -456,6 +457,20 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			const double e = (lean - rc.descent_lean_k * deg) / rc.lean_tol;
 			const double prog = CLAMP((double(v.x) * cv.x + double(v.z) * cv.y) / (cvl * cvl), 0.0, 1.0);
 			r += rc.lean_w * w * Math::exp(-e * e) * prog;
+		}
+	}
+	// Overspeed on a steep descent (amp_env.gd descent_over): the COM's speed along the command over the commanded
+	// costs descent_over per m/s, faded in over crouch_grade (counted with the tracking in the terms' log).
+	if (rc.descent_over > 0.0 && terrain.is_valid() && cvl >= 0.3 && !scramble) {
+		const Vector3 d = h.xform(Vector3(cv.x, 0.0f, cv.y));
+		const Vector2 dir = Vector2(d.x, d.z).normalized();
+		const double deg = -Math::rad_to_deg(Math::atan(terrain->grade(_rel(com_p), dir)));
+		const double w = CLAMP((deg - rc.crouch_grade.x) / (rc.crouch_grade.y - rc.crouch_grade.x), 0.0, 1.0);
+		if (w > 0.0) {
+			const double over = (double(v.x) * cv.x + double(v.z) * cv.y) / cvl - cvl;
+			if (over > 0.0) {
+				r -= rc.descent_over * w * over;
+			}
 		}
 	}
 	mark(5, r);
