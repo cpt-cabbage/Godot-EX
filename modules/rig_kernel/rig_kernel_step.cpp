@@ -57,6 +57,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	b("air_climb", rc.air_climb);
 	b("slip", rc.slip);
 	b("walk_contact", rc.walk_contact);
+	b("descent_crouch", rc.descent_crouch);
 	b("senses", rc.senses);
 	b("scramble_rhythm", rc.scramble_rhythm);
 	b("ankle_human", rc.ankle_human);
@@ -93,6 +94,8 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("lean_w", rc.lean_w);
 	f("lean_tol", rc.lean_tol);
 	v2("lean_grade", rc.lean_grade);
+	v2("crouch_grade", rc.crouch_grade);
+	v2("crouch_knee", rc.crouch_knee);
 	f("split_w", rc.split_w);
 	f("split_plant_const", rc.split_plant_const);
 	f("split_plant_min", rc.split_plant_min);
@@ -107,6 +110,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	f("slip_free", rc.slip_free);
 	f("slip_cap", rc.slip_cap);
 	f("walk_flight_w", rc.walk_flight_w);
+	f("crouch_w", rc.crouch_w);
 	f("turn_cycle_yaw", rc.turn_cycle_yaw);
 	f("turn_tap", rc.turn_tap);
 	i("brush_steps", rc.brush_steps);
@@ -407,6 +411,31 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 			const double lean = Math::rad_to_deg(Math::asin(CLAMP(double(up.dot(Vector3(dir.x, 0.0f, dir.y))), -1.0, 1.0)));
 			const double e = (lean - rc.lean_k * deg) / rc.lean_tol;
 			r += rc.lean_w * w * Math::exp(-e * e);
+		}
+	}
+	// A crouch on a steep descent (amp_env.gd descent_crouch): the lean term's mirror, each stance knee's flexion paid
+	// (counted with the lean in the terms' log).
+	if (rc.descent_crouch && terrain.is_valid() && cvl >= 0.3 && !scramble && (lc || rcn)) {
+		const Vector3 d = h.xform(Vector3(cv.x, 0.0f, cv.y));
+		const Vector2 dir = Vector2(d.x, d.z).normalized();
+		const double deg = -Math::rad_to_deg(Math::atan(terrain->grade(_rel(com_p), dir)));
+		const double w = CLAMP((deg - rc.crouch_grade.x) / (rc.crouch_grade.y - rc.crouch_grade.x), 0.0, 1.0);
+		if (w > 0.0) {
+			double pay = 0.0;
+			int n = 0;
+			const bool down_foot[2] = { lc, rcn };
+			for (int k = 0; k < 2 && k < knee_bodies.size(); k++) {
+				if (!down_foot[k]) {
+					continue;
+				}
+				const int lower = knee_bodies[k];
+				const double flex = rotation_vector(xform[parents[lower]].basis.inverse() * xform[lower].basis).x;
+				pay += CLAMP((flex - rc.crouch_knee.x) / (rc.crouch_knee.y - rc.crouch_knee.x), 0.0, 1.0);
+				n++;
+			}
+			if (n > 0) {
+				r += rc.crouch_w * w * pay / n;
+			}
 		}
 	}
 	mark(5, r);

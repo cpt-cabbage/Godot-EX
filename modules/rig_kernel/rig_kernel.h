@@ -133,7 +133,7 @@ class RigKernel : public RefCounted {
 	struct RewardConfig {
 		bool ready = false;
 		// flags
-		bool air_reward = false, air_climb = false, senses = false, scramble_rhythm = false, slip = false, walk_contact = false;
+		bool air_reward = false, air_climb = false, senses = false, scramble_rhythm = false, slip = false, walk_contact = false, descent_crouch = false;
 		bool ankle_human = false, ankle_push = false, lean_climb = false, stance_split = false;
 		bool terrain_features = false, props = false, water = false, flat = false;
 		double split_plant = 0.0, hand_support = 0.0, edge_cost = 0.0;
@@ -152,6 +152,8 @@ class RigKernel : public RefCounted {
 		int brush_steps = 2;
 		double lean_k = 0.7, lean_w = 0.3, lean_tol = 8.0;
 		Vector2 lean_grade = Vector2(8, 15);
+		double crouch_w = 0.3;
+		Vector2 crouch_grade = Vector2(15, 25), crouch_knee = Vector2(0.3, 0.8);
 		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
 		Vector2 split_grade = Vector2(15, 30);
 		Vector2 hand_grade = Vector2(30, 38);
