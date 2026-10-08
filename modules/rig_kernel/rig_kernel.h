@@ -155,6 +155,8 @@ class RigKernel : public RefCounted {
 		double crouch_w = 0.3;
 		double descent_lean_k = 0.0;
 		double descent_over = 0.0;
+		bool progress_bounded = false; // the progress term a triangle past the command (amp_env.gd progress_bounded)
+		double stride_cap = 0.0, stride_min = 0.8, stride_w = 1.0, stride_cost_max = 0.5; // the stride cap downhill (amp_env.gd stride_cap)
 		Vector2 crouch_grade = Vector2(15, 25), crouch_knee = Vector2(0.3, 0.8);
 		double split_w = 0.2, split_plant_const = 0.0, split_plant_min = 0.25, split_m = 0.35;
 		Vector2 split_grade = Vector2(15, 30);
