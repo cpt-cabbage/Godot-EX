@@ -57,6 +57,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	b("air_climb", rc.air_climb);
 	b("slip", rc.slip);
 	b("walk_contact", rc.walk_contact);
+	b("air_run", rc.air_run);
 	b("descent_crouch", rc.descent_crouch);
 	b("descent_lean", rc.descent_lean);
 	b("senses", rc.senses);
@@ -419,6 +420,8 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 					if (dyaw < rc.turn_cycle_yaw) {
 						pay = MIN(pay, 0.0) - rc.turn_tap;
 					}
+				} else if (rc.air_run && c.x >= rc.run_speed) {
+					pay = MIN(rc.air_w * (air[k] - rc.air_t), 0.0); // a run's swing: never paid, a stutter costs (amp_env.gd air_run)
 				} else if (pay > 0.0 && double(Vector2(d.x, d.z).length()) < rc.air_stride) {
 					pay = 0.0;
 				}

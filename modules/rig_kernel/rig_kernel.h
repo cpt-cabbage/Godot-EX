@@ -134,6 +134,7 @@ class RigKernel : public RefCounted {
 		bool ready = false;
 		// flags
 		bool air_reward = false, air_climb = false, senses = false, scramble_rhythm = false, slip = false, walk_contact = false, descent_crouch = false, descent_lean = false;
+		bool air_run = false; // a run's swing never paid, a stutter under air_t costs (amp_env.gd air_run)
 		bool ankle_human = false, ankle_push = false, lean_climb = false, stance_split = false;
 		bool terrain_features = false, props = false, water = false, flat = false;
 		double split_plant = 0.0, hand_support = 0.0, edge_cost = 0.0;
