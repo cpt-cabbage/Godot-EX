@@ -413,21 +413,49 @@ void JoltContactListener3D::_evaluate_area_overlap(const JoltArea3D &p_area, con
 	}
 }
 
+// Godot-EX: the contacts flushed in a fixed order. Each worker thread collects the manifolds it computed, and which
+// thread computes which pair varies from run to run; a body's reported contacts are capped (max_contacts_reported) and
+// a full list keeps the deepest, every point of a manifold at the manifold's depth, so ties went by arrival and two
+// identical simulations reported different contacts (ProjectEX's learn/replay_check.py: the physics identical, a
+// foot's contact flag not). The manifolds are added sorted by their shape pair (Jolt's own order for determinism), and
+// two manifolds of one pair at one depth are told apart by their first contact point.
+bool JoltContactListener3D::_manifold_deeper(const Manifold &p_a, const Manifold &p_b) {
+	if (p_a.depth != p_b.depth) {
+		return p_a.depth > p_b.depth;
+	}
+	if (p_a.contacts.size() != p_b.contacts.size()) {
+		return p_a.contacts.size() > p_b.contacts.size();
+	}
+	if (p_a.contacts.is_empty()) {
+		return false;
+	}
+	const Vector3 &a = p_a.contacts[0].point1;
+	const Vector3 &b = p_b.contacts[0].point1;
+	return a.x != b.x ? a.x < b.x : (a.y != b.y ? a.y < b.y : a.z < b.z);
+}
+
 void JoltContactListener3D::_flush_contacts() {
 	thread_local AHashMap<JPH::SubShapeIDPair, Manifold *, ShapePairHasher> deepest_manifolds;
+	thread_local LocalVector<Manifold *> ordered_manifolds;
 
 	for (ThreadLocals &tl : ThreadLocals::instances) {
 		for (Manifold &manifold : tl.manifolds) {
 			Manifold *&deepest_manifold = deepest_manifolds[manifold.shape_pair];
-			if (deepest_manifold == nullptr || manifold.depth > deepest_manifold->depth) {
+			if (deepest_manifold == nullptr || _manifold_deeper(manifold, *deepest_manifold)) {
 				deepest_manifold = &manifold;
 			}
 		}
 	}
 
+	ordered_manifolds.clear();
 	for (const KeyValue<JPH::SubShapeIDPair, Manifold *> &E : deepest_manifolds) {
-		const JPH::SubShapeIDPair &shape_pair = E.key;
-		const Manifold &manifold = *E.value;
+		ordered_manifolds.push_back(E.value);
+	}
+	ordered_manifolds.sort_custom<ManifoldShapePairOrder>();
+
+	for (const Manifold *manifold_ptr : ordered_manifolds) {
+		const Manifold &manifold = *manifold_ptr;
+		const JPH::SubShapeIDPair &shape_pair = manifold.shape_pair;
 
 		JoltBody3D *body1 = space->try_get_body(shape_pair.GetBody1ID());
 		ERR_CONTINUE(body1 == nullptr);
@@ -445,6 +473,7 @@ void JoltContactListener3D::_flush_contacts() {
 	}
 
 	deepest_manifolds.clear();
+	ordered_manifolds.clear();
 
 	for (ThreadLocals &tl : ThreadLocals::instances) {
 		tl.manifolds.clear();

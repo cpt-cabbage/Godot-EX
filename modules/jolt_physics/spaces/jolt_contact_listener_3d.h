@@ -83,6 +83,13 @@ class JoltContactListener3D final
 		float depth = 0.0f;
 	};
 
+	// Godot-EX: the flush's fixed order (jolt_contact_listener_3d.cpp _flush_contacts).
+	struct ManifoldShapePairOrder {
+		_FORCE_INLINE_ bool operator()(const Manifold *p_a, const Manifold *p_b) const { return p_a->shape_pair < p_b->shape_pair; }
+	};
+
+	static bool _manifold_deeper(const Manifold &p_a, const Manifold &p_b);
+
 	struct ThreadLocals {
 		SelfList<ThreadLocals> instances_element;
 
