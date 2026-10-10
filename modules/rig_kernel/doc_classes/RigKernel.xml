@@ -107,6 +107,12 @@
 				The distance the commands asked for this episode ([method reward_step]).
 			</description>
 		</method>
+		<method name="get_assist_level" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the assist level set by [method set_assist_level].
+			</description>
+		</method>
 		<method name="get_center_of_mass" qualifiers="const">
 			<return type="Vector3" />
 			<description>
@@ -301,6 +307,13 @@
 			<param index="2" name="gains" type="PackedFloat64Array" />
 			<description>
 				Sets the ankles for [method ankle_excess]: [param bodies] the left lower leg and foot, then the right's; [param actions] each foot's pitch in the action; [param gains] the drive's stiffness, damping and torque cap, the nominal pitch, the action's scale on it, and people's peak ankle torque.
+			</description>
+		</method>
+		<method name="set_assist_level">
+			<return type="void" />
+			<param index="0" name="level" type="float" />
+			<description>
+				Sets the episode's assist level (the caller applies the push). With the reward configuration's [code]assist_dim[/code] 1, [method observation_full] ends with it.
 			</description>
 		</method>
 		<method name="set_bodies">
