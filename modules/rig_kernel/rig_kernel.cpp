@@ -803,6 +803,8 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_strengths", "k"), &RigKernel::set_strengths);
 	ClassDB::bind_method(D_METHOD("get_strengths"), &RigKernel::get_strengths);
 	ClassDB::bind_method(D_METHOD("set_drive_groups", "groups"), &RigKernel::set_drive_groups);
+	ClassDB::bind_method(D_METHOD("set_effort_weight", "weight"), &RigKernel::set_effort_weight);
+	ClassDB::bind_method(D_METHOD("get_effort_weight"), &RigKernel::get_effort_weight);
 	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
 	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
 	ClassDB::bind_method(D_METHOD("balance", "support", "height"), &RigKernel::balance);

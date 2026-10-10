@@ -125,6 +125,12 @@
 				The steps this episode with a foot over a prop's edge ([method reward_step]).
 			</description>
 		</method>
+		<method name="get_effort_weight" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the effort weight set by [method set_effort_weight].
+			</description>
+		</method>
 		<method name="get_ground_data" qualifiers="const">
 			<return type="GroundData" />
 			<description>
@@ -319,6 +325,13 @@
 			<param index="0" name="groups" type="PackedInt32Array" />
 			<description>
 				Sets each drive's limb group, in [method add_drive]'s order: 0 the legs, the trunk and the neck, 1 the arms. [method effort] scales each drive's torque cap by its group's strength ([method set_strengths]).
+			</description>
+		</method>
+		<method name="set_effort_weight">
+			<return type="void" />
+			<param index="0" name="weight" type="float" />
+			<description>
+				Sets the episode's effort weight: [method reward_step] subtracts it times [method effort] over the reward configuration's [code]effort_ref[/code] each step, and with the configuration's [code]effort_dim[/code] 1 [method observation_full] ends with it.
 			</description>
 		</method>
 		<method name="set_ground_data">
