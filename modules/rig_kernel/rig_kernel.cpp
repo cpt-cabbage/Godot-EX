@@ -662,13 +662,37 @@ double RigKernel::effort(const PackedFloat32Array &p_action) const {
 			k++;
 		}
 		t = t.clamp(d.lo, d.hi);
-		const double cap = drive_cap[i] * strength;
+		const double cap = drive_cap[i] * (i < drive_group.size() ? strengths[CLAMP(drive_group[i], 0, 1)] : strength);
 		for (int axis : d.axes) {
 			const double tau = CLAMP(drive_kp[i] * (double(t[axis]) - double(rv[axis])) - drive_kd[i] * double(rel[axis]), -cap, cap);
 			e += Math::abs(tau * double(rel[axis]));
 		}
 	}
 	return e;
+}
+
+// The legs' (with the trunk and neck) and the arms' strength k (one value: both); strength becomes the legs'.
+void RigKernel::set_strengths(const PackedFloat64Array &p_k) {
+	ERR_FAIL_COND(p_k.is_empty());
+	strengths[0] = p_k[0];
+	strengths[1] = p_k.size() > 1 ? p_k[1] : p_k[0];
+	strength = strengths[0];
+}
+
+PackedFloat64Array RigKernel::get_strengths() const {
+	PackedFloat64Array out;
+	out.push_back(strengths[0]);
+	out.push_back(strengths[1]);
+	return out;
+}
+
+// Each drive's limb group (0 the legs, the trunk and the neck; 1 the arms), in drive order: effort()'s caps.
+void RigKernel::set_drive_groups(const PackedInt32Array &p_groups) {
+	ERR_FAIL_COND_MSG(p_groups.size() != drives.size(), "One group per drive (add_drive's order).");
+	drive_group.resize(p_groups.size());
+	for (int i = 0; i < p_groups.size(); i++) {
+		drive_group.write[i] = CLAMP(p_groups[i], 0, 1);
+	}
 }
 
 // The critic's balance quantities (ProjectEX amp_env.gd privileged(), run61; the script's _balance_script the reference),
@@ -776,6 +800,9 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("clear_leg_drag"), &RigKernel::clear_leg_drag);
 	ClassDB::bind_method(D_METHOD("set_drive_gains", "kp", "kd", "cap"), &RigKernel::set_drive_gains);
 	ClassDB::bind_method(D_METHOD("set_strength", "k"), &RigKernel::set_strength);
+	ClassDB::bind_method(D_METHOD("set_strengths", "k"), &RigKernel::set_strengths);
+	ClassDB::bind_method(D_METHOD("get_strengths"), &RigKernel::get_strengths);
+	ClassDB::bind_method(D_METHOD("set_drive_groups", "groups"), &RigKernel::set_drive_groups);
 	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
 	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
 	ClassDB::bind_method(D_METHOD("balance", "support", "height"), &RigKernel::balance);

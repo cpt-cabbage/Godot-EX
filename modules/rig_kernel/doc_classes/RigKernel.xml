@@ -162,6 +162,12 @@
 				Returns the number of the height scan's points.
 			</description>
 		</method>
+		<method name="get_strengths" qualifiers="const">
+			<return type="PackedFloat64Array" />
+			<description>
+				Returns the legs' (with the trunk and the neck) and the arms' strength, as set by [method set_strengths] or [method set_strength].
+			</description>
+		</method>
 		<method name="get_terrain" qualifiers="const">
 			<return type="TerrainField" />
 			<description>
@@ -308,6 +314,13 @@
 				Sets the bodies whose contacts make the left and right contact of [method contact].
 			</description>
 		</method>
+		<method name="set_drive_groups">
+			<return type="void" />
+			<param index="0" name="groups" type="PackedInt32Array" />
+			<description>
+				Sets each drive's limb group, in [method add_drive]'s order: 0 the legs, the trunk and the neck, 1 the arms. [method effort] scales each drive's torque cap by its group's strength ([method set_strengths]).
+			</description>
+		</method>
 		<method name="set_ground_data">
 			<return type="void" />
 			<param index="0" name="data" type="GroundData" />
@@ -405,6 +418,13 @@
 			<param index="0" name="enabled" type="bool" />
 			<description>
 				When enabled (default off), the ground probes consider static bodies only and the height scan's rays go to the physics server in one batch (Godot-EX's [code]JoltPhysicsServer3D.space_cast_static_ground[/code]; with another physics server, the general ray). Faster where the ground is all static, as on a training server; in a game a dynamic body can be ground.
+			</description>
+		</method>
+		<method name="set_strengths">
+			<return type="void" />
+			<param index="0" name="k" type="PackedFloat64Array" />
+			<description>
+				Sets the legs' (with the trunk and the neck) and the arms' strength (one value sets both). The single strength ([method get_strength]) becomes the legs'. With the reward configuration's [code]strength_dim[/code] 2, [method observation_full] ends with both logarithms.
 			</description>
 		</method>
 		<method name="set_terrain">

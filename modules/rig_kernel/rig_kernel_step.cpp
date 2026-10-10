@@ -708,7 +708,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 
 // observe_packed(): the observation (observation(), with the scan when configured), the nearest trunks,
 // the senses (the hands' contacts, the ground's friction under the feet, kept from the last touch), the
-// style's code and the strength's (log k).
+// style's code and the strength's (log k; with strength_dim 2 the legs' and the arms', set_strengths).
 PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_action, const Vector3 &p_command, int p_style, double p_strength) {
 	ERR_FAIL_COND_V_MSG(!rc.ready, PackedFloat32Array(), "set_reward_config() first.");
 	PackedFloat32Array o = observation(p_action, p_command, rc.scan);
@@ -743,7 +743,10 @@ PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_actio
 	for (int j = 0; j < rc.style_dim; j++) {
 		o.push_back(j == p_style ? 1.0f : 0.0f);
 	}
-	if (rc.strength_dim > 0) {
+	if (rc.strength_dim >= 2) { // strength per limb group (set_strengths): the legs', the arms'
+		o.push_back(Math::log(strengths[0]));
+		o.push_back(Math::log(strengths[1]));
+	} else if (rc.strength_dim > 0) {
 		o.push_back(Math::log(p_strength));
 	}
 	return o;
