@@ -78,7 +78,8 @@ float GroundData::friction_at(const Vector3 &p_point) const {
 	}
 	const int ix = MIN(int(fx), field_width - 2);
 	const int iz = MIN(int(fz), field_depth - 2);
-	return field_frictions[field_cells[iz * (field_width - 1) + ix]];
+	const float f = field_frictions[field_cells[iz * (field_width - 1) + ix]];
+	return f >= 0.0f ? f : Math::NaN; // negative: the body's own
 }
 
 PackedFloat32Array GroundData::friction_at_batch(const PackedVector3Array &p_points) const {

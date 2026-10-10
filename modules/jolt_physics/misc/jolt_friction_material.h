@@ -41,7 +41,7 @@ class JoltFrictionMaterial final : public JPH::PhysicsMaterial {
 public:
 	JPH_DECLARE_RTTI_VIRTUAL(JPH_NO_EXPORT, JoltFrictionMaterial)
 
-	float friction = 1.0f;
+	float friction = 1.0f; // negative: the body's
 
 	JoltFrictionMaterial() = default;
 	explicit JoltFrictionMaterial(float p_friction) :

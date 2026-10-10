@@ -58,7 +58,7 @@
 			<return type="float" />
 			<param index="0" name="point" type="Vector3" />
 			<description>
-				Returns the friction of the height field's cell under [param point]'s x and z ([method set_field_frictions]), or NaN off the field or with none set.
+				Returns the friction of the height field's cell under [param point]'s x and z ([method set_field_frictions]), or NaN off the field, with none set or where the cell's friction is negative (the body's own).
 			</description>
 		</method>
 		<method name="friction_at_batch" qualifiers="const">
