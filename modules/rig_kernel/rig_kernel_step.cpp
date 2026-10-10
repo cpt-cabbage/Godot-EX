@@ -37,6 +37,7 @@
 #include "rig_kernel.h"
 
 #include "core/object/class_db.h"
+#include "servers/physics_3d/physics_server_3d.h"
 
 void RigKernel::set_reward_config(const Dictionary &p_config) {
 	const Dictionary &d = p_config;
@@ -79,6 +80,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	i("strength_dim", rc.strength_dim);
 	i("effort_dim", rc.effort_dim);
 	i("assist_dim", rc.assist_dim);
+	i("surface", rc.surface);
 	f("effort_ref", rc.effort_ref);
 	i("trunks", rc.trunks);
 	f("trunk_range", rc.trunk_range);
@@ -744,6 +746,15 @@ PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_actio
 		o.push_back(hand[0] ? 1.0f : 0.0f);
 		o.push_back(hand[1] ? 1.0f : 0.0f);
 		o.push_back(ground_mu);
+	}
+	if (rc.surface > 0) { // the surface channel: the friction under the last rc.surface scan points (a patch's, else the field body's)
+		const float base = field_body.is_valid() ? float(PhysicsServer3D::get_singleton()->body_get_param(field_body, PS3DE::BODY_PARAM_FRICTION)) : 1.0f;
+		const int first = MAX(0, scan_points.size() - rc.surface);
+		for (int k = first; k < scan_points.size(); k++) {
+			const Vector3 w = xform[pelvis].origin + heading.xform(Vector3(scan_points[k].x, 0.0f, scan_points[k].y));
+			const float f = ground_data.is_valid() ? ground_data->friction_at(w) : Math::NaN;
+			o.push_back(Math::is_nan(f) ? base : f);
+		}
 	}
 	for (int j = 0; j < rc.style_dim; j++) {
 		o.push_back(j == p_style ? 1.0f : 0.0f);
