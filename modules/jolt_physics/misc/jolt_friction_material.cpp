@@ -40,7 +40,10 @@ float JoltFrictionMaterial::friction_of(const JPH::Body &p_body, const JPH::SubS
 	if (p_body.IsStatic()) {
 		const JPH::PhysicsMaterial *material = p_body.GetShape()->GetMaterial(p_sub_shape_id);
 		if (material != nullptr && material->GetRTTI() == JPH_RTTI(JoltFrictionMaterial)) {
-			return static_cast<const JoltFrictionMaterial *>(material)->friction;
+			const float f = static_cast<const JoltFrictionMaterial *>(material)->friction;
+			if (f >= 0.0f) { // negative: the body's own (the ground between patches, whatever friction it is given)
+				return f;
+			}
 		}
 	}
 	return p_body.GetFriction();
