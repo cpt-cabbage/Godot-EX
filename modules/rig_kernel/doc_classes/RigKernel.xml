@@ -325,6 +325,14 @@
 				Sets the rig's rigid bodies, their masses, and each one's parent index ([code]-1[/code] for the root). Body indices in the other methods refer to this order.
 			</description>
 		</method>
+		<method name="set_brace">
+			<return type="void" />
+			<param index="0" name="level" type="float" />
+			<param index="1" name="held" type="bool" />
+			<description>
+				Sets the brace's level (0, 0.5 or 1) and whether its button is held (the caller runs the brace). With the reward configuration's [code]brace_dim[/code] 2, [method observation_full] ends with both, after the assist's level.
+			</description>
+		</method>
 		<method name="set_contacts">
 			<return type="void" />
 			<param index="0" name="left" type="PackedInt32Array" />

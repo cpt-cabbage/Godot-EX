@@ -168,6 +168,7 @@ class RigKernel : public RefCounted {
 		int effort_dim = 0; // the effort weight observed (ProjectEX run61, amp_env.gd effort_weight): observation_full ends with it
 		double effort_ref = 1200.0; // W: the weight charges effort() over this each step (run60's measured mean, 1170 W)
 		int surface = 0; // the surface channel (ProjectEX run61, amp_env.gd surface): the last this many scan points' friction, after the senses
+		int brace_dim = 0; // the brace's level and button observed (ProjectEX run61, amp_env.gd brace_levels): observation_full ends with them
 		int assist_dim = 0; // the assist's level observed (ProjectEX run61, amp_env.gd assist_level): observation_full ends with it
 		bool effort = false; // the joints' mechanical power each step (step_terms' effort): every drive's PD torque estimate, as ankle_excess's, times the joint's rate, summed (amp_env.gd effort; train.py --effort)
 		bool zmp = false; // HumoSlope's balance prior (amp_env.gd zmp_w, _zmp_reward): the zero-moment point on the inclined support plane near the support anchor
@@ -231,6 +232,8 @@ class RigKernel : public RefCounted {
 	// The episode's effort weight (set_effort_weight, ProjectEX run61): reward_step charges it times effort() over
 	// effort_ref each step; observed with effort_dim 1 (the game's stamina raises it).
 	double effort_weight = 0.0;
+	double brace_level = 0.0; // the brace's level (0, 0.5, 1) and button (set_brace, ProjectEX run61): the script drives the brace, observed here
+	bool brace_held = false;
 	double assist_level = 0.0; // the episode's assist (set_assist_level, ProjectEX run61): the script applies the push, observed here
 	Vector<int> drive_group;
 	Vector3 com_vel_prev; // the step before's COM velocity (the ZMP's apparent force); none at an episode's start
@@ -328,6 +331,10 @@ public:
 	void set_slip_surface(bool p_enabled) { slip_surface = p_enabled; }
 	void set_effort_weight(double p_w) { effort_weight = p_w; }
 	void set_assist_level(double p_level) { assist_level = p_level; }
+	void set_brace(double p_level, bool p_held) {
+		brace_level = p_level;
+		brace_held = p_held;
+	}
 	double get_assist_level() const { return assist_level; }
 	double get_effort_weight() const { return effort_weight; }
 	double get_strength() const { return strength; }

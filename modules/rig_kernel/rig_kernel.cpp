@@ -821,6 +821,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_effort_weight", "weight"), &RigKernel::set_effort_weight);
 	ClassDB::bind_method(D_METHOD("get_effort_weight"), &RigKernel::get_effort_weight);
 	ClassDB::bind_method(D_METHOD("set_assist_level", "level"), &RigKernel::set_assist_level);
+	ClassDB::bind_method(D_METHOD("set_brace", "level", "held"), &RigKernel::set_brace);
 	ClassDB::bind_method(D_METHOD("get_assist_level"), &RigKernel::get_assist_level);
 	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
 	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
