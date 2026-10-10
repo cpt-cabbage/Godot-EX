@@ -215,6 +215,10 @@ class RigKernel : public RefCounted {
 	// (set_strength), for effort()'s torque estimate.
 	Vector<double> drive_kp, drive_kd, drive_cap;
 	double strength = 1.0;
+	// Strength per limb group (ProjectEX run61, set_strengths): the legs' with the trunk and neck (0), the arms' (1); each
+	// drive's group (set_drive_groups) picks its cap's k in effort(); strength stays the legs' (the ankles' and the rest).
+	double strengths[2] = { 1.0, 1.0 };
+	Vector<int> drive_group;
 	Vector3 com_vel_prev; // the step before's COM velocity (the ZMP's apparent force); none at an episode's start
 	bool com_prev_ok = false;
 
@@ -298,7 +302,14 @@ public:
 	void leg_drag(double p_coefficient, double p_height) const;
 	void clear_leg_drag() const;
 	void set_drive_gains(const PackedFloat64Array &p_kp, const PackedFloat64Array &p_kd, const PackedFloat64Array &p_cap);
-	void set_strength(double p_k) { strength = p_k; }
+	void set_strength(double p_k) {
+		strength = p_k;
+		strengths[0] = p_k;
+		strengths[1] = p_k;
+	}
+	void set_strengths(const PackedFloat64Array &p_k);
+	PackedFloat64Array get_strengths() const;
+	void set_drive_groups(const PackedInt32Array &p_groups);
 	double get_strength() const { return strength; }
 	double effort(const PackedFloat32Array &p_action) const;
 	PackedFloat32Array balance(const PackedInt32Array &p_support, double p_height) const;
