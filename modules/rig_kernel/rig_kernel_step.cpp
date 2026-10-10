@@ -78,6 +78,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	i("style_dim", rc.style_dim);
 	i("strength_dim", rc.strength_dim);
 	i("effort_dim", rc.effort_dim);
+	i("assist_dim", rc.assist_dim);
 	f("effort_ref", rc.effort_ref);
 	i("trunks", rc.trunks);
 	f("trunk_range", rc.trunk_range);
@@ -755,6 +756,9 @@ PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_actio
 	}
 	if (rc.effort_dim > 0) {
 		o.push_back(float(effort_weight));
+	}
+	if (rc.assist_dim > 0) {
+		o.push_back(float(assist_level));
 	}
 	return o;
 }
