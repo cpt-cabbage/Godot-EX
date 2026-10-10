@@ -181,6 +181,12 @@ float RigKernel::_world_friction(int p_body) const {
 	for (int i = 0; i < state->get_contact_count(); i++) {
 		const RID collider = state->get_contact_collider(i);
 		if (!body_set.has(collider)) {
+			if (collider == field_body && ground_data.is_valid()) { // the terrain's cell under the contact (friction patches)
+				const float cell = ground_data->friction_at(state->get_contact_collider_position(i));
+				if (!Math::is_nan(cell)) {
+					return cell;
+				}
+			}
 			return ps->body_get_param(collider, PS3DE::BODY_PARAM_FRICTION);
 		}
 	}
@@ -803,6 +809,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_strengths", "k"), &RigKernel::set_strengths);
 	ClassDB::bind_method(D_METHOD("get_strengths"), &RigKernel::get_strengths);
 	ClassDB::bind_method(D_METHOD("set_drive_groups", "groups"), &RigKernel::set_drive_groups);
+	ClassDB::bind_method(D_METHOD("set_field_body", "body"), &RigKernel::set_field_body);
 	ClassDB::bind_method(D_METHOD("set_effort_weight", "weight"), &RigKernel::set_effort_weight);
 	ClassDB::bind_method(D_METHOD("get_effort_weight"), &RigKernel::get_effort_weight);
 	ClassDB::bind_method(D_METHOD("set_assist_level", "level"), &RigKernel::set_assist_level);

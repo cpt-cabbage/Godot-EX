@@ -101,6 +101,9 @@ class RigKernel : public RefCounted {
 	// The bodies whose contacts update() reads (their reporting on): whether each touches anything outside
 	// the rig, and the friction of the first such collider (NaN without).
 	Vector<int> sensed;
+	// The terrain's height field body (set_field_body): a contact with it reads the friction of the cell under the contact
+	// from ground_data (friction patches, GroundData.set_field_frictions) in place of the body's.
+	RID field_body;
 	Vector<int8_t> touch; // per body: -1 not sensed, 0 or 1
 	Vector<float> touch_friction;
 	// The ankles' torque (ankle_excess): the lower leg and foot bodies, left then right, each foot's
@@ -317,6 +320,7 @@ public:
 	void set_strengths(const PackedFloat64Array &p_k);
 	PackedFloat64Array get_strengths() const;
 	void set_drive_groups(const PackedInt32Array &p_groups);
+	void set_field_body(RID p_body) { field_body = p_body; }
 	void set_effort_weight(double p_w) { effort_weight = p_w; }
 	void set_assist_level(double p_level) { assist_level = p_level; }
 	double get_assist_level() const { return assist_level; }
