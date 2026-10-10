@@ -478,7 +478,14 @@ double RigKernel::_slip_body(int p_body, double p_free, double p_cap) const {
 		return 0.0;
 	}
 	const Vector3 &v = lin_vel[p_body];
-	return MIN(MAX(double(Vector2(v.x, v.z).length()) - p_free, 0.0), p_cap);
+	double speed = Vector2(v.x, v.z).length();
+	if (slip_surface && terrain.is_valid()) { // along the ground's surface (ProjectEX: a hand or foot sliding down a 40 deg slope)
+		const Vector3 o = terrain->get_origin();
+		const Vector2 g = terrain->fall_line(Vector2(double(xform[p_body].origin.x) - o.x, double(xform[p_body].origin.z) - o.z));
+		const Vector3 n = Vector3(-g.x, 1.0f, -g.y).normalized();
+		speed = (v - n * v.dot(n)).length();
+	}
+	return MIN(MAX(speed - p_free, 0.0), p_cap);
 }
 
 double RigKernel::slip(const PackedInt32Array &p_bodies, double p_free, double p_cap) const {
@@ -810,6 +817,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_strengths"), &RigKernel::get_strengths);
 	ClassDB::bind_method(D_METHOD("set_drive_groups", "groups"), &RigKernel::set_drive_groups);
 	ClassDB::bind_method(D_METHOD("set_field_body", "body"), &RigKernel::set_field_body);
+	ClassDB::bind_method(D_METHOD("set_slip_surface", "enabled"), &RigKernel::set_slip_surface);
 	ClassDB::bind_method(D_METHOD("set_effort_weight", "weight"), &RigKernel::set_effort_weight);
 	ClassDB::bind_method(D_METHOD("get_effort_weight"), &RigKernel::get_effort_weight);
 	ClassDB::bind_method(D_METHOD("set_assist_level", "level"), &RigKernel::set_assist_level);

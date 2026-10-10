@@ -181,6 +181,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	ints("prop_bodies", rc.prop_bodies);
 	ints("still_bodies", rc.still_bodies);
 	ints("slip_bodies", rc.slip_bodies);
+	b("slip_surface", slip_surface);
 	ints("soles", rc.soles);
 	rc.water_data = d.has("water_data") ? Ref<GroundData>(d["water_data"]) : Ref<GroundData>();
 	for (const int x : { rc.torso, rc.foot[0], rc.foot[1], rc.toes[0], rc.toes[1], rc.lowerarm[0], rc.lowerarm[1], rc.air_limbs[0], rc.air_limbs[1], rc.air_limbs[2], rc.air_limbs[3] }) {

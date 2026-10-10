@@ -435,6 +435,13 @@
 				Sets the bodies whose contacts [method update] reads (their contact reporting must be on): whether each touches anything outside the rig and that collider's friction, for [method contact], [method touches], [method touches_any] and [method contact_friction].
 			</description>
 		</method>
+		<method name="set_slip_surface">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>
+				With [param enabled], [method slip] and the reward's slip measure a touching body's speed along the ground's surface (the terrain's normal from its fall line) instead of its horizontal speed. The reward configuration's [code]slip_surface[/code] sets it too.
+			</description>
+		</method>
 		<method name="set_soles">
 			<return type="void" />
 			<param index="0" name="heel" type="PackedVector3Array" />
