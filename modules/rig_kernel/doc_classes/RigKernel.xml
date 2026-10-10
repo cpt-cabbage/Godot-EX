@@ -39,6 +39,14 @@
 				The ankles' pitch torque past people's peak, each as a share of the rest of its cap, summed: from each foot's drive target (its nominal pitch plus the action's value, clamped to [code][-1, 1][/code], times the scale), its angle and rate relative to the lower leg, the drive's stiffness and damping, clamped to the cap. With [param push_only], only an ankle doing positive work counts. Needs [method set_ankles].
 			</description>
 		</method>
+		<method name="balance" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="support" type="PackedInt32Array" />
+			<param index="1" name="height" type="float" />
+			<description>
+				Returns nine balance quantities from the state [method update] read, every body a point mass at its origin: the capture point (the center of mass's horizontal position plus its horizontal velocity over [code]sqrt(g / h)[/code], [code]h[/code] its height over the ground under it) against the center of the [param support] bodies touching the world (all of them when none does; only sensed bodies count as touching), x and z in the heading frame; [code]h[/code]; the center of mass's velocity in the heading frame; and the bodies' angular momentum about the center of mass over the total mass times [param height] squared, in the heading frame. Gravity is the reward configuration's.
+			</description>
+		</method>
 		<method name="clear_leg_drag" qualifiers="const">
 			<return type="void" />
 			<description>
