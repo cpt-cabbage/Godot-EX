@@ -159,6 +159,8 @@ class RigKernel : public RefCounted {
 		bool progress_bounded = false; // the progress term a triangle past the command (amp_env.gd progress_bounded)
 		double stride_cap = 0.0, stride_min = 0.8, stride_w = 1.0, stride_cost_max = 0.5; // the stride cap downhill (amp_env.gd stride_cap)
 		bool stride_constraint = false; // the stride cost reported (step_terms' stride_x), not subtracted: train.py's multiplier applies it (amp_env.gd stride_constraint)
+		int effort_dim = 0; // the effort weight observed (ProjectEX run61, amp_env.gd effort_weight): observation_full ends with it
+		double effort_ref = 1200.0; // W: the weight charges effort() over this each step (run60's measured mean, 1170 W)
 		bool effort = false; // the joints' mechanical power each step (step_terms' effort): every drive's PD torque estimate, as ankle_excess's, times the joint's rate, summed (amp_env.gd effort; train.py --effort)
 		bool zmp = false; // HumoSlope's balance prior (amp_env.gd zmp_w, _zmp_reward): the zero-moment point on the inclined support plane near the support anchor
 		double zmp_w = 0.2, zmp_sigma = 0.15, gravity = 9.8;
@@ -218,6 +220,9 @@ class RigKernel : public RefCounted {
 	// Strength per limb group (ProjectEX run61, set_strengths): the legs' with the trunk and neck (0), the arms' (1); each
 	// drive's group (set_drive_groups) picks its cap's k in effort(); strength stays the legs' (the ankles' and the rest).
 	double strengths[2] = { 1.0, 1.0 };
+	// The episode's effort weight (set_effort_weight, ProjectEX run61): reward_step charges it times effort() over
+	// effort_ref each step; observed with effort_dim 1 (the game's stamina raises it).
+	double effort_weight = 0.0;
 	Vector<int> drive_group;
 	Vector3 com_vel_prev; // the step before's COM velocity (the ZMP's apparent force); none at an episode's start
 	bool com_prev_ok = false;
@@ -310,6 +315,8 @@ public:
 	void set_strengths(const PackedFloat64Array &p_k);
 	PackedFloat64Array get_strengths() const;
 	void set_drive_groups(const PackedInt32Array &p_groups);
+	void set_effort_weight(double p_w) { effort_weight = p_w; }
+	double get_effort_weight() const { return effort_weight; }
 	double get_strength() const { return strength; }
 	double effort(const PackedFloat32Array &p_action) const;
 	PackedFloat32Array balance(const PackedInt32Array &p_support, double p_height) const;

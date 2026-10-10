@@ -77,6 +77,8 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	i("scramble", rc.scramble);
 	i("style_dim", rc.style_dim);
 	i("strength_dim", rc.strength_dim);
+	i("effort_dim", rc.effort_dim);
+	f("effort_ref", rc.effort_ref);
 	i("trunks", rc.trunks);
 	f("trunk_range", rc.trunk_range);
 	f("fps", rc.fps);
@@ -628,8 +630,10 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		const Vector3 d = h.xform(cvl >= 0.3 ? Vector3(c.y, 0.0f, c.x) : Vector3(0.0f, 0.0f, 1.0f));
 		st[13] = float(terrain->grade(_rel(com_p), Vector2(d.x, d.z).normalized()));
 	}
-	if (rc.effort) {
-		st[15] = float(effort(p_action));
+	if (rc.effort || effort_weight > 0.0) { // the effort weight's charge (run61): its share of the joints' power over effort_ref
+		const double e = effort(p_action);
+		st[15] = float(e);
+		r -= effort_weight * e / MAX(rc.effort_ref, 1.0);
 	}
 	// Off balance, down.
 	const double com_h = double(com_p.y) - g_com;
@@ -748,6 +752,9 @@ PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_actio
 		o.push_back(Math::log(strengths[1]));
 	} else if (rc.strength_dim > 0) {
 		o.push_back(Math::log(p_strength));
+	}
+	if (rc.effort_dim > 0) {
+		o.push_back(float(effort_weight));
 	}
 	return o;
 }
