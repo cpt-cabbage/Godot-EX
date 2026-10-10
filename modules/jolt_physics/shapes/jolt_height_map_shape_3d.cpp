@@ -31,6 +31,7 @@
 #include "jolt_height_map_shape_3d.h"
 
 #include "../jolt_project_settings.h"
+#include "../misc/jolt_friction_material.h"
 #include "../misc/jolt_type_conversions.h"
 
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
@@ -103,7 +104,24 @@ JPH::ShapeRefC JoltHeightMapShape3D::_build_height_field() const {
 		}
 	}
 
-	JPH::HeightFieldShapeSettings shape_settings(heights_rev.ptr(), JPH::Vec3(offset_x, 0, offset_y), JPH::Vec3::sOne(), (JPH::uint32)width);
+	// Godot-EX's cell frictions, their rows reversed as the heights' (Jolt's material index per cell, row-major).
+	LocalVector<JPH::uint8> cells_rev;
+	JPH::PhysicsMaterialList materials;
+	if (!material_frictions.is_empty() && cell_materials.size() == quad_count_x * quad_count_y) {
+		cells_rev.resize(cell_materials.size());
+		for (int z = 0; z < quad_count_y; ++z) {
+			const int z_rev = (quad_count_y - 1) - z;
+			for (int x = 0; x < quad_count_x; ++x) {
+				cells_rev[z_rev * quad_count_x + x] = MIN(cell_materials[z * quad_count_x + x], (uint8_t)(material_frictions.size() - 1));
+			}
+		}
+		for (int i = 0; i < material_frictions.size(); ++i) {
+			materials.push_back(new JoltFrictionMaterial(material_frictions[i]));
+		}
+	}
+
+	JPH::HeightFieldShapeSettings shape_settings(heights_rev.ptr(), JPH::Vec3(offset_x, 0, offset_y), JPH::Vec3::sOne(), (JPH::uint32)width,
+			cells_rev.is_empty() ? nullptr : cells_rev.ptr(), materials);
 
 	shape_settings.mBitsPerSample = shape_settings.CalculateBitsPerSampleForError(0.0f);
 	shape_settings.mActiveEdgeCosThresholdAngle = JoltProjectSettings::active_edge_threshold_cos;
@@ -225,6 +243,22 @@ void JoltHeightMapShape3D::set_data(const Variant &p_data) {
 
 	aabb = _calculate_aabb();
 
+	if (cell_materials.size() != (width - 1) * (depth - 1)) {
+		cell_materials.clear();
+		material_frictions.clear();
+	}
+
+	destroy();
+}
+
+void JoltHeightMapShape3D::set_cell_frictions(const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions) {
+	ERR_FAIL_COND_MSG(!p_cells.is_empty() && p_cells.size() != (width - 1) * (depth - 1), vformat("One index per cell: %d of %d.", p_cells.size(), (width - 1) * (depth - 1)));
+	ERR_FAIL_COND_MSG(p_frictions.size() > 256, "At most 256 frictions (a byte per cell).");
+	cell_materials = p_cells;
+	material_frictions = p_frictions;
+	if (p_cells.is_empty()) {
+		material_frictions.clear();
+	}
 	destroy();
 }
 

@@ -54,6 +54,20 @@
 				Removes the water field.
 			</description>
 		</method>
+		<method name="friction_at" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="point" type="Vector3" />
+			<description>
+				Returns the friction of the height field's cell under [param point]'s x and z ([method set_field_frictions]), or NaN off the field or with none set.
+			</description>
+		</method>
+		<method name="friction_at_batch" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="points" type="PackedVector3Array" />
+			<description>
+				Returns [method friction_at] for each of [param points].
+			</description>
+		</method>
 		<method name="get_prop_count" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -86,6 +100,14 @@
 			<param index="0" name="enabled" type="bool" />
 			<description>
 				Sets whether a [RigKernel] reads this data (off while the terrain is off the physics world).
+			</description>
+		</method>
+		<method name="set_field_frictions">
+			<return type="void" />
+			<param index="0" name="cells" type="PackedByteArray" />
+			<param index="1" name="frictions" type="PackedFloat32Array" />
+			<description>
+				Sets the height field's friction per cell, as the physics' ([code]JoltPhysicsServer3D.height_map_shape_set_cell_frictions[/code]): each of the [code](width - 1) * (depth - 1)[/code] cells' index (row-major, as the heights) into [param frictions]. Empty [param cells] clears them.
 			</description>
 		</method>
 		<method name="set_height_field">

@@ -33,6 +33,7 @@
 #include "../joints/jolt_joint_3d.h"
 #include "../jolt_physics_server_3d.h"
 #include "../jolt_project_settings.h"
+#include "../misc/jolt_friction_material.h"
 #include "../misc/jolt_stream_wrappers.h"
 #include "../objects/jolt_area_3d.h"
 #include "../objects/jolt_body_3d.h"
@@ -151,8 +152,9 @@ JoltSpace3D::JoltSpace3D(JPH::JobSystem *p_job_system, JPH::TempAllocator *p_tem
 		}
 	});
 
+	// Godot-EX: a static body's part with its own friction (a height map's cells, JoltFrictionMaterial) in place of the body's.
 	physics_system->SetCombineFriction([](const JPH::Body &p_body1, const JPH::SubShapeID &p_sub_shape_id1, const JPH::Body &p_body2, const JPH::SubShapeID &p_sub_shape_id2) {
-		return Math::abs(MIN(p_body1.GetFriction(), p_body2.GetFriction()));
+		return Math::abs(MIN(JoltFrictionMaterial::friction_of(p_body1, p_sub_shape_id1), JoltFrictionMaterial::friction_of(p_body2, p_sub_shape_id2)));
 	});
 
 	physics_system->SetCombineRestitution([](const JPH::Body &p_body1, const JPH::SubShapeID &p_sub_shape_id1, const JPH::Body &p_body2, const JPH::SubShapeID &p_sub_shape_id2) {
