@@ -671,6 +671,59 @@ double RigKernel::effort(const PackedFloat32Array &p_action) const {
 	return e;
 }
 
+// The critic's balance quantities (ProjectEX amp_env.gd privileged(), run61; the script's _balance_script the reference),
+// from the bodies update() read, every body a point mass at its origin as the COM is: the capture point (the COM's ground
+// projection plus its horizontal velocity over sqrt(g / h), h the COM's height over the ground under it) against the
+// support's centre (the p_support bodies touching the world, or all of them when none does; sensed bodies only), x and z
+// in the heading frame; h; the COM's velocity in the heading frame; its angular momentum about the COM (the bodies' about
+// it) over the mass times p_height squared, in the heading frame (1/s).
+PackedFloat32Array RigKernel::balance(const PackedInt32Array &p_support, double p_height) const {
+	PackedFloat32Array out;
+	out.resize(9);
+	float *o = out.ptrw();
+	const double g = rc.gravity;
+	const double ground_y = terrain.is_valid() ? terrain->ground_at(com) : double(ground(com));
+	const double h = double(com.y) - ground_y;
+	const double w0 = Math::sqrt(g / MAX(h, 0.2));
+	Vector3 centre;
+	int n = 0;
+	for (const int b : p_support) {
+		if (b >= 0 && b < touch.size() && touch[b] == 1) {
+			centre += xform[b].origin;
+			n++;
+		}
+	}
+	if (n == 0) {
+		for (const int b : p_support) {
+			if (b >= 0 && b < xform.size()) {
+				centre += xform[b].origin;
+				n++;
+			}
+		}
+	}
+	centre = n > 0 ? centre / real_t(n) : com;
+	const Vector3 cp = com + com_vel * real_t(1.0 / w0);
+	const Vector3 d = heading.xform_inv(Vector3(cp.x - centre.x, 0.0f, cp.z - centre.z));
+	o[0] = d.x;
+	o[1] = d.z;
+	o[2] = float(h);
+	const Vector3 v = heading.xform_inv(com_vel);
+	o[3] = v.x;
+	o[4] = v.y;
+	o[5] = v.z;
+	Vector3 l;
+	real_t m = 0.0f;
+	for (int i = 0; i < bodies.size(); i++) {
+		l += (xform[i].origin - com).cross(lin_vel[i] - com_vel) * masses[i];
+		m += masses[i];
+	}
+	l = heading.xform_inv(l) / MAX(real_t(m * p_height * p_height), real_t(1e-6));
+	o[6] = l.x;
+	o[7] = l.y;
+	o[8] = l.z;
+	return out;
+}
+
 void RigKernel::_bind_methods() {
 	ClassDB::bind_static_method("RigKernel", D_METHOD("rotation_vector", "basis"), &RigKernel::rotation_vector);
 	ClassDB::bind_static_method("RigKernel", D_METHOD("heading_of", "basis"), &RigKernel::heading_of);
@@ -725,6 +778,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_strength", "k"), &RigKernel::set_strength);
 	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
 	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
+	ClassDB::bind_method(D_METHOD("balance", "support", "height"), &RigKernel::balance);
 	ClassDB::bind_method(D_METHOD("set_reward_config", "config"), &RigKernel::set_reward_config);
 	ClassDB::bind_method(D_METHOD("reset_terms", "wy_mean", "features", "pelvis_prev", "g_pelvis"), &RigKernel::reset_terms);
 	ClassDB::bind_method(D_METHOD("reward_step", "command", "style", "steps", "push_at", "trip_at", "switch_at", "scramble_cap", "action", "prev_action"), &RigKernel::reward_step);

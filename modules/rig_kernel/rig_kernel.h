@@ -301,6 +301,7 @@ public:
 	void set_strength(double p_k) { strength = p_k; }
 	double get_strength() const { return strength; }
 	double effort(const PackedFloat32Array &p_action) const;
+	PackedFloat32Array balance(const PackedInt32Array &p_support, double p_height) const;
 
 	// The whole step (reward_step): see the class reference.
 	void set_reward_config(const Dictionary &p_config);
