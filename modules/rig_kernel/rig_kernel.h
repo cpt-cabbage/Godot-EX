@@ -164,6 +164,7 @@ class RigKernel : public RefCounted {
 		bool stride_constraint = false; // the stride cost reported (step_terms' stride_x), not subtracted: train.py's multiplier applies it (amp_env.gd stride_constraint)
 		int effort_dim = 0; // the effort weight observed (ProjectEX run61, amp_env.gd effort_weight): observation_full ends with it
 		double effort_ref = 1200.0; // W: the weight charges effort() over this each step (run60's measured mean, 1170 W)
+		int surface = 0; // the surface channel (ProjectEX run61, amp_env.gd surface): the last this many scan points' friction, after the senses
 		int assist_dim = 0; // the assist's level observed (ProjectEX run61, amp_env.gd assist_level): observation_full ends with it
 		bool effort = false; // the joints' mechanical power each step (step_terms' effort): every drive's PD torque estimate, as ankle_excess's, times the joint's rate, summed (amp_env.gd effort; train.py --effort)
 		bool zmp = false; // HumoSlope's balance prior (amp_env.gd zmp_w, _zmp_reward): the zero-moment point on the inclined support plane near the support anchor
