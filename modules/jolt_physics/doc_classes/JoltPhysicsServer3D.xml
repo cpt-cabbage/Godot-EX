@@ -99,6 +99,22 @@
 				The cone is symmetric around zero, so each swing axis uses the larger of the magnitudes of its lower and upper angular limits as its half-angle. Changing this rebuilds the joint.
 			</description>
 		</method>
+		<method name="height_map_shape_get_cell_frictions" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="shape" type="RID" />
+			<description>
+				Returns the frictions set by [method height_map_shape_set_cell_frictions] (empty when none).
+			</description>
+		</method>
+		<method name="height_map_shape_set_cell_frictions">
+			<return type="void" />
+			<param index="0" name="shape" type="RID" />
+			<param index="1" name="cells" type="PackedByteArray" />
+			<param index="2" name="frictions" type="PackedFloat32Array" />
+			<description>
+				Gives a height map shape a friction per cell: [param cells] holds each of the [code](width - 1) * (depth - 1)[/code] cells' index (row-major, as the heights) into [param frictions] (at most 256). A contact on a cell combines that friction with the other body's (the smaller, as two bodies' frictions combine) in place of the static body's own. Empty [param cells] restores the body's friction everywhere. Only a square height map built as a height field takes them (a non-square one keeps the body's friction). Setting the heights anew keeps them while the size is unchanged.
+			</description>
+		</method>
 		<method name="hinge_joint_get_jolt_flag" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="joint" type="RID" />

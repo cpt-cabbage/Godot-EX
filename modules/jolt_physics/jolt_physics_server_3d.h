@@ -505,6 +505,10 @@ public:
 	bool generic_6dof_joint_is_using_cone_swing(RID p_joint) const;
 	void generic_6dof_joint_set_use_cone_swing(RID p_joint, bool p_enabled);
 
+	// Godot-EX: a height map shape's friction per cell (each cell's index into p_frictions; empty: the body's).
+	void height_map_shape_set_cell_frictions(RID p_shape, const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions);
+	PackedFloat32Array height_map_shape_get_cell_frictions(RID p_shape) const;
+
 	// Godot-EX: the height of the first static body under each point, by a ray from the point straight
 	// down p_length (NAN without a hit): a batch of ground probes for a learned controller's height scan
 	// (RigKernel). Only static bodies on p_collision_mask are considered, which skips the dynamic

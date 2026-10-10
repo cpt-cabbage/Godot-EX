@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  jolt_height_map_shape_3d.h                                            */
+/*  jolt_friction_material.cpp                                            */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,49 +28,20 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "jolt_friction_material.h"
 
-#include "jolt_shape_3d.h"
+#include <Jolt/Physics/Collision/Shape/Shape.h>
 
-class JoltHeightMapShape3D final : public JoltShape3D {
-	AABB aabb;
+JPH_IMPLEMENT_RTTI_VIRTUAL(JoltFrictionMaterial) {
+	JPH_ADD_BASE_CLASS(JoltFrictionMaterial, JPH::PhysicsMaterial)
+}
 
-#ifdef REAL_T_IS_DOUBLE
-	PackedFloat64Array heights;
-#else
-	PackedFloat32Array heights;
-#endif
-
-	int width = 0;
-	int depth = 0;
-
-	// Godot-EX: a friction per cell (height_map_shape_set_cell_frictions): each of the (width - 1) x (depth - 1)
-	// cells' index (row-major, z then x, as the heights) into the frictions; empty, the body's friction everywhere.
-	// The height field only (a non-square map builds as a mesh and keeps the body's).
-	PackedByteArray cell_materials;
-	PackedFloat32Array material_frictions;
-
-	virtual JPH::ShapeRefC _build() const override;
-	JPH::ShapeRefC _build_height_field() const;
-	JPH::ShapeRefC _build_mesh() const;
-
-	AABB _calculate_aabb() const;
-
-public:
-	virtual ShapeType get_type() const override { return ShapeType::SHAPE_HEIGHTMAP; }
-	virtual bool is_convex() const override { return false; }
-
-	virtual Variant get_data() const override;
-	virtual void set_data(const Variant &p_data) override;
-
-	void set_cell_frictions(const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions);
-	PackedByteArray get_cell_materials() const { return cell_materials; }
-	PackedFloat32Array get_material_frictions() const { return material_frictions; }
-
-	virtual float get_margin() const override { return 0.0f; }
-	virtual void set_margin(float p_margin) override {}
-
-	virtual AABB get_aabb() const override { return aabb; }
-
-	String to_string() const;
-};
+float JoltFrictionMaterial::friction_of(const JPH::Body &p_body, const JPH::SubShapeID &p_sub_shape_id) {
+	if (p_body.IsStatic()) {
+		const JPH::PhysicsMaterial *material = p_body.GetShape()->GetMaterial(p_sub_shape_id);
+		if (material != nullptr && material->GetRTTI() == JPH_RTTI(JoltFrictionMaterial)) {
+			return static_cast<const JoltFrictionMaterial *>(material)->friction;
+		}
+	}
+	return p_body.GetFriction();
+}

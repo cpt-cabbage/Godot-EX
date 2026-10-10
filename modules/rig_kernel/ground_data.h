@@ -66,6 +66,10 @@ class GroundData : public RefCounted {
 	int field_width = 0;
 	int field_depth = 0;
 	LocalVector<float> field;
+	// The height field's friction per cell (set_field_frictions; the physics' JoltPhysicsServer3D
+	// height_map_shape_set_cell_frictions alike): each cell's index into field_frictions; empty, none.
+	LocalVector<uint8_t> field_cells;
+	LocalVector<float> field_frictions;
 	LocalVector<Prop> props;
 	HashMap<int64_t, LocalVector<int>> buckets; // prop indices by BUCKET-sized cell of their bounds in x and z
 	static constexpr float BUCKET = 2.0f;
@@ -99,6 +103,11 @@ public:
 	bool is_enabled() const { return enabled; }
 	void set_height_field(const Transform3D &p_xform, int p_width, int p_depth, const PackedFloat32Array &p_heights);
 	void set_height_field_transform(const Transform3D &p_xform);
+	// The height field's friction per cell, as the physics' (one index a cell, row-major as the heights, into p_frictions);
+	// friction_at: the friction of the cell under p_point's x and z, NaN off the field or with none set.
+	void set_field_frictions(const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions);
+	float friction_at(const Vector3 &p_point) const;
+	PackedFloat32Array friction_at_batch(const PackedVector3Array &p_points) const;
 	void clear_props();
 	void add_box(const Transform3D &p_xform, const Vector3 &p_half_extents);
 	void add_cylinder(const Transform3D &p_xform, float p_radius, float p_height);

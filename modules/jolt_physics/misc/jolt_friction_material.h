@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  jolt_height_map_shape_3d.h                                            */
+/*  jolt_friction_material.h                                              */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,47 +30,24 @@
 
 #pragma once
 
-#include "jolt_shape_3d.h"
+#include <Jolt/Jolt.h>
 
-class JoltHeightMapShape3D final : public JoltShape3D {
-	AABB aabb;
+#include <Jolt/Physics/Body/Body.h>
+#include <Jolt/Physics/Collision/PhysicsMaterial.h>
 
-#ifdef REAL_T_IS_DOUBLE
-	PackedFloat64Array heights;
-#else
-	PackedFloat32Array heights;
-#endif
-
-	int width = 0;
-	int depth = 0;
-
-	// Godot-EX: a friction per cell (height_map_shape_set_cell_frictions): each of the (width - 1) x (depth - 1)
-	// cells' index (row-major, z then x, as the heights) into the frictions; empty, the body's friction everywhere.
-	// The height field only (a non-square map builds as a mesh and keeps the body's).
-	PackedByteArray cell_materials;
-	PackedFloat32Array material_frictions;
-
-	virtual JPH::ShapeRefC _build() const override;
-	JPH::ShapeRefC _build_height_field() const;
-	JPH::ShapeRefC _build_mesh() const;
-
-	AABB _calculate_aabb() const;
-
+// A part of a shape with its own friction (Godot-EX: a height map's cells, JoltPhysicsServer3D's
+// height_map_shape_set_cell_frictions): the space's friction combine takes it in place of the body's.
+class JoltFrictionMaterial final : public JPH::PhysicsMaterial {
 public:
-	virtual ShapeType get_type() const override { return ShapeType::SHAPE_HEIGHTMAP; }
-	virtual bool is_convex() const override { return false; }
+	JPH_DECLARE_RTTI_VIRTUAL(JPH_NO_EXPORT, JoltFrictionMaterial)
 
-	virtual Variant get_data() const override;
-	virtual void set_data(const Variant &p_data) override;
+	float friction = 1.0f;
 
-	void set_cell_frictions(const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions);
-	PackedByteArray get_cell_materials() const { return cell_materials; }
-	PackedFloat32Array get_material_frictions() const { return material_frictions; }
+	JoltFrictionMaterial() = default;
+	explicit JoltFrictionMaterial(float p_friction) :
+			friction(p_friction) {}
 
-	virtual float get_margin() const override { return 0.0f; }
-	virtual void set_margin(float p_margin) override {}
-
-	virtual AABB get_aabb() const override { return aabb; }
-
-	String to_string() const;
+	// The friction where a body is touched: its sub-shape's material's if that is a JoltFrictionMaterial
+	// (static bodies only: the terrain's; a dynamic body's shapes have no such materials), else the body's.
+	static float friction_of(const JPH::Body &p_body, const JPH::SubShapeID &p_sub_shape_id);
 };

@@ -47,6 +47,50 @@ void GroundData::set_height_field(const Transform3D &p_xform, int p_width, int p
 	set_height_field_transform(p_xform);
 }
 
+void GroundData::set_field_frictions(const PackedByteArray &p_cells, const PackedFloat32Array &p_frictions) {
+	field_cells.clear();
+	field_frictions.clear();
+	if (p_cells.is_empty()) {
+		return;
+	}
+	ERR_FAIL_COND_MSG(!has_field || p_cells.size() != (field_width - 1) * (field_depth - 1), "One index per cell of the height field (set_height_field first).");
+	ERR_FAIL_COND_MSG(p_frictions.is_empty() || p_frictions.size() > 256, "1 to 256 frictions.");
+	field_cells.resize(p_cells.size());
+	for (int i = 0; i < p_cells.size(); i++) {
+		field_cells[i] = MIN(p_cells[i], uint8_t(p_frictions.size() - 1));
+	}
+	field_frictions.resize(p_frictions.size());
+	for (int i = 0; i < p_frictions.size(); i++) {
+		field_frictions[i] = p_frictions[i];
+	}
+}
+
+float GroundData::friction_at(const Vector3 &p_point) const {
+	if (!has_field || field_cells.is_empty()) {
+		return Math::NaN;
+	}
+	const Vector3 s = field_xform.basis.get_scale_abs();
+	const Vector3 &o = field_xform.origin;
+	const float fx = (p_point.x - o.x) / s.x + 0.5f * (field_width - 1);
+	const float fz = (p_point.z - o.z) / s.z + 0.5f * (field_depth - 1);
+	if (fx < 0.0f || fz < 0.0f || fx > field_width - 1 || fz > field_depth - 1) {
+		return Math::NaN;
+	}
+	const int ix = MIN(int(fx), field_width - 2);
+	const int iz = MIN(int(fz), field_depth - 2);
+	return field_frictions[field_cells[iz * (field_width - 1) + ix]];
+}
+
+PackedFloat32Array GroundData::friction_at_batch(const PackedVector3Array &p_points) const {
+	PackedFloat32Array out;
+	out.resize(p_points.size());
+	float *w = out.ptrw();
+	for (int i = 0; i < p_points.size(); i++) {
+		w[i] = friction_at(p_points[i]);
+	}
+	return out;
+}
+
 void GroundData::set_height_field_transform(const Transform3D &p_xform) {
 	const Basis &b = p_xform.basis;
 	ERR_FAIL_COND_MSG(!Math::is_zero_approx(b.rows[0][1]) || !Math::is_zero_approx(b.rows[0][2]) || !Math::is_zero_approx(b.rows[1][0]) || !Math::is_zero_approx(b.rows[1][2]) || !Math::is_zero_approx(b.rows[2][0]) || !Math::is_zero_approx(b.rows[2][1]),
@@ -379,6 +423,9 @@ void GroundData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_enabled"), &GroundData::is_enabled);
 	ClassDB::bind_method(D_METHOD("set_height_field", "xform", "width", "depth", "heights"), &GroundData::set_height_field);
 	ClassDB::bind_method(D_METHOD("set_height_field_transform", "xform"), &GroundData::set_height_field_transform);
+	ClassDB::bind_method(D_METHOD("set_field_frictions", "cells", "frictions"), &GroundData::set_field_frictions);
+	ClassDB::bind_method(D_METHOD("friction_at", "point"), &GroundData::friction_at);
+	ClassDB::bind_method(D_METHOD("friction_at_batch", "points"), &GroundData::friction_at_batch);
 	ClassDB::bind_method(D_METHOD("clear_props"), &GroundData::clear_props);
 	ClassDB::bind_method(D_METHOD("add_box", "xform", "half_extents"), &GroundData::add_box);
 	ClassDB::bind_method(D_METHOD("add_cylinder", "xform", "radius", "height"), &GroundData::add_cylinder);
