@@ -347,6 +347,13 @@
 				Sets the episode's effort weight: [method reward_step] subtracts it times [method effort] over the reward configuration's [code]effort_ref[/code] each step, and with the configuration's [code]effort_dim[/code] 1 [method observation_full] ends with it.
 			</description>
 		</method>
+		<method name="set_field_body">
+			<return type="void" />
+			<param index="0" name="body" type="RID" />
+			<description>
+				Sets the terrain's height field body: a sensed body touching it reads the friction of the cell under the contact from the ground data ([method GroundData.friction_at], friction patches) in place of the body's friction, when the ground data has frictions.
+			</description>
+		</method>
 		<method name="set_ground_data">
 			<return type="void" />
 			<param index="0" name="data" type="GroundData" />
