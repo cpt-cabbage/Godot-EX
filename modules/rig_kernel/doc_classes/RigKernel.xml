@@ -519,6 +519,12 @@
 				The soles' touch, once a step: per foot its load (the ground's force along the ground's normal over the body's weight, clipped to 1.5: the foot's and its toes' mass times their acceleration, less their weight and the ankle joint's force), the share of its sole's points touching (within 2 cm, the sole aligned with the ground), and their weighted centre in the foot's frame over the sole's outline (zero under 5 % of the weight); this step's eight values, then the last step's. [method reset_terms] clears the last.
 			</description>
 		</method>
+		<method name="sole_touch_reset">
+			<return type="void" />
+			<description>
+				Forgets the soles' touch's last step (an episode's start): the next [method sole_touch] repeats its values as the last's and reads no acceleration.
+			</description>
+		</method>
 		<method name="touches" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="body" type="int" />

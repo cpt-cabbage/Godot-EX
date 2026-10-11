@@ -941,6 +941,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("knee_down", "height", "max_degrees"), &RigKernel::knee_down);
 	ClassDB::bind_method(D_METHOD("set_sole_touch", "bodies", "offsets", "sides", "feet", "ankles", "sign", "half", "centre_z", "dt"), &RigKernel::set_sole_touch);
 	ClassDB::bind_method(D_METHOD("sole_touch"), &RigKernel::sole_touch);
+	ClassDB::bind_method(D_METHOD("sole_touch_reset"), &RigKernel::sole_touch_reset);
 	ClassDB::bind_method(D_METHOD("set_soles", "heel", "toe", "lift", "probe", "edge_on"), &RigKernel::set_soles);
 	ClassDB::bind_method(D_METHOD("on_edge", "foot", "toes"), &RigKernel::on_edge);
 	ClassDB::bind_method(D_METHOD("sole_on_edge", "foot", "toes"), &RigKernel::sole_on_edge);

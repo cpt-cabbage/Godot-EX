@@ -334,6 +334,7 @@ public:
 	bool knee_down(double p_height, double p_max_degrees) const;
 	void set_sole_touch(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets, const PackedInt32Array &p_sides, const PackedInt32Array &p_feet, const TypedArray<RID> &p_ankles, double p_sign, const Vector2 &p_half, double p_centre_z, double p_dt);
 	PackedFloat32Array sole_touch();
+	void sole_touch_reset() { sole.has_last = false; }
 	void set_soles(const PackedVector3Array &p_heel, const PackedVector3Array &p_toe, float p_lift, float p_probe, float p_edge_on);
 	bool on_edge(int p_foot, int p_toes) const;
 	bool sole_on_edge(const Transform3D &p_foot, const Transform3D &p_toes) const;
