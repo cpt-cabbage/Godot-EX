@@ -569,6 +569,140 @@ bool RigKernel::knee_down(double p_height, double p_max_degrees) const {
 	return false;
 }
 
+void RigKernel::set_sole_touch(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets, const PackedInt32Array &p_sides, const PackedInt32Array &p_feet, const TypedArray<RID> &p_ankles, double p_sign, const Vector2 &p_half, double p_centre_z, double p_dt) {
+	ERR_FAIL_COND(p_bodies.size() != p_offsets.size() || p_bodies.size() != p_sides.size() || p_ankles.size() != 2 || p_feet.size() != 4);
+	for (int s = 0; s < 2; s++) {
+		sole.body[s].clear();
+		sole.offset[s].clear();
+		sole.ankle[s] = p_ankles[s];
+		sole.foot[s] = p_feet[s]; // left and right feet, then their toes
+		sole.toes[s] = p_feet[2 + s];
+	}
+	for (int i = 0; i < p_bodies.size(); i++) {
+		ERR_FAIL_INDEX(p_bodies[i], bodies.size());
+		ERR_FAIL_INDEX(p_sides[i], 2);
+		sole.body[p_sides[i]].push_back(p_bodies[i]);
+		sole.offset[p_sides[i]].push_back(p_offsets[i]);
+	}
+	double m = 0.0;
+	for (int i = 0; i < masses.size(); i++) {
+		m += masses[i];
+	}
+	sole.weight = m * sole.gravity;
+	sole.sign = p_sign;
+	sole.half = p_half;
+	sole.centre_z = p_centre_z;
+	sole.dt = p_dt;
+	sole.has_last = false;
+	sole.on = !sole.body[0].is_empty() && !sole.body[1].is_empty();
+}
+
+// amp_env.gd sole_touch_script, the reference (tests/kernel_check.gd sole_touch).
+PackedFloat32Array RigKernel::sole_touch() {
+	PackedFloat32Array out;
+	out.resize(16);
+	ERR_FAIL_COND_V(!sole.on, out);
+	static const StringName jolt("JoltPhysicsServer3D");
+	static const StringName force_method("generic_6dof_joint_get_applied_force_vector");
+	Object *js = Engine::get_singleton()->has_singleton(jolt) ? Engine::get_singleton()->get_singleton_object(jolt) : nullptr;
+	const double tau = (sole.gap_max - sole.gap_min) / Math::log(50.0);
+	float now[8];
+	for (int s = 0; s < 2; s++) {
+		const int n = sole.offset[s].size();
+		const int foot_i = sole.foot[s];
+		const int toes_i = sole.toes[s];
+		PackedVector3Array pts;
+		pts.resize(n);
+		for (int i = 0; i < n; i++) {
+			pts.write[i] = xform[sole.body[s][i]].xform(sole.offset[s][i]);
+		}
+		Vector<float> h;
+		h.resize(n);
+		if (!_static_ground_batch(pts, 0.1f, h.ptrw())) {
+			for (int i = 0; i < n; i++) {
+				h.write[i] = _ground_from(pts[i], 0.1f);
+			}
+		}
+		// The ground's plane under the sole: least squares over the points with ground near (h = a x + b z + c, centred).
+		double cx = 0, cz = 0, ch = 0;
+		int k = 0;
+		for (int i = 0; i < n; i++) {
+			if (pts[i].y - h[i] < 0.5) {
+				cx += pts[i].x;
+				cz += pts[i].z;
+				ch += h[i];
+				k++;
+			}
+		}
+		Vector3 ng(0, 1, 0);
+		if (k >= 3) {
+			cx /= k;
+			cz /= k;
+			ch /= k;
+			double sxx = 0, sxz = 0, szz = 0, sxh = 0, szh = 0;
+			for (int i = 0; i < n; i++) {
+				if (pts[i].y - h[i] < 0.5) {
+					const double dx = pts[i].x - cx, dz = pts[i].z - cz, dh = h[i] - ch;
+					sxx += dx * dx;
+					sxz += dx * dz;
+					szz += dz * dz;
+					sxh += dx * dh;
+					szh += dz * dh;
+				}
+			}
+			const double det = sxx * szz - sxz * sxz;
+			if (det > 1e-12) {
+				const double a = (sxh * szz - szh * sxz) / det;
+				const double b = (szh * sxx - sxh * sxz) / det;
+				ng = Vector3(-a, 1.0, -b).normalized();
+			}
+		}
+		const Vector3 nf = xform[foot_i].basis.get_column(1).normalized();
+		const double align = Math::pow(CLAMP((nf.dot(ng) - sole.eta) / (1.0 - sole.eta), 0.0, 1.0), sole.beta);
+		double wsum = 0.0, touching = 0.0;
+		Vector3 c;
+		for (int i = 0; i < n; i++) {
+			const double gap = (pts[i].y - h[i]) * ng.y;
+			const double w = gap > sole.gap_max ? 0.0 : align * Math::exp(-MAX(gap - sole.gap_min, 0.0) / tau);
+			wsum += w;
+			touching += w > sole.area_w ? 1.0 : 0.0;
+			c += pts[i] * real_t(w);
+		}
+		// The load: the ground's force on the foot and its toes, along the ground's normal, over the body's weight.
+		double load = 0.0;
+		if (wsum > 0.0 && js != nullptr) {
+			const Vector3 joint = Vector3(js->call(force_method, sole.ankle[s])) * sole.sign;
+			const double mf = masses[foot_i], mt = masses[toes_i];
+			Vector3 ma;
+			if (sole.has_last) {
+				ma = (lin_vel[foot_i] - sole.prev_v[s][0]) * real_t(mf / sole.dt) + (lin_vel[toes_i] - sole.prev_v[s][1]) * real_t(mt / sole.dt);
+			}
+			const Vector3 grf = ma + Vector3(0, real_t(sole.gravity * (mf + mt)), 0) - joint;
+			load = CLAMP(grf.dot(ng) / sole.weight, 0.0, sole.load_max);
+		}
+		float px = 0.0f, pz = 0.0f;
+		if (load > sole.cop_min && wsum > 0.0) {
+			const Vector3 local = xform[foot_i].affine_inverse().xform(c / wsum);
+			px = CLAMP(local.x / sole.half.x, -1.0, 1.0);
+			pz = CLAMP((local.z - sole.centre_z) / sole.half.y, -1.0, 1.0);
+		}
+		now[4 * s + 0] = float(load);
+		now[4 * s + 1] = float(touching / n);
+		now[4 * s + 2] = px;
+		now[4 * s + 3] = pz;
+		sole.prev_v[s][0] = lin_vel[foot_i];
+		sole.prev_v[s][1] = lin_vel[toes_i];
+	}
+	float *o = out.ptrw();
+	for (int j = 0; j < 8; j++) {
+		o[j] = now[j];
+		o[8 + j] = sole.has_last ? sole.last[j] : now[j];
+		sole.last[j] = now[j];
+	}
+	sole.has_last = true;
+	return out;
+}
+
 void RigKernel::set_soles(const PackedVector3Array &p_heel, const PackedVector3Array &p_toe, float p_lift, float p_probe, float p_edge_on) {
 	heel_corners.clear();
 	toe_corners.clear();
@@ -805,6 +939,8 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("ankle_excess", "action", "push_only"), &RigKernel::ankle_excess);
 	ClassDB::bind_method(D_METHOD("set_knees", "bodies", "offsets"), &RigKernel::set_knees);
 	ClassDB::bind_method(D_METHOD("knee_down", "height", "max_degrees"), &RigKernel::knee_down);
+	ClassDB::bind_method(D_METHOD("set_sole_touch", "bodies", "offsets", "sides", "feet", "ankles", "sign", "half", "centre_z", "dt"), &RigKernel::set_sole_touch);
+	ClassDB::bind_method(D_METHOD("sole_touch"), &RigKernel::sole_touch);
 	ClassDB::bind_method(D_METHOD("set_soles", "heel", "toe", "lift", "probe", "edge_on"), &RigKernel::set_soles);
 	ClassDB::bind_method(D_METHOD("on_edge", "foot", "toes"), &RigKernel::on_edge);
 	ClassDB::bind_method(D_METHOD("sole_on_edge", "foot", "toes"), &RigKernel::sole_on_edge);

@@ -450,6 +450,21 @@
 				With [param enabled], [method slip] and the reward's slip measure a touching body's speed along the ground's surface (the terrain's normal from its fall line) instead of its horizontal speed. The reward configuration's [code]slip_surface[/code] sets it too.
 			</description>
 		</method>
+		<method name="set_sole_touch">
+			<return type="void" />
+			<param index="0" name="bodies" type="PackedInt32Array" />
+			<param index="1" name="offsets" type="PackedVector3Array" />
+			<param index="2" name="sides" type="PackedInt32Array" />
+			<param index="3" name="feet" type="PackedInt32Array" />
+			<param index="4" name="ankles" type="RID[]" />
+			<param index="5" name="sign" type="float" />
+			<param index="6" name="half" type="Vector2" />
+			<param index="7" name="centre_z" type="float" />
+			<param index="8" name="dt" type="float" />
+			<description>
+				Sets the soles' touch ([method sole_touch]): each sole point's body and its offset in that body's frame, its side (0 left, 1 right); [param feet] the left and right feet's body indices, then their toes'; each side's ankle joint, and [param sign] +1 when the foot is the joint's second body; the sole's half width and half length in the foot's frame and its middle along the foot's z; the step's duration. After [method set_bodies]. Turns the soles' touch on in [method observation_full], after the surface channel.
+			</description>
+		</method>
 		<method name="set_soles">
 			<return type="void" />
 			<param index="0" name="heel" type="PackedVector3Array" />
@@ -496,6 +511,12 @@
 			<param index="1" name="toes" type="Transform3D" />
 			<description>
 				Whether a foot at [param foot] with its toes at [param toes] stands over a prop's edge: some of its sole's corners over a prop (the ground data's first surface down from over the corner more than [code]edge_on[/code] over the terrain's ground) and some not. Needs the ground data and [method set_soles].
+			</description>
+		</method>
+		<method name="sole_touch">
+			<return type="PackedFloat32Array" />
+			<description>
+				The soles' touch, once a step: per foot its load (the ground's force along the ground's normal over the body's weight, clipped to 1.5: the foot's and its toes' mass times their acceleration, less their weight and the ankle joint's force), the share of its sole's points touching (within 2 cm, the sole aligned with the ground), and their weighted centre in the foot's frame over the sole's outline (zero under 5 % of the weight); this step's eight values, then the last step's. [method reset_terms] clears the last.
 			</description>
 		</method>
 		<method name="touches" qualifiers="const">
