@@ -45,6 +45,31 @@ void TerrainField::set_macro(const PackedFloat32Array &p_heights, double p_half,
 	cross = p_cross;
 }
 
+void TerrainField::set_grid(const PackedFloat32Array &p_heights, int p_width, int p_depth, double p_cell, const Vector2 &p_corner) {
+	ERR_FAIL_COND_MSG(p_width < 2 || p_depth < 2 || p_heights.size() != p_width * p_depth, "TerrainField.set_grid: heights must be width x depth, both at least 2.");
+	ERR_FAIL_COND_MSG(p_cell <= 0.0, "TerrainField.set_grid: the cell must be positive.");
+	grid.resize(p_heights.size());
+	for (int i = 0; i < p_heights.size(); i++) {
+		grid[i] = p_heights[i];
+	}
+	grid_w = p_width;
+	grid_d = p_depth;
+	grid_cell = p_cell;
+	grid_corner = p_corner;
+}
+
+// terrain.gd _grid_at: bilinear between the samples, held past the edges.
+double TerrainField::_grid_at(double p_x, double p_z) const {
+	const double fx = CLAMP((p_x - grid_corner.x) / grid_cell, 0.0, double(grid_w) - 1.001);
+	const double fz = CLAMP((p_z - grid_corner.y) / grid_cell, 0.0, double(grid_d) - 1.001);
+	const int ix = int(fx);
+	const int iz = int(fz);
+	const double tx = fx - ix;
+	const double tz = fz - iz;
+	const float *g = grid.ptr() + iz * grid_w + ix;
+	return Math::lerp(Math::lerp(double(g[0]), double(g[1]), tx), Math::lerp(double(g[grid_w]), double(g[grid_w + 1]), tx), tz);
+}
+
 void TerrainField::set_hills(const Ref<Noise> &p_noise, double p_amplitude) {
 	hills = p_noise;
 	hill_amp = p_amplitude;
@@ -116,6 +141,9 @@ double TerrainField::_raw(double p_x, double p_z) const {
 		const double f = CLAMP((s + macro_half) / macro_step, 0.0, double(macro.size()) - 1.001);
 		const int i = int(f);
 		h += Math::lerp(double(macro[i]), double(macro[i + 1]), f - i) + cross * (up.x * p_z - up.y * p_x);
+	}
+	if (!grid.is_empty()) {
+		h += _grid_at(p_x, p_z);
 	}
 	if (hills.is_valid()) {
 		h += hill_amp * hills->get_noise_2d(p_x, p_z);
@@ -192,6 +220,8 @@ PackedFloat32Array TerrainField::heights(const PackedVector2Array &p_points) con
 void TerrainField::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_plane", "grade"), &TerrainField::set_plane);
 	ClassDB::bind_method(D_METHOD("set_macro", "heights", "half", "step", "up", "cross"), &TerrainField::set_macro);
+	ClassDB::bind_method(D_METHOD("set_grid", "heights", "width", "depth", "cell", "corner"), &TerrainField::set_grid);
+	ClassDB::bind_method(D_METHOD("clear_grid"), &TerrainField::clear_grid);
 	ClassDB::bind_method(D_METHOD("set_hills", "noise", "amplitude"), &TerrainField::set_hills);
 	ClassDB::bind_method(D_METHOD("set_bumps", "noise", "amplitude"), &TerrainField::set_bumps);
 	ClassDB::bind_method(D_METHOD("set_raw0", "raw0"), &TerrainField::set_raw0);

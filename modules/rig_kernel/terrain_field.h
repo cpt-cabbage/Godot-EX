@@ -65,6 +65,11 @@ class TerrainField : public RefCounted {
 
 	Vector2 plane;
 	LocalVector<float> macro;
+	LocalVector<float> grid; // a heightmap's samples (ProjectEX's terrain.gd map kind), row-major from the corner along +x
+	int grid_w = 0;
+	int grid_d = 0;
+	double grid_cell = 1.0;
+	Vector2 grid_corner;
 	double macro_half = 0.0;
 	double macro_step = 1.0;
 	Vector2 up;
@@ -89,6 +94,7 @@ class TerrainField : public RefCounted {
 	Vector3 origin;
 
 	double _raw(double p_x, double p_z) const;
+	double _grid_at(double p_x, double p_z) const;
 	double _carve(const Water &p_w, double p_x, double p_z, double p_h) const;
 
 protected:
@@ -97,6 +103,8 @@ protected:
 public:
 	void set_plane(const Vector2 &p_grade) { plane = p_grade; }
 	void set_macro(const PackedFloat32Array &p_heights, double p_half, double p_step, const Vector2 &p_up, double p_cross);
+	void set_grid(const PackedFloat32Array &p_heights, int p_width, int p_depth, double p_cell, const Vector2 &p_corner);
+	void clear_grid() { grid.clear(); }
 	void set_hills(const Ref<Noise> &p_noise, double p_amplitude);
 	void set_bumps(const Ref<Noise> &p_noise, double p_amplitude);
 	void set_raw0(double p_raw0) { raw0 = p_raw0; }

@@ -43,6 +43,12 @@
 				Adds a wall for [method wall_distance]: its centre (x, z), its yaw and its length.
 			</description>
 		</method>
+		<method name="clear_grid">
+			<return type="void" />
+			<description>
+				Removes the heightmap layer set by [method set_grid].
+			</description>
+		</method>
 		<method name="clear_walls">
 			<return type="void" />
 			<description>
@@ -131,6 +137,17 @@
 			<param index="1" name="amplitude" type="float" />
 			<description>
 				Sets the small-scale noise layer and its amplitude (m).
+			</description>
+		</method>
+		<method name="set_grid">
+			<return type="void" />
+			<param index="0" name="heights" type="PackedFloat32Array" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="depth" type="int" />
+			<param index="3" name="cell" type="float" />
+			<param index="4" name="corner" type="Vector2" />
+			<description>
+				Adds a heightmap layer (an authored map's patch): [param heights] holds [param width] x [param depth] samples, row-major along +x, one every [param cell] from [param corner] (x and z, relative to the origin), bilinear between them and held past the edges.
 			</description>
 		</method>
 		<method name="set_hills">
