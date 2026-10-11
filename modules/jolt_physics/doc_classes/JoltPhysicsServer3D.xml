@@ -45,6 +45,13 @@
 				Sets the value of the given Jolt-specific parameter of the cone-twist joint.
 			</description>
 		</method>
+		<method name="generic_6dof_joint_get_applied_force_vector" qualifiers="const">
+			<return type="Vector3" />
+			<param index="0" name="joint" type="RID" />
+			<description>
+				The force (N) the joint applied over the last physics step to its second body: in world space when the joint's translation is locked on every axis (a ball joint), else along the joint frame's axes. [method PhysicsServer3D.generic_6dof_joint_get_applied_force] is its length.
+			</description>
+		</method>
 		<method name="generic_6dof_joint_get_jolt_flag" qualifiers="const">
 			<return type="bool" />
 			<param index="0" name="joint" type="RID" />

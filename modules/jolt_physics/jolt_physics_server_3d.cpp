@@ -95,6 +95,7 @@ void JoltPhysicsServer3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("height_map_shape_get_cell_frictions", "shape"), &JoltPhysicsServer3D::height_map_shape_get_cell_frictions);
 
 	ClassDB::bind_method(D_METHOD("space_cast_static_ground", "space", "from", "length", "collision_mask"), &JoltPhysicsServer3D::space_cast_static_ground);
+	ClassDB::bind_method(D_METHOD("generic_6dof_joint_get_applied_force_vector", "joint"), &JoltPhysicsServer3D::generic_6dof_joint_get_applied_force_vector);
 
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_FREQUENCY);
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_DAMPING);
@@ -2166,6 +2167,16 @@ float JoltPhysicsServer3D::generic_6dof_joint_get_applied_force(RID p_joint) con
 	JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<JoltGeneric6DOFJoint3D *>(joint);
 
 	return g6dof_joint->get_applied_force();
+}
+
+Vector3 JoltPhysicsServer3D::generic_6dof_joint_get_applied_force_vector(RID p_joint) const {
+	JoltJoint3D *joint = joint_owner.get_or_null(p_joint);
+	ERR_FAIL_NULL_V(joint, Vector3());
+
+	ERR_FAIL_COND_V(joint->get_type() != PS3DE::JOINT_TYPE_6DOF, Vector3());
+	JoltGeneric6DOFJoint3D *g6dof_joint = static_cast<JoltGeneric6DOFJoint3D *>(joint);
+
+	return g6dof_joint->get_applied_force_vector();
 }
 
 float JoltPhysicsServer3D::generic_6dof_joint_get_applied_torque(RID p_joint) const {
