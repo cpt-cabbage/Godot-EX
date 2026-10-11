@@ -192,6 +192,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 }
 
 void RigKernel::reset_terms(double p_wy_mean, const PackedFloat32Array &p_features, const Transform3D &p_pelvis_prev, double p_g_pelvis) {
+	sole.has_last = false; // the soles' touch's last step
 	wy_mean = p_wy_mean;
 	for (int k = 0; k < 4; k++) {
 		air[k] = 0.0;
@@ -757,6 +758,9 @@ PackedFloat32Array RigKernel::observation_full(const PackedFloat32Array &p_actio
 			const float f = ground_data.is_valid() ? ground_data->friction_at(w) : Math::NaN;
 			o.push_back(Math::is_nan(f) ? base : f);
 		}
+	}
+	if (sole.on) { // the soles' touch (sole_touch), after the surface channel
+		o.append_array(sole_touch());
 	}
 	for (int j = 0; j < rc.style_dim; j++) {
 		o.push_back(j == p_style ? 1.0f : 0.0f);

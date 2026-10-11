@@ -130,6 +130,26 @@ class RigKernel : public RefCounted {
 	float sole_lift = 0.25f;
 	float sole_probe = 1.0f;
 	float edge_on = 0.03f;
+	// The soles' touch (ProjectEX amp_env.gd sole_touch; TactileStep, arXiv 2609.28959; the user's call 2026-10-10): per foot
+	// its load (the ground's force along the ground's normal over the body's weight: the foot's and its toes' mass times
+	// their acceleration less their weight and the ankle joint's force on the foot), the share of its sole's points
+	// touching, and their weighted centre (the centre of pressure) in the foot's frame over the sole's outline; this
+	// step's four and the last's (set_sole_touch, sole_touch; reset_terms clears the last).
+	struct SoleTouch {
+		bool on = false;
+		Vector<int> body[2]; // each point's body (the foot or its toes), per side
+		Vector<Vector3> offset[2]; // each point in its body's frame
+		RID ankle[2];
+		int foot[2] = { -1, -1 }, toes[2] = { -1, -1 };
+		double sign = 1.0; // the ankle's force on the foot: +1 when the foot is the joint's second body
+		Vector2 half = Vector2(0.045, 0.14); // the sole's outline: half its width and its length in the foot's frame
+		double centre_z = 0.0; // and its middle along the foot's z
+		double eta = 0.5, beta = 2.0, gap_min = 0.003, gap_max = 0.02, area_w = 0.5, cop_min = 0.05, load_max = 1.5;
+		double dt = 1.0 / 40.0, gravity = 9.8, weight = 0.0;
+		float last[8] = {};
+		bool has_last = false;
+		Vector3 prev_v[2][2]; // the foot's and the toes' velocity at the last call, per side
+	} sole;
 	// The legs' bodies (leg_drag).
 	Vector<int> legs;
 
@@ -312,6 +332,8 @@ public:
 	double ankle_excess(const PackedFloat32Array &p_action, bool p_push_only) const;
 	void set_knees(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets);
 	bool knee_down(double p_height, double p_max_degrees) const;
+	void set_sole_touch(const PackedInt32Array &p_bodies, const PackedVector3Array &p_offsets, const PackedInt32Array &p_sides, const PackedInt32Array &p_feet, const TypedArray<RID> &p_ankles, double p_sign, const Vector2 &p_half, double p_centre_z, double p_dt);
+	PackedFloat32Array sole_touch();
 	void set_soles(const PackedVector3Array &p_heel, const PackedVector3Array &p_toe, float p_lift, float p_probe, float p_edge_on);
 	bool on_edge(int p_foot, int p_toes) const;
 	bool sole_on_edge(const Transform3D &p_foot, const Transform3D &p_toes) const;
