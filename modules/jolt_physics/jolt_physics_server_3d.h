@@ -514,6 +514,7 @@ public:
 	// (RigKernel). Only static bodies on p_collision_mask are considered, which skips the dynamic
 	// bodies' broad phase tree, the hit's normal and shape index.
 	PackedFloat32Array space_cast_static_ground(RID p_space, const PackedVector3Array &p_from, float p_length, uint32_t p_collision_mask);
+	Vector3 generic_6dof_joint_get_applied_force_vector(RID p_joint) const;
 };
 
 VARIANT_ENUM_CAST(JoltPhysicsServer3D::HingeJointParamJolt)

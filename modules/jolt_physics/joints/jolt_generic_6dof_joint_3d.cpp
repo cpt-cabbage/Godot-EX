@@ -709,6 +709,25 @@ float JoltGeneric6DOFJoint3D::get_applied_force() const {
 	return total_lambda.Length() / last_step;
 }
 
+// The force the constraint applied over the last step, as a vector: on body B, in world space when the translation is
+// locked on every axis (a ball joint, Jolt's point constraint part); else along the constraint frame's axes.
+Vector3 JoltGeneric6DOFJoint3D::get_applied_force_vector() const {
+	JPH::SixDOFConstraint *constraint = static_cast<JPH::SixDOFConstraint *>(jolt_ref.GetPtr());
+	ERR_FAIL_NULL_V(constraint, Vector3());
+
+	JoltSpace3D *space = get_space();
+	ERR_FAIL_NULL_V(space, Vector3());
+
+	const float last_step = space->get_last_step();
+	if (unlikely(last_step == 0.0f)) {
+		return Vector3();
+	}
+
+	const JPH::Vec3 total_lambda = constraint->GetTotalLambdaPosition() + constraint->GetTotalLambdaMotorTranslation();
+
+	return to_godot(total_lambda) / last_step;
+}
+
 float JoltGeneric6DOFJoint3D::get_applied_torque() const {
 	JPH::SixDOFConstraint *constraint = static_cast<JPH::SixDOFConstraint *>(jolt_ref.GetPtr());
 	ERR_FAIL_NULL_V(constraint, 0.0f);
