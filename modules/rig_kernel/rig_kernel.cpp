@@ -659,6 +659,8 @@ PackedFloat32Array RigKernel::sole_touch() {
 		}
 		const Vector3 nf = xform[foot_i].basis.get_column(1).normalized();
 		const double align = Math::pow(CLAMP((nf.dot(ng) - sole.eta) / (1.0 - sole.eta), 0.0, 1.0), sole.beta);
+		// The centre summed about the foot's origin: world positions hundreds of metres out lose it in floats.
+		const Vector3 o = xform[foot_i].origin;
 		double wsum = 0.0, touching = 0.0;
 		Vector3 c;
 		for (int i = 0; i < n; i++) {
@@ -666,7 +668,7 @@ PackedFloat32Array RigKernel::sole_touch() {
 			const double w = gap > sole.gap_max ? 0.0 : align * Math::exp(-MAX(gap - sole.gap_min, 0.0) / tau);
 			wsum += w;
 			touching += w > sole.area_w ? 1.0 : 0.0;
-			c += pts[i] * real_t(w);
+			c += (pts[i] - o) * real_t(w);
 		}
 		// The load: the ground's force on the foot and its toes, along the ground's normal, over the body's weight.
 		double load = 0.0;
@@ -682,7 +684,7 @@ PackedFloat32Array RigKernel::sole_touch() {
 		}
 		float px = 0.0f, pz = 0.0f;
 		if (load > sole.cop_min && wsum > 0.0) {
-			const Vector3 local = xform[foot_i].affine_inverse().xform(c / wsum);
+			const Vector3 local = xform[foot_i].basis.inverse().xform(c / real_t(wsum));
 			px = CLAMP(local.x / sole.half.x, -1.0, 1.0);
 			pz = CLAMP((local.z - sole.centre_z) / sole.half.y, -1.0, 1.0);
 		}
