@@ -795,9 +795,31 @@ void RigKernel::set_drive_gains(const PackedFloat64Array &p_kp, const PackedFloa
 // times the episode's strength (ankle_excess's estimate, over every driven axis; the targets as write_targets writes
 // them), times the joint's rate, its magnitude summed (amp_env.gd _effort_script).
 double RigKernel::effort(const PackedFloat32Array &p_action) const {
-	ERR_FAIL_COND_V_MSG(drive_kp.size() != drives.size(), 0.0, "set_drive_gains() first.");
-	ERR_FAIL_COND_V(p_action.size() != action_size, 0.0);
-	double e = 0.0;
+	const PackedFloat64Array pn = effort_parts(p_action);
+	return pn.size() == 2 ? pn[0] + pn[1] : 0.0;
+}
+
+// The charge's net form (ProjectEX 2026-10-13, amp_env.gd effort_net_of): the positive power past the lift (the
+// mass times gravity times the COM's rate up), plus rc.effort_net times the negative power past the descent's.
+double RigKernel::effort_net_of(const PackedFloat32Array &p_action) const {
+	const PackedFloat64Array pn = effort_parts(p_action);
+	if (pn.size() != 2) {
+		return 0.0;
+	}
+	double m = 0.0;
+	for (int i = 0; i < masses.size(); i++) {
+		m += double(masses[i]);
+	}
+	const double lift = m * rc.gravity * double(com_vel.y);
+	return MAX(pn[0] - MAX(lift, 0.0), 0.0) + rc.effort_net * MAX(pn[1] - MAX(-lift, 0.0), 0.0);
+}
+
+// effort()'s power split: [0] the positive (a drive pushing along its joint's rate), [1] the negative (braking it), W.
+PackedFloat64Array RigKernel::effort_parts(const PackedFloat32Array &p_action) const {
+	PackedFloat64Array out;
+	ERR_FAIL_COND_V_MSG(drive_kp.size() != drives.size(), out, "set_drive_gains() first.");
+	ERR_FAIL_COND_V(p_action.size() != action_size, out);
+	double pos = 0.0, neg = 0.0;
 	int k = 0;
 	for (int i = 0; i < drives.size(); i++) {
 		const Drive &d = drives[i];
@@ -814,10 +836,17 @@ double RigKernel::effort(const PackedFloat32Array &p_action) const {
 		const double cap = drive_cap[i] * (i < drive_group.size() ? strengths[CLAMP(drive_group[i], 0, 1)] : strength);
 		for (int axis : d.axes) {
 			const double tau = CLAMP(drive_kp[i] * (double(t[axis]) - double(rv[axis])) - drive_kd[i] * double(rel[axis]), -cap, cap);
-			e += Math::abs(tau * double(rel[axis]));
+			const double power = tau * double(rel[axis]);
+			if (power > 0.0) {
+				pos += power;
+			} else {
+				neg -= power;
+			}
 		}
 	}
-	return e;
+	out.push_back(pos);
+	out.push_back(neg);
+	return out;
 }
 
 // The legs' (with the trunk and neck) and the arms' strength k (one value: both); strength becomes the legs'.
@@ -964,6 +993,7 @@ void RigKernel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_assist_level"), &RigKernel::get_assist_level);
 	ClassDB::bind_method(D_METHOD("get_strength"), &RigKernel::get_strength);
 	ClassDB::bind_method(D_METHOD("effort", "action"), &RigKernel::effort);
+	ClassDB::bind_method(D_METHOD("effort_parts", "action"), &RigKernel::effort_parts);
 	ClassDB::bind_method(D_METHOD("balance", "support", "height"), &RigKernel::balance);
 	ClassDB::bind_method(D_METHOD("set_reward_config", "config"), &RigKernel::set_reward_config);
 	ClassDB::bind_method(D_METHOD("reset_terms", "wy_mean", "features", "pelvis_prev", "g_pelvis"), &RigKernel::reset_terms);

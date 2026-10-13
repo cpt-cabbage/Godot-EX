@@ -187,6 +187,7 @@ class RigKernel : public RefCounted {
 		bool stride_constraint = false; // the stride cost reported (step_terms' stride_x), not subtracted: train.py's multiplier applies it (amp_env.gd stride_constraint)
 		int effort_dim = 0; // the effort weight observed (ProjectEX run61, amp_env.gd effort_weight): observation_full ends with it
 		double effort_ref = 1200.0; // W: the weight charges effort() over this each step (run60's measured mean, 1170 W)
+		double effort_net = -1.0; // the charge's net form (ProjectEX 2026-10-13, amp_env.gd effort_net): effort_parts' positive power past the lift (the mass times gravity times the COM's rate up) plus this times the negative past the descent's; negative: effort()
 		int surface = 0; // the surface channel (ProjectEX run61, amp_env.gd surface): the last this many scan points' friction, after the senses
 		int brace_dim = 0; // the brace's level and button observed (ProjectEX run61, amp_env.gd brace_levels): observation_full ends with them
 		int assist_dim = 0; // the assist's level observed (ProjectEX run61, amp_env.gd assist_level): observation_full ends with it
@@ -362,6 +363,8 @@ public:
 	double get_effort_weight() const { return effort_weight; }
 	double get_strength() const { return strength; }
 	double effort(const PackedFloat32Array &p_action) const;
+	PackedFloat64Array effort_parts(const PackedFloat32Array &p_action) const;
+	double effort_net_of(const PackedFloat32Array &p_action) const;
 	PackedFloat32Array balance(const PackedInt32Array &p_support, double p_height) const;
 
 	// The whole step (reward_step): see the class reference.

@@ -83,6 +83,7 @@ void RigKernel::set_reward_config(const Dictionary &p_config) {
 	i("brace_dim", rc.brace_dim);
 	i("surface", rc.surface);
 	f("effort_ref", rc.effort_ref);
+	f("effort_net", rc.effort_net);
 	i("trunks", rc.trunks);
 	f("trunk_range", rc.trunk_range);
 	f("fps", rc.fps);
@@ -637,7 +638,7 @@ PackedFloat32Array RigKernel::reward_step(const Vector3 &p_command, int p_style,
 		st[13] = float(terrain->grade(_rel(com_p), Vector2(d.x, d.z).normalized()));
 	}
 	if (rc.effort || effort_weight > 0.0) { // the effort weight's charge (run61): its share of the joints' power over effort_ref
-		const double e = effort(p_action);
+		const double e = rc.effort_net >= 0.0 ? effort_net_of(p_action) : effort(p_action); // the net form (2026-10-13) or the absolute
 		st[15] = float(e);
 		r -= effort_weight * e / MAX(rc.effort_ref, 1.0);
 	}
