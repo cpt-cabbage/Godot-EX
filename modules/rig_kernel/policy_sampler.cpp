@@ -64,6 +64,12 @@ void PolicySampler::set_layers(const PackedInt32Array &p_shapes, const PackedFlo
 		ERR_FAIL_COND_MSG(k + l.inputs * l.outputs + l.outputs > p_parameters.size(), "Too few parameters for the layers.");
 		l.weight.resize(l.inputs * l.outputs);
 		memcpy(l.weight.ptr(), p_parameters.ptr() + k, sizeof(float) * l.weight.size());
+		l.weight_t.resize(l.inputs * l.outputs);
+		for (int o = 0; o < l.outputs; o++) {
+			for (int i = 0; i < l.inputs; i++) {
+				l.weight_t[i * l.outputs + o] = l.weight[o * l.inputs + i];
+			}
+		}
 		k += l.weight.size();
 		l.bias.resize(l.outputs);
 		memcpy(l.bias.ptr(), p_parameters.ptr() + k, sizeof(float) * l.outputs);
@@ -114,14 +120,41 @@ const float *PolicySampler::_forward(const float *p_obs, int p_rows) {
 #ifdef __APPLE__
 		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, p_rows, l.outputs, l.inputs, 1.0f, a, l.inputs, l.weight.ptr(), l.inputs, 0.0f, y, l.outputs);
 #else
-		for (int r = 0; r < p_rows; r++) {
-			for (int o = 0; o < l.outputs; o++) {
-				float s = 0.0f;
-				const float *w = l.weight.ptr() + o * l.inputs;
-				for (int i = 0; i < l.inputs; i++) {
-					s += a[r * l.inputs + i] * w[i];
+		// Each output's sum input by input from 0, as a dot product would take it, but with the inner loop along the
+		// outputs (a row of the transposed weight), which compilers vectorise: the dot product's one accumulator was
+		// a chain (~3.6 ms a 64-rig step on the PC, 2026-10-13). Four observations at a time share each row's loads.
+		const float *wt = l.weight_t.ptr();
+		const int n = l.outputs;
+		int r = 0;
+		for (; r + 4 <= p_rows; r += 4) {
+			float *y0 = y + r * n, *y1 = y0 + n, *y2 = y1 + n, *y3 = y2 + n;
+			const float *a0 = a + r * l.inputs, *a1 = a0 + l.inputs, *a2 = a1 + l.inputs, *a3 = a2 + l.inputs;
+			for (int o = 0; o < n; o++) {
+				y0[o] = y1[o] = y2[o] = y3[o] = 0.0f;
+			}
+			for (int i = 0; i < l.inputs; i++) {
+				const float v0 = a0[i], v1 = a1[i], v2 = a2[i], v3 = a3[i];
+				const float *w = wt + i * n;
+				for (int o = 0; o < n; o++) {
+					y0[o] += v0 * w[o];
+					y1[o] += v1 * w[o];
+					y2[o] += v2 * w[o];
+					y3[o] += v3 * w[o];
 				}
-				y[r * l.outputs + o] = s;
+			}
+		}
+		for (; r < p_rows; r++) {
+			float *yr = y + r * n;
+			const float *ar = a + r * l.inputs;
+			for (int o = 0; o < n; o++) {
+				yr[o] = 0.0f;
+			}
+			for (int i = 0; i < l.inputs; i++) {
+				const float v = ar[i];
+				const float *w = wt + i * n;
+				for (int o = 0; o < n; o++) {
+					yr[o] += v * w[o];
+				}
 			}
 		}
 #endif
