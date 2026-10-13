@@ -51,6 +51,7 @@ class PolicySampler : public RefCounted {
 		int inputs = 0;
 		int outputs = 0;
 		LocalVector<float> weight; // outputs x inputs, row-major (PyTorch's nn.Linear)
+		LocalVector<float> weight_t; // inputs x outputs: _forward's product off Apple, its inner loop along the outputs
 		LocalVector<float> bias;
 	};
 
