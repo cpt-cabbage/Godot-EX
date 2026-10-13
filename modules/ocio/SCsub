@@ -104,6 +104,9 @@ if env["builtin_opencolorio"]:
         env_ocio.Append(CPPDEFINES=["OpenColorIO_SKIP_IMPORTS"])
 
     env_thirdparty = enable_exceptions(env_ocio.Clone())
+    if env["platform"] == "windows":
+        # As OCIO's own build on Windows: its SystemMonitor takes std::tstring (Platform.h) as std::wstring.
+        env_thirdparty.Append(CPPDEFINES=["UNICODE", "_UNICODE"])
     env_thirdparty.force_optimization_on_debug()
     env_thirdparty.disable_warnings()
     env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
