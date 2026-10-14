@@ -267,7 +267,7 @@ BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_static_blas_flags(
 
 BitField<RD::AccelerationStructureFlagBits> RaytracingScene::_deforming_blas_flags() {
 	static const bool hints = _as_usage_hint("deform");
-	BitField<RD::AccelerationStructureFlagBits> flags;
+	BitField<RD::AccelerationStructureFlagBits> flags = {}; // Zeroed: BitField's default constructor leaves it unset (garbage bits broke NVIDIA's builds).
 	if (hints) {
 		flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		flags.set_flag(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
