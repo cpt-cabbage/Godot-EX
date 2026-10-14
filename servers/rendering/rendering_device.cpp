@@ -465,6 +465,9 @@ BitField<RDD::BufferUsageBits> RenderingDevice::_creation_to_usage_bits(BitField
 				"The GPU doesn't support acceleration structure build input flag.");
 #endif
 		usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		// Vulkan reads build inputs by device address, which needs the address usage (VUID-VkBufferDeviceAddressInfo-buffer-02601;
+		// without it NVIDIA's AS builds read garbage and lose the device). Metal ignores the bit.
+		usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
 
 	return usage;
@@ -1548,6 +1551,9 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 				"The GPU doesn't support acceleration structure build input flag.");
 #endif
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		// Vulkan reads build inputs by device address, which needs the address usage (VUID-VkBufferDeviceAddressInfo-buffer-02601;
+		// without it NVIDIA's AS builds read garbage and lose the device). Metal ignores the bit.
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
 
 	buffer.alloc_type = _get_buffer_alloc_type(!p_data.is_empty(), Thread::get_caller_id());
@@ -3941,6 +3947,9 @@ RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p
 	}
 	if (p_creation_bits.has_flag(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		// Vulkan reads build inputs by device address, which needs the address usage (VUID-VkBufferDeviceAddressInfo-buffer-02601;
+		// without it NVIDIA's AS builds read garbage and lose the device). Metal ignores the bit.
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
 
 	buffer.alloc_type = _get_buffer_alloc_type(!p_data.is_empty(), Thread::get_caller_id());
@@ -4159,6 +4168,9 @@ RID RenderingDevice::index_buffer_create(uint32_t p_index_count, IndexBufferForm
 	}
 	if (p_creation_bits.has_flag(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
 		index_buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		// Vulkan reads build inputs by device address, which needs the address usage (VUID-VkBufferDeviceAddressInfo-buffer-02601;
+		// without it NVIDIA's AS builds read garbage and lose the device). Metal ignores the bit.
+		index_buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
 
 	index_buffer.alloc_type = _get_buffer_alloc_type(!p_data.is_empty(), Thread::get_caller_id());
