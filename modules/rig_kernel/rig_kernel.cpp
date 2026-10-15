@@ -126,9 +126,18 @@ void RigKernel::update() {
 	Vector3 v;
 	real_t m = 0.0f;
 	for (int i = 0; i < bodies.size(); i++) {
-		xform.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_TRANSFORM);
-		lin_vel.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_LINEAR_VELOCITY);
-		ang_vel.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_ANGULAR_VELOCITY);
+		// The direct state's accessors: body_get_state's same reads (the Jolt body's) without its three Variants a body
+		// (a Transform3D's on the heap; ProjectEX 2026-10-15).
+		const PhysicsDirectBodyState3D *st = ps->body_get_direct_state(bodies[i]);
+		if (st != nullptr) {
+			xform.write[i] = st->get_transform();
+			lin_vel.write[i] = st->get_linear_velocity();
+			ang_vel.write[i] = st->get_angular_velocity();
+		} else {
+			xform.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_TRANSFORM);
+			lin_vel.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_LINEAR_VELOCITY);
+			ang_vel.write[i] = ps->body_get_state(bodies[i], PS3DE::BODY_STATE_ANGULAR_VELOCITY);
+		}
 		p += xform[i].origin * masses[i];
 		v += lin_vel[i] * masses[i];
 		m += masses[i];
