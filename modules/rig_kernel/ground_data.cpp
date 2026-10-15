@@ -277,6 +277,13 @@ float GroundData::cast_down_cached(const Vector3 &p_from, float p_length, Bucket
 	const LocalVector<int> *cell = r_cache.cell;
 	if (cell != nullptr) {
 		for (const int i : *cell) {
+			// The vertical ray against the prop's world box first, widened over its rounding: most of a bucket's props
+			// miss a point, and the exact test runs for every one that might not (ProjectEX 2026-10-15).
+			const AABB &a = props[i].aabb;
+			if (p_from.x < a.position.x - PROP_MARGIN || p_from.x > a.position.x + a.size.x + PROP_MARGIN || p_from.z < a.position.z - PROP_MARGIN || p_from.z > a.position.z + a.size.z + PROP_MARGIN ||
+					p_from.y < a.position.y - PROP_MARGIN || p_from.y - p_length > a.position.y + a.size.y + PROP_MARGIN) {
+				continue;
+			}
 			if (_prop_hit(props[i], p_from, p_length, y) && y > best) {
 				best = y;
 			}

@@ -74,6 +74,7 @@ class GroundData : public RefCounted {
 	LocalVector<Prop> props;
 	HashMap<int64_t, LocalVector<int>> buckets; // prop indices by BUCKET-sized cell of their bounds in x and z
 	static constexpr float BUCKET = 2.0f;
+	static constexpr float PROP_MARGIN = 0.01f; // cast_down's box pre-test, over the box's rounding
 	// The trunks (nearest_trunks' props) by the BUCKET-sized cell of their centre, each once, and the
 	// largest's radius: the search visits the trunks alone (among a terrain's thousands of rocks).
 	HashMap<int64_t, LocalVector<int>> trunk_buckets;
