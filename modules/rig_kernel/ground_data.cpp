@@ -69,7 +69,7 @@ float GroundData::friction_at(const Vector3 &p_point) const {
 	if (!has_field || field_cells.is_empty()) {
 		return Math::NaN;
 	}
-	const Vector3 s = field_xform.basis.get_scale_abs();
+	const Vector3 &s = field_scale;
 	const Vector3 &o = field_xform.origin;
 	const float fx = (p_point.x - o.x) / s.x + 0.5f * (field_width - 1);
 	const float fz = (p_point.z - o.z) / s.z + 0.5f * (field_depth - 1);
@@ -97,6 +97,7 @@ void GroundData::set_height_field_transform(const Transform3D &p_xform) {
 	ERR_FAIL_COND_MSG(!Math::is_zero_approx(b.rows[0][1]) || !Math::is_zero_approx(b.rows[0][2]) || !Math::is_zero_approx(b.rows[1][0]) || !Math::is_zero_approx(b.rows[1][2]) || !Math::is_zero_approx(b.rows[2][0]) || !Math::is_zero_approx(b.rows[2][1]),
 			"The height field's transform must be a scale and a translation (no rotation).");
 	field_xform = p_xform;
+	field_scale = p_xform.basis.get_scale_abs();
 }
 
 void GroundData::clear_props() {
@@ -152,7 +153,7 @@ bool GroundData::_field_hit(const Vector3 &p_from, float p_length, float &r_y) c
 	if (!has_field) {
 		return false;
 	}
-	const Vector3 s = field_xform.basis.get_scale_abs();
+	const Vector3 &s = field_scale;
 	const Vector3 &o = field_xform.origin;
 	const float fx = (p_from.x - o.x) / s.x + 0.5f * (field_width - 1);
 	const float fz = (p_from.z - o.z) / s.z + 0.5f * (field_depth - 1);
@@ -256,12 +257,24 @@ bool GroundData::_prop_hit(const Prop &p_prop, const Vector3 &p_from, float p_le
 }
 
 float GroundData::cast_down(const Vector3 &p_from, float p_length) const {
+	BucketCache cache;
+	return cast_down_cached(p_from, p_length, cache);
+}
+
+float GroundData::cast_down_cached(const Vector3 &p_from, float p_length, BucketCache &r_cache) const {
 	float best = -Math::INF;
 	float y;
 	if (_field_hit(p_from, p_length, y)) {
 		best = y;
 	}
-	const LocalVector<int> *cell = buckets.getptr(_bucket_key(int(Math::floor(p_from.x / BUCKET)), int(Math::floor(p_from.z / BUCKET))));
+	const int bx = int(Math::floor(p_from.x / BUCKET));
+	const int bz = int(Math::floor(p_from.z / BUCKET));
+	if (bx != r_cache.x || bz != r_cache.z) {
+		r_cache.x = bx;
+		r_cache.z = bz;
+		r_cache.cell = buckets.getptr(_bucket_key(bx, bz));
+	}
+	const LocalVector<int> *cell = r_cache.cell;
 	if (cell != nullptr) {
 		for (const int i : *cell) {
 			if (_prop_hit(props[i], p_from, p_length, y) && y > best) {
@@ -276,8 +289,9 @@ PackedFloat32Array GroundData::cast_down_batch(const PackedVector3Array &p_from,
 	PackedFloat32Array out;
 	out.resize(p_from.size());
 	float *o = out.ptrw();
+	BucketCache cache;
 	for (int i = 0; i < p_from.size(); i++) {
-		o[i] = cast_down(p_from[i], p_length);
+		o[i] = cast_down_cached(p_from[i], p_length, cache);
 	}
 	return out;
 }
