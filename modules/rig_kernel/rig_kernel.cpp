@@ -219,8 +219,9 @@ float RigKernel::ground(const Vector3 &p_point) const {
 // as _ground_from's); false without that server method, and the caller casts its own.
 bool RigKernel::_static_ground_batch(const PackedVector3Array &p_points, float p_up, float *r_heights) const {
 	if (ground_data.is_valid() && ground_data->is_enabled()) {
+		GroundData::BucketCache cache;
 		for (int i = 0; i < p_points.size(); i++) {
-			const float h = ground_data->cast_down(p_points[i] + Vector3(0, p_up, 0), p_up + 4.0f);
+			const float h = ground_data->cast_down_cached(p_points[i] + Vector3(0, p_up, 0), p_up + 4.0f, cache);
 			r_heights[i] = Math::is_nan(h) ? p_points[i].y - 1.0f : h;
 		}
 		return true;
@@ -253,6 +254,10 @@ bool RigKernel::_static_ground_batch(const PackedVector3Array &p_points, float p
 // The first hit of a ray from p_up above the point to 4 m below it; without one, 1 m below the point.
 float RigKernel::_ground_from(const Vector3 &p_point, float p_up) const {
 	ERR_FAIL_COND_V(bodies.is_empty(), p_point.y - 1.0f);
+	if (ground_data.is_valid() && ground_data->is_enabled()) { // _static_ground_batch's for one point, without its array on the heap
+		const float g = ground_data->cast_down(p_point + Vector3(0, p_up, 0), p_up + 4.0f);
+		return Math::is_nan(g) ? p_point.y - 1.0f : g;
+	}
 	float h = 0.0f;
 	if (_static_ground_batch(PackedVector3Array({ p_point }), p_up, &h)) {
 		return h;
@@ -306,15 +311,20 @@ PackedFloat32Array RigKernel::observation(const PackedFloat32Array &p_action, co
 	o[k++] = contact(0) ? 1.0f : 0.0f;
 	o[k++] = contact(1) ? 1.0f : 0.0f;
 	if (p_scan) {
-		PackedVector3Array points;
+		PackedVector3Array points; // sized once: a push_back a point was ~15 % of the observation's own time (2026-10-15)
 		if (!scan_points.is_empty()) {
-			for (const Vector2 &q : scan_points) {
-				points.push_back(pt.origin + heading.xform(Vector3(q.x, 0, q.y)));
+			points.resize(scan_points.size());
+			Vector3 *pw = points.ptrw();
+			for (int i = 0; i < scan_points.size(); i++) {
+				pw[i] = pt.origin + heading.xform(Vector3(scan_points[i].x, 0, scan_points[i].y));
 			}
 		} else {
+			points.resize(scan_z.size() * scan_x.size());
+			Vector3 *pw = points.ptrw();
+			int i = 0;
 			for (int iz = 0; iz < scan_z.size(); iz++) {
 				for (int ix = 0; ix < scan_x.size(); ix++) {
-					points.push_back(pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz])));
+					pw[i++] = pt.origin + heading.xform(Vector3(scan_x[ix], 0, scan_z[iz]));
 				}
 			}
 		}

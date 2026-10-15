@@ -63,6 +63,7 @@ class GroundData : public RefCounted {
 	bool enabled = true;
 	bool has_field = false;
 	Transform3D field_xform; // the height field's collision shape's, scale included (axis-aligned)
+	Vector3 field_scale = Vector3(1, 1, 1); // field_xform's scale, kept with it (_field_hit's every call took its three square roots)
 	int field_width = 0;
 	int field_depth = 0;
 	LocalVector<float> field;
@@ -134,5 +135,13 @@ public:
 
 	// The first surface straight down from p_from within p_length (its y), or NaN.
 	float cast_down(const Vector3 &p_from, float p_length) const;
+	// cast_down for many points: a prop bucket's lookup kept while the points stay in it (the height scan's points lie
+	// close together); the same heights as cast_down's.
+	struct BucketCache {
+		int x = INT32_MIN;
+		int z = INT32_MIN;
+		const LocalVector<int> *cell = nullptr;
+	};
+	float cast_down_cached(const Vector3 &p_from, float p_length, BucketCache &r_cache) const;
 	PackedFloat32Array cast_down_batch(const PackedVector3Array &p_from, float p_length) const;
 };
