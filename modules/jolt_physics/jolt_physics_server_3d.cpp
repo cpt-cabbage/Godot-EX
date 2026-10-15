@@ -49,6 +49,7 @@
 #include "shapes/jolt_sphere_shape_3d.h"
 #include "shapes/jolt_world_boundary_shape_3d.h"
 #include "spaces/jolt_job_system.h"
+#include "spaces/jolt_contact_listener_3d.h"
 #include "spaces/jolt_physics_direct_space_state_3d.h"
 #include "spaces/jolt_space_3d.h"
 #include "misc/jolt_type_conversions.h"
@@ -96,6 +97,7 @@ void JoltPhysicsServer3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("space_cast_static_ground", "space", "from", "length", "collision_mask"), &JoltPhysicsServer3D::space_cast_static_ground);
 	ClassDB::bind_method(D_METHOD("generic_6dof_joint_get_applied_force_vector", "joint"), &JoltPhysicsServer3D::generic_6dof_joint_get_applied_force_vector);
+	ClassDB::bind_method(D_METHOD("set_contact_impulses", "enabled"), &JoltPhysicsServer3D::set_contact_impulses);
 
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_FREQUENCY);
 	BIND_ENUM_CONSTANT(HINGE_JOINT_LIMIT_SPRING_DAMPING);
@@ -2242,4 +2244,8 @@ PackedFloat32Array JoltPhysicsServer3D::space_cast_static_ground(RID p_space, co
 		out[i] = collector.HadHit() ? (float)ray.GetPointOnRay(collector.mHit.mFraction).GetY() : NAN;
 	}
 	return heights;
+}
+
+void JoltPhysicsServer3D::set_contact_impulses(bool p_enabled) {
+	JoltContactListener3D::estimate_impulses = p_enabled;
 }

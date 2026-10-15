@@ -90,6 +90,13 @@ class JoltContactListener3D final
 
 	static bool _manifold_deeper(const Manifold &p_a, const Manifold &p_b);
 
+public:
+	// Godot-EX: the reported contacts' impulses estimated (EstimateCollisionResponse, a manifold each), else zero; the
+	// simulation never reads them (JoltPhysicsServer3D.set_contact_impulses; training's servers turn it off).
+	inline static bool estimate_impulses = true;
+
+private:
+
 	struct ThreadLocals {
 		SelfList<ThreadLocals> instances_element;
 
