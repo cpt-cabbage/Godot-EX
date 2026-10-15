@@ -70,6 +70,12 @@ class JoltSpace3D {
 	LocalVector<JPH::BodyID> pending_objects_sleeping;
 	LocalVector<JPH::BodyID> pending_objects_awake;
 
+public:
+	// Godot-EX: whether set_is_object_sleeping put the body to sleep pending (JoltBody3D::set_is_sleeping's shortcut).
+	bool is_object_sleep_pending(const JPH::BodyID &p_jolt_id) const { return pending_objects_sleeping.has(p_jolt_id); }
+
+private:
+
 	RID rid;
 
 	JPH::JobSystem *job_system = nullptr;

@@ -200,10 +200,13 @@ bool JoltContactListener3D::_try_add_contacts(const JPH::Body &p_jolt_body1, con
 	manifold.depth = p_manifold.mPenetrationDepth;
 
 	JPH::CollisionEstimationResult collision;
-	JPH::EstimateCollisionResponse(p_jolt_body1, p_jolt_body2, p_manifold, collision, p_settings.mCombinedFriction, p_settings.mCombinedRestitution, JoltProjectSettings::bounce_velocity_threshold, 5);
+	const bool impulses = estimate_impulses;
+	if (impulses) {
+		JPH::EstimateCollisionResponse(p_jolt_body1, p_jolt_body2, p_manifold, collision, p_settings.mCombinedFriction, p_settings.mCombinedRestitution, JoltProjectSettings::bounce_velocity_threshold, 5);
+	}
 
-	const JPH::Vec3 friction_impulse1 = contact_count > 0 ? (collision.mTangent1 * collision.mFrictionImpulse1) / contact_count : JPH::Vec3::sZero();
-	const JPH::Vec3 friction_impulse2 = contact_count > 0 ? (collision.mTangent2 * collision.mFrictionImpulse2) / contact_count : JPH::Vec3::sZero();
+	const JPH::Vec3 friction_impulse1 = impulses && contact_count > 0 ? (collision.mTangent1 * collision.mFrictionImpulse1) / contact_count : JPH::Vec3::sZero();
+	const JPH::Vec3 friction_impulse2 = impulses && contact_count > 0 ? (collision.mTangent2 * collision.mFrictionImpulse2) / contact_count : JPH::Vec3::sZero();
 
 	manifold.contacts.resize(contact_count);
 
@@ -217,7 +220,7 @@ bool JoltContactListener3D::_try_add_contacts(const JPH::Body &p_jolt_body1, con
 		const JPH::Vec3 velocity1 = p_jolt_body1.GetPointVelocity(world_point1);
 		const JPH::Vec3 velocity2 = p_jolt_body2.GetPointVelocity(world_point2);
 
-		const JPH::Vec3 contact_impulse = p_manifold.mWorldSpaceNormal * collision.mContactImpulse[i];
+		const JPH::Vec3 contact_impulse = impulses ? p_manifold.mWorldSpaceNormal * collision.mContactImpulse[i] : JPH::Vec3::sZero();
 		const JPH::Vec3 combined_impulse = contact_impulse + friction_impulse1 + friction_impulse2;
 
 		Contact &contact = manifold.contacts[i];

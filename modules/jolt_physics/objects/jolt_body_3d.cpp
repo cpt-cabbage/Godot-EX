@@ -693,6 +693,9 @@ bool JoltBody3D::is_sleep_actually_allowed() const {
 void JoltBody3D::set_is_sleeping(bool p_enabled) {
 	if (!in_space()) {
 		sleep_initially = p_enabled;
+	} else if (!p_enabled && jolt_body->IsActive() && !space->is_object_sleep_pending(jolt_body->GetID())) {
+		// Godot-EX: awake already and no sleep pending, where ActivateBody does nothing: without its body lookup (a
+		// joint's motor target wakes both its bodies at every set; ProjectEX 2026-10-15).
 	} else {
 		space->set_is_object_sleeping(jolt_body->GetID(), p_enabled);
 	}
