@@ -47,6 +47,7 @@ STATIC_ASSERT_INCOMPLETE_TYPE(class, RenderingServer);
 #include "scene/main/canvas_layer.h"
 #include "scene/main/scene_tree.h"
 #include "scene/main/window.h"
+#include "scene/resources/audio/audio_stream_randomizer.h"
 #include "scene/theme/theme_db.h"
 #include "scene/theme/theme_owner.h"
 #include "servers/display/accessibility_server.h"
@@ -89,8 +90,7 @@ public:
 
 // Editor plugin interoperability.
 
-// TODO: Decouple controls from their editor plugin and get rid of this.
-#ifdef TOOLS_ENABLED
+#ifdef DEBUG_ENABLED
 Dictionary Control::_edit_get_state() const {
 	Dictionary s;
 	s["rotation"] = get_rotation();
@@ -153,8 +153,14 @@ void Control::_edit_set_state(const Dictionary &p_state) {
 }
 
 void Control::_edit_set_position(const Point2 &p_position) {
-	ERR_FAIL_COND_MSG(!Engine::get_singleton()->is_editor_hint(), "This function can only be used from editor plugins.");
-	set_position(p_position, ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled() && get_parent_control());
+#ifdef TOOLS_ENABLED
+	if (Engine::get_singleton()->is_editor_hint()) {
+		set_position(p_position, ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled() && get_parent_control());
+	} else
+#endif
+	{
+		set_position(p_position);
+	}
 }
 
 Point2 Control::_edit_get_position() const {
@@ -170,13 +176,20 @@ Size2 Control::_edit_get_scale() const {
 }
 
 void Control::_edit_set_rect(const Rect2 &p_edit_rect) {
-	ERR_FAIL_COND_MSG(!Engine::get_singleton()->is_editor_hint(), "This function can only be used from editor plugins.");
 	// Changing the size might change the internal transform (in case of non-zero `pivot_offset_ratio`),
 	// hence `position` (which is in the parent space, and is not always equivalent to the Control's rect top-left corner)
 	// needs to be changed after `size` (which is local) and needs to account for the possibly changed internal transform.
 	Vector2 rect_new_pos_in_parent_space = get_transform().xform(p_edit_rect.position);
-	set_size(p_edit_rect.size, ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled());
-	set_position(rect_new_pos_in_parent_space - _get_internal_transform().get_origin(), ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled());
+#ifdef TOOLS_ENABLED
+	if (Engine::get_singleton()->is_editor_hint()) {
+		set_size(p_edit_rect.size, ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled());
+		set_position(rect_new_pos_in_parent_space - _get_internal_transform().get_origin(), ControlEditorToolbar::get_singleton()->is_anchors_mode_enabled());
+	} else
+#endif
+	{
+		set_size(p_edit_rect.size);
+		set_position(rect_new_pos_in_parent_space - _get_internal_transform().get_origin());
+	}
 }
 
 void Control::_edit_set_rotation(real_t p_rotation) {
@@ -210,9 +223,7 @@ bool Control::_edit_use_pivot() const {
 Size2 Control::_edit_get_minimum_size() const {
 	return get_combined_minimum_size();
 }
-#endif // TOOLS_ENABLED
 
-#ifdef DEBUG_ENABLED
 Rect2 Control::_edit_get_rect() const {
 	return Rect2(Point2(), get_size());
 }
@@ -1342,7 +1353,7 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 	ERR_FAIL_INDEX((int)p_resize_mode, 4);
 
 	// Calculate the size if the node is not resized
-	Size2 min_size = get_minimum_size();
+	Size2 min_size = get_bound_minimum_size();
 	Size2 new_size = get_size();
 	if (p_resize_mode == PRESET_MODE_MINSIZE || p_resize_mode == PRESET_MODE_KEEP_HEIGHT) {
 		new_size.x = min_size.x;
@@ -1367,21 +1378,21 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_LEFT_WIDE:
 		case PRESET_HCENTER_WIDE:
 		case PRESET_FULL_RECT:
-			data.offset[0] = x * (0.0 - data.anchor[0]) + p_margin + parent_rect.position.x;
+			data.offset[0] = x * (0.0 - data.anchor[0]) + p_margin;
 			break;
 
 		case PRESET_CENTER_TOP:
 		case PRESET_CENTER_BOTTOM:
 		case PRESET_CENTER:
 		case PRESET_VCENTER_WIDE:
-			data.offset[0] = x * (0.5 - data.anchor[0]) - new_size.x / 2 + parent_rect.position.x;
+			data.offset[0] = x * (0.5 - data.anchor[0]) - new_size.x / 2;
 			break;
 
 		case PRESET_TOP_RIGHT:
 		case PRESET_BOTTOM_RIGHT:
 		case PRESET_CENTER_RIGHT:
 		case PRESET_RIGHT_WIDE:
-			data.offset[0] = x * (1.0 - data.anchor[0]) - new_size.x - p_margin + parent_rect.position.x;
+			data.offset[0] = x * (1.0 - data.anchor[0]) - new_size.x - p_margin;
 			break;
 	}
 
@@ -1395,21 +1406,21 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_TOP_WIDE:
 		case PRESET_VCENTER_WIDE:
 		case PRESET_FULL_RECT:
-			data.offset[1] = parent_rect.size.y * (0.0 - data.anchor[1]) + p_margin + parent_rect.position.y;
+			data.offset[1] = parent_rect.size.y * (0.0 - data.anchor[1]) + p_margin;
 			break;
 
 		case PRESET_CENTER_LEFT:
 		case PRESET_CENTER_RIGHT:
 		case PRESET_CENTER:
 		case PRESET_HCENTER_WIDE:
-			data.offset[1] = parent_rect.size.y * (0.5 - data.anchor[1]) - new_size.y / 2 + parent_rect.position.y;
+			data.offset[1] = parent_rect.size.y * (0.5 - data.anchor[1]) - new_size.y / 2;
 			break;
 
 		case PRESET_BOTTOM_LEFT:
 		case PRESET_BOTTOM_RIGHT:
 		case PRESET_CENTER_BOTTOM:
 		case PRESET_BOTTOM_WIDE:
-			data.offset[1] = parent_rect.size.y * (1.0 - data.anchor[1]) - new_size.y - p_margin + parent_rect.position.y;
+			data.offset[1] = parent_rect.size.y * (1.0 - data.anchor[1]) - new_size.y - p_margin;
 			break;
 	}
 
@@ -1419,14 +1430,14 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_BOTTOM_LEFT:
 		case PRESET_CENTER_LEFT:
 		case PRESET_LEFT_WIDE:
-			data.offset[2] = x * (0.0 - data.anchor[2]) + new_size.x + p_margin + parent_rect.position.x;
+			data.offset[2] = x * (0.0 - data.anchor[2]) + new_size.x + p_margin;
 			break;
 
 		case PRESET_CENTER_TOP:
 		case PRESET_CENTER_BOTTOM:
 		case PRESET_CENTER:
 		case PRESET_VCENTER_WIDE:
-			data.offset[2] = x * (0.5 - data.anchor[2]) + new_size.x / 2 + parent_rect.position.x;
+			data.offset[2] = x * (0.5 - data.anchor[2]) + new_size.x / 2;
 			break;
 
 		case PRESET_TOP_RIGHT:
@@ -1437,7 +1448,7 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_BOTTOM_WIDE:
 		case PRESET_HCENTER_WIDE:
 		case PRESET_FULL_RECT:
-			data.offset[2] = x * (1.0 - data.anchor[2]) - p_margin + parent_rect.position.x;
+			data.offset[2] = x * (1.0 - data.anchor[2]) - p_margin;
 			break;
 	}
 
@@ -1447,14 +1458,14 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_TOP_RIGHT:
 		case PRESET_CENTER_TOP:
 		case PRESET_TOP_WIDE:
-			data.offset[3] = parent_rect.size.y * (0.0 - data.anchor[3]) + new_size.y + p_margin + parent_rect.position.y;
+			data.offset[3] = parent_rect.size.y * (0.0 - data.anchor[3]) + new_size.y + p_margin;
 			break;
 
 		case PRESET_CENTER_LEFT:
 		case PRESET_CENTER_RIGHT:
 		case PRESET_CENTER:
 		case PRESET_HCENTER_WIDE:
-			data.offset[3] = parent_rect.size.y * (0.5 - data.anchor[3]) + new_size.y / 2 + parent_rect.position.y;
+			data.offset[3] = parent_rect.size.y * (0.5 - data.anchor[3]) + new_size.y / 2;
 			break;
 
 		case PRESET_BOTTOM_LEFT:
@@ -1465,7 +1476,7 @@ void Control::set_offsets_preset(LayoutPreset p_preset, LayoutPresetMode p_resiz
 		case PRESET_BOTTOM_WIDE:
 		case PRESET_VCENTER_WIDE:
 		case PRESET_FULL_RECT:
-			data.offset[3] = parent_rect.size.y * (1.0 - data.anchor[3]) - p_margin + parent_rect.position.y;
+			data.offset[3] = parent_rect.size.y * (1.0 - data.anchor[3]) - p_margin;
 			break;
 	}
 
@@ -2154,7 +2165,7 @@ void Control::remove_child_notify(Node *p_child) {
 
 bool Control::is_layout_pending() const {
 	ERR_MAIN_THREAD_GUARD_V(false);
-	return data.layout_pending;
+	return data.layout_pending || !is_inside_tree() || !is_visible_in_tree();
 }
 
 bool Control::is_layout_pending_in_tree() const {
@@ -2192,6 +2203,18 @@ Control *Control::get_layout_pending_control_in_tree() const {
 }
 
 void Control::call_on_all_layout_pending_finished(const Callable &p_callable) {
+	if (!is_inside_tree()) {
+		Callable recheck(memnew(LayoutRecheckCallable(get_instance_id(), p_callable)));
+		connect(SceneStringName(tree_entered), recheck, CONNECT_ONE_SHOT);
+		return;
+	}
+
+	if (!is_visible_in_tree()) {
+		Callable recheck(memnew(LayoutRecheckCallable(get_instance_id(), p_callable)));
+		connect(SceneStringName(visibility_changed), recheck, CONNECT_ONE_SHOT);
+		return;
+	}
+
 	Control *pending_control = get_layout_pending_control_in_tree();
 	if (pending_control != nullptr) {
 		Callable recheck(memnew(LayoutRecheckCallable(get_instance_id(), p_callable)));
@@ -3113,11 +3136,23 @@ void Control::release_focus() {
 
 void Control::play_theme_sound(const Ref<AudioStream> &p_stream) {
 	ERR_MAIN_THREAD_GUARD;
-	if (p_stream.is_null() || p_stream->get_length() == 0 || !get_tree()) {
+	if (p_stream.is_null() || !get_tree()) {
 		return;
 	}
 
-	get_tree()->play_theme_sound(p_stream);
+	// Ignore playback attempt if the sound has no length, so that empty AudioStream resources
+	// can be used to disable sounds on specific controls using theme overrides.
+	// Without this check, no sound would be played, but a
+	// "Failed to instantiate playback." error would also be printed.
+	bool sound_no_length = false;
+	if (!Object::cast_to<AudioStreamRandomizer>(p_stream.ptr())) {
+		// AudioStreamRandomizer has no length defined.
+		sound_no_length = p_stream->get_length() == 0;
+	}
+
+	if (!sound_no_length) {
+		get_tree()->play_theme_sound(p_stream);
+	}
 }
 
 static Control *_next_control(Control *p_from) {
@@ -4997,6 +5032,8 @@ void Control::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("find_prev_valid_focus"), &Control::find_prev_valid_focus);
 	ClassDB::bind_method(D_METHOD("find_next_valid_focus"), &Control::find_next_valid_focus);
 	ClassDB::bind_method(D_METHOD("find_valid_focus_neighbor", "side"), &Control::find_valid_focus_neighbor);
+
+	ClassDB::bind_method(D_METHOD("play_theme_sound", "stream"), &Control::play_theme_sound);
 
 	ClassDB::bind_method(D_METHOD("set_h_size_flags", "flags"), &Control::set_h_size_flags);
 	ClassDB::bind_method(D_METHOD("get_h_size_flags"), &Control::get_h_size_flags);

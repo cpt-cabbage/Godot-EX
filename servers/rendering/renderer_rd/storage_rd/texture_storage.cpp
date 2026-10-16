@@ -705,8 +705,7 @@ void TextureStorage::_tex_blit_shader_initialize() {
 		tex_blit_modes.push_back("\n#define USE_OUTPUT1\n#define USE_OUTPUT2\n"); // 3 Outputs
 		tex_blit_modes.push_back("\n#define USE_OUTPUT1\n#define USE_OUTPUT2\n#define USE_OUTPUT3\n"); // 4 Outputs
 		String global_defines;
-		global_defines += "\n#define SAMPLERS_BINDING_FIRST_INDEX " + itos(SAMPLERS_BINDING_FIRST_INDEX) + "\n";
-		global_defines += "#define MAX_GLOBAL_SHADER_UNIFORMS 256\n"; // TODO: this is arbitrary for now
+		global_defines += "\n#define SAMPLERS_BINDING_FIRST_INDEX " + itos(BLIT_TEXTURE_SAMPLERS_BINDING_FIRST_INDEX) + "\n";
 		tex_blit_shader.shader.initialize(tex_blit_modes, global_defines);
 	}
 	material_storage->shader_set_data_request_function(MaterialStorage::SHADER_TYPE_TEXTURE_BLIT, MaterialStorage::_create_tex_blit_shader_funcs);
@@ -734,6 +733,7 @@ void TextureStorage::_tex_blit_shader_initialize() {
 		actions.base_uniform_string = "material.";
 		actions.base_texture_binding_index = 1;
 		actions.texture_layout_set = 1;
+		actions.global_buffer_array_variable = "global_shader_uniforms.data";
 
 		tex_blit_shader.compiler.initialize(actions);
 	}
@@ -1768,7 +1768,7 @@ void TextureStorage::texture_drawable_blit_rect(const TypedArray<RID> &p_texture
 	int TEX_BLIT_TEXTURE_SET = 0;
 	int srgb_mask = 0;
 	const int srgbMaskArray[4] = { 1, 2, 4, 8 };
-	LocalVector<RD::Uniform> texture_uniforms;
+	LocalVector<RD::Uniform> uniforms;
 
 	int i = 0;
 	while (i < 4) {
@@ -1798,9 +1798,17 @@ void TextureStorage::texture_drawable_blit_rect(const TypedArray<RID> &p_texture
 		} else {
 			u.append_id(default_tex_rid);
 		}
-		texture_uniforms.push_back(u);
+		uniforms.push_back(u);
 
 		i += 1;
+	}
+
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 4;
+		u.append_id(RendererRD::MaterialStorage::get_singleton()->global_shader_uniforms_get_storage_buffer());
+		uniforms.push_back(u);
 	}
 
 	// Calculates the Rects Offset & Size in UV space for Shader to scale Vertex Quad correctly
@@ -1856,9 +1864,9 @@ void TextureStorage::texture_drawable_blit_rect(const TypedArray<RID> &p_texture
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(tex_blit_fb);
 	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipeline->get_render_pipeline(RD::INVALID_ID, fb_format, false, 0));
 
-	material_storage->samplers_rd_get_default().append_uniforms(texture_uniforms, 4);
+	material_storage->samplers_rd_get_default().append_uniforms(uniforms, BLIT_TEXTURE_SAMPLERS_BINDING_FIRST_INDEX);
 
-	uniform_texture_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shaderRD, TEX_BLIT_TEXTURE_SET, texture_uniforms);
+	uniform_texture_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shaderRD, TEX_BLIT_TEXTURE_SET, uniforms);
 
 	{
 		// Push Constants
@@ -2353,11 +2361,27 @@ uint64_t TextureStorage::texture_get_native_handle(RID p_texture, bool p_srgb) c
 	}
 }
 
-Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, TextureToRDFormat &r_format) {
-	Image::Format original_format = p_image->get_format();
-	Ref<Image> image = p_image->duplicate();
+static Ref<Image> duplicate_and_convert(const Ref<Image> &p_source_image, Image::Format p_format) {
+	Ref<Image> image = p_source_image->duplicate();
+	image->convert(p_format);
+	return image;
+}
 
-	switch (p_image->get_format()) {
+static Ref<Image> duplicate_decompress_and_convert(const Ref<Image> &p_source_image, Image::Format p_format) {
+	Ref<Image> image = p_source_image->duplicate();
+	image->decompress();
+	image->convert(p_format);
+	return image;
+}
+
+Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, TextureToRDFormat &r_format) {
+	const Image::Format original_format = p_image->get_format();
+
+	// Assume we have a supported format.  If the format is not supported it will be converted
+	// to a supported format for only those cases.
+	Ref<Image> image = p_image;
+
+	switch (original_format) {
 		case Image::FORMAT_L8: {
 			r_format.format = RD::DATA_FORMAT_R8_UNORM;
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
@@ -2395,7 +2419,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2446,7 +2470,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
-				image->convert(Image::FORMAT_RGBAF);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGBAF);
 			}
 
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
@@ -2485,7 +2509,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
@@ -2517,8 +2541,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2534,8 +2557,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2551,8 +2573,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2565,8 +2586,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8_UNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_R8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_R8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2580,8 +2600,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8_UNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_RG8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RG8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2597,8 +2616,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2612,8 +2630,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2626,8 +2643,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2640,8 +2656,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8_UNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_R8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_R8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2655,8 +2670,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8_SNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_R8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_R8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2669,8 +2683,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8_UNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_RG8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RG8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2683,8 +2696,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8_SNORM;
-				image->decompress();
-				image->convert(Image::FORMAT_RG8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RG8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2701,8 +2713,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2718,8 +2729,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2734,8 +2744,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2752,8 +2761,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
 				r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_b = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2769,8 +2777,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
 				r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
-				image->decompress();
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_b = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2782,10 +2789,9 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format_srgb = RD::DATA_FORMAT_ASTC_4x4_SRGB_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2798,9 +2804,8 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format = RD::DATA_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2814,10 +2819,9 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format_srgb = RD::DATA_FORMAT_ASTC_6x6_SRGB_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2830,9 +2834,8 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format = RD::DATA_FORMAT_ASTC_6x6_SFLOAT_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2846,10 +2849,9 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format_srgb = RD::DATA_FORMAT_ASTC_8x8_SRGB_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
 				r_format.format_srgb = RD::DATA_FORMAT_R8G8B8A8_SRGB;
-				image->convert(Image::FORMAT_RGBA8);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBA8);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2862,9 +2864,8 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				r_format.format = RD::DATA_FORMAT_ASTC_8x8_SFLOAT_BLOCK;
 			} else {
 				//not supported, reconvert
-				image->decompress();
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-				image->convert(Image::FORMAT_RGBAH);
+				image = duplicate_decompress_and_convert(p_image, Image::FORMAT_RGBAH);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2878,7 +2879,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				// Not supported, reconvert.
 				r_format.format = RD::DATA_FORMAT_R32_SFLOAT;
-				image->convert(Image::FORMAT_RF);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RF);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_ZERO;
@@ -2891,7 +2892,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				// Not supported, reconvert.
 				r_format.format = RD::DATA_FORMAT_R32G32_SFLOAT;
-				image->convert(Image::FORMAT_RGF);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGF);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2905,10 +2906,10 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 				// Not supported, reconvert.
 				if (RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R16G16B16A16_UNORM, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT)) {
 					r_format.format = RD::DATA_FORMAT_R16G16B16A16_UNORM;
-					image->convert(Image::FORMAT_RGBA16);
+					image = duplicate_and_convert(p_image, Image::FORMAT_RGBA16);
 				} else {
 					r_format.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
-					image->convert(Image::FORMAT_RGBAF);
+					image = duplicate_and_convert(p_image, Image::FORMAT_RGBAF);
 				}
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
@@ -2922,7 +2923,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				// Not supported, reconvert.
 				r_format.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
-				image->convert(Image::FORMAT_RGBAF);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGBAF);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;
@@ -2950,7 +2951,7 @@ Ref<Image> TextureStorage::_validate_texture_format(const Ref<Image> &p_image, T
 			} else {
 				//not supported, reconvert
 				r_format.format = RD::DATA_FORMAT_R16G16B16A16_UINT;
-				image->convert(Image::FORMAT_RGBA16I);
+				image = duplicate_and_convert(p_image, Image::FORMAT_RGBA16I);
 			}
 			r_format.swizzle_r = RD::TEXTURE_SWIZZLE_R;
 			r_format.swizzle_g = RD::TEXTURE_SWIZZLE_G;

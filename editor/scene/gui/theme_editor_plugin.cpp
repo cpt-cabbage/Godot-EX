@@ -151,7 +151,17 @@ void ThemeItemImportTree::_update_items_tree() {
 
 			names.clear();
 			filtered_names.clear();
-			base_theme->get_theme_item_list(dt, E, &names);
+
+			if (base_theme == ThemeDB::get_singleton()->get_default_theme()) {
+				// For the default theme, include all registered theme items, even if they aren't assigned.
+				List<ThemeDB::ThemeItemBind> binds;
+				ThemeDB::get_singleton()->get_class_items(E, &binds, false, dt);
+				for (const ThemeDB::ThemeItemBind &bind : binds) {
+					names.push_back(bind.item_name);
+				}
+			} else {
+				base_theme->get_theme_item_list(dt, E, &names);
+			}
 
 			bool data_type_has_filtered_items = false;
 
@@ -360,8 +370,7 @@ void ThemeItemImportTree::_update_items_tree() {
 	}
 
 	if (sound_amount > 0) {
-		Array arr = { sound_amount };
-		select_sounds_label->set_text(TTRN("1 sound", "{num} sounds", sound_amount).format(arr, "{num}"));
+		select_sounds_label->set_text(vformat(TTRN("%d sound", "%d sounds", sound_amount), sound_amount));
 		select_all_sounds_button->set_visible(true);
 		select_full_sounds_button->set_visible(true);
 		deselect_all_sounds_button->set_visible(true);

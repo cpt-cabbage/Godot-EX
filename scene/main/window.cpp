@@ -445,8 +445,7 @@ void Window::move_to_center() {
 		parent_rect = get_embedder()->get_visible_rect();
 	} else {
 		int parent_screen = DisplayServer::get_singleton()->window_get_current_screen(get_window_id());
-		parent_rect.position = DisplayServer::get_singleton()->screen_get_position(parent_screen);
-		parent_rect.size = DisplayServer::get_singleton()->screen_get_size(parent_screen);
+		parent_rect = DisplayServer::get_singleton()->screen_get_usable_rect(parent_screen);
 	}
 
 	if (parent_rect != Rect2()) {
@@ -731,6 +730,13 @@ void Window::set_ime_position(const Point2i &p_pos) {
 	}
 }
 
+void Window::set_ime_rect(const Rect2i &p_rect) {
+	ERR_MAIN_THREAD_GUARD;
+	if (window_id != DisplayServerEnums::INVALID_WINDOW_ID) {
+		DisplayServer::get_singleton()->window_set_ime_rect(p_rect, window_id);
+	}
+}
+
 bool Window::is_embedded() const {
 	ERR_READ_THREAD_GUARD_V(false);
 	return get_embedder() != nullptr;
@@ -784,6 +790,8 @@ void Window::_make_window() {
 	DisplayServer::get_singleton()->window_attach_instance_id(get_instance_id(), window_id);
 	DisplayServer::get_singleton()->window_request_hdr_output(hdr_output_requested, window_id);
 	AccessibilityServer::get_singleton()->set_window_callbacks(window_id, callable_mp(this, &Window::_accessibility_activate), callable_mp(this, &Window::_accessibility_deactivate));
+
+	_update_window_size();
 
 	if (transient_parent) {
 		for (const Window *E : transient_children) {
@@ -1750,7 +1758,7 @@ void Window::_notification(int p_what) {
 					_update_viewport_size(); // Then feed back to the viewport.
 					_update_window_callbacks();
 					// Simulate mouse-enter event when mouse is over the window, since OS event might arrive before setting callbacks.
-					if (!mouse_in_window && Rect2(position, size).has_point(DisplayServer::get_singleton()->mouse_get_position())) {
+					if (!mouse_in_window && DisplayServer::get_singleton()->has_feature(DisplayServerEnums::FEATURE_MOUSE) && Rect2(position, size).has_point(DisplayServer::get_singleton()->mouse_get_position())) {
 						_event_callback(DisplayServerEnums::WINDOW_EVENT_MOUSE_ENTER);
 					}
 					RS::get_singleton()->viewport_set_update_mode(get_viewport_rid(), RSE::VIEWPORT_UPDATE_WHEN_VISIBLE);
@@ -3562,6 +3570,7 @@ void Window::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_ime_active", "active"), &Window::set_ime_active);
 	ClassDB::bind_method(D_METHOD("set_ime_position", "position"), &Window::set_ime_position);
+	ClassDB::bind_method(D_METHOD("set_ime_rect", "rect"), &Window::set_ime_rect);
 
 	ClassDB::bind_method(D_METHOD("is_embedded"), &Window::is_embedded);
 

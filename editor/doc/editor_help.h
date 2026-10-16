@@ -151,6 +151,7 @@ class EditorHelp : public VBoxContainer {
 	void _help_callback(const String &p_topic);
 	void _class_desc_scroll_to_paragraph(int p_line, bool p_save_history);
 	bool _need_save_new_history() const;
+	void _emit_request_save_new_history(const Dictionary &p_state);
 
 	void _add_text(const String &p_bbcode);
 	bool scroll_locked = false;
@@ -358,6 +359,8 @@ public:
 
 	void set_content_height_limits(float p_min, float p_max);
 	void update_content_height();
+
+	void override_custom_minimum_width(float p_min_width);
 
 	EditorHelpBit(
 			const String &p_symbol = String(),
