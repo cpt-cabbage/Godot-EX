@@ -31,6 +31,7 @@
 #pragma once
 
 #include "jolt_shape_3d.h"
+#include "../jolt_project_settings.h"
 
 class JoltHeightMapShape3D final : public JoltShape3D {
 	AABB aabb;
@@ -59,6 +60,10 @@ class JoltHeightMapShape3D final : public JoltShape3D {
 public:
 	virtual ShapeType get_type() const override { return ShapeType::SHAPE_HEIGHTMAP; }
 	virtual bool is_convex() const override { return false; }
+	// Godot-EX: the project setting (physics/jolt_physics_3d/collisions/height_map_back_face_collision; the training ground
+	// is one-sided, env_server.gd refuses it on) where upstream has true; before upstream 62cd25492d it was the
+	// double-sided decorator with the same flag.
+	virtual bool has_back_face_collision() const override { return JoltProjectSettings::height_map_back_face_collision; }
 
 	virtual Variant get_data() const override;
 	virtual void set_data(const Variant &p_data) override;

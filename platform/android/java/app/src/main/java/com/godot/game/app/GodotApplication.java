@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  jolt_custom_user_data_shape.h                                         */
+/*  GodotApplication.java                                                 */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,31 +28,21 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+package com.godot.game.app;
 
-#include "jolt_custom_decorated_shape.h"
-#include "jolt_custom_shape_type.h"
+import android.app.Application;
+import android.util.Log;
 
-class JoltCustomUserDataShapeSettings final : public JoltCustomDecoratedShapeSettings {
-public:
-	using JoltCustomDecoratedShapeSettings::JoltCustomDecoratedShapeSettings;
-
-	virtual ShapeResult Create() const override;
-};
-
-class JoltCustomUserDataShape final : public JoltCustomDecoratedShape {
-public:
-	static void register_type();
-
-	JoltCustomUserDataShape() :
-			JoltCustomDecoratedShape(JoltCustomShapeSubType::OVERRIDE_USER_DATA) {}
-
-	JoltCustomUserDataShape(const JoltCustomUserDataShapeSettings &p_settings, ShapeResult &p_result) :
-			JoltCustomDecoratedShape(JoltCustomShapeSubType::OVERRIDE_USER_DATA, p_settings, p_result) {
-		if (!p_result.HasError()) {
-			p_result.Set(this);
+public class GodotApplication extends Application {
+	static {
+		// .NET libraries.
+		if (BuildConfig.FLAVOR.equals("mono")) {
+			try {
+				Log.v("GODOT", "Loading System.Security.Cryptography.Native.Android library");
+				System.loadLibrary("System.Security.Cryptography.Native.Android");
+			} catch (UnsatisfiedLinkError e) {
+				Log.e("GODOT", "Unable to load System.Security.Cryptography.Native.Android library");
+			}
 		}
 	}
-
-	virtual JPH::uint64 GetSubShapeUserData(const JPH::SubShapeID &p_sub_shape_id) const override { return GetUserData(); }
-};
+}

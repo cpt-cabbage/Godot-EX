@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  GodotApp.java                                                         */
+/*  gdscript_helper.h                                                     */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,78 +28,14 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-package com.godot.game;
+#pragma once
 
-import org.godotengine.godot.Godot;
-import org.godotengine.godot.GodotActivity;
+#include "gdscript_function.h"
 
-import android.os.Bundle;
-import android.util.Log;
+#include "core/variant/variant.h"
 
-import androidx.activity.EdgeToEdge;
-import androidx.core.splashscreen.SplashScreen;
+namespace GDScriptHelper {
 
-/**
- * Template activity for Godot Android builds.
- * Feel free to extend and modify this class for your custom logic.
- */
-public class GodotApp extends GodotActivity {
-	static {
-		// .NET libraries.
-		if (BuildConfig.FLAVOR.equals("mono")) {
-			try {
-				Log.v("GODOT", "Loading System.Security.Cryptography.Native.Android library");
-				System.loadLibrary("System.Security.Cryptography.Native.Android");
-			} catch (UnsatisfiedLinkError e) {
-				Log.e("GODOT", "Unable to load System.Security.Cryptography.Native.Android library");
-			}
-		}
-	}
+Variant construct_empty_value_for_data_type(const GDScriptDataType &p_data_type);
 
-	private final Runnable updateWindowAppearance = () -> {
-		Godot godot = getGodot();
-		if (godot != null) {
-			godot.enableImmersiveMode(godot.isInImmersiveMode(), true);
-			godot.enableEdgeToEdge(godot.isInEdgeToEdgeMode(), true);
-			godot.setSystemBarsAppearance();
-		}
-	};
-
-	@Override
-	public void onCreate(Bundle savedInstanceState) {
-		SplashScreen splashScreen = SplashScreen.installSplashScreen(this);
-		EdgeToEdge.enable(this);
-		super.onCreate(savedInstanceState);
-
-		Godot godot = getGodot();
-		if (godot != null && godot.getDisableGodotSplash()) {
-			splashScreen.setKeepOnScreenCondition(() -> godot.getRunStatus() != Godot.RunStatus.STARTED);
-		}
-	}
-
-	@Override
-	public void onResume() {
-		super.onResume();
-		updateWindowAppearance.run();
-	}
-
-	@Override
-	public void onGodotMainLoopStarted() {
-		super.onGodotMainLoopStarted();
-		runOnUiThread(updateWindowAppearance);
-	}
-
-	@Override
-	public void onGodotForceQuit(Godot instance) {
-		if (!BuildConfig.FLAVOR.equals("instrumented")) {
-			// For instrumented builds, we disable force-quitting to allow the instrumented tests to complete
-			// successfully, otherwise they fail when the process crashes.
-			super.onGodotForceQuit(instance);
-		}
-	}
-
-	@Override
-	protected boolean isPiPEnabled() {
-		return true;
-	}
-}
+};

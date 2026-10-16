@@ -127,6 +127,7 @@ private:
 		FILE_MENU_SHOW_IN_EXPLORER,
 		FILE_MENU_OPEN_EXTERNAL,
 		FILE_MENU_OPEN_IN_TERMINAL,
+		FILE_MENU_DOWNLOAD, // Web editor only
 		FILE_MENU_COPY_PATH,
 		FILE_MENU_COPY_ABSOLUTE_PATH,
 		FILE_MENU_COPY_UID,
@@ -256,6 +257,7 @@ private:
 	String current_path = "res://";
 	String select_after_scan;
 	String main_scene_path;
+	LocalVector<StringName> path_project_settings;
 
 	bool updating_tree = false;
 	int tree_update_id;
@@ -421,6 +423,7 @@ public:
 	static constexpr double ITEM_BG_DARK_SCALE = 0.3;
 
 	static Color get_dir_icon_color(const String &p_dir_path, const Color &p_default);
+	const LocalVector<StringName> &get_path_project_settings() const { return path_project_settings; }
 
 	const HashMap<String, Color> &get_folder_colors() const;
 	Dictionary get_assigned_folder_colors() const;

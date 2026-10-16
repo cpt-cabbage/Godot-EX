@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  web_tools_editor_plugin.h                                             */
+/*  gdscript_helper.cpp                                                   */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,18 +28,45 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "gdscript_helper.h"
 
-#include "editor/plugins/editor_plugin.h"
+#include "core/variant/variant.h"
 
-class WebToolsEditorPlugin : public EditorPlugin {
-	GDCLASS(WebToolsEditorPlugin, EditorPlugin);
+namespace GDScriptHelper {
 
-private:
-	void _download_zip();
+Variant construct_empty_value_for_data_type(const GDScriptDataType &p_data_type) {
+	if (p_data_type.kind == GDScriptDataType::BUILTIN) {
+		if (p_data_type.builtin_type == Variant::ARRAY) {
+			Array array;
+			// Typed array.
+			if (p_data_type.has_container_element_type(0)) {
+				const GDScriptDataType &element_type = p_data_type.get_container_element_type(0);
+				array.set_typed(element_type.builtin_type, element_type.native_type, element_type.script_type);
+			}
 
-public:
-	static void initialize();
+			return array;
+		} else if (p_data_type.builtin_type == Variant::DICTIONARY) {
+			Dictionary dict;
+			// Typed dictionary.
+			if (p_data_type.has_container_element_types()) {
+				const GDScriptDataType &key_type = p_data_type.get_container_element_type_or_variant(0);
+				const GDScriptDataType &value_type = p_data_type.get_container_element_type_or_variant(1);
+				dict.set_typed(key_type.builtin_type, key_type.native_type, key_type.script_type, value_type.builtin_type, value_type.native_type, value_type.script_type);
+			}
 
-	WebToolsEditorPlugin();
-};
+			return dict;
+		} else {
+			Callable::CallError ce;
+			Variant variant;
+			Variant::construct(p_data_type.builtin_type, variant, nullptr, 0, ce);
+
+			ERR_FAIL_COND_V(ce.error != Callable::CallError::CALL_OK, Variant());
+
+			return variant;
+		}
+	}
+
+	return Variant();
+}
+
+} //namespace GDScriptHelper
