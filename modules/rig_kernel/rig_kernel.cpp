@@ -42,6 +42,11 @@ Vector3 RigKernel::rotation_vector(const Basis &p_basis) {
 	if (q.w < 0.0f) {
 		q = -q;
 	}
+	if (exact_rotvec) {
+		const Vector3 v(q.x, q.y, q.z);
+		const real_t s = v.length();
+		return s > 1e-12f ? v * (2.0f * Math::atan2(s, q.w) / s) : v * 2.0f;
+	}
 	const real_t angle = q.get_angle();
 	return angle > 1e-6f ? q.get_axis() * angle : Vector3();
 }
@@ -947,6 +952,8 @@ PackedFloat32Array RigKernel::balance(const PackedInt32Array &p_support, double 
 
 void RigKernel::_bind_methods() {
 	ClassDB::bind_static_method("RigKernel", D_METHOD("rotation_vector", "basis"), &RigKernel::rotation_vector);
+	ClassDB::bind_static_method("RigKernel", D_METHOD("set_exact_rotvec", "enabled"), &RigKernel::set_exact_rotvec);
+	ClassDB::bind_static_method("RigKernel", D_METHOD("is_exact_rotvec"), &RigKernel::is_exact_rotvec);
 	ClassDB::bind_static_method("RigKernel", D_METHOD("heading_of", "basis"), &RigKernel::heading_of);
 	ClassDB::bind_method(D_METHOD("set_bodies", "bodies", "masses", "parents"), &RigKernel::set_bodies);
 	ClassDB::bind_method(D_METHOD("set_pelvis_head", "pelvis", "head"), &RigKernel::set_pelvis_head);

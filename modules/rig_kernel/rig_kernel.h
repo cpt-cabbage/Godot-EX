@@ -285,6 +285,12 @@ protected:
 	static void _bind_methods();
 
 public:
+	// The rotation vector exactly (the axis normalised; ProjectEX 2026-10-16): Quaternion::get_axis() returns the raw
+	// (x, y, z) when |w| > 1 - CMP_EPSILON, so q.get_axis() * angle read a rotation under ~0.009 rad as ~angle^2 / 2.
+	// Off by default: the policies trained before read the old way (their checkpoints say exact_rotvec).
+	static inline bool exact_rotvec = false;
+	static void set_exact_rotvec(bool p_enabled) { exact_rotvec = p_enabled; }
+	static bool is_exact_rotvec() { return exact_rotvec; }
 	static Vector3 rotation_vector(const Basis &p_basis);
 	static Basis heading_of(const Basis &p_basis);
 
