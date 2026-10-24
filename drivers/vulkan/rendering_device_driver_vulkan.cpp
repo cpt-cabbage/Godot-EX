@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
@@ -74,9 +75,29 @@
 #define RECORD_PIPELINE_STATISTICS 0
 
 #if RECORD_PIPELINE_STATISTICS
-#include "core/io/file_access.h"
 #define RECORD_PIPELINE_STATISTICS_PATH "./pipelines.csv"
 #endif
+
+// Diagnostics, read once: GODOT_VK_RESPV=0 hands every shader to the driver without re-spirv (the frames it renders
+// should match re-spirv's), and GODOT_VK_RESPV_DUMP=<directory> saves every module re-spirv writes there as
+// <shader>_s<stage>_<hash>.spv, for spirv-val and spirv-dis.
+static bool _respv_disabled_by_environment() {
+	static const bool disabled = OS::get_singleton()->get_environment("GODOT_VK_RESPV") == "0";
+	return disabled;
+}
+
+static void _respv_dump(const String &p_shader_name, uint32_t p_stage_index, const uint8_t *p_data, size_t p_size) {
+	static const String dump_directory = OS::get_singleton()->get_environment("GODOT_VK_RESPV_DUMP");
+	if (dump_directory.is_empty()) {
+		return;
+	}
+
+	const String path = dump_directory.path_join(vformat("%s_s%d_%08x.spv", p_shader_name.validate_filename(), p_stage_index, hash_murmur3_buffer(p_data, p_size)));
+	Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
+	if (file.is_valid()) {
+		file->store_buffer(p_data, p_size);
+	}
+}
 
 #define POWERVR_ROGUE_SHADER_CRASH_WORKAROUND_MUTEX_LOCK \
 	if (powervr_rogue_shader_crash_workaround_mutex) { \
@@ -4396,7 +4417,7 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 	Vector<uint8_t> decompressed_code;
 	VkShaderModule vk_module;
 	PackedByteArray decoded_spirv;
-	const bool use_respv = (RESPV_ENABLED == 1) && !shader_container_format.get_debug_info_enabled();
+	const bool use_respv = (RESPV_ENABLED == 1) && !shader_container_format.get_debug_info_enabled() && !_respv_disabled_by_environment();
 	const bool store_respv = use_respv && !shader_refl.specialization_constants.is_empty();
 	const int64_t stage_count = shader_refl.stages_vector.size();
 	shader_info.vk_stages_create_info.reserve(stage_count);
@@ -4462,6 +4483,7 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 #endif
 					decoded_spirv.resize(respv_optimized_data.size());
 					memcpy(decoded_spirv.ptrw(), respv_optimized_data.data(), respv_optimized_data.size());
+					_respv_dump(shader_info.name, i, respv_optimized_data.data(), respv_optimized_data.size());
 				} else {
 #if RESPV_VERBOSE
 					print_line("re-spirv failed to optimize the shader.");
@@ -6224,6 +6246,7 @@ RDD::PipelineID RenderingDeviceDriverVulkan::render_pipeline_create(
 
 					print_line(vformat("re-spirv transformed the shader from %d bytes to %d bytes with constants %s (%d).", shader_info->respv_stage_shaders[i].inlinedSpirvWords.size() * sizeof(uint32_t), respv_optimized_data.size(), spec_constants, p_shader.id));
 #endif
+					_respv_dump(shader_info->name, i, respv_optimized_data.data(), respv_optimized_data.size());
 
 					// Create the shader module with the optimized output.
 					VkShaderModule shader_module = VK_NULL_HANDLE;
