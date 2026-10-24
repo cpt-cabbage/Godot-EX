@@ -2931,13 +2931,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					using_ssil ||
 					using_sscs ||
 					ce_needs_normal_roughness ||
+					use_raytraced_shadows ||
 					use_stochastic_lighting ||
 					use_rt_gi ||
 					get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER ||
 					scene_state.used_normal_texture) {
 				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 			}
-		} else if (use_stochastic_lighting || use_rt_gi || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
+		} else if (use_raytraced_shadows || use_stochastic_lighting || use_rt_gi || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
 		// The ray-traced temporal passes run before the colour pass, whose
