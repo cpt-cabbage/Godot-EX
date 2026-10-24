@@ -271,7 +271,7 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	float spec_fix;
 	float borrow_band; // How far outside the frame (UV) a history may lie and still borrow the edge's (GODOT_GI_BORROW; 0 never borrows).
 	float young_rays; // The gather's diffuse rays for a pixel whose history is under 8 frames: that frame's sample counts for as many.
-	float pad0;
+	float spec_smear_lobe; // The share of the lobe's screen blur the reflection's parallax smear may reach (0.5; GODOT_GI_SPEC_SMEAR, 0: the fixed pixels only).
 	// Half the previous frame's TAA jitter minus this frame's, in NDC: the
 	// motion vectors are unjittered (the scene shader subtracts both
 	// frames' jitters) where this pass's pixels sit in the jittered image,
@@ -1064,6 +1064,30 @@ void main() {
 			{
 				float smear_px = parallax_px * (1.0 - virtual_weight);
 				float allowed_px = 4.0 + 12.0 * clamp(nr_rough, 0.0, 1.0);
+				// What the lobe hides is its blur on screen, not a fixed count
+				// of the signal's pixels, which a finer signal reaches sooner
+				// (the PC's half tier is 2.4 times the Air's quarter across) and
+				// a rough lobe outgrows by far: the lobe's median spread, 2
+				// atan(alpha), opened over the ray's length past the surface and
+				// seen from the image's depth, in the signal's pixels; the smear
+				// may reach a share of it (spec_smear_lobe, 0.5; the fixed
+				// pixels stay the floor, so a glossy lobe and a contact
+				// reflection keep the old cap). Under the fixed pixels alone, the
+				// TPS demo played on the PC (walking at 4.5 m/s, the half tier at
+				// 2259x1271 under FSR2) kept the road's and the chevron panels'
+				// reflections at a median 1.5 frames (86% under 4) and 30-44% of
+				// the glossy pixels young: one GGX sample a pixel, filtered into
+				// blotches on every metal surface in motion. At
+				// half the blur: a median 16.8 frames, 5-8% young (no cap at all:
+				// the same), the blotches gone, no trail behind a highlight seen
+				// in the walk's frames. 2026-10-24.
+				if (reprojection.spec_smear_lobe > 0.0 && virtual_view_depth > 0.0) {
+					float alpha = nr_rough * nr_rough;
+					float surface_depth = linearize_depth(center_depth);
+					float spread = 2.0 * atan(alpha) * max(virtual_view_depth - surface_depth, 0.0) / virtual_view_depth;
+					float px_per_rad = 0.5 * float(params.screen_size.y) / max(movers.view_from_ndc[1][1], 1e-4);
+					allowed_px = max(allowed_px, reprojection.spec_smear_lobe * spread * px_per_rad);
+				}
 				if (smear_px > 1e-3 && (params.flags & FLAG_SPEC_NO_SMEAR) == 0u) {
 					frames_s = min(frames_s, max(allowed_px / smear_px, 1.0));
 				}

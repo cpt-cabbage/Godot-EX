@@ -956,6 +956,12 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		// temporal pass weighs such a frame's sample by as many.
 		static const int64_t young_rays = OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS") == "" ? 2 : OS::get_singleton()->get_environment("GODOT_GI_YOUNG_RAYS").to_int();
 		ubo.young_rays = float(CLAMP(young_rays, 1, 4));
+		// The reflection's parallax smear may reach half its lobe's blur on
+		// screen (the temporal pass's smear cap); GODOT_GI_SPEC_SMEAR=<share>
+		// sets the share, 0 reverts to the fixed pixels alone.
+		static const String spec_smear_env = OS::get_singleton()->get_environment("GODOT_GI_SPEC_SMEAR");
+		static const float spec_smear_lobe = spec_smear_env.is_empty() ? 0.5f : MAX(float(spec_smear_env.to_float()), 0.0f);
+		ubo.spec_smear_lobe = spec_smear_lobe;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;

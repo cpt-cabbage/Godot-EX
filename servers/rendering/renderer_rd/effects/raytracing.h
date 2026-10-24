@@ -643,7 +643,7 @@ private:
 		float spec_fix; // The frames a rough reflection's restarted history is worth with the raw resolve standing in (0: off).
 		float borrow_band; // The frame-edge history borrow's reach outside the frame, in UV (GODOT_GI_BORROW; 0 off).
 		float young_rays; // Diffuse rays the gather spends on a pixel whose history is under 8 frames (GODOT_GI_YOUNG_RAYS): the temporal pass weighs that frame's sample by as many.
-		float pad0;
+		float spec_smear_lobe; // The share of the lobe's screen blur the reflection's parallax smear may reach (0.5; GODOT_GI_SPEC_SMEAR, 0: the fixed pixels only).
 		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's.
 		float pad1[2]; // The std140 block rounds to 96 bytes.
 	};
