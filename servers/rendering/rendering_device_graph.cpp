@@ -635,7 +635,12 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		if (!search_tracker->previous_frame_stages.is_empty()) {
 			// Add to the command the stages the tracker was used on in the previous frame.
 			r_command->previous_stages = r_command->previous_stages | search_tracker->previous_frame_stages;
-			search_tracker->previous_frame_stages.clear();
+
+			// A slice's barrier only covers its own subresources, so the parent keeps the stages for the commands
+			// that use its other slices this frame: those inherit the parent's access from the previous frame too.
+			if (!resource_has_parent) {
+				search_tracker->previous_frame_stages.clear();
+			}
 		}
 
 		if (different_usage) {
