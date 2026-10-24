@@ -283,6 +283,9 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// (FLAG_VELOCITY_CURRENT). The block is 96 bytes; the C++ struct
 	// carries the same.
 	vec2 jitter_delta;
+	// The frames a revealed rough reflection's 5x5 start is worth (0: its
+	// one sample; GODOT_GI_REVEAL_FIX).
+	float reveal_frames;
 }
 reprojection;
 #endif
@@ -1204,8 +1207,58 @@ void main() {
 		}
 	}
 	if (reveal == 1.0) {
+#ifdef HAS_DIRECTIONAL
+		// A revealed rough reflection starts from the mean of this frame's
+		// samples on its own surface over the 5x5, worth reveal_frames
+		// (GODOT_GI_REVEAL_FIX), as the change mark's restart does above,
+		// rather than from its one GGX sample. The floor a third-person
+		// character uncovers as it walks is revealed every frame, a band
+		// around its legs: on the TPS demo's metal (roughness 0.4-0.6, lit
+		// only by its reflection) the band glittered with single samples
+		// (a median 7 frames around the legs against 32 a meter away) and
+		// healed 10-20 frames after the character stopped. The mean keeps
+		// to the pixel's surface (depth within a tenth, normals within 25
+		// degrees): the band lies along the character's silhouette, whose
+		// own reflection would otherwise be averaged in. A mirror keeps
+		// its sample. Walking from the spawn (4K, FSR2 0.588, GI high) the
+		// band's specks -15 % (-19 / -21 % worth 8 / 16, which held the
+		// level's first, unlit estimate long enough to darken the frame 1.6
+		// / 2.9 % while it filled). Measured and not kept: a young pixel's
+		// spatial taps weighed by their histories, nothing on the band, and
+		// after a lighting change it kept the old light (rt_lab/r8).
+		if (reprojection.reveal_frames > 0.0) {
+			float lobe = smoothstep(0.15, 0.4, nr_rough);
+			if (lobe > 0.0) {
+				vec3 n_c = nr_normal(texelFetch(normal_roughness_texture, nr_pixel, 0));
+				float view_c = linearize_depth(center_depth);
+				vec3 sum_s = vec3(0.0);
+				float taps_s = 0.0;
+				for (int y = -2; y <= 2; y++) {
+					for (int x = -2; x <= 2; x++) {
+						ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), params.screen_size - 1);
+						float sd = texelFetch(depth_texture, rt_full_pixel(sp, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
+						if (sd == 0.0 || abs(linearize_depth(sd) - view_c) > 0.1 * view_c) {
+							continue;
+						}
+						ivec2 np = (params.flags & FLAG_SPEC_AA) != 0u ? sp : rt_full_pixel(sp, params.depth_scale, textureSize(normal_roughness_texture, 0));
+						if (dot(nr_normal(texelFetch(normal_roughness_texture, np, 0)), n_c) < 0.9) {
+							continue;
+						}
+						sum_s += texelFetch(in_specular, sp, 0).rgb;
+						taps_s += 1.0;
+					}
+				}
+				// A pixel with too little of its surface around it (a thin
+				// rail, a corner) keeps its sample.
+				if (taps_s >= 5.0) {
+					result_specular = mix(current_specular, sum_s / taps_s, lobe);
+					frames_s = mix(1.0, reprojection.reveal_frames, lobe);
+				}
+			}
+		}
+#endif
 		float lum_d = luminance(current_diffuse);
-		float lum_s = luminance(current_specular);
+		float lum_s = luminance(result_specular);
 #ifdef HAS_DIRECTIONAL
 		if (dyn_split) {
 			lum_d = luminance(current_diffuse + current_dyn);

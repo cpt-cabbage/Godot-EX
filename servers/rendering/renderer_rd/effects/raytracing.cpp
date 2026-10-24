@@ -964,6 +964,12 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		static const String spec_smear_env = OS::get_singleton()->get_environment("GODOT_GI_SPEC_SMEAR");
 		static const float spec_smear_lobe = spec_smear_env.is_empty() ? 0.5f : MAX(float(spec_smear_env.to_float()), 0.0f);
 		ubo.spec_smear_lobe = spec_smear_lobe;
+		// A revealed rough reflection starts from its surface's 5x5 mean,
+		// worth 4 frames (the temporal pass); GODOT_GI_REVEAL_FIX=<frames>
+		// sets the worth, 0 reverts to its one sample.
+		static const String reveal_env = OS::get_singleton()->get_environment("GODOT_GI_REVEAL_FIX");
+		static const float reveal_frames = reveal_env.is_empty() ? 4.0f : MAX(float(reveal_env.to_float()), 0.0f);
+		ubo.reveal_frames = reveal_frames;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;

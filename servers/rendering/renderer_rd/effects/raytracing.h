@@ -647,7 +647,8 @@ private:
 		float young_rays; // Diffuse rays the gather spends on a pixel whose history is under 8 frames (GODOT_GI_YOUNG_RAYS): the temporal pass weighs that frame's sample by as many.
 		float spec_smear_lobe; // The share of the lobe's screen blur the reflection's parallax smear may reach (0.5; GODOT_GI_SPEC_SMEAR, 0: the fixed pixels only).
 		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's.
-		float pad1[2]; // The std140 block rounds to 96 bytes.
+		float reveal_frames; // The frames a revealed rough reflection's 5x5 start is worth (GODOT_GI_REVEAL_FIX; 0: its one sample).
+		float pad1; // The std140 block rounds to 96 bytes.
 	};
 	static_assert(sizeof(ReprojectUBO) == 96, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
