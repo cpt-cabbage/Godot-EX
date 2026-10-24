@@ -1223,9 +1223,10 @@ void main() {
 		// its sample. Walking from the spawn (4K, FSR2 0.588, GI high) the
 		// band's specks -15 % (-19 / -21 % worth 8 / 16, which held the
 		// level's first, unlit estimate long enough to darken the frame 1.6
-		// / 2.9 % while it filled). Measured and not kept: a young pixel's
-		// spatial taps weighed by their histories, nothing on the band, and
-		// after a lighting change it kept the old light (rt_lab/r8).
+		// / 2.9 % while it filled). Measured and not kept (rt_lab/r8), as
+		// neither moved the band: a young pixel's spatial taps weighed by
+		// their histories (-0.3 / -3.6 %), and a second reflection ray for
+		// a young pixel (+2 / -5 %; a second ray everywhere the same there).
 		if (reprojection.reveal_frames > 0.0) {
 			float lobe = smoothstep(0.15, 0.4, nr_rough);
 			if (lobe > 0.0) {
