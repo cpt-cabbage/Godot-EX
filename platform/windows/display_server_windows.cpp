@@ -7335,7 +7335,10 @@ Error DisplayServerWindows::_create_window(DisplayServerEnums::WindowID p_window
 		} else {
 			Rect2i srect = screen_get_usable_rect(rq_screen);
 			Point2i wpos = p_rect.position;
-			if (srect != Rect2i()) {
+			// A main window that takes no focus (Godot-EX's --background) keeps its position, even off every
+			// screen: a test harness's run opens out of the user's way instead of on a screen's corner.
+			const bool keep_position = p_window_id == DisplayServerEnums::MAIN_WINDOW_ID && (p_flags & DisplayServerEnums::WINDOW_FLAG_NO_FOCUS_BIT);
+			if (srect != Rect2i() && !keep_position) {
 				wpos = wpos.clamp(srect.position, srect.position + srect.size - p_rect.size / 3);
 			}
 
