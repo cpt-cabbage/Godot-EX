@@ -35,6 +35,7 @@
 #include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
+#include "drivers/vulkan/ngx_vulkan.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
 #include <thirdparty/misc/smolv.h>
@@ -648,6 +649,20 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	}
 
 	_register_requested_device_extension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, false);
+
+#ifdef DLSS_ENABLED
+	// DLSS: what NGX asks for on this GPU, NVIDIA's only. DLSS is available
+	// (SUPPORTS_DLSS) only if every one of them was enabled.
+	ngx_device_extensions.clear();
+	if (context_device.vendor == RenderingContextDriver::Vendor::VENDOR_NVIDIA) {
+		NGXVulkan::get_device_extensions(context_driver->instance_get(), physical_device, ngx_device_extensions);
+		for (const CharString &extension_name : ngx_device_extensions) {
+			if (!requested_device_extensions.has(extension_name)) {
+				_register_requested_device_extension(extension_name, false);
+			}
+		}
+	}
+#endif
 
 	uint32_t device_extension_count = 0;
 	VkResult err = vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &device_extension_count, nullptr);
@@ -3541,6 +3556,10 @@ RDD::CommandBufferID RenderingDeviceDriverVulkan::command_buffer_create(CommandP
 	command_buffer->vk_command_buffer = vk_command_buffer;
 	command_pool->command_buffers_created.push_back(command_buffer);
 	return CommandBufferID(command_buffer);
+}
+
+VkCommandBuffer RenderingDeviceDriverVulkan::command_buffer_get_vk_handle(CommandBufferID p_cmd_buffer) {
+	return ((const CommandBufferInfo *)p_cmd_buffer.id)->vk_command_buffer;
 }
 
 bool RenderingDeviceDriverVulkan::command_buffer_begin(CommandBufferID p_cmd_buffer) {
@@ -7490,6 +7509,21 @@ uint64_t RenderingDeviceDriverVulkan::api_trait_get(ApiTrait p_trait) {
 	}
 }
 
+#ifdef DLSS_ENABLED
+bool RenderingDeviceDriverVulkan::_ngx_initialize() {
+	if (ngx_device_extensions.is_empty()) {
+		return false;
+	}
+	for (const CharString &extension_name : ngx_device_extensions) {
+		if (!enabled_device_extension_names.has(extension_name)) {
+			print_verbose("NGX: device extension " + String::utf8(extension_name) + " is missing; DLSS is unavailable.");
+			return false;
+		}
+	}
+	return NGXVulkan::initialize(context_driver->instance_get(), physical_device, vk_device);
+}
+#endif
+
 bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 	switch (p_feature) {
 		case SUPPORTS_HALF_FLOAT:
@@ -7529,6 +7563,12 @@ bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 #endif // defined(WINDOWS_ENABLED)
 		case SUPPORTS_GPU_MAPPABLE_BUFFER:
 			return device_local_host_visible_host_coherent_memory_support;
+		case SUPPORTS_DLSS:
+#ifdef DLSS_ENABLED
+			return _ngx_initialize();
+#else
+			return false;
+#endif
 		default:
 			return false;
 	}
@@ -7588,6 +7628,11 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
 }
 
 RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
+#ifdef DLSS_ENABLED
+	// The device is idle here: NGX releases the features still queued and its own resources.
+	NGXVulkan::shutdown(vk_device);
+#endif
+
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	if (breadcrumb_buffer != BufferID()) {
 		buffer_free(breadcrumb_buffer);

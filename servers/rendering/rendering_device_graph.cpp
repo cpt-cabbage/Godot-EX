@@ -1976,6 +1976,12 @@ void RenderingDeviceGraph::add_driver_callback(RDD::DriverCallback p_callback, v
 	command->type = RecordedCommand::TYPE_DRIVER_CALLBACK;
 	command->callback = p_callback;
 	command->userdata = p_userdata;
+	// A callback records whatever work its library does (a vendor upscaler's
+	// compute dispatches, its own copies), at stages the graph cannot know.
+	// Without stages of its own, the barriers before it waited for nothing
+	// (bottom of pipe) and the commands after it on none of its writes (top
+	// of pipe).
+	command->self_stages = RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	_add_command_to_graph((ResourceTracker **)p_trackers.ptr(), (ResourceUsage *)p_usages.ptr(), p_trackers.size(), command_index, command);
 }
 

@@ -117,6 +117,21 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_fsr2(Rende
 	}
 }
 
+#ifdef DLSS_ENABLED
+RendererRD::DLSSContext *RenderForwardClustered::RenderBufferDataForwardClustered::ensure_dlss(RendererRD::DLSSEffect *p_effect, bool p_auto_exposure) {
+	if (dlss_context != nullptr && dlss_context->auto_exposure != p_auto_exposure) {
+		memdelete(dlss_context);
+		dlss_context = nullptr;
+	}
+	if (dlss_context == nullptr && !dlss_unavailable) {
+		dlss_context = p_effect->create_context(render_buffers->get_internal_size(), render_buffers->get_target_size(), p_auto_exposure);
+		dlss_unavailable = dlss_context == nullptr;
+	}
+	// NGX creates the feature in the first evaluation; if that failed, FSR2 takes over.
+	return dlss_context != nullptr && !dlss_context->failed ? dlss_context : nullptr;
+}
+#endif
+
 #ifdef METAL_MFXTEMPORAL_ENABLED
 bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect) {
 	if (mfx_temporal_context == nullptr) {
@@ -183,6 +198,14 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		memdelete(fsr2_context);
 		fsr2_context = nullptr;
 	}
+
+#ifdef DLSS_ENABLED
+	if (dlss_context) {
+		memdelete(dlss_context);
+		dlss_context = nullptr;
+	}
+	dlss_unavailable = false;
+#endif
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	if (mfx_temporal_context) {
@@ -2764,11 +2787,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		SCALE_NONE,
 		SCALE_FSR2,
 		SCALE_MFX,
+		SCALE_DLSS,
 	} scale_type = SCALE_NONE;
 
 	switch (rb->get_scaling_3d_mode()) {
 		case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
 			scale_type = SCALE_FSR2;
+			break;
+		case RSE::VIEWPORT_SCALING_3D_MODE_DLSS:
+#ifdef DLSS_ENABLED
+			// FSR2 where DLSS cannot upscale this viewport's sizes.
+			scale_type = rb_data.is_valid() && rb_data->ensure_dlss(dlss_effect, RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) != nullptr ? SCALE_DLSS : SCALE_FSR2;
+#else
+			scale_type = SCALE_FSR2;
+#endif
 			break;
 		case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
 #ifdef METAL_MFXTEMPORAL_ENABLED
@@ -3629,7 +3661,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->draw_command_end_label();
 
 		if (using_motion_pass) {
-			if (scale_type == SCALE_MFX) {
+			if (scale_type == SCALE_MFX || scale_type == SCALE_DLSS) {
+				// The camera's motion for every pixel, the moving objects'
+				// own drawn over it by the motion pass: these upscalers take
+				// no marker for the pixels left to them (FSR2's -1 clear).
 				motion_vectors_store->process(rb,
 						p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform,
 						p_render_data->scene_data->prev_cam_projection, p_render_data->scene_data->prev_cam_transform);
@@ -4001,6 +4036,25 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 
 			RD::get_singleton()->draw_command_end_label();
+		} else if (scale_type == SCALE_DLSS) {
+#ifdef DLSS_ENABLED
+			RD::get_singleton()->draw_command_begin_label("DLSS");
+			RENDER_TIMESTAMP("DLSS");
+
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				RendererRD::DLSSEffect::Params params;
+				params.color = rb->get_internal_texture(v);
+				params.depth = rb->get_depth_texture(v);
+				params.velocity = rb->get_velocity_buffer(false, v);
+				params.output = rb->get_upscaled_texture(v);
+				// As FSR2 takes it: the projection's jitter in render pixels.
+				params.jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+				params.frame_time_ms = float(time_step * 1000.0);
+				dlss_effect->upscale(rb_data->ensure_dlss(dlss_effect, RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)), params);
+			}
+
+			RD::get_singleton()->draw_command_end_label();
+#endif
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
 			// GODOT_MFX_DENOISE=1: the temporal denoised scaler in place of
@@ -7075,8 +7129,13 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
-#ifdef METAL_MFXTEMPORAL_ENABLED
+#if defined(METAL_MFXTEMPORAL_ENABLED) || defined(DLSS_ENABLED)
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
+#endif
+#ifdef DLSS_ENABLED
+	dlss_effect = memnew(RendererRD::DLSSEffect);
+#endif
+#ifdef METAL_MFXTEMPORAL_ENABLED
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 	mfx_denoised_effect = memnew(RendererRD::MFXTemporalDenoisedEffect);
 	mfx_guides = memnew(RendererRD::MFXGuides);
@@ -7163,6 +7222,13 @@ RenderForwardClustered::~RenderForwardClustered() {
 		fsr2_effect = nullptr;
 	}
 
+#ifdef DLSS_ENABLED
+	if (dlss_effect) {
+		memdelete(dlss_effect);
+		dlss_effect = nullptr;
+	}
+#endif
+
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	if (mfx_temporal_effect) {
 		memdelete(mfx_temporal_effect);
@@ -7176,6 +7242,7 @@ RenderForwardClustered::~RenderForwardClustered() {
 		memdelete(mfx_guides);
 		mfx_guides = nullptr;
 	}
+#endif
 	if (oidn_aovs) {
 		memdelete(oidn_aovs);
 		oidn_aovs = nullptr;
@@ -7185,7 +7252,6 @@ RenderForwardClustered::~RenderForwardClustered() {
 		memdelete(motion_vectors_store);
 		motion_vectors_store = nullptr;
 	}
-#endif
 
 	RD::get_singleton()->free_rid(shadow_sampler);
 	RSG::light_storage->directional_shadow_atlas_set_size(0);

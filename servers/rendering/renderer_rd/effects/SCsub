@@ -11,6 +11,15 @@ env_effects = env.Clone()
 if env["metal"]:
     env_effects.Prepend(CPPPATH=["#thirdparty/metal-cpp"])
 
+# DLSS (NGX on Vulkan): the Vulkan headers as drivers/vulkan sees them, which
+# is built after this directory. The DLSS SDK's own include path comes from
+# the platform's dlss_sdk option.
+if env["vulkan"] and env.get("dlss_sdk", "") != "":
+    env_effects.Prepend(CPPPATH=["#thirdparty/vulkan", "#thirdparty/vulkan/include"])
+    if env["use_volk"]:
+        env_effects.AppendUnique(CPPDEFINES=["USE_VOLK"])
+        env_effects.Prepend(CPPPATH=["#thirdparty/volk"])
+
 # Thirdparty source files
 
 thirdparty_obj = []

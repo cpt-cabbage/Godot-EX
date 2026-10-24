@@ -35,6 +35,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/version.h"
+#include "drivers/vulkan/ngx_vulkan.h"
 #include "drivers/vulkan/rendering_device_driver_vulkan.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
@@ -459,6 +460,20 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 	if (want_debug_utils) {
 		_register_requested_instance_extension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false);
 	}
+
+#ifdef DLSS_ENABLED
+	// What NGX asks for DLSS, as optional extensions: the GPU is not known yet,
+	// and without an NVIDIA driver the query comes back empty.
+	{
+		LocalVector<CharString> ngx_extensions;
+		NGXVulkan::get_instance_extensions(ngx_extensions);
+		for (const CharString &extension_name : ngx_extensions) {
+			if (!requested_instance_extensions.has(extension_name)) {
+				_register_requested_instance_extension(extension_name, false);
+			}
+		}
+	}
+#endif
 
 	// Load instance extensions that are available.
 	uint32_t instance_extension_count = 0;

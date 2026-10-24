@@ -252,6 +252,14 @@ def get_opts():
         BoolVariable(
             "prefer_high_performance_gpu", "Prefer high-performance GPU on NVIDIA Optimus/AMD PowerXpress systems", True
         ),
+        # NVIDIA DLSS (Vulkan, MSVC). The SDK's headers and libraries are proprietary and stay out of the
+        # repository: point this at a local checkout of https://github.com/NVIDIA/DLSS.
+        ("dlss_sdk", "Path to a local DLSS SDK checkout, enabling the DLSS 3D scaling mode (optional, Vulkan)", ""),
+        BoolVariable(
+            "dlss_dev_dll",
+            "Copy the DLSS SDK's development DLL (on-screen debug overlay, not redistributable) instead of the release one",
+            False,
+        ),
     ]
 
 
@@ -486,6 +494,25 @@ def configure_msvc(env: "SConsEnvironment"):
 
         if not env["use_volk"]:
             LIBS += ["vulkan"]
+
+        if env["dlss_sdk"] != "":
+            if env["arch"] != "x86_64":
+                print_error("DLSS (dlss_sdk) is only supported on x86_64.")
+                sys.exit(255)
+            dlss_lib_dir = os.path.join(env["dlss_sdk"], "lib", "Windows_x86_64", "x64")
+            # The static NGX library built against the runtime Godot links: static (/MT) or dynamic (/MD).
+            dlss_lib = "nvsdk_ngx_s" if env["use_static_cpp"] else "nvsdk_ngx_d"
+            if env["debug_crt"]:
+                dlss_lib = "nvsdk_ngx_d_dbg"
+            if not os.path.isfile(os.path.join(env["dlss_sdk"], "include", "nvsdk_ngx_vk.h")) or not os.path.isfile(
+                os.path.join(dlss_lib_dir, dlss_lib + ".lib")
+            ):
+                print_error(f"dlss_sdk: no DLSS SDK (include/nvsdk_ngx_vk.h, {dlss_lib}.lib) at {env['dlss_sdk']}.")
+                sys.exit(255)
+            env.AppendUnique(CPPDEFINES=["DLSS_ENABLED"])
+            env.Append(CPPPATH=[os.path.join(env["dlss_sdk"], "include")])
+            env.Append(LIBPATH=[dlss_lib_dir])
+            LIBS += [dlss_lib]
 
     if env["sdl"]:
         env.Append(CPPDEFINES=["SDL_ENABLED"])
@@ -898,6 +925,10 @@ def configure_mingw(env: "SConsEnvironment"):
 
         if not env["use_volk"]:
             env.Append(LIBS=["vulkan"])
+
+    if env["dlss_sdk"] != "":
+        print_error("DLSS (dlss_sdk) needs MSVC: the DLSS SDK's NGX libraries are built for it.")
+        sys.exit(255)
 
     if env["sdl"]:
         env.Append(CPPDEFINES=["SDL_ENABLED"])

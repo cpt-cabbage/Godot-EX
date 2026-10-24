@@ -163,6 +163,16 @@ if env["d3d12"]:
             Copy("$TARGET", "$SOURCE"),
         )
 
+# DLSS: NGX loads the feature DLL from the executable's directory.
+if env["vulkan"] and env["dlss_sdk"] != "":
+    dlss_dll = "nvngx_dlss.dll"
+    dlss_dll_dir = "dev" if env["dlss_dev_dll"] else "rel"
+    env.CommandNoCache(
+        "#bin/" + dlss_dll,
+        env["dlss_sdk"] + "/lib/Windows_x86_64/" + dlss_dll_dir + "/" + dlss_dll,
+        Copy("$TARGET", "$SOURCE"),
+    )
+
 if not env.msvc:
     if env["debug_symbols"]:
         env.AddPostAction(prog, env.Run(platform_windows_builders.make_debug_mingw))
