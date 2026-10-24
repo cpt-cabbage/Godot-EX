@@ -170,9 +170,11 @@ Raytracing::Raytracing(bool p_sky_use_octmap_array) {
 	{
 		Vector<String> guide_modes;
 		guide_modes.push_back("");
+		guide_modes.push_back("\n#define SPEC_AA\n");
 		denoise_guide_shader.initialize(guide_modes);
 		denoise_guide_shader_version = denoise_guide_shader.version_create();
 		denoise_guide_pipeline = RD::get_singleton()->compute_pipeline_create(denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 0));
+		spec_aa_pipeline = RD::get_singleton()->compute_pipeline_create(denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 1));
 	}
 
 	{
@@ -1308,6 +1310,51 @@ bool Raytracing::_denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint
 	return true;
 }
 
+RID Raytracing::_spec_aa_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness) {
+	// GODOT_GI_SPEC_AA=<scale on the normals' variance>: 2 by default (the
+	// TPS panels' glints measured at 1, 2 and 4: 82, 39 and 28 of 202), 1
+	// Toksvig's own, 0 off (each texel the sample pixel's normal and
+	// roughness, the form before).
+	static const float spec_aa = OS::get_singleton()->get_environment("GODOT_GI_SPEC_AA") == "" ? 2.0f : MAX(float(OS::get_singleton()->get_environment("GODOT_GI_SPEC_AA").to_float()), 0.0f);
+	if (spec_aa <= 0.0f || p_scale <= 1 || p_depth.is_null() || p_normal_roughness.is_null()) {
+		return RID();
+	}
+	RD *rd = RD::get_singleton();
+	if (!p_render_buffers->has_texture(RB_SCOPE_RT_GI, RB_RT_GI_SPEC_NR)) {
+		_create_cleared_texture(p_render_buffers, RB_SCOPE_RT_GI, RB_RT_GI_SPEC_NR, RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, p_size);
+	}
+	RID out = p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_SPEC_NR, p_view, 0);
+	if (out.is_null()) {
+		return RID();
+	}
+	Size2i full_size = p_render_buffers->get_internal_size();
+	DenoiseGuidePushConstant pc = {};
+	pc.size[0] = p_size.x;
+	pc.size[1] = p_size.y;
+	pc.full_size[0] = full_size.x;
+	pc.full_size[1] = full_size.y;
+	pc.scale = packed_sample_scale(p_scale);
+	pc.spec_variance = spec_aa;
+	pc.depth_tolerance = 0.05f;
+	RID shader_rid = denoise_guide_shader.version_get_shader(denoise_guide_shader_version, 1);
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	RD::Uniform g_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_depth }));
+	RD::Uniform g_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, p_normal_roughness }));
+	RD::Uniform g_out(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ out }));
+	RENDER_TIMESTAMP("RT GI Spec AA");
+	rd->draw_command_begin_label("RT GI Spec AA");
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, spec_aa_pipeline);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 0, g_depth, g_nr), 0);
+	rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(shader_rid, 1, g_out), 1);
+	rd->compute_list_set_push_constant(list, &pc, sizeof(DenoiseGuidePushConstant));
+	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+	return out;
+}
+
 void Raytracing::fill_diffuse_target_sky(RID p_depth, RID p_color, RID p_diffuse_target, Size2i p_size) {
 	RD *rd = RD::get_singleton();
 	const int32_t pc[4] = { p_size.x, p_size.y, 0, 0 };
@@ -2326,6 +2373,14 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (p_quality.specular) {
 		params.flags |= 2; // FLAG_SPECULAR
 	}
+	// The reflection's lobe per texel from its footprint (GODOT_GI_SPEC_AA;
+	// see rt_denoise_guide.glsl): the gather draws the ray from it, the reuse
+	// and the resolve weigh by it, the temporal and spatial passes size the
+	// reflection's reprojection and kernel by its roughness.
+	const RID spec_nr = p_quality.specular ? _spec_aa_guide(p_render_buffers, p_view, size, depth_scale, depth, p_normal_roughness) : RID();
+	if (spec_nr.is_valid()) {
+		params.flags |= 2147483648u; // FLAG_SPEC_AA
+	}
 	if (p_cascades.active) {
 		params.flags |= 4; // FLAG_SDFGI
 	}
@@ -2553,6 +2608,8 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	RID prev_hist_dyn = dyn_split ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, rb_state->history_parity ? RB_RT_GI_HIST_DYN_1 : RB_RT_GI_HIST_DYN_0, p_view, 0) : default_black;
 	RD::Uniform u_prev_hist_dyn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 43, Vector<RID>({ sampler, prev_hist_dyn }));
 	RD::Uniform u_prev_signal_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 44, Vector<RID>({ sampler, prev_view_depth }));
+	// The reflection's lobe (FLAG_SPEC_AA; the normal texture stands in when off, never read then).
+	RD::Uniform u_spec_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 38, Vector<RID>({ sampler, spec_nr.is_valid() ? spec_nr : p_normal_roughness }));
 	RID raw_dyn = dyn_split ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_RAW_DYN, p_view, 0) : RID();
 	RID raw_fallback_dyn = dyn_split ? p_render_buffers->get_texture_slice(RB_SCOPE_RT_GI, RB_RT_GI_FALLBACK_DYN, p_view, 0) : RID();
 	RD::Uniform u_params(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ rb_state->rt_gi_params_ubos[p_view] }));
@@ -2674,7 +2731,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Gather");
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
-		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth), 0);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, u_out_spec_hit, u_reuse_rays), 1);
 		rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 		rd->compute_list_end();
@@ -2716,7 +2773,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		{
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_setup_pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records, u_out_spec_hit), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -2727,7 +2784,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		{
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_trace_pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args_dummy, g_requests, g_records, u_out_spec_hit), 1);
 			rd->compute_list_dispatch_indirect(list, gather_args, 0);
 			rd->compute_list_end();
@@ -2738,7 +2795,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		{
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_resolve_pipeline);
-			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth), 0);
+			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records, u_out_spec_hit, u_reuse_rays), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -2772,7 +2829,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		// r of this pixel's own hit distance (the visibility proxy; default
 		// 2, 0 off).
 		static const float reuse_t_ratio = OS::get_singleton()->get_environment("GODOT_GI_REUSE_TRATIO") == "" ? 2.0f : float(OS::get_singleton()->get_environment("GODOT_GI_REUSE_TRATIO").to_float());
-		reuse_push.flags = reuse_flags | (dyn_split ? 4u : 0u) | (reuse_no_pool ? 8u : 0u) | (spec_vndf ? 16u : 0u) | (spec_weight && dfg_lut.is_valid() ? 32u : 0u) | (uint32_t(CLAMP(reuse_t_ratio * 16.0f, 0.0f, 65535.0f)) << 16);
+		reuse_push.flags = reuse_flags | (dyn_split ? 4u : 0u) | (reuse_no_pool ? 8u : 0u) | (spec_vndf ? 16u : 0u) | (spec_weight && dfg_lut.is_valid() ? 32u : 0u) | (spec_nr.is_valid() ? 64u : 0u) | (uint32_t(CLAMP(reuse_t_ratio * 16.0f, 0.0f, 65535.0f)) << 16);
 		reuse_push.radius = int32_t(CLAMP(reuse_radius, int64_t(0), int64_t(4)));
 		reuse_push.rough_min = 0.2f; // The gather's mirror threshold.
 		reuse_push.rough_full = 0.35f;
@@ -2784,6 +2841,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform r_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, depth }));
 		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, p_normal_roughness }));
 		RD::Uniform r_dfg(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ material_sampler, dfg_lut.is_valid() ? dfg_lut : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK) }));
+		RD::Uniform r_spec_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, spec_nr.is_valid() ? spec_nr : p_normal_roughness }));
 		RD::Uniform r_ambient(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ raw_ambient }));
 		RD::Uniform r_reflection(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ raw_reflection }));
 		RD::Uniform r_directional(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ raw_directional }));
@@ -2792,7 +2850,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Reuse");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, gi_reuse_pipeline);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(reuse_rid, 0, r_rays, r_depth, r_nr, r_dfg), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(reuse_rid, 0, r_rays, r_depth, r_nr, r_dfg, r_spec_nr), 0);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(reuse_rid, 1, r_ambient, r_reflection, r_directional, r_ambient_dyn), 1);
 		rd->compute_list_set_push_constant(list, &reuse_push, sizeof(GiReusePushConstant));
 		rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
@@ -2875,7 +2933,10 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform r_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, raw_reflection }));
 		RD::Uniform r_ray(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, raw_spec_ray }));
 		RD::Uniform r_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, guide_depth }));
-		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, guide_nr }));
+		// The reflection's lobe in place of the guide's normal under
+		// GODOT_GI_SPEC_AA (the same texels: the gather's, at the signal's
+		// size): the weights are the lobe the gather drew from.
+		RD::Uniform r_nr(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, guided && spec_nr.is_valid() ? spec_nr : guide_nr }));
 		RD::Uniform r_dfg(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ material_sampler, dfg_lut.is_valid() ? dfg_lut : default_black }));
 		RD::Uniform r_out(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ resolved_reflection }));
 		RENDER_TIMESTAMP("RT GI Reflection Resolve");
@@ -2982,7 +3043,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::Uniform u_prev_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, prev_view_depth }));
 		RD::Uniform u_raw_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ sampler, raw_directional }));
 		RD::Uniform u_hist_d(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 11, Vector<RID>({ sampler, hist_read_d }));
-		RD::Uniform u_nr_temporal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, p_normal_roughness }));
+		// The reflection's lobe under GODOT_GI_SPEC_AA, read at the signal's
+		// pixel: the virtual image's weight and the smear's allowance are
+		// the lobe's the gather traced.
+		RD::Uniform u_nr_temporal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, spec_nr.is_valid() ? spec_nr : p_normal_roughness }));
+		if (spec_nr.is_valid()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_AA;
+		}
 		// The moving lights' term (GODOT_GI_DYN_SPLIT): its sample, its
 		// history, and the two outputs (dummies otherwise, never touched).
 		RD::Uniform u_raw_dyn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 17, Vector<RID>({ sampler, dyn_split ? raw_dyn : default_black }));
@@ -3052,6 +3119,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (dyn_split) {
 			denoise_push_constant.flags |= DENOISE_FLAG_DYN_SPLIT;
 		}
+		if (spec_nr.is_valid()) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_AA;
+		}
 		static const bool spec_no_young = OS::get_singleton()->get_environment("GODOT_GI_SPEC_ABLATE").contains("young");
 		if (spec_no_young) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_NO_YOUNG;
@@ -3093,6 +3163,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		// The cards' bounce irradiance the last iteration fades young pixels in from.
 		RD::Uniform u_fallback(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, raw_fallback }));
 		RD::Uniform u_fallback_dyn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 11, Vector<RID>({ sampler, dyn_split ? raw_fallback_dyn : default_black }));
+		RD::Uniform u_spec_nr_dn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, spec_nr.is_valid() ? spec_nr : guide_nr }));
 		RD::Uniform u_out_a(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ out_ambient }));
 		RD::Uniform u_out_r(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ out_reflection }));
 		RD::Uniform u_out_d(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ out_directional }));
@@ -3101,7 +3172,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		rd->draw_command_begin_label("RT GI Spatial");
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, stochastic_denoise_pipelines[variant]);
-		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d, u_fallback, u_fallback_dyn), 0);
+		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 0, u_in_a, u_in_r, u_dn_depth, u_moments, u_normal_dn, u_meta, u_analytic_a, u_analytic_r, u_in_d, u_fallback, u_fallback_dyn, u_spec_nr_dn), 0);
 		if (last) {
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(rid, 1, u_out_a, u_out_r, u_out_d), 1);
 		} else {

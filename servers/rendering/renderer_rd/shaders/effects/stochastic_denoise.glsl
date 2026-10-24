@@ -47,6 +47,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_OBJECTS 2048u // A mirror's image of an object that moved this frame is fetched where the object was.
 #define FLAG_SPEC_DISOCC 8u // A near-mirror reflection whose every virtual tap fails its depth test restarts by its virtual weight.
 #define FLAG_CAUSE_STATS 4194304u // Diagnostics (GI temporal; GODOT_GI_TIER_PRINT / GODOT_RT_STATE_PRINT): count why this frame's young pixels are young into the gather's calibration buffer (see cause_stats).
+#define FLAG_SPEC_AA 8388608u // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size (rt_denoise_guide.glsl SPEC_AA), read at the pixel: the temporal pass's normal_roughness_texture, the spatial pass's spec_normal_roughness_texture.
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
@@ -241,6 +242,9 @@ layout(set = 0, binding = 8) uniform sampler2D in_directional;
 layout(set = 0, binding = 9) uniform sampler2D fallback_texture;
 // The moving lights' share of the fallback (FLAG_DYN_SPLIT; see store_result).
 layout(set = 0, binding = 11) uniform sampler2D fallback_dyn_texture;
+// The reflection's lobe at the signal's size (FLAG_SPEC_AA): its roughness
+// sizes the reflection's kernel, as it decided the gather's ray.
+layout(set = 0, binding = 13) uniform sampler2D spec_normal_roughness_texture;
 #endif
 
 // The spatial pass writes the final buffers, which stay packed on both paths:
@@ -431,7 +435,11 @@ void main() {
 	// of the way toward it the reflection's history is looked up: all of it
 	// for a mirror, none for a rough surface whose lobe has no single image.
 	float virtual_view_depth = current_specular4.a;
-	float nr_rough = nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
+	// The reflection's lobe: its footprint's under FLAG_SPEC_AA (the mean
+	// normal and widened roughness at the signal's pixel), so the image's
+	// weight and the smear's allowance are the lobe's that was traced.
+	ivec2 nr_pixel = (params.flags & FLAG_SPEC_AA) != 0u ? pixel : rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0));
+	float nr_rough = nr_roughness(texelFetch(normal_roughness_texture, nr_pixel, 0));
 	float virtual_weight = 1.0 - smoothstep(0.15, 0.6, nr_rough);
 #endif
 
@@ -647,7 +655,7 @@ void main() {
 				vec4 v4 = movers.view_from_ndc * vec4(ndc_xy, depth_from_linear(virtual_view_depth), 1.0);
 				vec3 surface = p4.xyz / p4.w;
 				vec3 image = v4.xyz / v4.w;
-				vec3 n = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
+				vec3 n = nr_normal(texelFetch(normal_roughness_texture, nr_pixel, 0));
 				// The hit: the virtual point mirrored back across the plane.
 				vec3 hit = image - 2.0 * dot(image - surface, n) * n;
 				bool hit_moved = false;
@@ -1562,7 +1570,7 @@ void main() {
 	// The reflection's kernel follows roughness: a rough lobe is as wide as
 	// the diffuse one, a mirror's image must not be filtered at all.
 	{
-		float r = nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
+		float r = (params.flags & FLAG_SPEC_AA) != 0u ? nr_roughness(texelFetch(spec_normal_roughness_texture, pixel, 0)) : nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
 		float spec_scale = clamp(r / 0.35, 0.0, 1.0);
 		if (spec_scale < 0.25) {
 			// A mirror's image is never filtered. Filtering a young mirror

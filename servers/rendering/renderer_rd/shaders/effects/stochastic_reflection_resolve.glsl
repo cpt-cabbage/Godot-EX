@@ -48,6 +48,9 @@ layout(set = 0, binding = 0) uniform sampler2D raw_reflection;
 // z nonzero where the gather traced a rough ray (its sampling density).
 layout(set = 0, binding = 1) uniform sampler2D spec_ray;
 layout(set = 0, binding = 2) uniform sampler2D depth_texture;
+// The denoisers' guide, or under GODOT_GI_SPEC_AA the reflection's lobe the
+// gather drew from (rt_denoise_guide.glsl SPEC_AA: the block's mean normal
+// and widened roughness), both at the signal's size.
 layout(set = 0, binding = 3) uniform sampler2D normal_roughness_texture;
 // The scene shader's DFG LUT (integrate_dfg.glsl; y the F0 = 1 albedo), for the BRDF weight.
 layout(set = 0, binding = 4) uniform sampler2D dfg_lut;

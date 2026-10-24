@@ -116,6 +116,7 @@
 #define RB_RT_GI_RAW_SPEC_RAY SNAME("raw_spec_ray")
 #define RB_RT_GI_SPEC_HIT SNAME("spec_hit") // What the reflection ray hit (SPEC_HIT_* in the gather): a card set, a screen position, or nothing.
 #define RB_RT_GI_RESOLVED_REFLECTION SNAME("resolved_reflection")
+#define RB_RT_GI_SPEC_NR SNAME("spec_nr") // The reflection's lobe per texel (GODOT_GI_SPEC_AA): its footprint's mean normal and widened roughness, encoded like the normal-roughness buffer (alpha: the texel carries a lobe of its own).
 #define RB_RT_GI_HIST_DIRECTIONAL_0 SNAME("hist_directional_0")
 #define RB_RT_GI_HIST_DIRECTIONAL_1 SNAME("hist_directional_1")
 // The moving lights' term as a history of its own (GODOT_GI_DYN_SPLIT, plan
@@ -341,6 +342,7 @@ private:
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.
+		DENOISE_FLAG_SPEC_AA = 8388608, // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size, read at the pixel (the temporal pass's normal-roughness binding; the spatial pass's binding 13).
 		DENOISE_FLAG_DYN_SPLIT = 2097152, // GI (GODOT_GI_DYN_SPLIT): the moving lights' term is a history of its own; the temporal pass accumulates it apart and hands the spatial pass the sum, the spatial pass fades each history's share of the stand-in in on its own.
 	};
 
@@ -676,13 +678,20 @@ private:
 	RtDenoiseGuideShaderRD denoise_guide_shader;
 	RID denoise_guide_shader_version;
 	RID denoise_guide_pipeline;
+	RID spec_aa_pipeline; // The same shader's SPEC_AA variant (GODOT_GI_SPEC_AA).
 	struct DenoiseGuidePushConstant {
 		int32_t size[2];
 		int32_t full_size[2];
 		int32_t scale;
-		int32_t pad[3];
+		float spec_variance;
+		float depth_tolerance;
+		int32_t pad;
 	};
 	bool _denoise_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness, RID &r_depth, RID &r_normal_roughness);
+	// The GI reflection's lobe per texel (rt_denoise_guide.glsl SPEC_AA): its
+	// footprint's mean normal and the roughness the bumps there widen, at the
+	// GI's size. Null when off (GODOT_GI_SPEC_AA=0) or at full resolution.
+	RID _spec_aa_guide(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, Size2i p_size, uint32_t p_scale, RID p_depth, RID p_normal_roughness);
 
 	// The diffuse target's sky pixels (rt_diffuse_target_sky.glsl, fill_diffuse_target_sky()).
 	RtDiffuseTargetSkyShaderRD diffuse_target_sky_shader;

@@ -77,6 +77,8 @@ layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
 // The scene shader's DFG LUT (y the F0 = 1 albedo), for the own sample's BRDF weight (FLAG_WEIGHT).
 layout(set = 0, binding = 3) uniform sampler2D dfg_lut;
+// The reflection's lobe per pixel at this pass's size (FLAG_SPEC_AA; rt_denoise_guide.glsl SPEC_AA).
+layout(set = 0, binding = 4) uniform sampler2D spec_normal_roughness_texture;
 
 layout(set = 1, binding = 0, rgba16f) uniform restrict image2D raw_ambient;
 layout(set = 1, binding = 1, rgba16f) uniform restrict image2D raw_reflection;
@@ -101,6 +103,11 @@ layout(set = 1, binding = 3, rgba16f) uniform restrict image2D raw_ambient_dyn;
 // target is f cos rather than the sampling density, a draw that fell below the
 // horizon is no candidate, and the pixel's own sample carries its weight.
 #define FLAG_WEIGHT 32u
+// The reflection's lobe is the gather's footprint's (GODOT_GI_SPEC_AA): its
+// mean normal and widened roughness, which the gather drew the ray from and
+// decided the mirror class by. The diffuse rays' cosine lobe stays the
+// sample pixel's, and so do the stops.
+#define FLAG_SPEC_AA 64u
 
 layout(push_constant, std430) uniform Params {
 	mat4 view_from_ndc;
@@ -136,7 +143,8 @@ float luminance(vec3 c) {
 struct Surface {
 	vec3 pos; // View space.
 	vec3 normal;
-	float alpha; // GGX, roughness squared.
+	vec3 spec_normal; // The reflection lobe's (the normal but under FLAG_SPEC_AA).
+	float alpha; // GGX, roughness squared: the reflection lobe's.
 	bool mirror;
 };
 
@@ -154,6 +162,12 @@ bool surface_at(ivec2 pixel, out Surface s) {
 	vec4 nr = texelFetch(normal_roughness_texture, full_pixel, 0);
 	s.normal = nr_normal(nr);
 	float roughness = nr_roughness(nr);
+	s.spec_normal = s.normal;
+	if ((params.flags & FLAG_SPEC_AA) != 0u) {
+		vec4 spec_nr = texelFetch(spec_normal_roughness_texture, pixel, 0);
+		s.spec_normal = nr_normal(spec_nr);
+		roughness = nr_roughness(spec_nr);
+	}
 	s.alpha = roughness * roughness;
 	s.mirror = roughness <= params.rough_min;
 	return true;
@@ -167,13 +181,13 @@ float cosine_pdf(Surface s, vec3 dir) {
 float ggx_pdf(Surface s, vec3 dir) {
 	vec3 v = normalize(-s.pos);
 	vec3 h = normalize(v + dir);
-	float ndh = max(dot(s.normal, h), 0.0);
+	float ndh = max(dot(s.spec_normal, h), 0.0);
 	float vdh = max(dot(v, h), 1e-4);
 	float a2 = max(s.alpha * s.alpha, 1e-6);
 	float d = ndh * ndh * (a2 - 1.0) + 1.0;
 	float ndf = a2 / (M_PI * d * d);
 	if ((params.flags & FLAG_VNDF) != 0u) {
-		float ndv = max(dot(s.normal, v), 1e-4);
+		float ndv = max(dot(s.spec_normal, v), 1e-4);
 		return ndf / (2.0 * (ndv + sqrt(a2 + (1.0 - a2) * ndv * ndv)));
 	}
 	return ndf * ndh / (4.0 * vdh);
@@ -182,14 +196,14 @@ float ggx_pdf(Surface s, vec3 dir) {
 // f cos at F = 1 with the DFG LUT's G (separable Schlick-GGX, k = alpha /
 // 2): the reflection's target under FLAG_WEIGHT.
 float brdf_cos(Surface s, vec3 dir) {
-	float nl = dot(s.normal, dir);
+	float nl = dot(s.spec_normal, dir);
 	if (nl <= 0.0) {
 		return 0.0;
 	}
 	vec3 v = normalize(-s.pos);
-	float nv = clamp(dot(s.normal, v), 1e-4, 1.0);
+	float nv = clamp(dot(s.spec_normal, v), 1e-4, 1.0);
 	vec3 h = normalize(v + dir);
-	float ndh = max(dot(s.normal, h), 0.0);
+	float ndh = max(dot(s.spec_normal, h), 0.0);
 	float a2 = max(s.alpha * s.alpha, 1e-6);
 	float d = ndh * ndh * (a2 - 1.0) + 1.0;
 	float k = s.alpha * 0.5;
@@ -201,12 +215,12 @@ float brdf_cos(Surface s, vec3 dir) {
 // pass computes it: the visible normals' G / G1(v), D cancelled (FLAG_WEIGHT
 // is only set with them).
 float own_brdf_weight(Surface s, vec3 dir) {
-	float nl = dot(s.normal, dir);
+	float nl = dot(s.spec_normal, dir);
 	if (nl <= 0.0) {
 		return 0.0;
 	}
 	vec3 v = normalize(-s.pos);
-	float nv = clamp(dot(s.normal, v), 1e-4, 1.0);
+	float nv = clamp(dot(s.spec_normal, v), 1e-4, 1.0);
 	float k = s.alpha * 0.5;
 	float g = nv / (nv * (1.0 - k) + k) * nl / (nl * (1.0 - k) + k);
 	float a2 = s.alpha * s.alpha;
@@ -333,7 +347,7 @@ void main() {
 					sum_d_dyn += luminance(radiance) * float((rec.w >> RAY_DYN_SHIFT) & 255u) / 255.0 * w;
 					w_d += w;
 				}
-				if (reuse_s && visible_s && (pool || is_spec) && dot(p.normal, dir_p) > 1e-4) {
+				if (reuse_s && visible_s && (pool || is_spec) && dot(p.spec_normal, dir_p) > 1e-4) {
 					float w = (weighted ? brdf_cos(p, dir_p) : ggx_pdf(p, dir_p)) / density;
 					sum_s += radiance * w;
 					w_s += w;

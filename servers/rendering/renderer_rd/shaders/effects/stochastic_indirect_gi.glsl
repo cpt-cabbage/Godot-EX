@@ -62,6 +62,11 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 #endif
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 0, binding = 2) uniform sampler2D normal_roughness_texture;
+// The reflection's lobe per texel at the signal's size (FLAG_SPEC_AA,
+// rt_denoise_guide.glsl SPEC_AA): its footprint's mean normal and the
+// roughness the bumps there widen, encoded like the normal-roughness buffer
+// (alpha 1: the texel carries such a lobe, 0: the sample pixel's own).
+layout(set = 0, binding = 38) uniform sampler2D spec_normal_roughness_texture;
 
 #define MAX_MIRROR_PLANES 4u
 struct MirrorPlane {
@@ -173,6 +178,7 @@ params;
 #define FLAG_DYN_SPLIT 536870912u // The moving lights' term apart (GODOT_GI_DYN_SPLIT, section 88): out_ambient_dyn carries it with its own change mark, the temporal pass accumulates it as a history of its own, and out_ambient's mark is the static lights' alone.
 #define FLAG_SPEC_HALF_RATE 268435456u // The rough reflection ray on a checkerboard that alternates each frame; the resolve fills the rest from the traced neighbors (raytraced_gi/quality/half_rate_reflections).
 #define FLAG_RECORD_HIT_NORMAL 1073741824u // The ray records carry each diffuse hit's normal: ReSTIR GI's reconnection (GODOT_GI_RESTIR) and nothing else, a card-normal or G-buffer fetch a ray.
+#define FLAG_SPEC_AA 2147483648u // The reflection ray's lobe is its footprint's (GODOT_GI_SPEC_AA; spec_normal_roughness_texture), the diffuse rays' the sample pixel's.
 #define FLAG_CARD_MIRROR_FOLD 4194304u // The cards light a planar mirror's texels with their F0 folded back out of the albedo (surface_cache_light.glsl card_diffuse_albedo); a hit's dynamic direct term does the same.
 
 layout(set = 0, binding = 4) uniform sampler2DArray stbn_texture;
@@ -1976,6 +1982,16 @@ struct GatherPixel {
 	vec3 rel_pos;
 	vec3 world_normal;
 	vec3 world_geo_normal;
+	// The reflection's lobe: the sample pixel's own, or its footprint's under
+	// FLAG_SPEC_AA, whose roughness decides the class (a mirror whose bumps
+	// widen it past 0.2 is a glossy texel, under it a narrow lobe).
+	vec3 spec_world_normal;
+	float spec_roughness;
+	bool spec_lobe; // The texel carries its footprint's lobe (FLAG_SPEC_AA), not the sample pixel's own.
+	// A mirror, or under FLAG_SPEC_AA a mirror whose footprint's bumps gave
+	// it a narrow lobe (spec_roughness at most 0.2): drawn from that lobe,
+	// its ray is otherwise a mirror ray (its hits, its reuse).
+	bool mirror_class;
 	float prev_frames;
 	float prev_frames_static;
 	uint rays; // The diffuse rays traced.
@@ -2031,6 +2047,21 @@ bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
 	g.rel_pos = world_basis * g.view_pos;
 	g.world_normal = normalize(world_basis * g.view_normal);
 	g.world_geo_normal = normalize(world_basis * g.geo_view_normal);
+	g.spec_world_normal = g.world_normal;
+	g.spec_roughness = g.roughness;
+	g.spec_lobe = false;
+	if (bool(params.flags & FLAG_SPEC_AA)) {
+		// Faced like the pixel's own normal (the footprint's normals were
+		// averaged as the buffer holds them).
+		vec4 spec_nr = texelFetch(spec_normal_roughness_texture, pixel, 0);
+		vec3 spec_view_normal = nr_normal(spec_nr);
+		if (dot(spec_view_normal, g.geo_view_normal) < 0.0) {
+			spec_view_normal = -spec_view_normal;
+		}
+		g.spec_world_normal = normalize(world_basis * spec_view_normal);
+		g.spec_roughness = nr_roughness(spec_nr);
+		g.spec_lobe = spec_nr.a > 0.5;
+	}
 
 	// How young this pixel's screen history is (last frame's frame count at
 	// its reprojection, none off frame): a young pixel traces more rays
@@ -2064,7 +2095,8 @@ bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
 	// give the hit a surface at texture resolution; otherwise the rough band
 	// alone, with sharp reflections left to SSR / probes, whose sharpness the
 	// blurry cache cannot match.
-	g.mirror = bool(params.flags & FLAG_MIRROR) && g.roughness <= 0.2;
+	g.mirror = bool(params.flags & FLAG_MIRROR) && g.spec_roughness <= 0.2 && !g.spec_lobe;
+	g.mirror_class = bool(params.flags & FLAG_MIRROR) && g.spec_roughness <= 0.2;
 	// Diagnostics (FLAG_ABLATE_SPEC): no reflection ray, the diffuse rays'
 	// mean radiance standing in (what a lobe as wide as the hemisphere
 	// would return; as a budget for rough dielectrics it read 12% bright on
@@ -2088,7 +2120,7 @@ bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
 	// two patterns met in the history. Fixed, a skipped pixel is always
 	// the mean of its four traced neighbors: a blurrier reflection on
 	// half the pixels, and a still one.
-	bool spec_skip = bool(params.flags & FLAG_SPEC_HALF_RATE) && !g.mirror && g.roughness > 0.2 && ((pixel.x + pixel.y) & 1) != 0;
+	bool spec_skip = bool(params.flags & FLAG_SPEC_HALF_RATE) && !g.mirror && g.spec_roughness > 0.2 && ((pixel.x + pixel.y) & 1) != 0;
 	if (spec_skip) {
 		// Only where a 4-neighbour is on this surface by the fill's own
 		// stops (a twentieth of the depth, the normal to a few degrees):
@@ -2119,7 +2151,7 @@ bool gather_pixel_setup(ivec2 pixel, out GatherPixel g) {
 	// Measured and not kept (section 90): the diffuse ray standing in as a
 	// rough pixel's reflection sample, reweighted into the lobe by the
 	// resolve -- +8% brighter for -1.8 ms, +2.7% gated to steep views.
-	g.spec_trace = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && (g.roughness > 0.2 || g.mirror) && !spec_skip;
+	g.spec_trace = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && (g.spec_roughness > 0.2 || g.mirror_class) && !spec_skip;
 	g.fallback = bool(params.flags & FLAG_SURFACE_CACHE) && !bool(params.flags & FLAG_FALLBACK_OFF) && (g.prev_frames < FALLBACK_FRAMES || bool(params.flags & FLAG_FALLBACK_ALL));
 	return true;
 }
@@ -2142,8 +2174,8 @@ vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel, out bool below) {
 	// in the history read 0.034 against 0.028 at the stop of the flick
 	// case and was still behind at stop + 16; a rough lobe's blur is
 	// what the eye expects there.)
-	float alpha = g.roughness * g.roughness;
-	vec3 dir = reflect(-v, g.world_normal);
+	float alpha = g.spec_roughness * g.spec_roughness;
+	vec3 dir = reflect(-v, g.spec_world_normal);
 	below = false;
 	if (!g.mirror) {
 		// The half vector's density: the plain NDF draws half vectors facing
@@ -2165,7 +2197,7 @@ vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel, out bool below) {
 		float phi = rnd.x * 2.0 * M_PI;
 		vec3 h_local;
 		if (bool(params.flags & FLAG_SPEC_VNDF)) {
-			mat3 basis = basis_around(g.world_normal);
+			mat3 basis = basis_around(g.spec_world_normal);
 			vec3 v_local = transpose(basis) * v;
 			v_local.z = max(v_local.z, 1e-4);
 			vec3 v_std = normalize(vec3(v_local.xy * alpha, v_local.z));
@@ -2178,8 +2210,8 @@ vec3 gather_reflection_dir(GatherPixel g, ivec2 pixel, out bool below) {
 			float st = sqrt(max(1.0 - ct * ct, 0.0));
 			h_local = vec3(st * cos(phi), st * sin(phi), ct);
 		}
-		vec3 d = reflect(-v, normalize(basis_around(g.world_normal) * h_local));
-		if (dot(d, g.world_normal) > 1e-4) {
+		vec3 d = reflect(-v, normalize(basis_around(g.spec_world_normal) * h_local));
+		if (dot(d, g.spec_world_normal) > 1e-4) {
 			dir = d;
 		} else {
 			below = true;
@@ -2470,7 +2502,7 @@ void gather_main() {
 		reflection = irradiance;
 	} else if (g.spec_trace) {
 		vec3 v = normalize(-rel_pos);
-		float alpha = roughness * roughness;
+		float alpha = g.spec_roughness * g.spec_roughness;
 		specular_cone_tan = mirror ? 0.0 : min(2.0 * alpha, params.card_cone_tan);
 		bool below;
 #ifdef GATHER_RESOLVE
@@ -2484,21 +2516,21 @@ void gather_main() {
 		float spec_t_hit;
 		hit_slot = params.ray_count;
 		hit_specular = true;
-		hit_mirror = mirror;
+		hit_mirror = g.mirror_class;
 		reflection = trace_radiance(rel_pos, world_geo_normal, dir, view_pos, view_dir, stbn_sample(pixel, 5u).r, spec_t_hit);
 		if (!mirror) {
 			// The density of the direction traced (after the folds), GGX
 			// over the half vector turned to directions, and the hit's
 			// distance, for the resolve.
 			vec3 h_final = normalize(v + dir);
-			float ndh = max(dot(world_normal, h_final), 0.0);
+			float ndh = max(dot(g.spec_world_normal, h_final), 0.0);
 			float vdh = max(dot(v, h_final), 1e-4);
 			float d = ndh * ndh * (alpha * alpha - 1.0) + 1.0;
 			float ndf = alpha * alpha / (M_PI * d * d);
 			float pdf = ndf * ndh / (4.0 * vdh);
 			if (bool(params.flags & FLAG_SPEC_VNDF)) {
 				// D(h) G1(v) / (4 n.v), G1 Smith's.
-				float ndv = max(dot(world_normal, v), 1e-4);
+				float ndv = max(dot(g.spec_world_normal, v), 1e-4);
 				pdf = ndf / (2.0 * (ndv + sqrt(alpha * alpha + (1.0 - alpha * alpha) * ndv * ndv)));
 			}
 			// Negative where the draw fell below the horizon and the mirror
@@ -2522,13 +2554,13 @@ void gather_main() {
 		t_image /= (1.0 + 2.0 * curvature * t_image);
 		virtual_view_depth = -view_pos.z * (1.0 + t_image / view_len);
 		if (bool(params.flags & FLAG_REUSE_RECORD)) {
-			uint flags = GI_REUSE_RAY_VALID | GI_REUSE_RAY_SPEC | (mirror ? GI_REUSE_RAY_MIRROR : 0u) | (below ? GI_REUSE_RAY_BELOW : 0u);
+			uint flags = GI_REUSE_RAY_VALID | GI_REUSE_RAY_SPEC | (g.mirror_class ? GI_REUSE_RAY_MIRROR : 0u) | (below ? GI_REUSE_RAY_BELOW : 0u);
 			reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + params.ray_count] = gi_reuse_record(max(reflection, vec3(0.0)), view_dir, spec_t_hit, flags);
 		}
 	} else if (bool(params.flags & FLAG_REUSE_RECORD)) {
 		// No reflection ray: skipped by the half-rate checkerboard (a rough
 		// pixel that reflects, valid without GI_REUSE_RAY_SPEC), or none.
-		bool skipped = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && roughness > 0.2 && !mirror;
+		bool skipped = !g.spec_stand_in && bool(params.flags & FLAG_SPECULAR) && g.spec_roughness > 0.2 && !mirror;
 		reuse_rays.data[uint(pixel.y * params.screen_size.x + pixel.x) * (params.ray_count + 1u) + params.ray_count] = uvec4(0u, 0u, 0u, skipped ? GI_REUSE_RAY_VALID : 0u);
 	}
 
