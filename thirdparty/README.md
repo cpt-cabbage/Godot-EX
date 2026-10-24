@@ -1072,6 +1072,12 @@ Files extracted from upstream source:
 - `re-spirv.h`
 - `LICENSE`
 
+Patches:
+
+- `0001-ray-query.patch` (Godot-EX: the SPV_KHR_ray_query instructions, so shaders
+  with ray queries are optimized instead of skipped with "OpTypeRayQueryKHR is
+  not supported yet")
+
 
 ## rvo2
 

@@ -252,6 +252,33 @@ namespace respv {
         case SpvOpGroupNonUniformQuadBroadcast:
         case SpvOpGroupNonUniformQuadSwap:
         case SpvOpCopyLogical:
+        case SpvOpConvertUToAccelerationStructureKHR:
+        case SpvOpTypeRayQueryKHR:
+        case SpvOpRayQueryInitializeKHR:
+        case SpvOpRayQueryTerminateKHR:
+        case SpvOpRayQueryGenerateIntersectionKHR:
+        case SpvOpRayQueryConfirmIntersectionKHR:
+        case SpvOpRayQueryProceedKHR:
+        case SpvOpRayQueryGetIntersectionTypeKHR:
+        case SpvOpRayQueryGetIntersectionTriangleVertexPositionsKHR:
+        case SpvOpTypeAccelerationStructureKHR:
+        case SpvOpRayQueryGetRayTMinKHR:
+        case SpvOpRayQueryGetRayFlagsKHR:
+        case SpvOpRayQueryGetIntersectionTKHR:
+        case SpvOpRayQueryGetIntersectionInstanceCustomIndexKHR:
+        case SpvOpRayQueryGetIntersectionInstanceIdKHR:
+        case SpvOpRayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR:
+        case SpvOpRayQueryGetIntersectionGeometryIndexKHR:
+        case SpvOpRayQueryGetIntersectionPrimitiveIndexKHR:
+        case SpvOpRayQueryGetIntersectionBarycentricsKHR:
+        case SpvOpRayQueryGetIntersectionFrontFaceKHR:
+        case SpvOpRayQueryGetIntersectionCandidateAABBOpaqueKHR:
+        case SpvOpRayQueryGetIntersectionObjectRayDirectionKHR:
+        case SpvOpRayQueryGetIntersectionObjectRayOriginKHR:
+        case SpvOpRayQueryGetWorldRayDirectionKHR:
+        case SpvOpRayQueryGetWorldRayOriginKHR:
+        case SpvOpRayQueryGetIntersectionObjectToWorldKHR:
+        case SpvOpRayQueryGetIntersectionWorldToObjectKHR:
             return true;
         default:
             return false;
@@ -277,6 +304,8 @@ namespace respv {
         case SpvOpReturnValue:
         case SpvOpDecorate:
         case SpvOpMemberDecorate:
+        case SpvOpRayQueryTerminateKHR:
+        case SpvOpRayQueryConfirmIntersectionKHR:
             rOperandWordStart = 1;
             rOperandWordCount = 1;
             rOperandWordStride = 1;
@@ -285,8 +314,16 @@ namespace respv {
             return true;
         case SpvOpStore:
         case SpvOpMemoryBarrier:
+        case SpvOpRayQueryGenerateIntersectionKHR:
             rOperandWordStart = 1;
             rOperandWordCount = 2;
+            rOperandWordStride = 1;
+            rOperandWordSkip = UINT32_MAX;
+            rOperandWordSkipString = false;
+            return true;
+        case SpvOpRayQueryInitializeKHR:
+            rOperandWordStart = 1;
+            rOperandWordCount = 8;
             rOperandWordStride = 1;
             rOperandWordSkip = UINT32_MAX;
             rOperandWordSkipString = false;
@@ -373,6 +410,13 @@ namespace respv {
         case SpvOpFwidthCoarse:
         case SpvOpGroupNonUniformElect:
         case SpvOpCopyLogical:
+        case SpvOpConvertUToAccelerationStructureKHR:
+        case SpvOpRayQueryProceedKHR:
+        case SpvOpRayQueryGetRayTMinKHR:
+        case SpvOpRayQueryGetRayFlagsKHR:
+        case SpvOpRayQueryGetIntersectionCandidateAABBOpaqueKHR:
+        case SpvOpRayQueryGetWorldRayDirectionKHR:
+        case SpvOpRayQueryGetWorldRayOriginKHR:
             rOperandWordStart = 3;
             rOperandWordCount = 1;
             rOperandWordStride = 1;
@@ -449,6 +493,20 @@ namespace respv {
         case SpvOpGroupNonUniformInverseBallot:
         case SpvOpGroupNonUniformBallotFindLSB:
         case SpvOpGroupNonUniformBallotFindMSB:
+        case SpvOpRayQueryGetIntersectionTypeKHR:
+        case SpvOpRayQueryGetIntersectionTriangleVertexPositionsKHR:
+        case SpvOpRayQueryGetIntersectionTKHR:
+        case SpvOpRayQueryGetIntersectionInstanceCustomIndexKHR:
+        case SpvOpRayQueryGetIntersectionInstanceIdKHR:
+        case SpvOpRayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR:
+        case SpvOpRayQueryGetIntersectionGeometryIndexKHR:
+        case SpvOpRayQueryGetIntersectionPrimitiveIndexKHR:
+        case SpvOpRayQueryGetIntersectionBarycentricsKHR:
+        case SpvOpRayQueryGetIntersectionFrontFaceKHR:
+        case SpvOpRayQueryGetIntersectionObjectRayDirectionKHR:
+        case SpvOpRayQueryGetIntersectionObjectRayOriginKHR:
+        case SpvOpRayQueryGetIntersectionObjectToWorldKHR:
+        case SpvOpRayQueryGetIntersectionWorldToObjectKHR:
             rOperandWordStart = 3;
             rOperandWordCount = 2;
             rOperandWordStride = 1;
@@ -629,6 +687,8 @@ namespace respv {
         case SpvOpTypeInt:
         case SpvOpTypeFloat:
         case SpvOpTypeSampler:
+        case SpvOpTypeRayQueryKHR:
+        case SpvOpTypeAccelerationStructureKHR:
         case SpvOpLoopMerge:
         case SpvOpSelectionMerge:
         case SpvOpKill:
@@ -710,6 +770,12 @@ namespace respv {
         case SpvOpAtomicXor:
         case SpvOpAtomicFlagTestAndSet:
         case SpvOpAtomicFlagClear:
+        // A ray query's traversal advances through its pointer: rayQueryProceedEXT() is often called for that alone.
+        case SpvOpRayQueryInitializeKHR:
+        case SpvOpRayQueryTerminateKHR:
+        case SpvOpRayQueryGenerateIntersectionKHR:
+        case SpvOpRayQueryConfirmIntersectionKHR:
+        case SpvOpRayQueryProceedKHR:
             return true;
         default:
             return false;
