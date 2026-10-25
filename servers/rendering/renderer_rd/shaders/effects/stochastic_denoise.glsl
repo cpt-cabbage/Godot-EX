@@ -47,6 +47,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_OBJECTS 2048u // A mirror's image of an object that moved this frame is fetched where the object was.
 #define FLAG_SPEC_DISOCC 8u // A near-mirror reflection whose every virtual tap fails its depth test restarts by its virtual weight.
 #define FLAG_CAUSE_STATS 4194304u // Diagnostics (GI temporal; GODOT_GI_TIER_PRINT / GODOT_RT_STATE_PRINT): count why this frame's young pixels are young into the gather's calibration buffer (see cause_stats).
+#define FLAG_SPEC_YOUNG 16777216u // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail, its normal stop at that power (the spatial pass's taps, the reveal's 5x5), tightening to the usual as its history fills.
 #define FLAG_SPEC_AA 8388608u // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size (rt_denoise_guide.glsl SPEC_AA), read at the pixel: the temporal pass's normal_roughness_texture, the spatial pass's spec_normal_roughness_texture.
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
@@ -286,6 +287,9 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// The frames a revealed rough reflection's 5x5 start is worth (0: its
 	// one sample; GODOT_GI_REVEAL_FIX).
 	float reveal_frames;
+	// FLAG_SPEC_YOUNG: the normal stop's power for a young rough reflection
+	// (GODOT_GI_SPEC_YOUNG; the spatial pass carries it in spec_restart_min).
+	float spec_young_power;
 }
 reprojection;
 #endif
@@ -1227,12 +1231,16 @@ void main() {
 		// neither moved the band: a young pixel's spatial taps weighed by
 		// their histories (-0.3 / -3.6 %), and a second reflection ray for
 		// a young pixel (+2 / -5 %; a second ray everywhere the same there).
+		// What the band was short of was neighbours, not rays: its specks sat
+		// on the plate's bump rims, whose normals no tap shared (rt_lab/r9);
+		// under FLAG_SPEC_YOUNG the 5x5 takes them at the young stop.
 		if (reprojection.reveal_frames > 0.0) {
 			float lobe = smoothstep(0.15, 0.4, nr_rough);
 			if (lobe > 0.0) {
 				vec3 n_c = nr_normal(texelFetch(normal_roughness_texture, nr_pixel, 0));
 				float view_c = linearize_depth(center_depth);
 				vec3 sum_s = vec3(0.0);
+				float sum_w = 0.0;
 				float taps_s = 0.0;
 				for (int y = -2; y <= 2; y++) {
 					for (int x = -2; x <= 2; x++) {
@@ -1242,17 +1250,24 @@ void main() {
 							continue;
 						}
 						ivec2 np = (params.flags & FLAG_SPEC_AA) != 0u ? sp : rt_full_pixel(sp, params.depth_scale, textureSize(normal_roughness_texture, 0));
-						if (dot(nr_normal(texelFetch(normal_roughness_texture, np, 0)), n_c) < 0.9) {
+						float nd = dot(nr_normal(texelFetch(normal_roughness_texture, np, 0)), n_c);
+						// Under FLAG_SPEC_YOUNG the normal map's detail is
+						// averaged over too, as the spatial pass does for a
+						// young rough reflection (see there): the taps
+						// weighed by the young stop.
+						float w = (params.flags & FLAG_SPEC_YOUNG) != 0u ? pow(max(nd, 0.0), reprojection.spec_young_power) : (nd < 0.9 ? 0.0 : 1.0);
+						if (w < 0.1) {
 							continue;
 						}
-						sum_s += texelFetch(in_specular, sp, 0).rgb;
+						sum_s += texelFetch(in_specular, sp, 0).rgb * w;
+						sum_w += w;
 						taps_s += 1.0;
 					}
 				}
 				// A pixel with too little of its surface around it (a thin
 				// rail, a corner) keeps its sample.
 				if (taps_s >= 5.0) {
-					result_specular = mix(current_specular, sum_s / taps_s, lobe);
+					result_specular = mix(current_specular, sum_s / sum_w, lobe);
 					frames_s = mix(1.0, reprojection.reveal_frames, lobe);
 				}
 			}
@@ -1571,8 +1586,33 @@ void main() {
 	float youth_static = 0.0;
 	float youth_dyn = 0.0;
 #endif
+	// FLAG_SPEC_YOUNG: how young a rough reflection is, for the normal stop
+	// of its taps below. The history keeps each pixel to its own normal (this
+	// pass's output is not fed back), so a young one is the few samples its
+	// own normal caught: on a normal-mapped metal (the TPS demo's diamond
+	// plate, its bumps' rims tilted 20-45 degrees and a texel or two wide)
+	// the rims' texels found no tap within the usual stop (a cosine to the
+	// 32nd: 0.14 at 20 degrees) and stayed one or two samples each, every
+	// rim a different colour in the floor a walking character uncovers
+	// (rt_lab/r9: 71-80 % of the band's extra speck energy on the rims, the
+	// rest of the floor the same with the character hidden). A rough lobe
+	// blurs what the detail would tell apart anyway, and this output is the
+	// display's alone; full from the first frames, gone by 16. At power 2 the
+	// spawn walk's band -39 / -48 % walking / strafing (4K, FSR2 0.588; the
+	// quarter tier -17 / -38 %), the bridge walk's frame and the temporal
+	// suite's free-camera cases unchanged within their spread.
+	float spec_youth = 0.0;
+#ifdef FILTER_DIRECTIONAL
+	if ((params.flags & FLAG_SPEC_YOUNG) != 0u) {
+		float r_y = (params.flags & FLAG_SPEC_AA) != 0u ? nr_roughness(texelFetch(spec_normal_roughness_texture, pixel, 0)) : nr_roughness(texelFetch(normal_roughness_texture, rt_full_pixel(pixel, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
+		spec_youth = smoothstep(0.15, 0.4, r_y) * (1.0 - smoothstep(4.0, 16.0, frames_s));
+	}
+#endif
+	// Its stop's power: 32 mature, params.spec_restart_min (the young power)
+	// at full youth, geometrically between.
+	float spec_power = spec_youth > 0.0 ? exp2(mix(5.0, log2(max(params.spec_restart_min, 1.0)), spec_youth)) : 32.0;
 	bool filter_d = newly_revealed || young_d || (rel_d >= params.variance_threshold && !(dominance > 0.8 && frames_d >= 8.0 && rel_d < 0.25));
-	bool filter_s = newly_revealed || (young_s && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u) || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
+	bool filter_s = newly_revealed || (young_s && (params.flags & FLAG_SPEC_NO_YOUNG) == 0u) || spec_youth > 0.0 || (rel_s >= params.variance_threshold && !(dominance > 0.8 && frames_s >= 8.0 && rel_s < 0.25));
 	if ((params.flags & FLAG_SPATIAL_OFF) != 0u) {
 		filter_d = false;
 		filter_s = false;
@@ -1683,21 +1723,23 @@ void main() {
 			// depth test is the view-space tolerance expressed as a raw-depth
 			// window, so it means the same thing at every range.
 			float w_spatial = 0.0;
+			// The specular taps sit on their own stride, and a young rough
+			// reflection's on its own normal stop (spec_power).
+			ivec2 sp_s = sp;
+			float w_spatial_s = 0.0;
 			if (sd != 0.0 && sd >= depth_min && sd <= depth_max) {
 				vec3 n = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(sp, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
-				float w_normal = pow(max(dot(center_normal, n), 0.0), 32.0);
-				w_spatial = exp(-0.3 * float(x * x + y * y)) * w_normal;
+				float nd = max(dot(center_normal, n), 0.0);
+				w_spatial = exp(-0.3 * float(x * x + y * y)) * pow(nd, 32.0);
+				w_spatial_s = spec_youth > 0.0 ? exp(-0.3 * float(x * x + y * y)) * pow(nd, spec_power) : w_spatial;
 			}
-			// The specular taps sit on their own stride.
-			ivec2 sp_s = sp;
-			float w_spatial_s = w_spatial;
 			if (stride_s != stride) {
 				sp_s = clamp(pixel + ivec2(round(rot * (vec2(x, y) * float(stride_s)))), ivec2(0), params.screen_size - 1);
 				float sd_s = texelFetch(depth_texture, rt_full_pixel(sp_s, params.depth_scale, textureSize(depth_texture, 0)), 0).r;
 				w_spatial_s = 0.0;
 				if (sd_s != 0.0 && sd_s >= depth_min && sd_s <= depth_max) {
 					vec3 n_s = nr_normal(texelFetch(normal_roughness_texture, rt_full_pixel(sp_s, params.depth_scale, textureSize(normal_roughness_texture, 0)), 0));
-					w_spatial_s = exp(-0.3 * float(x * x + y * y)) * pow(max(dot(center_normal, n_s), 0.0), 32.0);
+					w_spatial_s = exp(-0.3 * float(x * x + y * y)) * pow(max(dot(center_normal, n_s), 0.0), spec_power);
 				}
 			}
 			if (w_spatial <= 0.0 && w_spatial_s <= 0.0) {
@@ -1714,7 +1756,9 @@ void main() {
 				wd *= exp(-abs(luminance(d) - moments.x) / sigma_d);
 			}
 			if (!newly_revealed && !young_s) {
-				ws *= exp(-abs(luminance(s) - moments.z) / sigma_s);
+				// A young rough reflection's variance is a few frames' (see
+				// spec_youth): its stop fades in with the normal's.
+				ws *= mix(exp(-abs(luminance(s) - moments.z) / sigma_s), 1.0, spec_youth);
 			}
 #ifdef FILTER_DIRECTIONAL
 			// Neighbors whose rays travelled a very different distance are

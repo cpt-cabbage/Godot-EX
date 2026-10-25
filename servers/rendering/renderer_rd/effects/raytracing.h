@@ -342,6 +342,7 @@ private:
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.
+		DENOISE_FLAG_SPEC_YOUNG = 16777216, // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail (the spatial pass carries the power in spec_restart_min, the temporal in the reprojection UBO).
 		DENOISE_FLAG_SPEC_AA = 8388608, // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size, read at the pixel (the temporal pass's normal-roughness binding; the spatial pass's binding 13).
 		DENOISE_FLAG_DYN_SPLIT = 2097152, // GI (GODOT_GI_DYN_SPLIT): the moving lights' term is a history of its own; the temporal pass accumulates it apart and hands the spatial pass the sum, the spatial pass fades each history's share of the stand-in in on its own.
 	};
@@ -648,7 +649,7 @@ private:
 		float spec_smear_lobe; // The share of the lobe's screen blur the reflection's parallax smear may reach (0.5; GODOT_GI_SPEC_SMEAR, 0: the fixed pixels only).
 		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's.
 		float reveal_frames; // The frames a revealed rough reflection's 5x5 start is worth (GODOT_GI_REVEAL_FIX; 0: its one sample).
-		float pad1; // The std140 block rounds to 96 bytes.
+		float spec_young_power; // A young rough reflection's normal stop in the reveal's 5x5 (GODOT_GI_SPEC_YOUNG; with DENOISE_FLAG_SPEC_YOUNG). The std140 block rounds to 96 bytes.
 	};
 	static_assert(sizeof(ReprojectUBO) == 96, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
