@@ -814,7 +814,14 @@ void main() {
 			// 2-6 %, but the spawn walk under FSR2 took 6 % more speck
 			// energy (the floor by the character +13-15 % and 0.7-2.3 %
 			// brighter), and the RT GI's temporal pass 0.23 -> 0.39 ms at
-			// 2259x1271 (the frame +0.3 ms). The patch in rt_lab/r11.
+			// 2259x1271 (the frame +0.3 ms). Faded in over the history's
+			// age (8-16 frames, or 16-32) the specks +5.5 / +3.2 % for
+			// -5 / -3.5 % of the bilinear's error: they come with the
+			// sharpness, not from young pixels; and at 8-16 under FSR2 the
+			// error rose 2-3 % (the bridge walk and strafe, two repeats
+			// within 0.5 %; the detail 0.84 of the reference's either way:
+			// FSR2's accumulation takes the sharpness back and leaves the
+			// noise). The patches in rt_lab/r11.
 			if (history_usable) {
 				float inv_weight = 1.0 / hist_weight;
 				hist_d4 *= inv_weight;
