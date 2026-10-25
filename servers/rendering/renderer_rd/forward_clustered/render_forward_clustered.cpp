@@ -4013,6 +4013,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.color = rb->get_internal_texture(v);
 				params.depth = rb->get_depth_texture(v);
 				params.velocity = rb->get_velocity_buffer(false, v);
+				// FSR2's reactive and transparency-and-composition masks raised
+				// on the reflection's pixels, measured and not kept. The ray
+				// traced reflection reaches FSR2 accumulated by its own history
+				// (reprojected through the virtual image) and FSR2 accumulates
+				// it again by the surface's motion, so in motion the second
+				// history lags and blurs it; each mask took a pixel's
+				// reflecting share (f0 against the diffuse albedo, a metal's
+				// one) faded out over roughness 0.6-0.85. Against converged
+				// references under FSR2 (the TPS free-camera cases, 0.588, GI
+				// high, two repeats within 0.6 %), the reactive mask at 0.3
+				// seemed to win: -2.2 to -5.4 % in motion, the detail in
+				// motion 0.85 -> 0.92 of the reference. But its references
+				// are FSR2 accumulating less too, and against the masks-off
+				// arm's the same frames are +3.8 to +6.4 % (the hall -0.9 %,
+				// within its references' 9 % spread), the shimmer after the
+				// stop +9-15 %: the sharpness is the RT signal's noise and the
+				// jitter's aliasing let through. The composition mask alone
+				// +3.0 to +6.8 % (the hall -2.4 %), the hot pixels in the
+				// corridor +12 %; the spawn walk's specks within 1 % for
+				// either. The patch in rt_lab/r13.
 				params.reactive = rb->get_internal_texture_reactive(v);
 				params.exposure = exposure;
 				params.output = rb->get_upscaled_texture(v);
