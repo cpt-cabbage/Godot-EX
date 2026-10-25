@@ -802,6 +802,19 @@ void main() {
 			if (!history_usable) {
 				paint_why = 3;
 			}
+			// A Catmull-Rom history in place of this bilinear (the 4x4's 12
+			// taps without its corners where every one passes the depth
+			// test, clamped to the inner four's range; the reflection's
+			// virtual-image fetch the same), measured and not kept. The
+			// bilinear blurs a history by a fraction of a texel each frame
+			// it is resampled, and in motion the RT GI's mature glossy
+			// reflection keeps 0.39-0.42 of its converged reference's 3x3
+			// detail. Against converged references (the TPS free-camera
+			// cases, a bilinear upscale at 0.588) the error in motion fell
+			// 2-6 %, but the spawn walk under FSR2 took 6 % more speck
+			// energy (the floor by the character +13-15 % and 0.7-2.3 %
+			// brighter), and the RT GI's temporal pass 0.23 -> 0.39 ms at
+			// 2259x1271 (the frame +0.3 ms). The patch in rt_lab/r11.
 			if (history_usable) {
 				float inv_weight = 1.0 / hist_weight;
 				hist_d4 *= inv_weight;

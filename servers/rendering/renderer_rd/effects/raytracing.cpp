@@ -722,6 +722,8 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		// This frame's GI temporal history and meta (r the static history's frames / 64, g the reflection's, b the moving lights', a the reveal age).
 		{ "gi_hist", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_AMBIENT_0 : RB_RT_GI_HIST_AMBIENT_1 },
 		{ "gi_hist_dyn", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_DYN_0 : RB_RT_GI_HIST_DYN_1 },
+		// This frame's reflection temporal output (before the spatial pass).
+		{ "gi_hist_spec", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_REFLECTION_0 : RB_RT_GI_HIST_REFLECTION_1 },
 		{ "gi_meta", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_META_0 : RB_RT_GI_META_1 },
 		{ "spec", RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION },
 		{ "spec_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION },
@@ -738,6 +740,9 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		{ "hist_spec_1", RB_SCOPE_RT_GI, RB_RT_GI_HIST_REFLECTION_1 },
 		{ "direct", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE },
 		{ "direct_spec", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR },
+		// This frame's direct lighting temporal output (before the spatial pass).
+		{ "direct_hist", RB_SCOPE_RT_SHADOWS, get_history_parity() ? RB_RT_STOCHASTIC_HIST_DIFFUSE_0 : RB_RT_STOCHASTIC_HIST_DIFFUSE_1 },
+		{ "direct_hist_spec", RB_SCOPE_RT_SHADOWS, get_history_parity() ? RB_RT_STOCHASTIC_HIST_SPECULAR_0 : RB_RT_STOCHASTIC_HIST_SPECULAR_1 },
 		{ "direct_raw", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_DIFFUSE },
 		{ "direct_analytic", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE },
 		{ "direct_meta_0", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_META_0 },
