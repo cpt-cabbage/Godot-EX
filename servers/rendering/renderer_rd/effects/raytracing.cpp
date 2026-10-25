@@ -722,6 +722,8 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		// This frame's GI temporal history and meta (r the static history's frames / 64, g the reflection's, b the moving lights', a the reveal age).
 		{ "gi_hist", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_AMBIENT_0 : RB_RT_GI_HIST_AMBIENT_1 },
 		{ "gi_hist_dyn", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_DYN_0 : RB_RT_GI_HIST_DYN_1 },
+		// This frame's reflection temporal output (before the spatial pass).
+		{ "gi_hist_spec", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_HIST_REFLECTION_0 : RB_RT_GI_HIST_REFLECTION_1 },
 		{ "gi_meta", RB_SCOPE_RT_GI, get_history_parity() ? RB_RT_GI_META_0 : RB_RT_GI_META_1 },
 		{ "spec", RB_SCOPE_RT_GI, RB_RT_GI_REFLECTION },
 		{ "spec_raw", RB_SCOPE_RT_GI, RB_RT_GI_RAW_REFLECTION },
@@ -738,6 +740,9 @@ void Raytracing::dump_aovs(Ref<RenderSceneBuffersRD> p_render_buffers) {
 		{ "hist_spec_1", RB_SCOPE_RT_GI, RB_RT_GI_HIST_REFLECTION_1 },
 		{ "direct", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_DIFFUSE },
 		{ "direct_spec", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_SPECULAR },
+		// This frame's direct lighting temporal output (before the spatial pass).
+		{ "direct_hist", RB_SCOPE_RT_SHADOWS, get_history_parity() ? RB_RT_STOCHASTIC_HIST_DIFFUSE_0 : RB_RT_STOCHASTIC_HIST_DIFFUSE_1 },
+		{ "direct_hist_spec", RB_SCOPE_RT_SHADOWS, get_history_parity() ? RB_RT_STOCHASTIC_HIST_SPECULAR_0 : RB_RT_STOCHASTIC_HIST_SPECULAR_1 },
 		{ "direct_raw", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_RAW_DIFFUSE },
 		{ "direct_analytic", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_ANALYTIC_DIFFUSE },
 		{ "direct_meta_0", RB_SCOPE_RT_SHADOWS, RB_RT_STOCHASTIC_META_0 },
@@ -922,6 +927,17 @@ uint32_t Raytracing::_velocity_flags(RID p_velocity) const {
 	return DENOISE_FLAG_HAS_VELOCITY | (velocity_current ? DENOISE_FLAG_VELOCITY_CURRENT : 0);
 }
 
+// A young rough reflection averages over the normal map's detail, its normal
+// stop at this power where the usual is 32 (the denoiser's FLAG_SPEC_YOUNG:
+// the reveal's 5x5 and the spatial taps, tightening as the history fills);
+// GODOT_GI_SPEC_YOUNG=<power> sets it, 0 reverts. 2: the TPS spawn walk's
+// trail specks -39 / -48 % walking / strafing (4: -30 / -37 %, 8: -16 / -17 %).
+static float gi_spec_young_power() {
+	static const String env = OS::get_singleton()->get_environment("GODOT_GI_SPEC_YOUNG");
+	static const float power = env.is_empty() ? 2.0f : MAX(float(env.to_float()), 0.0f);
+	return power;
+}
+
 RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_reproject) {
 	while (rb_state->reproject_history.size() <= p_view) {
 		rb_state->reproject_history.push_back(RenderBuffersRT::ReprojectHistory());
@@ -970,6 +986,7 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		static const String reveal_env = OS::get_singleton()->get_environment("GODOT_GI_REVEAL_FIX");
 		static const float reveal_frames = reveal_env.is_empty() ? 4.0f : MAX(float(reveal_env.to_float()), 0.0f);
 		ubo.reveal_frames = reveal_frames;
+		ubo.spec_young_power = gi_spec_young_power();
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;
@@ -3056,6 +3073,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		if (spec_nr.is_valid()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_AA;
 		}
+		if (gi_spec_young_power() > 0.0f) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_YOUNG;
+		}
 		// The moving lights' term (GODOT_GI_DYN_SPLIT): its sample, its
 		// history, and the two outputs (dummies otherwise, never touched).
 		RD::Uniform u_raw_dyn(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 17, Vector<RID>({ sampler, dyn_split ? raw_dyn : default_black }));
@@ -3127,6 +3147,12 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		}
 		if (spec_nr.is_valid()) {
 			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_AA;
+		}
+		// The young rough reflection's normal stop rides the change mark's
+		// floor, which this pass does not read.
+		if (gi_spec_young_power() > 0.0f) {
+			denoise_push_constant.flags |= DENOISE_FLAG_SPEC_YOUNG;
+			denoise_push_constant.spec_restart_min = gi_spec_young_power();
 		}
 		static const bool spec_no_young = OS::get_singleton()->get_environment("GODOT_GI_SPEC_ABLATE").contains("young");
 		if (spec_no_young) {
