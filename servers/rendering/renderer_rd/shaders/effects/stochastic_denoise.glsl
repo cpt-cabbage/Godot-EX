@@ -1117,6 +1117,19 @@ void main() {
 			// neighbourhood clamp on this path to catch it). Only the smooth
 			// end of the roughness range has a hit depth stable enough to
 			// compare; the rough end's lobe lands somewhere new every frame.
+			// It compares one sample's depth with another's, so a glossy lobe
+			// fails it on noise too (on the TPS bridge at rest 38% of the
+			// glossy pixels fail every virtual tap and 2% a frame are cut
+			// here). Measured and not kept (rt_lab/r10, against converged
+			// references): the 3x3 harmonic means of the image's depth in
+			// place of the single samples, for this test alone or stored in
+			// the history for the taps too. The glossy boil at rest -10 to
+			// -13%, but the error after a stop +1 to +7% (the noise's cuts
+			// also clear what the motion left in the history), the lab's
+			// moving box's trail on the glossy floor +5%, and with the taps
+			// the TPS level 1-2% bright (taps blended across the image's
+			// depth edges). Off altogether (and the taps unvalidated) the
+			// error +15 to +50%.
 			if (virtual_weight > 0.0 && predicted_virtual_depth > 0.0 && hist_s4.a > 0.0 && (params.flags & FLAG_SPEC_NO_MISMATCH) == 0u) {
 				float rel = abs(hist_s4.a - predicted_virtual_depth) / max(predicted_virtual_depth, 1.0);
 				float mismatch = smoothstep(0.1, 0.5, rel) * virtual_weight;
