@@ -1,0 +1,78 @@
+# Godot-EX's own CI, run in place of upstream's runner.yml (every platform's
+# builds on every push). Two jobs:
+# - upstream's static checks on what a push changed;
+# - the macOS arm64 editor, the only build that compiles the Metal driver's ray
+#   tracing (upstream's x86_64 macOS build passes metal=no).
+# The fork's work happens on Windows and Vulkan, so this job is what catches a
+# Metal break before a session on the Mac does.
+# Upstream's runner stays in the tree for merges. Disable it on this
+# repository (`gh workflow disable runner.yml`, or set the repository variable
+# DISABLE_GODOT_CI, which runner.yml already reads) so that a push runs only
+# this workflow.
+name: Godot-EX CI
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}|${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    name: Static checks
+    uses: ./.github/workflows/static_checks.yml
+
+  # Not gated on the static checks: a formatting complaint should not hide a
+  # Metal compile error.
+  macos-editor:
+    name: macOS editor (arm64, Metal)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Restore Godot build cache
+        uses: ./.github/actions/godot-cache-restore
+        with:
+          cache-name: godot-ex-macos-editor
+        continue-on-error: true
+
+      - name: Setup Python and SCons
+        uses: ./.github/actions/godot-deps
+
+      - name: Setup Vulkan SDK
+        id: vulkan-sdk
+        run: |
+          if sh misc/scripts/install_vulkan_sdk_macos.sh; then
+            echo "VULKAN_ENABLED=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::macOS: Vulkan SDK installation failed, building without Vulkan support."
+            echo "VULKAN_ENABLED=no" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+
+      # Warnings are reported, not fatal (upstream's dev_mode makes them
+      # errors): the job is here for compile errors. ANGLE and AccessKit are
+      # left out, as nothing of ours touches them.
+      - name: Compilation (arm64 editor)
+        uses: ./.github/actions/godot-build
+        with:
+          scons-flags: arch=arm64 vulkan=${{ steps.vulkan-sdk.outputs.VULKAN_ENABLED }} angle=no accesskit=no werror=no
+          platform: macos
+          target: editor
+
+      - name: Save Godot build cache
+        uses: ./.github/actions/godot-cache-save
+        with:
+          cache-name: godot-ex-macos-editor
+        continue-on-error: true
+
+      - name: Smoke test
+        run: |
+          ./bin/godot.macos.editor.arm64 --version
+          ./bin/godot.macos.editor.arm64 --help > /dev/null
