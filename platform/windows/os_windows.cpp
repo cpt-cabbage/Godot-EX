@@ -39,6 +39,7 @@
 #include "core/config/engine.h"
 #include "core/debugger/engine_debugger.h"
 #include "core/debugger/script_debugger.h"
+#include "core/os/knob_log.h"
 #include "core/os/main_loop.h"
 #include "core/profiling/profiling.h"
 #include "core/version_generated.gen.h"
@@ -2064,10 +2065,12 @@ String OS_Windows::get_executable_path() const {
 }
 
 bool OS_Windows::has_environment(const String &p_var) const {
+	knob_log_note(p_var);
 	return GetEnvironmentVariableW((LPCWSTR)(p_var.utf16().get_data()), nullptr, 0) > 0;
 }
 
 String OS_Windows::get_environment(const String &p_var) const {
+	knob_log_note(p_var);
 	WCHAR wval[0x7fff]; // MSDN says 32767 char is the maximum
 	int wlen = GetEnvironmentVariableW((LPCWSTR)(p_var.utf16().get_data()), wval, 0x7fff);
 	if (wlen > 0) {

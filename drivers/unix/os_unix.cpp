@@ -34,6 +34,7 @@
 
 #include "core/debugger/engine_debugger.h"
 #include "core/debugger/script_debugger.h"
+#include "core/os/knob_log.h"
 #include "core/string/char_utils.h"
 #include "drivers/unix/dir_access_unix.h"
 #include "drivers/unix/file_access_unix.h"
@@ -1073,10 +1074,12 @@ String OS_Unix::get_cwd() const {
 }
 
 bool OS_Unix::has_environment(const String &p_var) const {
+	knob_log_note(p_var);
 	return getenv(p_var.utf8().get_data()) != nullptr;
 }
 
 String OS_Unix::get_environment(const String &p_var) const {
+	knob_log_note(p_var);
 	const char *val = getenv(p_var.utf8().get_data());
 	if (val == nullptr) { // Not set; return empty string
 		return "";
