@@ -1,7 +1,7 @@
 # Godot runtime verification of the Jolt joint-drive chain (Phase 0)
 
-Built 2026-09-27 and run 2026-09-27/28 (UTC) against fork commit `efc1d2ea978f675e5a184cf0adab57dbb15cbfd3`
-(`4.8.dev.custom_build.efc1d2ea9`, Jolt 5.6.0 vendored in `thirdparty/jolt_physics`).
+Built 2026-09-27 and run 2026-09-27/28 (UTC) against fork commit `cca967ab9168112dabcf2db3f97e176816a828ef`
+(`4.8.dev.custom_build.cca967ab9`, Jolt 5.6.0 vendored in `thirdparty/jolt_physics`).
 The design report's Phase 0 lists four engine claims as "verified in source but not at
 runtime". This note records a headless build of the fork, a small GDScript test project that
 exercises each claim, and the numbers it printed. Everything here was produced by running the
@@ -57,7 +57,7 @@ scons platform=linuxbsd target=template_debug arch=x86_64 use_llvm=yes linker=ll
 | wall time | **6 min 35 s** (`real 6m35.119s`, `user 18m20s`, `sys 0m40s`; 17:48:27Z to 17:55:02Z); memory use was about 2 GB when sampled mid-build |
 | result | exit 0, one compiler warning (`platform/linuxbsd/x11/display_server_x11.cpp:7149` unused variable `executable_name`) |
 | binary | `bin/godot.linuxbsd.template_debug.x86_64.llvm`, **50 826 760 bytes (48.5 MiB)**, ELF x86-64 PIE; `bin/` is gitignored (`git check-ignore bin` matches `.gitignore:263`) |
-| `--version` | `4.8.dev.custom_build.efc1d2ea9` |
+| `--version` | `4.8.dev.custom_build.cca967ab9` |
 
 Notes on the option set:
 
@@ -115,7 +115,7 @@ bin/godot.linuxbsd.template_debug.x86_64.llvm --headless \
 Runner header as printed:
 
 ```
-[phase0] Godot 4.8-dev (custom_build) (hash efc1d2ea978f675e5a184cf0adab57dbb15cbfd3) | PhysicsServer3D class=PhysicsServer3D | physics/3d/physics_engine=Jolt Physics
+[phase0] Godot 4.8-dev (custom_build) (hash cca967ab9168112dabcf2db3f97e176816a828ef) | PhysicsServer3D class=PhysicsServer3D | physics/3d/physics_engine=Jolt Physics
 [phase0] physics_ticks_per_second=120 max_physics_steps_per_frame=16 physics_interpolation=true jitter_fix=0.00
 [phase0] CPU=Intel(R) Xeon(R) Processor @ 2.10GHz x4 | OS=Linux
 ```
