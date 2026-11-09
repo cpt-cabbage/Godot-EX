@@ -137,6 +137,7 @@ void InstanceField3D::set_type_visible(int p_type, bool p_visible) {
 	types[p_type].visible = p_visible;
 	if (!p_visible) {
 		for (Level &lv : types[p_type].levels) {
+			_free_copies(lv);
 			for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 				_free_cell(E.value);
 			}
@@ -163,9 +164,66 @@ void InstanceField3D::_free_cell(DrawCell &p_cell) {
 	p_cell.multimesh = RID();
 }
 
+void InstanceField3D::_free_copies(Level &p_level) {
+	for (KeyValue<uint32_t, RID> &E : p_level.copies) {
+		RS::get_singleton()->free_rid(E.value);
+	}
+	p_level.copies.clear();
+}
+
+void InstanceField3D::set_per_copy_levels(int p_levels) {
+	per_copy_levels = CLAMP(p_levels, 0, 8);
+	_free_all();
+}
+
+// A per-copy level's copies in its band, each an instance of its own; one that left the band is freed, one that stays
+// keeps its instance (and so its cards).
+void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible) {
+	RenderingServer *rs = RS::get_singleton();
+	p_level.copies_frame++;
+	const float b2 = p_level.begin * p_level.begin, e2 = p_level.end * p_level.end;
+	const int x0 = MAX(0, int(Math::floor((viewer.x - p_level.end - grid_origin.x) / base_cell)));
+	const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + p_level.end - grid_origin.x) / base_cell)));
+	const int z0 = MAX(0, int(Math::floor((viewer.z - p_level.end - grid_origin.y) / base_cell)));
+	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + p_level.end - grid_origin.y) / base_cell)));
+	LocalVector<uint32_t> in_band;
+	for (int bz = z0; bz <= z1; bz++) {
+		for (int bx = x0; bx <= x1; bx++) {
+			const uint32_t c = uint32_t(bz * grid_x + bx);
+			for (uint32_t k = p_type.cell_start[c]; k < p_type.cell_start[c + 1]; k++) {
+				const uint32_t i = p_type.order[k];
+				const float *x = p_type.xf.ptr() + int64_t(i) * 12;
+				const float dx = x[3] - viewer.x, dy = x[7] - viewer.y, dz = x[11] - viewer.z;
+				const float d2 = dx * dx + dy * dy + dz * dz;
+				if (d2 >= b2 && d2 < e2) {
+					in_band.push_back(i);
+				}
+			}
+		}
+	}
+	HashMap<uint32_t, RID> kept;
+	for (uint32_t i : in_band) {
+		if (HashMap<uint32_t, RID>::Iterator it = p_level.copies.find(i)) {
+			kept.insert(i, it->value);
+			p_level.copies.remove(it);
+			continue;
+		}
+		const float *x = p_type.xf.ptr() + int64_t(i) * 12;
+		const Transform3D t(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11]));
+		RID inst = rs->instance_create2(p_level.mesh.is_valid() ? p_level.mesh->get_rid() : RID(), p_scenario);
+		rs->instance_set_transform(inst, p_xf * t);
+		rs->instance_geometry_set_cast_shadows_setting(inst, p_level.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
+		rs->instance_set_visible(inst, p_visible);
+		kept.insert(i, inst);
+	}
+	_free_copies(p_level); // the ones left over have left the band
+	p_level.copies = kept;
+}
+
 void InstanceField3D::_free_all() {
 	for (Type &t : types) {
 		for (Level &lv : t.levels) {
+			_free_copies(lv);
 			for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 				_free_cell(E.value);
 			}
@@ -237,6 +295,10 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 				continue;
 			}
 			lv.last_update = viewer;
+			if (int(li) < per_copy_levels) {
+				_update_copies(t, lv, get_global_transform(), get_world_3d()->get_scenario(), is_visible_in_tree());
+				continue;
+			}
 			updated.push_back(Vector2i(ti, li));
 			const int ncx = (grid_x + lv.cell_span - 1) / lv.cell_span, ncz = (grid_z + lv.cell_span - 1) / lv.cell_span;
 			const int x0 = MAX(0, int(Math::floor((viewer.x - lv.end - grid_origin.x) / lv.cell)));
@@ -329,6 +391,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 Dictionary InstanceField3D::get_stats() const {
 	Dictionary d;
 	int cells = 0;
+	int single = 0;
 	int64_t copies = 0;
 	Array per_type;
 	for (const Type &t : types) {
@@ -337,8 +400,9 @@ Dictionary InstanceField3D::get_stats() const {
 		td["count"] = int(t.order.size());
 		PackedInt32Array lv_cells;
 		for (const Level &lv : t.levels) {
-			lv_cells.push_back(lv.cells.size());
+			lv_cells.push_back(lv.cells.size() + lv.copies.size());
 			cells += lv.cells.size();
+			single += lv.copies.size();
 		}
 		td["cells"] = lv_cells;
 		per_type.push_back(td);
@@ -346,6 +410,7 @@ Dictionary InstanceField3D::get_stats() const {
 	}
 	d["types"] = per_type;
 	d["cells_drawn"] = cells;
+	d["single_copies"] = single;
 	d["copies"] = copies;
 	d["update_ms"] = last_update_ms;
 	d["jobs_last"] = last_jobs;
@@ -366,6 +431,10 @@ void InstanceField3D::_notification(int p_what) {
 			const Transform3D xf = get_global_transform();
 			for (Type &t : types) {
 				for (Level &lv : t.levels) {
+					for (KeyValue<uint32_t, RID> &E : lv.copies) {
+						const float *x = t.xf.ptr() + int64_t(E.key) * 12;
+						RS::get_singleton()->instance_set_transform(E.value, xf * Transform3D(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11])));
+					}
 					for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 						RS::get_singleton()->instance_set_transform(E.value.instance, xf);
 					}
@@ -376,6 +445,9 @@ void InstanceField3D::_notification(int p_what) {
 			const bool vis = is_visible_in_tree();
 			for (Type &t : types) {
 				for (Level &lv : t.levels) {
+					for (KeyValue<uint32_t, RID> &E : lv.copies) {
+						RS::get_singleton()->instance_set_visible(E.value, vis);
+					}
 					for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 						RS::get_singleton()->instance_set_visible(E.value.instance, vis);
 					}
@@ -406,6 +478,8 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_type_count"), &InstanceField3D::get_type_count);
 	ClassDB::bind_method(D_METHOD("get_instance_count", "type"), &InstanceField3D::get_instance_count);
 	ClassDB::bind_method(D_METHOD("clear"), &InstanceField3D::clear);
+	ClassDB::bind_method(D_METHOD("set_per_copy_levels", "levels"), &InstanceField3D::set_per_copy_levels);
+	ClassDB::bind_method(D_METHOD("get_per_copy_levels"), &InstanceField3D::get_per_copy_levels);
 	ClassDB::bind_method(D_METHOD("set_follow_camera", "follow"), &InstanceField3D::set_follow_camera);
 	ClassDB::bind_method(D_METHOD("get_follow_camera"), &InstanceField3D::get_follow_camera);
 	ClassDB::bind_method(D_METHOD("set_focus_position", "position"), &InstanceField3D::set_focus_position);
@@ -413,6 +487,7 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_now", "position", "force"), &InstanceField3D::update_now, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_stats"), &InstanceField3D::get_stats);
 
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "per_copy_levels", PROPERTY_HINT_RANGE, "0,8,1"), "set_per_copy_levels", "get_per_copy_levels");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_camera"), "set_follow_camera", "get_follow_camera");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "focus_position", PROPERTY_HINT_NONE, "suffix:m"), "set_focus_position", "get_focus_position");
 }

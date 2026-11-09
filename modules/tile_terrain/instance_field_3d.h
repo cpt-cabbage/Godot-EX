@@ -37,6 +37,10 @@
 // near levels are many small cells and far levels a few large ones; a level's cells are refilled when the viewer has moved
 // 1 % of its end distance, and a cell's buffer is sent only when its copies changed. Levels below `shadow_levels` cast
 // shadows; the others do not, which also keeps them out of Godot-EX's ray-traced scene.
+//
+// The nearest `per_copy_levels` levels draw each copy as an instance of its own, kept while the copy stays in the
+// level's band: Godot-EX's surface cache gives each its own cards (captured, and lit at its own place), where a
+// MultiMesh cell shares one set, captured whole, so a ray that hits a tree reads that tree's light, not the cell's.
 
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
@@ -62,6 +66,8 @@ class InstanceField3D : public Node3D {
 		bool shadows = true;
 		Vector3 last_update = Vector3(Math::INF, Math::INF, Math::INF);
 		HashMap<uint64_t, DrawCell> cells;
+		HashMap<uint32_t, RID> copies; // per-copy levels: the copy's instance, by its index
+		uint64_t copies_frame = 0;
 	};
 
 	struct Type {
@@ -89,6 +95,7 @@ class InstanceField3D : public Node3D {
 	Vector2 grid_origin; // x, z of the base grid's corner
 	int grid_x = 0;
 	int grid_z = 0;
+	int per_copy_levels = 0;
 	bool follow_camera = true;
 	Vector3 focus_position;
 	Vector3 viewer; // in local space, for the jobs
@@ -100,6 +107,8 @@ class InstanceField3D : public Node3D {
 	void _build_grid(Type &p_type);
 	void _job(uint32_t p_index, Job *p_jobs);
 	void _free_cell(DrawCell &p_cell);
+	void _free_copies(Level &p_level);
+	void _update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible);
 	void _free_all();
 
 protected:
@@ -120,6 +129,8 @@ public:
 	int get_instance_count(int p_type) const;
 	void clear();
 
+	void set_per_copy_levels(int p_levels);
+	int get_per_copy_levels() const { return per_copy_levels; }
 	void set_follow_camera(bool p_follow) { follow_camera = p_follow; }
 	bool get_follow_camera() const { return follow_camera; }
 	void set_focus_position(const Vector3 &p_position) { focus_position = p_position; }
