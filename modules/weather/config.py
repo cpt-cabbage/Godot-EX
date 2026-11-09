@@ -8,7 +8,7 @@ def configure(env):
 
 
 def get_doc_classes():
-    return ["AtmosphereEffect", "SkyLook", "TimeOfDay3D", "WeatherDirector", "WeatherState", "WeatherTrigger3D", "WindField3D", "WindZone3D"]
+    return ["AtmosphereEffect", "SkyLook", "SunShadowEffect", "TimeOfDay3D", "WeatherDirector", "WeatherState", "WeatherTrigger3D", "WindField3D", "WindZone3D"]
 
 
 def get_doc_path():

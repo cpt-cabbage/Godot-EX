@@ -5511,6 +5511,12 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.binding = 38;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID mask = rb.is_valid() && rb->has_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) ? rb->get_texture(RB_SCOPE_RT_SHADOWS, RB_RT_SHADOW_MASK) : RID();
+		// Without ray-traced shadows, a sun mask a compositor effect wrote after the depth prepass (Godot-EX, 2026-11-10:
+		// the weather module's SunShadowEffect, the terrain's and the clouds' shadows over the cascades). Its own scope:
+		// the RT shadows' context is cleared on the frames they are off.
+		if (!mask.is_valid() && rb.is_valid() && rb->has_texture(SNAME("rb_sun_shadow"), SNAME("mask"))) {
+			mask = rb->get_texture(SNAME("rb_sun_shadow"), SNAME("mask"));
+		}
 		RID texture = mask.is_valid() ? mask : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 		u.append_id(texture);
 		uniforms.push_back(u);

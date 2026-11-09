@@ -9,4 +9,5 @@ if "RD_GLSL" in env["BUILDERS"]:
     env_weather.RD_GLSL("atmosphere.glsl")
     env_weather.RD_GLSL("air_volume.glsl")
     env_weather.RD_GLSL("clouds.glsl")
+    env_weather.RD_GLSL("sun_shadow.glsl")
 env_weather.add_source_files(env.modules_sources, "*.cpp")
