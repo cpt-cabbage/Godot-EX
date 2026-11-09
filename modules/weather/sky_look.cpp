@@ -73,6 +73,12 @@ void SkyLook::apply(const Ref<AtmosphereEffect> &p_atmosphere, float p_sun_eleva
 	p_atmosphere->set_sky_luminance(sky_luminance);
 	p_atmosphere->set_sky_tint_height(sky_tint_height);
 	p_atmosphere->set_sky_tint(get_sky_tint_at(p_sun_elevation));
+	p_atmosphere->set_ground_haze_density(ground_haze_density);
+	p_atmosphere->set_ground_haze_height(ground_haze_height);
+	p_atmosphere->set_mist_density(mist_density);
+	p_atmosphere->set_mist_top(mist_top);
+	p_atmosphere->set_mist_falloff(mist_falloff);
+	p_atmosphere->set_fog_anisotropy(fog_anisotropy);
 	p_atmosphere->set_sky_recolor(get_sky_recolor_at(p_sun_elevation));
 }
 
@@ -103,5 +109,12 @@ void SkyLook::_bind_methods() {
 	B(sky_recolor, Variant::OBJECT, PROPERTY_HINT_RESOURCE_TYPE, "Curve")
 	B(elevation_min, Variant::FLOAT, PROPERTY_HINT_RANGE, "-90,90,0.1,suffix:deg")
 	B(elevation_max, Variant::FLOAT, PROPERTY_HINT_RANGE, "-90,90,0.1,suffix:deg")
+	ADD_GROUP("Air volume", "");
+	B(ground_haze_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.00001,suffix:/m")
+	B(ground_haze_height, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.1,1000,0.1,suffix:m")
+	B(mist_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.5,0.00001,suffix:/m")
+	B(mist_top, Variant::FLOAT, PROPERTY_HINT_RANGE, "-5000,5000,0.1,suffix:m")
+	B(mist_falloff, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.1,2000,0.1,suffix:m")
+	B(fog_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
 #undef B
 }

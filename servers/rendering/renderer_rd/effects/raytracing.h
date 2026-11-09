@@ -1095,6 +1095,13 @@ public:
 
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return scene.get_tlas(); }
+	// The alpha-tested casters' data as the shadow rays use it (rt_alpha_inc.glsl), its state on when they can be tested:
+	// for passes outside the renderer that trace the sun's visibility (the weather module's air volume).
+	RtAlphaBinding get_shadow_alpha_binding() const {
+		RtAlphaBinding b = _alpha_binding(0);
+		b.state = scene.get_alpha_state(_alpha_shadows_ready());
+		return b;
+	}
 
 	// Surface cache control. Enabling creates it (settings applied live);
 	// disabling frees it. update_scene() registers instances with it and
