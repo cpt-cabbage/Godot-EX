@@ -434,13 +434,20 @@ void main() {
 			ivec2 ct = clamp(c0 + ivec2(cj & 1, cj >> 1), ivec2(0), ivec2(csz) - 1); \
 			float cb = ((cj & 1) != 0 ? cf.x : 1.0 - cf.x) * ((cj >> 1) != 0 ? cf.y : 1.0 - cf.y); \
 			vec2 ctd = texelFetch(cloud_depth, ct, 0).rg; \
-			float cwt = cb * ((dist > ctd.r ? 1.0 : 0.0) + 1e-4); \
+			float cwt = cb * (dist > ctd.r ? 1.0 : 0.0); \
 			cl += texelFetch(cloud_light, ct, 0) * cwt; \
 			cmean += ctd.g * cwt; \
 			cwsum += cwt; \
 		} \
-		cl /= max(cwsum, 1e-8); \
-		cmean /= max(cwsum, 1e-8); \
+		/* No texel's cloud stands in front of the scene here: none is drawn. (Each had a token weight, which the */ \
+		/* division made whole again, so a ridge's pixels took the clouds behind them from every march texel that */ \
+		/* also held sky: a skyline against a cloud was eaten in blocks the march's size. 2026-11-10.) */ \
+		if (cwsum > 1e-5) { \
+			cl /= cwsum; \
+			cmean /= cwsum; \
+		} else { \
+			cl = vec4(0.0, 0.0, 0.0, 1.0); \
+		} \
 		if (cl.a < 0.999) { \
 			float cw = sqrt(clamp(cmean * params.misc.x / params.radii.w, 0.0, 1.0)); \
 			vec4 apc = textureLod(aerial_lut, vec3(uv, cw), 0.0); \
