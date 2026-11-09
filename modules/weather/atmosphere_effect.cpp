@@ -448,7 +448,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			if (use_rt) {
 				rt->get_shadow_alpha_binding().bind(list, s_inject, 1);
 			}
-			rd->compute_list_dispatch_threads(list, FOG_W, FOG_H, 1);
+			rd->compute_list_dispatch_threads(list, FOG_W, FOG_H, FOG_Z); // a thread a froxel
 			rd->compute_list_add_barrier(list);
 			LocalVector<RD::Uniform> ui;
 			ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 0, Vector<RID>({ fog_ubo })));
