@@ -58,7 +58,15 @@
 // `light_color` (TimeOfDay3D sets it: the light's colour and energy) through the terrain's shadow map and, within
 // `fog_rt_distance`, ray-traced visibility with alpha-tested leaves (shafts through the trees), and by the sky (its
 // table's mean, times `fog_sky_light`). Each frame's point in a froxel is jittered and blended into the reprojected
-// last frame's (`fog_history`). Off with `fog_enabled`. `sky_recolor` (0 to 1) replaces that light's own colour by its luminance
+// last frame's (`fog_history`). Off with `fog_enabled`.
+//
+// The clouds (clouds.glsl, atmosphere_clouds.cpp): a layer `cloud_base` m above sea level (it may lie below the peaks),
+// as thick as its `cloud_type` makes it (layered, heaped, towering; `cloud_thickness_scale`), `cloud_cover` of the sky,
+// carried by `cloud_wind`; shaped by noise at `cloud_scale` and `cloud_detail_scale` m, their cover by a weather map at
+// `cloud_weather_scale`. Marched at `cloud_resolution` of the screen out to `cloud_reach` m, blended with the last
+// frame (`cloud_history`); laid over the scene behind the haze in front of them. Their shadow map (`cloud_shadows`, a
+// `cloud_shadow_size` m square round the camera) shades the haze and the air volume; get_cloud_panorama_texture() is the
+// clouds over the whole sky for the sky shader's light probe. WeatherDirector sets the cover, base, type and wind. `sky_recolor` (0 to 1) replaces that light's own colour by its luminance
 // times the tint, so a tint can make a blue sky orange rather than brown; `sky_tint_height` (radians of the view's
 // elevation) is how far up from the horizon the tint and recolour reach, fading as exp(-elevation / height): 10 is the
 // whole sky, 0.3 a band low down with the zenith left as it was.
@@ -68,6 +76,7 @@
 #include "servers/rendering/renderer_rd/shader_rd.h"
 
 #include "air_volume.glsl.gen.h"
+#include "clouds.glsl.gen.h"
 #include "atmosphere.glsl.gen.h"
 
 class AtmosphereEffect : public CompositorEffect {
@@ -140,6 +149,53 @@ class AtmosphereEffect : public CompositorEffect {
 	RID fog_ubo;
 	int fog_frame = 0;
 	bool fog_rt_supported = false;
+	// The clouds.
+	bool clouds_enabled = true;
+	float cloud_cover = 0.3;
+	float cloud_base = 2600.0;
+	float cloud_type = 0.5;
+	float cloud_thickness_scale = 1.0;
+	float cloud_density = 0.04;
+	float cloud_scale = 3000.0;
+	float cloud_detail_scale = 280.0;
+	float cloud_weather_scale = 14000.0;
+	float cloud_erosion = 0.35;
+	Vector3 cloud_wind = Vector3(6, 0, 3);
+	float cloud_anisotropy = 0.8;
+	float cloud_sky_light = 1.0;
+	float cloud_multiscatter = 1.0;
+	int cloud_steps = 64;
+	float cloud_light_step = 40.0;
+	float cloud_reach = 100000.0; // past 40 km a low layer's end showed as a band of clear sky at the horizon
+	float cloud_resolution = 0.5;
+	float cloud_history = 0.85;
+	bool cloud_shadows = true;
+	float cloud_shadow_size = 40000.0;
+	CloudsShaderRD cloud_shader;
+	RID cloud_version;
+	RID cloud_pipelines[5];
+	RID sampler_repeat;
+	RID noise_base_rd, noise_detail_rd;
+	RID clouds_rd[2], cloud_depth_rd[2];
+	RID cloud_current, cloud_current_depth;
+	RID cloud_panorama_rd, cloud_shadow_rd;
+	Ref<Texture2DRD> cloud_panorama_texture;
+	RID cloud_ubo;
+	bool cloud_noise_ready = false;
+	int cloud_noise_slice = -1; // the next base noise slice to make; -1 the detail volume first
+	Size2i cloud_size;
+	int cloud_frame = 0;
+	uint64_t cloud_last_ticks = 0;
+	Vector3 cloud_offset;
+	Vector2 cloud_shadow_origin;
+	Projection cloud_view_proj, cloud_prev_view_proj;
+	Vector3 cloud_cam, cloud_prev_cam;
+	bool cloud_prev_valid = false;
+	void _clouds_ensure(const Size2i &p_full);
+	void _clouds_free();
+	bool _clouds_prepare(const Transform3D &p_cam, const Projection &p_inv_rot, const Projection &p_view_proj, const Size2i &p_full);
+	void _clouds_dispatch(int64_t p_list, RID p_depth, bool p_march);
+
 	Projection prev_view_proj;
 	Vector3 prev_cam;
 	bool prev_valid = false;
@@ -185,9 +241,14 @@ public:
 	static constexpr int SKY_VIEW_W = 192, SKY_VIEW_H = 108;
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
-	static constexpr int CAMERA_FLOATS = 40; // atmosphere.glsl's Camera block
+	static constexpr int CAMERA_FLOATS = 48; // atmosphere.glsl's Camera block
+	static constexpr int CLOUD_FLOATS = 32 + 4 * 12; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_NOISE_SLICES = 8; // base noise slices made a frame
+	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
+	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
+	static constexpr int CLOUD_SHADOW_N = 512;
 	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
-	static constexpr int FOG_FLOATS = 32 + 4 * 15; // air_volume.glsl's Fog block
+	static constexpr int FOG_FLOATS = 32 + 4 * 17; // air_volume.glsl's Fog block
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
@@ -260,7 +321,33 @@ public:
 	FOGP(float, fog_rt_distance)
 	FOGP(float, fog_history)
 	FOGP(Color, light_color)
+	FOGP(bool, clouds_enabled)
+	FOGP(float, cloud_cover)
+	FOGP(float, cloud_base)
+	FOGP(float, cloud_type)
+	FOGP(float, cloud_thickness_scale)
+	FOGP(float, cloud_density)
+	FOGP(float, cloud_scale)
+	FOGP(float, cloud_detail_scale)
+	FOGP(float, cloud_weather_scale)
+	FOGP(float, cloud_erosion)
+	FOGP(Vector3, cloud_wind)
+	FOGP(float, cloud_anisotropy)
+	FOGP(float, cloud_sky_light)
+	FOGP(float, cloud_multiscatter)
+	FOGP(int, cloud_steps)
+	FOGP(float, cloud_light_step)
+	FOGP(float, cloud_reach)
+	FOGP(float, cloud_history)
+	FOGP(bool, cloud_shadows)
+	FOGP(float, cloud_shadow_size)
 #undef FOGP
+	void set_cloud_resolution(float p_v) { cloud_resolution = CLAMP(p_v, 0.125f, 1.0f); }
+	float get_cloud_resolution() const { return cloud_resolution; }
+	// The layer's thickness (m) its type gives it.
+	float get_cloud_thickness() const;
+	// The clouds over the whole sky round the camera (equirectangular: rgb their light, a the transmittance).
+	Ref<Texture2D> get_cloud_panorama_texture();
 	void set_apply_aerial(bool p_v) { apply_aerial = p_v; }
 	bool get_apply_aerial() const { return apply_aerial; }
 	void set_light_direction(const Vector3 &p_dir) { light_direction = p_dir.normalized(); }

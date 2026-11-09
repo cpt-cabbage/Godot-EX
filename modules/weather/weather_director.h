@@ -40,13 +40,16 @@
 // WeatherDirector: blends the current weather to a target over a time (transition_to, from any script or story beat;
 // set_state_now), adds surprises when `volatility` > 0 (seeded, bounded: the wind swinging and strengthening, gust
 // spikes, mist and cloud jumping; each eases in and out over seconds, more often and larger as volatility rises), and
-// applies the result to `wind` (a WindField3D) every frame. `volatility` can follow `subject`'s altitude through
-// `volatility_by_altitude` (a Curve: altitude in m on X, volatility on Y), so the weather turns wilder toward the top.
+// applies the result to `wind` (a WindField3D) and the clouds of `atmosphere` (an AtmosphereEffect: cover, base, type,
+// the wind aloft at `cloud_wind_factor` times the wind's speed) every frame. `volatility` can follow `subject`'s
+// altitude through `volatility_by_altitude` (a Curve: altitude in m on X, volatility on Y), so the weather turns
+// wilder toward the top.
 // `current` is the weather now, surprises included, for everything that reads it.
 //
 // WeatherTrigger3D: a place (a cylinder, `radius` by `height`) that, when the director's subject enters it, calls
 // transition_to(`state`, `seconds`): once, or each time it enters.
 
+#include "atmosphere_effect.h"
 #include "core/io/resource.h"
 #include "core/math/random_pcg.h"
 #include "core/templates/local_vector.h"
@@ -123,6 +126,8 @@ class WeatherDirector : public Node {
 	bool transitioning = false;
 
 	NodePath wind;
+	Ref<AtmosphereEffect> atmosphere; // the clouds follow the weather: cover, base, type, carried by the wind aloft
+	float cloud_wind_factor = 1.8; // the wind at the clouds against the wind 10 m up
 	NodePath subject;
 	float volatility = 0.0;
 	Ref<Curve> volatility_by_altitude;
@@ -153,6 +158,10 @@ public:
 
 	void set_wind(const NodePath &p_path) { wind = p_path; }
 	NodePath get_wind() const { return wind; }
+	void set_atmosphere(const Ref<AtmosphereEffect> &p_a) { atmosphere = p_a; }
+	Ref<AtmosphereEffect> get_atmosphere() const { return atmosphere; }
+	void set_cloud_wind_factor(float p_v) { cloud_wind_factor = p_v; }
+	float get_cloud_wind_factor() const { return cloud_wind_factor; }
 	void set_subject(const NodePath &p_path) { subject = p_path; }
 	NodePath get_subject() const { return subject; }
 	void set_volatility(float p_v) { volatility = CLAMP(p_v, 0.0f, 1.0f); }

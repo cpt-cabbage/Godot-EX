@@ -1093,6 +1093,18 @@ public:
 	// the jitter difference the reprojection by it needs (see the member).
 	void set_velocity_current(bool p_current, const Vector2 &p_jitter_delta);
 
+	// The sun's light through what the TLAS does not hold (Godot-EX, 2026-11-09: the weather module's clouds): a texture
+	// of transmittance (R) on a horizontal plane at world height p_frame.w, over a square with its corner at (p_frame.x,
+	// p_frame.y) in world x, z and side p_frame.z; the sun shadow mask multiplies by it where a pixel reaches the plane
+	// along the light. Set each frame by its owner (an invalid RID or p_enabled false: none). Render thread only.
+	static void set_sun_shadow_modulator(RID p_texture, const Vector4 &p_frame, bool p_enabled) {
+		sun_modulator = p_enabled ? p_texture : RID();
+		sun_modulator_frame = p_frame;
+	}
+	static RID sun_modulator;
+	static Vector4 sun_modulator_frame;
+	RID sun_modulator_ubo;
+
 	// The frame's acceleration structure (for consumers like volumetric fog).
 	RID get_tlas() const { return scene.get_tlas(); }
 	// The alpha-tested casters' data as the shadow rays use it (rt_alpha_inc.glsl), its state on when they can be tested:

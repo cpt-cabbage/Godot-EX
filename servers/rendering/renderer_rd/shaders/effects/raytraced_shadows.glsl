@@ -10,6 +10,17 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
+#ifndef MODE_AREA
+// The sun's light through something the TLAS does not hold, set by a module (Raytracing::set_sun_shadow_modulator):
+// the weather module's clouds, their transmittance on a plane (`frame.w`, world y) that a point reaches along the
+// light, over a square (`frame.xy` its corner in world x, z, `frame.z` its side).
+layout(set = 0, binding = 2) uniform sampler2D sun_modulator;
+layout(set = 0, binding = 3, std140) uniform SunModulator {
+	vec4 frame;
+	vec4 flags; // x 1 when set
+}
+sun_mod;
+#endif
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D shadow_mask;
 
 // Alpha-tested casters (rt_alpha_inc.glsl): the records, the hit shading's pools and the alpha masks, in set 2.
@@ -139,6 +150,13 @@ void main() {
 		visibility = 1.0 - float(hits) / float(SOFT_SHADOW_SAMPLES);
 	} else {
 		visibility = trace_occluded(world.xyz, to_sun, params.axis_v.w) ? 0.0 : 1.0;
+	}
+	if (sun_mod.flags.x > 0.5) {
+		vec3 q = world.xyz + to_sun * (max(sun_mod.frame.w - world.y, 0.0) / max(to_sun.y, 0.02));
+		vec2 muv = (q.xz - sun_mod.frame.xy) / sun_mod.frame.z;
+		if (all(greaterThanEqual(muv, vec2(0.0))) && all(lessThanEqual(muv, vec2(1.0)))) {
+			visibility *= textureLod(sun_modulator, muv, 0.0).r;
+		}
 	}
 #endif
 

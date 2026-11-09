@@ -43,6 +43,8 @@ layout(set = 0, binding = 7, std140) uniform Camera {
 	vec4 terrain_rect; // the height texture's world rectangle: x, z origin, x, z size (m)
 	vec4 terrain_h; // x height_min, y height_range (m), z the mip to read at the map's texel size
 	vec4 air_volume; // x the air volume's reach (m), y 1 when it is drawn (air_volume.glsl)
+	vec4 cloud_flags; // x 1 when the clouds are drawn, y 1 when their shadow map is
+	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 }
 camera;
 
@@ -65,10 +67,13 @@ layout(set = 0, binding = 9, r32f) uniform restrict writeonly image2D shadow_out
 #ifdef MODE_AERIAL
 layout(set = 0, binding = 10) uniform sampler2D terrain_shadow;
 layout(set = 0, binding = 11, rgba16f) uniform restrict writeonly image2D out_sky_shadow;
+layout(set = 0, binding = 16) uniform sampler2D cloud_shadow_map;
 #endif
 #ifdef MODE_APPLY
 layout(set = 0, binding = 12) uniform sampler2D sky_shadow;
 layout(set = 0, binding = 13) uniform sampler3D air_light;
+layout(set = 0, binding = 14) uniform sampler2D cloud_light;
+layout(set = 0, binding = 15) uniform sampler2D cloud_depth;
 layout(set = 0, binding = 4) uniform sampler3D aerial_lut;
 layout(set = 0, binding = 5) uniform sampler2D depth_texture;
 layout(set = 0, binding = 6, rgba16f) uniform restrict image2D color_image;
@@ -169,6 +174,20 @@ float terrain_visibility(vec3 w) {
 	}
 	float s = textureLod(terrain_shadow, uv, 0.0).r;
 	return smoothstep(-camera.shadow_params.y, camera.shadow_params.y, w.y - s);
+}
+
+// The clouds' transmittance to the light from a world position (1 off their map).
+float cloud_visibility(vec3 w) {
+	if (camera.cloud_flags.y < 0.5) {
+		return 1.0;
+	}
+	vec3 l = params.light.xyz;
+	vec3 q = w + l * (max(camera.cloud_shadow.w - w.y, 0.0) / max(l.y, 0.02));
+	vec2 uv = (q.xz - camera.cloud_shadow.xy) / camera.cloud_shadow.z;
+	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+		return 1.0;
+	}
+	return textureLod(cloud_shadow_map, uv, 0.0).r;
 }
 #endif
 
@@ -339,7 +358,8 @@ void main() {
 			Medium m = medium(r);
 			vec3 single = (m.scatter_r * pr + m.scatter_m * pm) * light_transmittance(p, l);
 			vec3 multi = (m.scatter_r + m.scatter_m) * multiscatter(r, dot(p / r, l)) * params.misc.y;
-			float vis = terrain_visibility(camera.cam_pos.xyz + d * (t * m_per_km));
+			vec3 wpos = camera.cam_pos.xyz + d * (t * m_per_km);
+			float vis = terrain_visibility(wpos) * cloud_visibility(wpos);
 			vec3 step_t = exp(-m.extinction * dt);
 			vec3 k_int = (vec3(1.0) - step_t) / max(m.extinction, vec3(1e-7));
 			L += T * (single * vis + multi) * k_int;
@@ -397,6 +417,33 @@ void main() {
 		return;
 	}
 	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+// The four march texels round the pixel, each weighted by its bilinear share and by whether its first cloud lies in
+// front of the pixel's scene (so a ridge's edge does not take the clouds behind it).
+#define CLOUDS(c, dist) \
+	if (camera.cloud_flags.x > 0.5) { \
+		vec2 csz = vec2(textureSize(cloud_light, 0)); \
+		vec2 cp = uv * csz - 0.5; \
+		ivec2 c0 = ivec2(floor(cp)); \
+		vec2 cf = cp - vec2(c0); \
+		vec4 cl = vec4(0.0); \
+		float cmean = 0.0, cwsum = 0.0; \
+		for (int cj = 0; cj < 4; cj++) { \
+			ivec2 ct = clamp(c0 + ivec2(cj & 1, cj >> 1), ivec2(0), ivec2(csz) - 1); \
+			float cb = ((cj & 1) != 0 ? cf.x : 1.0 - cf.x) * ((cj >> 1) != 0 ? cf.y : 1.0 - cf.y); \
+			vec2 ctd = texelFetch(cloud_depth, ct, 0).rg; \
+			float cwt = cb * ((dist > ctd.r ? 1.0 : 0.0) + 1e-4); \
+			cl += texelFetch(cloud_light, ct, 0) * cwt; \
+			cmean += ctd.g * cwt; \
+			cwsum += cwt; \
+		} \
+		cl /= max(cwsum, 1e-8); \
+		cmean /= max(cwsum, 1e-8); \
+		if (cl.a < 0.999) { \
+			float cw = sqrt(clamp(cmean * params.misc.x / params.radii.w, 0.0, 1.0)); \
+			vec4 apc = textureLod(aerial_lut, vec3(uv, cw), 0.0); \
+			c.rgb = c.rgb * cl.a + cl.rgb * apc.a + apc.rgb * params.light.w * (1.0 - cl.a); \
+		} \
+	}
 	float depth = texelFetch(depth_texture, px, 0).r;
 	if (depth == 0.0) {
 		// The sky (reverse Z): its own shader drew the atmosphere, unshadowed; the terrain's shadows in the air are taken
@@ -405,6 +452,7 @@ void main() {
 		if (camera.cam_pos.w > 0.5) {
 			c.rgb = max(c.rgb + textureLod(sky_shadow, uv, 0.0).rgb * params.light.w, vec3(0.0));
 		}
+		CLOUDS(c, 1e12)
 		AIR_VOLUME(c, 1e9)
 		imageStore(color_image, px, c);
 		return;
@@ -417,7 +465,9 @@ void main() {
 	float near = clamp(w * 32.0 - 0.5, 0.0, 1.0);
 	vec4 c = imageLoad(color_image, px);
 	c.rgb = c.rgb * mix(1.0, ap.a, near) + ap.rgb * params.light.w * near;
-	AIR_VOLUME(c, dist / max(params.misc.x, 1e-12)) // back to metres
+	float dist_m = dist / max(params.misc.x, 1e-12); // back to metres
+	CLOUDS(c, dist_m)
+	AIR_VOLUME(c, dist_m)
 	imageStore(color_image, px, c);
 #endif
 }
