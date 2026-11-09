@@ -198,6 +198,9 @@ void AtmosphereEffect::_ensure() {
 	transmittance_texture->set_texture_rd_rid(transmittance_rd);
 	sky_view_texture.instantiate();
 	sky_view_texture->set_texture_rd_rid(sky_view_rd);
+	// The clouds' panorama for the sky's light probe (atmosphere_clouds.cpp fills it).
+	cloud_panorama_rd = tex2d(CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
+	cloud_panorama_texture->set_texture_rd_rid(cloud_panorama_rd);
 	initialized = true;
 	tables_dirty = true;
 }
@@ -209,13 +212,15 @@ void AtmosphereEffect::_free() {
 	RD *rd = RD::get_singleton();
 	transmittance_texture.unref();
 	sky_view_texture.unref();
-	for (RID r : { transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd, sky_shadow_rd, shadow_rd, camera_ubo, sampler, sampler_mip, fog_media[0], fog_media[1], fog_light, fog_ubo }) {
+	cloud_panorama_texture.unref();
+	for (RID r : { cloud_panorama_rd, transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd, sky_shadow_rd, shadow_rd, camera_ubo, sampler, sampler_mip, fog_media[0], fog_media[1], fog_light, fog_ubo }) {
 		if (r.is_valid()) {
 			rd->free_rid(r);
 		}
 	}
 	shader.version_free(shader_version);
 	fog_shader.version_free(fog_version);
+	_clouds_free();
 	initialized = false;
 }
 
@@ -299,6 +304,17 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	m[34] = MAX(0.0f, Math::floor(Math::log2(side / SHADOW_N / MAX(spacing, 1e-3f))));
 	m[36] = fog_distance;
 	m[37] = fog_enabled ? 1.0f : 0.0f;
+	// The clouds: their block first (it sets the shadow map's origin).
+	const bool clouds_on = apply_aerial && _clouds_prepare(cam, inv, sd->get_cam_projection() * Projection(Transform3D(cam.basis, Vector3()).affine_inverse()), size);
+	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;
+	m[40] = clouds_on ? 1.0f : 0.0f;
+	m[41] = cloud_shadows_on ? 1.0f : 0.0f;
+	m[44] = cloud_shadow_origin.x;
+	m[45] = cloud_shadow_origin.y;
+	m[46] = cloud_shadow_size;
+	m[47] = cloud_base - altitude_offset; // the base's world y
+	// The ground's sun shadow (the ray-traced mask, next frame) takes the clouds' shadow too.
+	RendererRD::Raytracing::set_sun_shadow_modulator(cloud_shadow_rd, Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset), cloud_shadows_on);
 	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
 	// Rebuilt when the light has moved by about 0.02 degrees.
 	const bool rebuild_shadow = shadows && (shadow_dirty || light_direction.distance_to(shadow_light) > 3e-4f);
@@ -346,6 +362,8 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		}
 		f[o - 1] = heights_rd.is_valid() ? 1.0f : 0.0f;
 		v4(light_illuminance, 0, 0, 0);
+		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset);
+		v4(cloud_shadows_on ? 1.0f : 0.0f, 0, 0, 0);
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -356,9 +374,10 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		// Declared samplers and blocks stay in a variant's layout whether it reads them or not: each set gets the
 		// shared ones it does not name (a binding the variant lacks is ignored).
 		LocalVector<RD::Uniform> u;
-		bool have[16] = {};
+		bool have[32] = {}; // indexed by binding: past the highest one used
 		for (const RD::Uniform &x : p_uniforms) {
 			u.push_back(x);
+			ERR_CONTINUE(x.binding >= 32);
 			have[x.binding] = true;
 		}
 		if (!have[0] && p_mode != MODE_TRANSMITTANCE) {
@@ -387,13 +406,21 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		tables_dirty = false;
 	}
 	run(MODE_SKY_VIEW, { u_trans_sampled, u_ms_sampled, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ sky_view_rd })) }, SKY_VIEW_W, SKY_VIEW_H, 1);
+	if (clouds_on) {
+		// The clouds' shadow map, in a list of their own (no push constants).
+		rd->compute_list_end();
+		list = rd->compute_list_begin();
+		_clouds_dispatch(list, RID(), false);
+		rd->compute_list_end();
+		list = rd->compute_list_begin();
+	}
 	if (rebuild_shadow) {
 		run(MODE_TERRAIN_SHADOW, { RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler_mip, heights_rd })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 9, Vector<RID>({ shadow_rd })) }, SHADOW_N, 1, 1);
 		shadow_light = light_direction;
 		shadow_dirty = false;
 	}
 	if (apply_aerial) {
-		run(MODE_AERIAL, { u_trans_sampled, u_ms_sampled, u_camera, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ sampler, shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 11, Vector<RID>({ sky_shadow_rd })) }, AERIAL_W, AERIAL_H, 1);
+		run(MODE_AERIAL, { u_trans_sampled, u_ms_sampled, u_camera, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ sampler, shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 11, Vector<RID>({ sky_shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 16, Vector<RID>({ sampler, cloud_shadow_rd.is_valid() ? cloud_shadow_rd : shadow_rd })) }, AERIAL_W, AERIAL_H, 1);
 		if (fog_enabled) {
 			// The air volume: inject (ray-traced when the TLAS is there), then integrate, in a list of their own (they take
 			// no push constants, and a list keeps the last pass's).
@@ -409,6 +436,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler_mip, heights_or_dummy })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, shadow_rd })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, sky_view_rd })));
+			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_shadow_rd.is_valid() ? cloud_shadow_rd : shadow_rd })));
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));
@@ -437,10 +465,19 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			rd->compute_list_end();
 			list = rd->compute_list_begin();
 		}
+		if (clouds_on) {
+			rd->compute_list_end();
+			list = rd->compute_list_begin();
+			_clouds_dispatch(list, rb->get_depth_texture(0), true);
+			rd->compute_list_end();
+			list = rd->compute_list_begin();
+		}
+		const RID clouds_tex = clouds_on && cloud_current.is_valid() ? cloud_current : sky_shadow_rd;
+		const RID clouds_depth_tex = clouds_on && cloud_current_depth.is_valid() ? cloud_current_depth : sky_shadow_rd;
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RID color = rb->get_internal_texture(v);
 			RID depth = rb->get_depth_texture(v);
-			run(MODE_APPLY, { u_camera, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, sky_shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, fog_light })) }, size.x, size.y, 1);
+			run(MODE_APPLY, { u_camera, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, sky_shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, fog_light })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, clouds_tex })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, clouds_depth_tex })) }, size.x, size.y, 1);
 		}
 	}
 	rd->compute_list_end();
@@ -539,6 +576,30 @@ void AtmosphereEffect::_bind_methods() {
 	FB(fog_rt_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,5000,1,suffix:m")
 	FB(fog_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.98,0.01")
 	FB(light_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
+	ADD_GROUP("Clouds", "");
+	FB(clouds_enabled, Variant::BOOL, PROPERTY_HINT_NONE, "")
+	FB(cloud_cover, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_base, Variant::FLOAT, PROPERTY_HINT_RANGE, "-500,12000,1,suffix:m")
+	FB(cloud_type, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_thickness_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.1,4,0.01")
+	FB(cloud_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.0001,suffix:/m")
+	FB(cloud_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "100,50000,1,suffix:m")
+	FB(cloud_detail_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "10,5000,1,suffix:m")
+	FB(cloud_weather_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "500,200000,1,suffix:m")
+	FB(cloud_erosion, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_wind, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m/s")
+	FB(cloud_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.95,0.01")
+	FB(cloud_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
+	FB(cloud_multiscatter, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
+	FB(cloud_steps, Variant::INT, PROPERTY_HINT_RANGE, "8,256,1")
+	FB(cloud_light_step, Variant::FLOAT, PROPERTY_HINT_RANGE, "1,1000,0.1,suffix:m")
+	FB(cloud_reach, Variant::FLOAT, PROPERTY_HINT_RANGE, "1000,200000,1,suffix:m")
+	FB(cloud_resolution, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.125,1,0.125")
+	FB(cloud_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.97,0.01")
+	FB(cloud_shadows, Variant::BOOL, PROPERTY_HINT_NONE, "")
+	FB(cloud_shadow_size, Variant::FLOAT, PROPERTY_HINT_RANGE, "1000,200000,1,suffix:m")
+	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
+	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);
 #undef FB
 	ClassDB::bind_method(D_METHOD("set_apply_aerial", "apply"), &AtmosphereEffect::set_apply_aerial);
 	ClassDB::bind_method(D_METHOD("get_apply_aerial"), &AtmosphereEffect::get_apply_aerial);
@@ -546,6 +607,7 @@ void AtmosphereEffect::_bind_methods() {
 }
 
 AtmosphereEffect::AtmosphereEffect() {
+	cloud_panorama_texture.instantiate();
 	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_SKY);
 }
 

@@ -202,6 +202,13 @@ void WeatherDirector::_apply() {
 			w->set_turbulence(current->turbulence);
 		}
 	}
+	if (atmosphere.is_valid()) {
+		atmosphere->set_cloud_cover(current->cloud_cover);
+		atmosphere->set_cloud_base(current->cloud_base);
+		atmosphere->set_cloud_type(current->cloud_type);
+		const float h = Math::deg_to_rad(current->wind_heading);
+		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
+	}
 }
 
 void WeatherDirector::step(double p_delta) {
@@ -254,6 +261,12 @@ void WeatherDirector::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_seed"), &WeatherDirector::get_seed);
 
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "wind", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "WindField3D"), "set_wind", "get_wind");
+	ClassDB::bind_method(D_METHOD("set_atmosphere", "atmosphere"), &WeatherDirector::set_atmosphere);
+	ClassDB::bind_method(D_METHOD("get_atmosphere"), &WeatherDirector::get_atmosphere);
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "atmosphere", PROPERTY_HINT_RESOURCE_TYPE, "AtmosphereEffect"), "set_atmosphere", "get_atmosphere");
+	ClassDB::bind_method(D_METHOD("set_cloud_wind_factor", "factor"), &WeatherDirector::set_cloud_wind_factor);
+	ClassDB::bind_method(D_METHOD("get_cloud_wind_factor"), &WeatherDirector::get_cloud_wind_factor);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_wind_factor", PROPERTY_HINT_RANGE, "0,10,0.01"), "set_cloud_wind_factor", "get_cloud_wind_factor");
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "subject", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "Node3D"), "set_subject", "get_subject");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volatility", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_volatility", "get_volatility");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "volatility_by_altitude", PROPERTY_HINT_RESOURCE_TYPE, "Curve"), "set_volatility_by_altitude", "get_volatility_by_altitude");

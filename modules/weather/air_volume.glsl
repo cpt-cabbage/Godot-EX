@@ -38,6 +38,8 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 terrain_rect;
 	vec4 terrain_h; // x height_min, y height_range, z the mip for the shadow map, w 1 when the heights are bound
 	vec4 sky; // x the sky table's light illuminance, yzw unused
+	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
+	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn
 }
 fog;
 
@@ -47,6 +49,7 @@ layout(set = 0, binding = 2) uniform sampler3D history;
 layout(set = 0, binding = 3) uniform sampler2D terrain_heights;
 layout(set = 0, binding = 4) uniform sampler2D terrain_shadow;
 layout(set = 0, binding = 5) uniform sampler2D sky_view;
+layout(set = 0, binding = 9) uniform sampler2D cloud_shadow_map;
 #endif
 #ifdef MODE_INJECT_RT
 layout(set = 0, binding = 6) uniform accelerationStructureEXT tlas;
@@ -118,6 +121,19 @@ float density(vec3 w) {
 		d *= mix(1.0, smoothstep(0.25, 0.75, fbm(q)) * 2.0, fog.mist.y);
 	}
 	return d;
+}
+
+float cloud_visibility(vec3 w) {
+	if (fog.cloud_flags.x < 0.5) {
+		return 1.0;
+	}
+	vec3 l = fog.light_dir.xyz;
+	vec3 q = w + l * (max(fog.cloud_shadow.w - w.y, 0.0) / max(l.y, 0.02));
+	vec2 uv = (q.xz - fog.cloud_shadow.xy) / fog.cloud_shadow.z;
+	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+		return 1.0;
+	}
+	return textureLod(cloud_shadow_map, uv, 0.0).r;
 }
 
 float terrain_visibility(vec3 w) {
@@ -195,7 +211,7 @@ void main() {
 		float sigma = density(p);
 		vec3 scatter = vec3(0.0);
 		if (sigma > 1e-7) {
-			float vis = terrain_visibility(p);
+			float vis = terrain_visibility(p) * cloud_visibility(p);
 #ifdef MODE_INJECT_RT
 			if (vis > 0.0 && dist < fog.range.y) {
 				vis *= rt_visibility(p, 2000.0);
