@@ -53,9 +53,15 @@ AtmosphereEffect::Push AtmosphereEffect::_push(float p_camera_altitude_m, int p_
 	p.rayleigh[1] = r.y;
 	p.rayleigh[2] = r.z;
 	p.rayleigh[3] = rayleigh_scale_height;
-	p.mie_scattering[0] = p.mie_scattering[1] = p.mie_scattering[2] = mie_scattering * mie_density;
+	const Vector3 ms = _mie_scattering_rgb();
+	const Vector3 me = _extinction_rgb();
+	p.mie_scattering[0] = ms.x;
+	p.mie_scattering[1] = ms.y;
+	p.mie_scattering[2] = ms.z;
 	p.mie_scattering[3] = mie_scale_height;
-	p.mie_extinction[0] = p.mie_extinction[1] = p.mie_extinction[2] = mie_extinction * mie_density;
+	p.mie_extinction[0] = me.x;
+	p.mie_extinction[1] = me.y;
+	p.mie_extinction[2] = me.z;
 	p.mie_extinction[3] = mie_anisotropy;
 	p.ozone[0] = ozone_absorption.x;
 	p.ozone[1] = ozone_absorption.y;
@@ -73,7 +79,21 @@ AtmosphereEffect::Push AtmosphereEffect::_push(float p_camera_altitude_m, int p_
 	p.misc[1] = multiscatter;
 	p.misc[2] = float(p_width);
 	p.misc[3] = float(p_height);
+	p.tint[0] = sky_tint.r * sky_luminance;
+	p.tint[1] = sky_tint.g * sky_luminance;
+	p.tint[2] = sky_tint.b * sky_luminance;
+	p.tint[3] = sky_recolor;
 	return p;
+}
+
+Vector3 AtmosphereEffect::_mie_scattering_rgb() const {
+	return Vector3(mie_tint.r, mie_tint.g, mie_tint.b) * (mie_scattering * mie_density);
+}
+
+Vector3 AtmosphereEffect::_extinction_rgb() const {
+	// What the tint takes from the haze's scattering is absorbed: the haze's extinction stays the physical one.
+	const Vector3 haze = Vector3(1, 1, 1) * (MAX(mie_extinction, mie_scattering) * mie_density);
+	return haze + Vector3(absorption_color.r, absorption_color.g, absorption_color.b) * absorption_density;
 }
 
 void AtmosphereEffect::_ensure() {
@@ -217,7 +237,12 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		}
 		rd->compute_list_bind_compute_pipeline(list, pipelines[p_mode]);
 		rd->compute_list_bind_uniform_set(list, cache->get_cache_vec(s, 0, u), 0);
-		rd->compute_list_set_push_constant(list, &push, sizeof(Push));
+		// The screen's size is the apply pass's alone: the tables' passes take the tint's height there.
+		Push pm = push;
+		if (p_mode != MODE_APPLY) {
+			pm.misc[2] = sky_tint_height;
+		}
+		rd->compute_list_set_push_constant(list, &pm, sizeof(Push));
 		rd->compute_list_dispatch_threads(list, x, y, z);
 		rd->compute_list_add_barrier(list);
 	};
@@ -260,7 +285,7 @@ Vector3 AtmosphereEffect::transmittance(float p_altitude_m, const Vector3 &p_dir
 		const float dr = Math::exp(-h / rayleigh_scale_height);
 		const float dm = Math::exp(-h / mie_scale_height);
 		const float dz = MAX(0.0f, 1.0f - Math::abs(h - 25.0f) / 15.0f);
-		depth += (rs * dr + Vector3(1, 1, 1) * mie_extinction * mie_density * dm + ozone_absorption * dz) * dt;
+		depth += (rs * dr + _extinction_rgb() * dm + ozone_absorption * dz) * dt;
 	}
 	return Vector3(Math::exp(-depth.x), Math::exp(-depth.y), Math::exp(-depth.z));
 }
@@ -289,6 +314,13 @@ void AtmosphereEffect::_bind_methods() {
 	B(float, mie_anisotropy, Variant::FLOAT, "0,0.99,0.01")
 	B(float, ground_albedo, Variant::FLOAT, "0,1,0.01")
 	B(float, multiscatter, Variant::FLOAT, "0,4,0.01")
+	B(Color, mie_tint, Variant::COLOR, "")
+	B(Color, absorption_color, Variant::COLOR, "")
+	B(float, absorption_density, Variant::FLOAT, "0,1,0.0001,suffix:/km")
+	B(Color, sky_tint, Variant::COLOR, "")
+	B(float, sky_luminance, Variant::FLOAT, "0,10,0.01")
+	B(float, sky_recolor, Variant::FLOAT, "0,1,0.01")
+	B(float, sky_tint_height, Variant::FLOAT, "0.01,10,0.01,suffix:rad")
 	B(float, aerial_perspective_scale, Variant::FLOAT, "0,100,0.01")
 	B(float, aerial_distance, Variant::FLOAT, "1,500,1,suffix:km")
 	B(float, altitude_offset, Variant::FLOAT, "-10000,10000,1,suffix:m")

@@ -39,6 +39,14 @@
 // `mie_density` (haze; the weather's mist raises it), `mie_anisotropy`, `ground_albedo`, `aerial_perspective_scale` (how
 // far the air seems, a multiplier on distance), `multiscatter`. Altitudes: world y plus `altitude_offset` m.
 // transmittance() gives the same air's transmittance on the CPU, for the sun's and the moon's colour.
+// The art's colour (2026-11-09): `mie_tint` colours what the haze scatters (dust or smoke glows orange at sunset), the
+// rest of it absorbed; `absorption_color` at `absorption_density` (per km at the ground, thinning as the haze) is other
+// matter that absorbs (smoke, dust), taking those colours out of the sunlight and the sky; `sky_tint` and `sky_luminance`
+// scale the sky's and the aerial perspective's light (not the discs) and need no new tables, so SkyLook (sky_look.h)
+// drives them by the sun's height every frame. `sky_recolor` (0 to 1) replaces that light's own colour by its luminance
+// times the tint, so a tint can make a blue sky orange rather than brown; `sky_tint_height` (radians of the view's
+// elevation) is how far up from the horizon the tint and recolour reach, fading as exp(-elevation / height): 10 is the
+// whole sky, 0.3 a band low down with the zenith left as it was.
 
 #include "scene/resources/compositor.h"
 #include "scene/resources/texture_rd.h"
@@ -69,6 +77,13 @@ class AtmosphereEffect : public CompositorEffect {
 	float aerial_distance = 32.0; // km the volume reaches
 	float altitude_offset = 1400.0;
 	bool apply_aerial = true;
+	Color mie_tint = Color(1, 1, 1);
+	Color absorption_color = Color(0.25, 0.55, 1.0);
+	float absorption_density = 0.0;
+	Color sky_tint = Color(1, 1, 1);
+	float sky_luminance = 1.0;
+	float sky_recolor = 0.0;
+	float sky_tint_height = 10.0;
 
 	Vector3 light_direction = Vector3(0, 1, 0);
 	float light_illuminance = 1.0;
@@ -94,7 +109,10 @@ class AtmosphereEffect : public CompositorEffect {
 		float radii[4];
 		float light[4];
 		float misc[4];
+		float tint[4];
 	};
+	Vector3 _mie_scattering_rgb() const;
+	Vector3 _extinction_rgb() const; // the haze's and the other absorption's, per km at the ground
 	Push _push(float p_camera_altitude_m, int p_width, int p_height) const;
 	void _ensure();
 	void _free();
@@ -117,9 +135,11 @@ public:
 	float get_camera_altitude() const { return camera_altitude; }
 
 #define PROP(type, m)                                          \
-	void set_##m(type p_v) {                                     \
-		m = p_v;                                                   \
-		_dirty();                                                  \
+	void set_##m(type p_v) { \
+		if (m != p_v) { \
+			m = p_v; \
+			_dirty(); \
+		} \
 	}                                                            \
 	type get_##m() const { return m; }
 	PROP(Vector3, rayleigh_scattering)
@@ -135,7 +155,18 @@ public:
 	PROP(float, mie_anisotropy)
 	PROP(float, ground_albedo)
 	PROP(float, multiscatter)
+	PROP(Color, mie_tint)
+	PROP(Color, absorption_color)
+	PROP(float, absorption_density)
 #undef PROP
+	void set_sky_tint(const Color &p_c) { sky_tint = p_c; }
+	Color get_sky_tint() const { return sky_tint; }
+	void set_sky_luminance(float p_v) { sky_luminance = MAX(p_v, 0.0f); }
+	float get_sky_luminance() const { return sky_luminance; }
+	void set_sky_recolor(float p_v) { sky_recolor = CLAMP(p_v, 0.0f, 1.0f); }
+	float get_sky_recolor() const { return sky_recolor; }
+	void set_sky_tint_height(float p_v) { sky_tint_height = MAX(p_v, 0.01f); }
+	float get_sky_tint_height() const { return sky_tint_height; }
 	void set_aerial_perspective_scale(float p_v) { aerial_perspective_scale = MAX(p_v, 0.0f); }
 	float get_aerial_perspective_scale() const { return aerial_perspective_scale; }
 	void set_aerial_distance(float p_v) { aerial_distance = MAX(p_v, 1.0f); }

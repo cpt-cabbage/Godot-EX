@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SkyLook" inherits="Resource" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		The sky's look as editable data: the haze's density and colour, other absorption, and colours by the sun's height.
+	</brief_description>
+	<description>
+		A [TimeOfDay3D] applies its [member TimeOfDay3D.look] every frame: the haze and air properties go to the [AtmosphereEffect] (a change rebuilds its small tables), [member sky_tint] multiplies the sky's and the aerial perspective's light and [member sun_tint] the sunlight, both read at the sun's elevation between [member elevation_min] (offset 0) and [member elevation_max] (offset 1). Without gradients the sky is the physical one.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="apply" qualifiers="const">
+			<return type="void" />
+			<param index="0" name="atmosphere" type="AtmosphereEffect" />
+			<param index="1" name="sun_elevation" type="float" />
+			<description>
+				Sets [param atmosphere]'s art properties and its sky tint for a sun at [param sun_elevation] degrees.
+			</description>
+		</method>
+		<method name="get_sky_tint_at" qualifiers="const">
+			<return type="Color" />
+			<param index="0" name="sun_elevation" type="float" />
+			<description>
+				The sky's tint for a sun at [param sun_elevation] degrees (white without [member sky_tint]).
+			</description>
+		</method>
+		<method name="get_sky_recolor_at" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="sun_elevation" type="float" />
+			<description>
+				The sky's recolour for a sun at [param sun_elevation] degrees (0 without [member sky_recolor]).
+			</description>
+		</method>
+		<method name="get_sun_tint_at" qualifiers="const">
+			<return type="Color" />
+			<param index="0" name="sun_elevation" type="float" />
+			<description>
+				The sunlight's tint for a sun at [param sun_elevation] degrees (white without [member sun_tint]).
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="absorption_color" type="Color" setter="set_absorption_color" getter="get_absorption_color" default="Color(0.25, 0.55, 1, 1)">
+			The colours other matter (smoke, dust) absorbs, per km at [member absorption_density]: blue absorbed leaves the sun and the sky orange.
+		</member>
+		<member name="absorption_density" type="float" setter="set_absorption_density" getter="get_absorption_density" default="0.0">
+			How much of [member absorption_color] the air holds, per km at the ground, thinning with height as the haze.
+		</member>
+		<member name="aerial_perspective_scale" type="float" setter="set_aerial_perspective_scale" getter="get_aerial_perspective_scale" default="1.0">
+			How far the air seems: a multiplier on distance for the haze over the ground.
+		</member>
+		<member name="elevation_max" type="float" setter="set_elevation_max" getter="get_elevation_max" default="48.0">
+			The sun's elevation in degrees at the gradients' offset 1.
+		</member>
+		<member name="elevation_min" type="float" setter="set_elevation_min" getter="get_elevation_min" default="-12.0">
+			The sun's elevation in degrees at the gradients' offset 0.
+		</member>
+		<member name="mie_anisotropy" type="float" setter="set_mie_anisotropy" getter="get_mie_anisotropy" default="0.8">
+			How much the haze scatters forward: higher, a tighter glow around the sun.
+		</member>
+		<member name="mie_density" type="float" setter="set_mie_density" getter="get_mie_density" default="1.0">
+			The haze, as a multiple of Earth's standard.
+		</member>
+		<member name="mie_tint" type="Color" setter="set_mie_tint" getter="get_mie_tint" default="Color(1, 1, 1, 1)">
+			The colour the haze scatters; what it takes away is absorbed. Below white is physical.
+		</member>
+		<member name="multiscatter" type="float" setter="set_multiscatter" getter="get_multiscatter" default="1.0">
+			The share of multiple scattering: the sky's fill.
+		</member>
+		<member name="rayleigh_density" type="float" setter="set_rayleigh_density" getter="get_rayleigh_density" default="1.0">
+			The air's blue, as a multiple of Earth's.
+		</member>
+		<member name="sky_luminance" type="float" setter="set_sky_luminance" getter="get_sky_luminance" default="1.0">
+			A multiplier on the sky's and the aerial perspective's light.
+		</member>
+		<member name="sky_recolor" type="Curve" setter="set_sky_recolor" getter="get_sky_recolor">
+			How much the sky's own colour gives way to [member sky_tint] (its luminance in the tint's colour), 0 to 1, over the same sun elevations: a tint then makes a blue sky orange rather than brown.
+		</member>
+		<member name="sky_tint_height" type="float" setter="set_sky_tint_height" getter="get_sky_tint_height" default="10.0">
+			How far up from the horizon [member sky_tint] and [member sky_recolor] reach, in radians of the view's elevation (they fade as exp(-elevation / height)): 10 is the whole sky, 0.3 a band low down.
+		</member>
+		<member name="sky_tint" type="Gradient" setter="set_sky_tint" getter="get_sky_tint">
+			The sky's and the aerial perspective's tint by the sun's elevation.
+		</member>
+		<member name="sun_tint" type="Gradient" setter="set_sun_tint" getter="get_sun_tint">
+			The sunlight's tint by the sun's elevation.
+		</member>
+	</members>
+</class>

@@ -25,7 +25,9 @@ layout(push_constant, std430) uniform Params {
 	vec4 ozone; // rgb absorption per km, w ground albedo
 	vec4 radii; // bottom radius, top radius, camera radius (km), aerial max distance (km)
 	vec4 light; // xyz direction toward the light (Y up), w its illuminance (for MODE_APPLY)
-	vec4 misc; // x metres to km times the aerial scale, y the multiple scattering's factor, zw screen size
+	vec4 misc; // x metres to km times the aerial scale, y the multiple scattering's factor, zw screen size (MODE_APPLY;
+	// the other modes: z the art tint's height in radians)
+	vec4 tint; // rgb: the art's tint and luminance on the sky's and the aerial perspective's light, w: its recolour
 }
 params;
 
@@ -128,6 +130,14 @@ float phase_mie(float c, float g) {
 	// Cornette-Shanks.
 	float g2 = g * g;
 	return 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + c * c)) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+
+// The art's tint for a view direction d: a multiply, or (by tint.w) the light's luminance in the tint's colour, fading
+// with the view's elevation over misc.z radians.
+vec3 art_tint(vec3 L, vec3 d) {
+	vec3 t = mix(L, vec3(dot(L, vec3(0.2126, 0.7152, 0.0722))), params.tint.w) * params.tint.rgb;
+	float el = asin(clamp(d.y, 0.0, 1.0));
+	return mix(L, t, exp(-el / max(params.misc.z, 0.01)));
 }
 
 #if defined(MODE_SKY_VIEW) || defined(MODE_AERIAL)
@@ -255,7 +265,7 @@ void main() {
 	float t_max = tg > 0.0 ? tg : tt;
 	vec3 T;
 	vec3 L = t_max > 0.0 ? integrate(o, d, t_max, 30, l, T) : vec3(0.0);
-	imageStore(out_lut, px, vec4(L, 1.0));
+	imageStore(out_lut, px, vec4(art_tint(L, d), 1.0));
 #endif
 
 #ifdef MODE_AERIAL
@@ -273,7 +283,7 @@ void main() {
 	vec3 l = params.light.xyz;
 	vec3 T;
 	vec3 L = integrate(o, d, dist, 8 + cell.z / 2, l, T);
-	imageStore(out_aerial, cell, vec4(L, dot(T, vec3(1.0 / 3.0))));
+	imageStore(out_aerial, cell, vec4(art_tint(L, d), dot(T, vec3(1.0 / 3.0))));
 #endif
 
 #ifdef MODE_APPLY
