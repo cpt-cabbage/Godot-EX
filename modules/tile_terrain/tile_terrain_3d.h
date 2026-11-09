@@ -38,15 +38,21 @@
 // displacement, so the ray tracer's acceleration structures hold the terrain as it is drawn (Terrain3D's clipmap, the
 // reference for this node, displaces a flat mesh in its shader, which a BLAS never sees).
 //
-// The heights and masks also go to the material as textures (`heights`, `masks`, with `terrain_origin`,
-// `terrain_spacing`, `terrain_samples`, `height_min`, `height_range`): the ground's look is the material's, a
-// .gdshader the project owns.
+// The heights and masks go to the GPU streamed round the camera (2026-11-10; they were whole: 0.7 GB of heights and
+// 1.07 GB of masks): CLIP_LEVELS windows of CLIP_SIZE^2 samples taken every 1, 2, 4 samples (Texture2DArrays, a layer
+// a level), re-centred when the camera has moved an eighth of a window (the masks read from their file then: they
+// are not kept in memory), and the whole map every FAR_STEP samples (mipmapped). They are global shader parameters
+// (terrain_heights_clip, terrain_masks_clip, terrain_heights_far, terrain_masks_far, terrain_clip_01,
+// terrain_clip_2, terrain_frame, terrain_heights; the project's terrain.gdshaderinc reads them), and the material gets
+// the far ones as `heights`, `masks` with `terrain_origin`, `terrain_spacing` (the far step's), `terrain_samples`,
+// `height_min`, `height_range`: the ground's look is the material's, a .gdshader the project owns.
 //
 // Collision: a Jolt heightfield of `collision_samples` a side, at the data's own samples, that follows
 // `collision_target` (the walker). Its triangles, the level-0 chunks' and get_height() split each cell the same way.
 
 #include "scene/3d/node_3d.h"
 #include "scene/resources/image_texture.h"
+#include "scene/resources/texture.h"
 #include "scene/resources/material.h"
 
 class TileTerrain3D : public Node3D {
@@ -101,8 +107,20 @@ private:
 	double height_min = 0.0;
 	double height_range = 1.0;
 	Vector<uint16_t> heights; // [row (east, Z)][column (north, X)]
-	Ref<ImageTexture> height_texture;
-	Ref<ImageTexture> mask_texture;
+	Ref<ImageTexture> height_texture; // the far map's
+	Ref<ImageTexture> mask_texture; // the far map's
+	// The streamed windows round the camera.
+	String masks_path;
+	Ref<Texture2DArray> clip_heights;
+	Ref<Texture2DArray> clip_masks;
+	Vector2i clip_origin[3]; // each level's first sample (column, row); a multiple of its step
+	uint64_t clip_updates = 0;
+	double clip_update_ms = 0.0;
+	void _build_far();
+	void _update_clip(const Vector3 &p_local, bool p_force);
+	Ref<Image> _clip_heights(int p_level, const Vector2i &p_origin) const;
+	Ref<Image> _clip_masks(int p_level, const Vector2i &p_origin) const;
+	void _publish_globals();
 	int max_lod = 0;
 	// Each level's chunks' lowest and highest sample (metres), for their boxes: [lod][z * n + x].
 	LocalVector<LocalVector<Vector2>> chunk_range;
@@ -126,6 +144,13 @@ private:
 	}
 
 	Error _load();
+public:
+	static constexpr int CLIP_SIZE = 1024, CLIP_LEVELS = 3, FAR_STEP = 8;
+	static void register_globals();
+	int get_clip_updates() const { return int(clip_updates); }
+	double get_clip_update_ms() const { return clip_update_ms; }
+
+private:
 	void _clear();
 	void _apply_material();
 	void _select(int p_lod, int p_x, int p_z, const Vector3 &p_camera);

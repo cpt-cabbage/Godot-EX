@@ -41,6 +41,7 @@ void initialize_tile_terrain_module(ModuleInitializationLevel p_level) {
 	}
 	GDREGISTER_CLASS(InstanceField3D);
 	GDREGISTER_CLASS(TileTerrain3D);
+	TileTerrain3D::register_globals();
 }
 
 void uninitialize_tile_terrain_module(ModuleInitializationLevel p_level) {

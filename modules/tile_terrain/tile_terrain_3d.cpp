@@ -182,43 +182,19 @@ Error TileTerrain3D::_load() {
 		heights.resize(count);
 		f->get_buffer((uint8_t *)heights.ptrw(), count * 2);
 	}
-	{
-		Ref<Image> image = Image::create_empty(samples, samples, true, Image::FORMAT_R16);
-		ERR_FAIL_COND_V(image.is_null() || image->is_empty(), ERR_OUT_OF_MEMORY);
-		uint8_t *w = image->ptrw();
-		memcpy(w, heights.ptr(), count * 2);
-		const int mips = image->get_mipmap_count();
-		for (int m = 1; m <= mips; m++) {
-			int64_t src_ofs, src_size, dst_ofs, dst_size;
-			int sw, sh, dw, dh;
-			image->get_mipmap_offset_size_and_dimensions(m - 1, src_ofs, src_size, sw, sh);
-			image->get_mipmap_offset_size_and_dimensions(m, dst_ofs, dst_size, dw, dh);
-			const uint16_t *src = (const uint16_t *)(w + src_ofs);
-			uint16_t *dst = (uint16_t *)(w + dst_ofs);
-			for (int y = 0; y < dh; y++) {
-				const int y0 = MIN(y * 2, sh - 1), y1 = MIN(y * 2 + 1, sh - 1);
-				for (int x = 0; x < dw; x++) {
-					const int x0 = MIN(x * 2, sw - 1), x1 = MIN(x * 2 + 1, sw - 1);
-					const uint32_t s = uint32_t(src[int64_t(y0) * sw + x0]) + src[int64_t(y0) * sw + x1] + src[int64_t(y1) * sw + x0] + src[int64_t(y1) * sw + x1];
-					dst[int64_t(y) * dw + x] = uint16_t((s + 2) / 4);
-				}
-			}
-		}
-		height_texture = ImageTexture::create_from_image(image);
-	}
-	// Masks: RGBA8, GPU only.
+	// Masks: read from their file as the windows need them (and once for the far map), not kept.
+	masks_path = String();
 	if (meta.has("masks")) {
-		Ref<FileAccess> f = FileAccess::open(data_path.path_join(String(meta["masks"])), FileAccess::READ);
+		const String mp = data_path.path_join(String(meta["masks"]));
+		Ref<FileAccess> f = FileAccess::open(mp, FileAccess::READ);
 		if (f.is_valid() && int64_t(f->get_length()) == count * 4) {
-			Ref<Image> image = Image::create_empty(samples, samples, false, Image::FORMAT_RGBA8);
-			f->get_buffer(image->ptrw(), count * 4);
-			f.unref();
-			image->generate_mipmaps();
-			mask_texture = ImageTexture::create_from_image(image);
+			masks_path = mp;
 		} else {
 			WARN_PRINT("TileTerrain3D: no masks (missing, or not samples^2 x 4 bytes)");
 		}
 	}
+	_build_far();
+	_update_clip(Vector3(origin_north + spacing * samples * 0.5, 0.0, origin_east + spacing * samples * 0.5), true);
 
 	// The quadtree's levels and each chunk's height range.
 	chunks_per_side.clear();
@@ -289,6 +265,179 @@ Error TileTerrain3D::_load() {
 	return OK;
 }
 
+void TileTerrain3D::register_globals() {
+	static bool registered = false;
+	RenderingServer *rs = RS::get_singleton();
+	if (registered || rs == nullptr) {
+		return;
+	}
+	registered = true;
+	rs->global_shader_parameter_add("terrain_heights_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
+	rs->global_shader_parameter_add("terrain_masks_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
+	rs->global_shader_parameter_add("terrain_heights_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
+	rs->global_shader_parameter_add("terrain_masks_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
+	rs->global_shader_parameter_add("terrain_clip_01", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
+	rs->global_shader_parameter_add("terrain_clip_2", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
+	rs->global_shader_parameter_add("terrain_frame", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4(0, 0, 1, 1));
+	rs->global_shader_parameter_add("terrain_heights", RSE::GLOBAL_VAR_TYPE_VEC2, Vector2(0, 1));
+}
+
+// The whole map every FAR_STEP samples: heights averaged, masks averaged from their file a band at a time.
+void TileTerrain3D::_build_far() {
+	const int n = (samples + FAR_STEP - 1) / FAR_STEP;
+	{
+		Ref<Image> image = Image::create_empty(n, n, false, Image::FORMAT_R16);
+		uint16_t *w = (uint16_t *)image->ptrw();
+		for (int y = 0; y < n; y++) {
+			for (int x = 0; x < n; x++) {
+				uint32_t sum = 0, k = 0;
+				for (int dy = 0; dy < FAR_STEP; dy++) {
+					const int r = MIN(y * FAR_STEP + dy, samples - 1);
+					for (int dx = 0; dx < FAR_STEP; dx++) {
+						const int c = MIN(x * FAR_STEP + dx, samples - 1);
+						sum += heights[int64_t(r) * samples + c];
+						k++;
+					}
+				}
+				w[int64_t(y) * n + x] = uint16_t(sum / k);
+			}
+		}
+		image->generate_mipmaps();
+		height_texture = ImageTexture::create_from_image(image);
+	}
+	mask_texture.unref();
+	if (!masks_path.is_empty()) {
+		Ref<FileAccess> f = FileAccess::open(masks_path, FileAccess::READ);
+		Ref<Image> image = Image::create_empty(n, n, false, Image::FORMAT_RGBA8);
+		uint8_t *w = image->ptrw();
+		LocalVector<uint8_t> band;
+		band.resize(uint32_t(int64_t(samples) * 4 * FAR_STEP));
+		for (int y = 0; y < n; y++) {
+			const int r0 = y * FAR_STEP;
+			const int rows = MIN(FAR_STEP, samples - r0);
+			f->seek(uint64_t(int64_t(r0) * samples * 4));
+			f->get_buffer(band.ptr(), uint64_t(int64_t(rows) * samples * 4));
+			for (int x = 0; x < n; x++) {
+				uint32_t sum[4] = {}, k = 0;
+				for (int dy = 0; dy < rows; dy++) {
+					for (int dx = 0; dx < FAR_STEP; dx++) {
+						const int c = MIN(x * FAR_STEP + dx, samples - 1);
+						const uint8_t *p = band.ptr() + (int64_t(dy) * samples + c) * 4;
+						sum[0] += p[0];
+						sum[1] += p[1];
+						sum[2] += p[2];
+						sum[3] += p[3];
+						k++;
+					}
+				}
+				for (int ch = 0; ch < 4; ch++) {
+					w[(int64_t(y) * n + x) * 4 + ch] = uint8_t(sum[ch] / MAX(k, 1u));
+				}
+			}
+		}
+		image->generate_mipmaps();
+		mask_texture = ImageTexture::create_from_image(image);
+	}
+}
+
+// A level's window of heights: CLIP_SIZE^2 samples every 2^level from p_origin, clamped to the map.
+Ref<Image> TileTerrain3D::_clip_heights(int p_level, const Vector2i &p_origin) const {
+	const int step = 1 << p_level;
+	Ref<Image> image = Image::create_empty(CLIP_SIZE, CLIP_SIZE, false, Image::FORMAT_R16);
+	uint16_t *w = (uint16_t *)image->ptrw();
+	for (int y = 0; y < CLIP_SIZE; y++) {
+		const int r = CLAMP(p_origin.y + y * step, 0, samples - 1);
+		const uint16_t *row = heights.ptr() + int64_t(r) * samples;
+		for (int x = 0; x < CLIP_SIZE; x++) {
+			w[int64_t(y) * CLIP_SIZE + x] = row[CLAMP(p_origin.x + x * step, 0, samples - 1)];
+		}
+	}
+	return image;
+}
+
+// A level's window of masks, read from their file a row at a time.
+Ref<Image> TileTerrain3D::_clip_masks(int p_level, const Vector2i &p_origin) const {
+	const int step = 1 << p_level;
+	Ref<Image> image = Image::create_empty(CLIP_SIZE, CLIP_SIZE, false, Image::FORMAT_RGBA8);
+	if (masks_path.is_empty()) {
+		return image;
+	}
+	Ref<FileAccess> f = FileAccess::open(masks_path, FileAccess::READ);
+	if (f.is_null()) {
+		return image;
+	}
+	uint8_t *w = image->ptrw();
+	const int c0 = CLAMP(p_origin.x, 0, samples - 1);
+	const int c1 = CLAMP(p_origin.x + (CLIP_SIZE - 1) * step, 0, samples - 1);
+	LocalVector<uint8_t> row;
+	row.resize(uint32_t(c1 - c0 + 1) * 4);
+	for (int y = 0; y < CLIP_SIZE; y++) {
+		const int r = CLAMP(p_origin.y + y * step, 0, samples - 1);
+		f->seek(uint64_t((int64_t(r) * samples + c0) * 4));
+		f->get_buffer(row.ptr(), row.size());
+		for (int x = 0; x < CLIP_SIZE; x++) {
+			const int c = CLAMP(p_origin.x + x * step, 0, samples - 1) - c0;
+			memcpy(w + (int64_t(y) * CLIP_SIZE + x) * 4, row.ptr() + int64_t(c) * 4, 4);
+		}
+	}
+	return image;
+}
+
+// Each level's window centred on the camera (local position), its origin snapped to an eighth of the window: re-made
+// when the camera has moved that far.
+void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
+	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
+	const double col = (p_local.x - origin_north) / spacing;
+	const double row = (p_local.z - origin_east) / spacing;
+	bool changed = false;
+	Vector<Ref<Image>> h_layers, m_layers;
+	for (int level = 0; level < CLIP_LEVELS; level++) {
+		const int step = 1 << level;
+		const int snap = step * (CLIP_SIZE / 8);
+		const Vector2i want(int(Math::round((col - CLIP_SIZE * step * 0.5) / snap)) * snap, int(Math::round((row - CLIP_SIZE * step * 0.5) / snap)) * snap);
+		if (p_force || clip_heights.is_null() || want != clip_origin[level]) {
+			clip_origin[level] = want;
+			changed = true;
+		}
+	}
+	if (!changed) {
+		return;
+	}
+	for (int level = 0; level < CLIP_LEVELS; level++) {
+		h_layers.push_back(_clip_heights(level, clip_origin[level]));
+		m_layers.push_back(_clip_masks(level, clip_origin[level]));
+	}
+	// Re-made whole (a level a few times a minute at a walk): simpler than updating strips, and a layer's upload is a
+	// few MB.
+	if (clip_heights.is_null()) {
+		clip_heights.instantiate();
+		clip_heights->create_from_images(h_layers);
+		clip_masks.instantiate();
+		clip_masks->create_from_images(m_layers);
+	} else {
+		for (int level = 0; level < CLIP_LEVELS; level++) {
+			clip_heights->update_layer(h_layers[level], level);
+			clip_masks->update_layer(m_layers[level], level);
+		}
+	}
+	clip_updates++;
+	clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
+	_publish_globals();
+}
+
+void TileTerrain3D::_publish_globals() {
+	register_globals();
+	RenderingServer *rs = RS::get_singleton();
+	rs->global_shader_parameter_set("terrain_heights_clip", clip_heights);
+	rs->global_shader_parameter_set("terrain_masks_clip", clip_masks);
+	rs->global_shader_parameter_set("terrain_heights_far", height_texture);
+	rs->global_shader_parameter_set("terrain_masks_far", mask_texture);
+	rs->global_shader_parameter_set("terrain_clip_01", Vector4(clip_origin[0].x, clip_origin[0].y, clip_origin[1].x, clip_origin[1].y));
+	rs->global_shader_parameter_set("terrain_clip_2", Vector4(clip_origin[2].x, clip_origin[2].y, CLIP_SIZE, FAR_STEP));
+	rs->global_shader_parameter_set("terrain_frame", Vector4(origin_north, origin_east, spacing, samples));
+	rs->global_shader_parameter_set("terrain_heights", Vector2(height_min, height_range));
+}
+
 void TileTerrain3D::_apply_material() {
 	if (!loaded) {
 		return;
@@ -307,8 +456,8 @@ void TileTerrain3D::_apply_material() {
 		sm->set_shader_parameter("heights", height_texture);
 		sm->set_shader_parameter("masks", mask_texture);
 		sm->set_shader_parameter("terrain_origin", Vector2(origin_north, origin_east));
-		sm->set_shader_parameter("terrain_spacing", spacing);
-		sm->set_shader_parameter("terrain_samples", float(samples));
+		sm->set_shader_parameter("terrain_spacing", spacing * FAR_STEP); // the far map's
+		sm->set_shader_parameter("terrain_samples", float((samples + FAR_STEP - 1) / FAR_STEP));
 		sm->set_shader_parameter("height_min", height_min);
 		sm->set_shader_parameter("height_range", height_range);
 	}
@@ -421,6 +570,7 @@ void TileTerrain3D::update_lods(const Vector3 &p_position) {
 	}
 	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
 	const Vector3 camera = get_global_transform().affine_inverse().xform(p_position);
+	_update_clip(camera, false);
 	last_update_position = p_position;
 	frame++;
 	selected.clear();
@@ -680,6 +830,8 @@ void TileTerrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_spacing"), &TileTerrain3D::get_spacing);
 	ClassDB::bind_method(D_METHOD("get_samples"), &TileTerrain3D::get_samples);
 	ClassDB::bind_method(D_METHOD("get_height_texture"), &TileTerrain3D::get_height_texture);
+	ClassDB::bind_method(D_METHOD("get_clip_updates"), &TileTerrain3D::get_clip_updates);
+	ClassDB::bind_method(D_METHOD("get_clip_update_ms"), &TileTerrain3D::get_clip_update_ms);
 	ClassDB::bind_method(D_METHOD("get_mask_texture"), &TileTerrain3D::get_mask_texture);
 	ClassDB::bind_method(D_METHOD("update_lods", "position"), &TileTerrain3D::update_lods);
 	ClassDB::bind_method(D_METHOD("update_collision_now"), &TileTerrain3D::update_collision_now);
