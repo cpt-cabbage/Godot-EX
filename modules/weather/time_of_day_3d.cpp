@@ -135,14 +135,19 @@ void TimeOfDay3D::_apply() {
 		const float em = moon_illuminance * full * MAX(moon_direction.y + 0.1f, 0.0f);
 		// The sky is lit by the sun until well after it sets (twilight), then by the moon.
 		// The air volume's light is the light's own colour and energy at the camera (its DirectionalLight3D's).
+		// In the lights' units: Godot (without physical light units) lights a surface with pi times a directional
+		// light's energy (light_storage.cpp; the BRDF's 1/pi cancels it), so the irradiance the atmosphere scatters is
+		// pi times the energy too. Without it the sky, the clouds and the sky's light on the ground were a third of
+		// what they should be against the sunlit ground (grass four times the sky's brightness against the photos' half,
+		// 2026-11-09).
 		if (sun_direction.y > -0.2f || em <= 0.0f) {
 			atmosphere->set_light_direction(sun_direction);
-			atmosphere->set_light_illuminance(sun_illuminance);
-			atmosphere->set_light_color(Color(ts.x, ts.y, ts.z) * sun_illuminance);
+			atmosphere->set_light_illuminance(sun_illuminance * Math::PI);
+			atmosphere->set_light_color(Color(ts.x, ts.y, ts.z) * (sun_illuminance * Math::PI));
 		} else {
 			atmosphere->set_light_direction(moon_direction);
-			atmosphere->set_light_illuminance(moon_illuminance * full);
-			atmosphere->set_light_color(Color(tm.x, tm.y, tm.z) * (moon_illuminance * full));
+			atmosphere->set_light_illuminance(moon_illuminance * full * Math::PI);
+			atmosphere->set_light_color(Color(tm.x, tm.y, tm.z) * (moon_illuminance * full * Math::PI));
 		}
 		(void)es;
 	}
