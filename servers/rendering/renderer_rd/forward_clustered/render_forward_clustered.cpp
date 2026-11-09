@@ -5090,6 +5090,11 @@ void RenderForwardClustered::_update_render_base_uniform_set() {
 }
 
 RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, bool p_is_multiview, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas) {
+	if (scene_shader_ray_query) {
+		// A pass before the frame's settings (a particle collider's heightfield, rendered first) needs the placeholder
+		// TLAS too: binding 47 took none and the set failed (Godot-EX, 2026-11-09). Outside any draw list here.
+		_ensure_rt_dummy_tlas();
+	}
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
