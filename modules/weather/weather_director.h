@@ -77,6 +77,8 @@ public:
 	float cloud_cover = 0.3;
 	float cloud_base = 2600.0; // m above sea level: may lie below the peaks
 	float cloud_type = 0.5; // 0 layered (stratus), 1 heaped (cumulus), toward towers (cumulonimbus) with storm
+	float high_cover = 0.1; // the high layer's share of the sky
+	float high_type = 0.2; // 0 cirrus streaks, 1 altocumulus puffs
 	float mist = 0.0;
 	float mist_top = 1800.0; // m above sea level
 	float precipitation = 0.0;
@@ -101,6 +103,8 @@ public:
 	WEATHER_PROP(cloud_cover)
 	WEATHER_PROP(cloud_base)
 	WEATHER_PROP(cloud_type)
+	WEATHER_PROP(high_cover)
+	WEATHER_PROP(high_type)
 	WEATHER_PROP(mist)
 	WEATHER_PROP(mist_top)
 	WEATHER_PROP(precipitation)

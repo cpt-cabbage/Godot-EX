@@ -168,7 +168,7 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	// The wind carries the clouds: its offset grows with the frame's time (not a function of time, so a change of wind
 	// does not jump them).
 	const uint64_t now = OS::get_singleton()->get_ticks_usec();
-	const double dt = cloud_last_ticks == 0 ? 0.0 : MIN(double(now - cloud_last_ticks) * 1e-6, 0.25);
+	const double dt = (cloud_last_ticks == 0 ? 0.0 : MIN(double(now - cloud_last_ticks) * 1e-6, 0.25)) * MAX(cloud_time_scale, 0.0f);
 	cloud_last_ticks = now;
 	cloud_offset += cloud_wind * float(dt);
 	// The cells' life: a phase of `cloud_lifetime`, wrapped where it repeats (float precision).
@@ -218,6 +218,9 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(snap(CLOUD_MAP_NEAR, p_cam.origin.x), snap(CLOUD_MAP_NEAR, p_cam.origin.z), CLOUD_MAP_NEAR, far_side);
 	v4(snap(far_side, p_cam.origin.x), snap(far_side, p_cam.origin.z), float(cloud_time), MAX(cloud_cell_size, 100.0f));
 	v4(MAX(cloud_lifetime, 1.0f), CLAMP(cloud_variation, 0.0f, 1.0f), 0, 0);
+	const Vector2 wdir = Vector2(cloud_wind.x, cloud_wind.z).length() > 0.01f ? Vector2(cloud_wind.x, cloud_wind.z).normalized() : Vector2(1, 0);
+	v4(wdir.x, wdir.y, cloud_shear, cloud_rise);
+	v4(CLAMP(cloud_high_cover, 0.0f, 1.0f), cloud_high_altitude, CLAMP(cloud_high_type, 0.0f, 1.0f), cloud_high_density);
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;

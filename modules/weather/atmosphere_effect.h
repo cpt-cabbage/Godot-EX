@@ -190,6 +190,18 @@ class AtmosphereEffect : public CompositorEffect {
 	float cloud_base_spread = 150.0;
 	float cloud_lifetime = 1200.0;
 	float cloud_variation = 0.6;
+	// Over time: a cloud leans `cloud_shear` m downwind per m up, its billows rise at `cloud_rise` m/s; the clock and the
+	// wind's carry run at `cloud_time_scale` (a time-lapse), and both can be set (a sky held, or a film).
+	float cloud_shear = 0.25;
+	float cloud_rise = 1.5;
+	float cloud_time_scale = 1.0;
+	// The high layer (2026-11-09): a thin sheet `cloud_high_altitude` m above sea level, cirrus streaks along the wind
+	// (`cloud_high_type` 0) or altocumulus puffs (1), over `cloud_high_cover` of the sky, its optical depth at full
+	// `cloud_high_density`.
+	float cloud_high_cover = 0.1;
+	float cloud_high_type = 0.2;
+	float cloud_high_altitude = 8000.0;
+	float cloud_high_density = 0.5;
 	CloudsShaderRD cloud_shader;
 	RID cloud_version;
 	RID cloud_pipelines[6];
@@ -263,7 +275,7 @@ public:
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
 	static constexpr int CAMERA_FLOATS = 48; // atmosphere.glsl's Camera block
-	static constexpr int CLOUD_FLOATS = 32 + 4 * 18; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_FLOATS = 32 + 4 * 20; // clouds.glsl's Clouds block
 	static constexpr int CLOUD_MAP_N = 512; // the weather map's side (texels), each layer
 	static constexpr float CLOUD_MAP_NEAR = 32000.0f; // the near layer's side (m); the far one's twice the reach
 	static constexpr int CLOUD_NOISE_SLICES = 8; // base noise slices made a frame
@@ -380,7 +392,18 @@ public:
 	FOGP(float, cloud_base_spread)
 	FOGP(float, cloud_lifetime)
 	FOGP(float, cloud_variation)
+	FOGP(float, cloud_shear)
+	FOGP(float, cloud_rise)
+	FOGP(float, cloud_time_scale)
+	FOGP(float, cloud_high_cover)
+	FOGP(float, cloud_high_type)
+	FOGP(float, cloud_high_altitude)
+	FOGP(float, cloud_high_density)
+	FOGP(Vector3, cloud_offset)
 #undef FOGP
+	// The clouds' clock (s): their cells' lives, the regions' change, the billows' rise.
+	void set_cloud_time(float p_v) { cloud_time = p_v; }
+	float get_cloud_time() const { return float(cloud_time); }
 	void set_cloud_resolution(float p_v) { cloud_resolution = CLAMP(p_v, 0.125f, 1.0f); }
 	float get_cloud_resolution() const { return cloud_resolution; }
 	// A cloud's thickness (m) at a type (0 layered, 0.5 heaped, 1 towering), and the layer's at its type.

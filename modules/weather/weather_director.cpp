@@ -48,6 +48,8 @@ void WeatherState::blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &
 	L(cloud_cover)
 	L(cloud_base)
 	L(cloud_type)
+	L(high_cover)
+	L(high_type)
 	L(mist)
 	L(mist_top)
 	L(precipitation)
@@ -76,6 +78,8 @@ void WeatherState::_bind_methods() {
 	P(cloud_cover, "0,1,0.01")
 	P(cloud_base, "0,10000,1,suffix:m")
 	P(cloud_type, "0,1,0.01")
+	P(high_cover, "0,1,0.01")
+	P(high_type, "0,1,0.01")
 	ADD_GROUP("Mist", "");
 	P(mist, "0,1,0.01")
 	P(mist_top, "0,10000,1,suffix:m")
@@ -308,6 +312,8 @@ void WeatherDirector::_apply() {
 		atmosphere->set_cloud_cover(current->cloud_cover);
 		atmosphere->set_cloud_base(current->cloud_base);
 		atmosphere->set_cloud_type(current->cloud_type);
+		atmosphere->set_cloud_high_cover(current->high_cover);
+		atmosphere->set_cloud_high_type(current->high_type);
 		const float h = Math::deg_to_rad(current->wind_heading);
 		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
 		atmosphere->set_weather_mist_density(current->mist * mist_density);

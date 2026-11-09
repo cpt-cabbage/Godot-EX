@@ -18,6 +18,9 @@
 // MODE_SHADOW        the clouds' transmittance to the light from a plane at their base, around the camera
 // MODE_MAP           the weather map round the camera, near and far layers (each frame): R the cover (0 at a cloud's
 //                    edge, 1 at its core), G its type, B its base (m above sea level), A its thickness (m)
+// Over time the cells form and dissolve, the regions change (cross-faded noise), clouds lean downwind with height and
+// their billows rise. A thin high layer (cirrus streaks or altocumulus puffs, 2D) lies above, drawn behind the clouds
+// and shading them a little.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -45,6 +48,8 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 map_near; // xy the near weather map's origin (world x, z), z its side (m), w the far map's side (m)
 	vec4 map_far; // xy the far map's origin, z the time (s), w the cells' size (m)
 	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1)
+	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
+	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
 }
 clouds;
 
@@ -149,7 +154,7 @@ float type_thickness(float t) {
 	return t < 0.5 ? mix(300.0, 1000.0, t * 2.0) : 1000.0 * pow(8.0, pow((t - 0.5) * 2.0, 1.5));
 }
 
-#ifdef MODE_MAP
+#if !defined(MODE_NOISE_BASE) && !defined(MODE_NOISE_DETAIL)
 // Value noise in the plane, not tiling, 0 to 1.
 float vnoise(vec2 p) {
 	ivec2 i = ivec2(floor(p));
@@ -164,6 +169,19 @@ float vnoise(vec2 p) {
 
 float vfbm(vec2 p) {
 	return vnoise(p) * 0.5333 + vnoise(p * 2.03 + 17.1) * 0.2667 + vnoise(p * 4.07 + 41.7) * 0.1333 + vnoise(p * 8.11 + 73.3) * 0.0667;
+}
+#endif
+
+#ifdef MODE_MAP
+// The same, changing over time: two fields cross-faded every four cells' lifetimes (renormalised so the blend keeps
+// the contrast), sixteen of them round the clock's wrap.
+float vfbm_evolving(vec2 p, float seed) {
+	float tt = clouds.map_far.z / (clouds.life.x * 4.0);
+	float k = floor(tt);
+	float s = smoothstep(0.0, 1.0, tt - k);
+	float a = vfbm(p + seed + mod(k, 16.0) * 37.1);
+	float b = vfbm(p + seed + mod(k + 1.0, 16.0) * 37.1);
+	return 0.5 + (mix(a, b, s) - 0.5) / sqrt(s * s + (1.0 - s) * (1.0 - s));
 }
 
 // The cells' mean radius (in cells) for a cover: calibrated so the share of the sky clouded (a cell's cover above about
@@ -185,11 +203,11 @@ vec4 weather_field(vec2 f) {
 	float cover = clouds.layer.w;
 	float mean_type = clouds.layer.z;
 	// Regions: some clear, some clumped; the cover's lift there heaps the clouds higher.
-	float region = vfbm(f / clouds.shape.w);
+	float region = vfbm_evolving(f / clouds.shape.w, 0.0);
 	float c = clamp(cover + (region * 2.0 - 1.0) * clouds.life.y * 2.0 * min(cover, 1.0 - cover), 0.0, 1.0);
-	float region_t = vfbm(f / (clouds.shape.w * 0.7) + 91.7) * 2.0 - 1.0;
+	float region_t = vfbm_evolving(f / (clouds.shape.w * 0.7), 91.7) * 2.0 - 1.0;
 	float t_local = mean_type + region_t * clouds.field.z + (c - cover) * 0.3;
-	float region_b = vfbm(f / (clouds.shape.w * 1.3) + 53.1) * 2.0 - 1.0;
+	float region_b = vfbm_evolving(f / (clouds.shape.w * 1.3), 53.1) * 2.0 - 1.0;
 	float base_local = clouds.field.x + region_b * clouds.field.w;
 
 	// Cumulus: a cloud a cell, alive by the cover, its size, type, height and phase of life its own.
@@ -312,8 +330,11 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 	cs.density = 0.0;
 	cs.profile = 0.0;
 	cs.h = 0.0;
-	vec4 m = weather_at(w);
 	float a = altitude(w);
+	// Lean: the wind grows with height, so a cloud's top runs ahead of its base (read where it came from).
+	vec3 ws = w;
+	ws.xz -= clouds.motion.xy * (clouds.motion.z * max(a - clouds.layer.x, 0.0));
+	vec4 m = weather_at(ws);
 	float h = (a - m.b) / max(m.a, 1.0);
 	cs.h = clamp(h, 0.0, 1.0);
 	if (h < 0.0) {
@@ -346,13 +367,18 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 		d = clamp(dp - 0.45, 0.0, 1.0);
 	} else {
 		// Squashed: a lump of the noise wider than it is tall.
-		vec3 q = (w - clouds.wind.xyz) / clouds.shape.y;
+		vec3 q = (ws - clouds.wind.xyz) / clouds.shape.y;
 		q.y *= 1.6;
+		// Billows rise through the cloud (the noise's tile repeats, so wrapped).
+		q.y -= fract(clouds.motion.w * clouds.map_far.z * 1.6 / clouds.shape.y);
 		vec4 n = textureLod(noise_base, q, 0.0);
 		float low = dot(n.gba, vec3(0.625, 0.25, 0.125));
 		float heaped = clamp(remap(n.r, -(1.0 - low), 1.0, 0.0, 1.0), 0.0, 1.0); // Perlin-Worley heaped on Worley's cells
-		vec3 dq = (w - clouds.wind.xyz * 1.3) / clouds.shape.z;
+		vec3 dq = (ws - clouds.wind.xyz * 1.3) / clouds.shape.z;
 		dq.y *= 1.3;
+		// The small ones faster, curled by the large (Nubis Cubed's curly wisps, here a distortion by the base noise).
+		dq.y -= fract(clouds.motion.w * 1.5 * clouds.map_far.z * 1.3 / clouds.shape.z);
+		dq += (n.gba - 0.5) * 0.45;
 		float fine = dot(textureLod(noise_detail, dq, 0.0).rgb, vec3(0.625, 0.25, 0.125)); // Worley cells, 1 at a cell's point
 		// Billows: the heaped lumps with smaller ones on them; wisps: Perlin-Worley frayed by inverted Worley (webs),
 		// finer inward.
@@ -497,6 +523,83 @@ vec2 layer_span(vec3 o, vec3 d, float reach) {
 	}
 	return vec2(t0, min(t1, reach));
 }
+
+// The high layer's share of cloud at a point of it (world x, z): cirrus fibres along the wind, hooked by a slow wave,
+// or rows of altocumulus puffs; patchy over tens of kilometres.
+float high_density(vec2 xz) {
+	float cover = clouds.high.x;
+	if (cover <= 0.001) {
+		return 0.0;
+	}
+	vec2 f = xz - clouds.wind.xz * 1.6; // the wind aloft is stronger
+	vec2 dir = clouds.motion.xy;
+	vec2 uv = vec2(dot(f, dir), dot(f, vec2(-dir.y, dir.x)));
+	float bend = (vfbm(uv / 9000.0 + 5.0) - 0.5) * 5000.0;
+	float streak = vfbm(vec2(uv.x / 9000.0, (uv.y + bend) / 2200.0));
+	float fibre = vfbm(vec2(uv.x / 2500.0, (uv.y + bend) / 250.0) + 13.0);
+	float cirrus = streak * 0.75 + fibre * 0.25;
+	float puffs = textureLod(noise_detail, vec3(f / 2400.0, 0.37), 0.0).r * 0.7 + vfbm(f / 4000.0 + 7.0) * 0.3;
+	float n = clamp((mix(cirrus, puffs, clouds.high.z) - 0.3) / 0.4, 0.0, 1.0);
+	float patches = vfbm(f / 25000.0 + 3.1);
+	float c = clamp(cover + (patches - 0.5) * 1.2 * min(cover, 1.0 - cover), 0.0, 1.0);
+	// Soft: thin veils fraying to nothing, not drawn lines.
+	return smoothstep(1.0 - c - 0.1, 1.0 - c + 0.5, n) * smoothstep(0.0, 0.05, cover);
+}
+
+// The high layer seen along a ray (o, d) from below, nearer than `limit` m: its light (rgb) and transmittance (a), and
+// its distance (or -1).
+vec4 high_layer(vec3 o, vec3 d, float limit, out float dist) {
+	dist = -1.0;
+	if (clouds.high.x <= 0.001 || altitude(o) > clouds.high.y) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	if (sphere_hits(o, d, clouds.planet.x).x > 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0); // the ground in the way
+	}
+	float t = sphere_hits(o, d, clouds.planet.x + clouds.high.y).y;
+	if (t <= 0.0 || t > limit) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	vec3 p = o + d * t;
+	float dens = high_density(p.xz);
+	if (dens <= 0.0) {
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+	// Thin: the path through it longer the more slanting, the light in it hardly dimmed.
+	float mu = max(abs(dot(d, normalize(p - planet_centre()))), 0.06);
+	float alpha = (1.0 - exp(-dens * clouds.high.w / mu)) * smoothstep(300000.0, 150000.0, t);
+	float c = dot(d, clouds.light_dir.xyz);
+	float g = clouds.light_color.w;
+	vec3 S = clouds.light_color.rgb * (mix(phase_hg(c, g), phase_hg(c, -0.2), 0.3) + clouds.sky.y / (4.0 * PI)) + sky_ambient(1.0);
+	dist = t;
+	return vec4(S * alpha, 1.0 - alpha);
+}
+
+// The high layer's transmittance to the light from a point below it.
+float high_shadow(vec3 w) {
+	vec3 l = clouds.light_dir.xyz;
+	if (clouds.high.x <= 0.001 || l.y <= 0.02) {
+		return 1.0;
+	}
+	float up = clouds.high.y - clouds.planet.y - w.y;
+	vec3 p = w + l * (max(up, 0.0) / l.y);
+	return exp(-high_density(p.xz) * clouds.high.w / l.y);
+}
+
+// The high layer behind the clouds already marched (cur: their light and transmittance; first, mean: their distances).
+void add_high_layer(vec3 o, vec3 d, float limit, inout vec4 cur, inout float first, inout float mean) {
+	float th;
+	vec4 hl = high_layer(o, d, limit, th);
+	if (th < 0.0) {
+		return;
+	}
+	float low_w = 1.0 - cur.a;
+	float high_w = cur.a * (1.0 - hl.a);
+	cur.rgb += cur.a * hl.rgb;
+	mean = (low_w * (first < 0.0 ? th : mean) + high_w * th) / max(low_w + high_w, 1e-5);
+	first = first < 0.0 ? th : first;
+	cur.a *= hl.a;
+}
 #endif
 
 void main() {
@@ -569,6 +672,7 @@ void main() {
 		steps = clamp(int(float(steps) * clamp((span.y - span.x) / 4000.0, 0.25, 1.0)), 16, steps);
 		cur = march(o, d, span.x, span.y, steps, jitter, first, mean);
 	}
+	add_high_layer(o, d, scene, cur, first, mean);
 	// The last frame's clouds where they were.
 	float front = first < 0.0 ? 1e9 : first;
 	if (clouds.prev_cam.w > 0.5) {
@@ -609,10 +713,11 @@ void main() {
 	vec3 o = clouds.cam_pos.xyz;
 	vec2 span = layer_span(o, d, clouds.planet.z);
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
+	float first = -1.0, mean = 1e9;
 	if (span.y > span.x) {
-		float first, mean;
 		cur = march(o, d, span.x, span.y, 32, 0.5, first, mean);
 	}
+	add_high_layer(o, d, 1e12, cur, first, mean);
 	imageStore(out_clouds, px, cur);
 #endif
 
@@ -640,7 +745,7 @@ void main() {
 			// The shapes the eye sees (eroded): the uneroded ones cast a fuller shadow than the clouds overhead.
 			tau += cloud_density(p, false) * dt;
 		}
-		T = exp(-tau);
+		T = exp(-tau) * high_shadow(vec3(xz.x, base_y, xz.y));
 	}
 	imageStore(out_shadow, px, vec4(T));
 #endif

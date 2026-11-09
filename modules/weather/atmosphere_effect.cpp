@@ -658,6 +658,15 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_base_spread, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2000,1,suffix:m")
 	FB(cloud_lifetime, Variant::FLOAT, PROPERTY_HINT_RANGE, "30,20000,1,suffix:s")
 	FB(cloud_variation, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_shear, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
+	FB(cloud_rise, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,20,0.01,suffix:m/s")
+	FB(cloud_time_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1000,0.01")
+	FB(cloud_time, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1000000,0.01,suffix:s")
+	FB(cloud_offset, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m")
+	FB(cloud_high_cover, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_high_type, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_high_altitude, Variant::FLOAT, PROPERTY_HINT_RANGE, "1000,20000,1,suffix:m")
+	FB(cloud_high_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,8,0.01")
 	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
 	ClassDB::bind_method(D_METHOD("get_cloud_shell"), &AtmosphereEffect::get_cloud_shell);
 	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);
