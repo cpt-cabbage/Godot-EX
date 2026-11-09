@@ -289,6 +289,9 @@ private:
 		SHADER_VARIANT_MAX,
 	};
 
+	bool _alpha_shadows_ready() const;
+	void _bind_alpha_shadows(RD::ComputeListID p_list, RID p_shader);
+
 	RaytracedShadowsShaderRD shader;
 	RID shader_version;
 	RID pipeline; // Directional variant.

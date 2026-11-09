@@ -35,6 +35,7 @@
 #include "servers/rendering/renderer_geometry_instance.h"
 #include "servers/rendering/renderer_rd/effects/surface_cache.h"
 #include "servers/rendering/renderer_rd/shaders/effects/raytraced_shadows_decode.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/rt_alpha_extract.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_geometry_unpack.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/rt_particles_expand.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -72,6 +73,9 @@ public:
 	class HitMaterialResolver {
 	public:
 		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, HitMaterial &r_material) = 0;
+		// The alpha-tested surface's coverage: its material's albedo texture (an RD texture, alpha in .a) and alpha
+		// scissor cut, for the shadow rays' alpha test (rt_alpha_inc.glsl).
+		virtual bool resolve_alpha(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RID &r_texture, float &r_cut) { return false; }
 		virtual ~HitMaterialResolver() {}
 	};
 
@@ -284,6 +288,25 @@ private:
 	uint32_t hit_material_table_capacity = 0;
 	uint32_t hit_materials_dropped = 0; // Slots past HIT_MAX_MATERIALS this frame.
 
+	// Alpha-tested shadow casters (rt_alpha_inc.glsl): each distinct alpha texture once, at ALPHA_MASK_SIZE square,
+	// in a layer of one R8 array; per frame, beside the hit material table, each instance geometry's layer and cut.
+	static constexpr uint32_t ALPHA_MASK_SIZE = 512;
+	static constexpr uint32_t ALPHA_MAX_LAYERS = 1024;
+	RtAlphaExtractShaderRD alpha_extract_shader;
+	RID alpha_extract_shader_version;
+	RID alpha_extract_pipeline;
+	RID alpha_sampler; // linear, repeat
+	RID alpha_source_sampler; // linear with mipmaps, repeat
+	RID alpha_masks; // 2D array, R8
+	RID alpha_masks_dummy; // one layer, white: bound when there are none
+	uint32_t alpha_mask_capacity = 0;
+	uint32_t alpha_mask_count = 0;
+	HashMap<RID, uint32_t> alpha_mask_layers; // by source texture
+	LocalVector<uint32_t> hit_alpha_table;
+	RID hit_alpha_table_buffer;
+	uint32_t hit_alpha_table_capacity = 0;
+	uint32_t _alpha_mask_layer(RID p_texture);
+
 	RtGeometryUnpackShaderRD hit_unpack_shader;
 	RID hit_unpack_shader_version;
 	RID hit_unpack_pipeline;
@@ -345,6 +368,10 @@ public:
 	RID get_hit_vertex_buffer() const { return hit_vertex_pool.buffer; }
 	RID get_hit_index_buffer() const { return hit_index_pool.buffer; }
 	RID get_hit_material_table_buffer() const { return hit_material_table_buffer; }
+	RID get_hit_alpha_table_buffer() const { return hit_alpha_table_buffer; }
+	RID get_alpha_masks() const { return alpha_masks.is_valid() ? alpha_masks : alpha_masks_dummy; }
+	RID get_alpha_sampler() const { return alpha_sampler; }
+	uint32_t get_alpha_mask_count() const { return alpha_mask_count; }
 	const LocalVector<HitMaterial> &get_hit_materials() const { return hit_material_slots; }
 
 	RaytracingScene();

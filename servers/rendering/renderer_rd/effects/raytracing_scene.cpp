@@ -61,6 +61,32 @@ RaytracingScene::RaytracingScene() {
 	hit_unpack_shader.initialize(unpack_modes);
 	hit_unpack_shader_version = hit_unpack_shader.version_create();
 	hit_unpack_pipeline = RD::get_singleton()->compute_pipeline_create(hit_unpack_shader.version_get_shader(hit_unpack_shader_version, 0));
+	Vector<String> alpha_modes;
+	alpha_modes.push_back("");
+	alpha_extract_shader.initialize(alpha_modes);
+	alpha_extract_shader_version = alpha_extract_shader.version_create();
+	alpha_extract_pipeline = RD::get_singleton()->compute_pipeline_create(alpha_extract_shader.version_get_shader(alpha_extract_shader_version, 0));
+	{
+		RD::SamplerState ss;
+		ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+		ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+		ss.repeat_u = RD::SAMPLER_REPEAT_MODE_REPEAT;
+		ss.repeat_v = RD::SAMPLER_REPEAT_MODE_REPEAT;
+		alpha_sampler = RD::get_singleton()->sampler_create(ss);
+		ss.mip_filter = RD::SAMPLER_FILTER_LINEAR;
+		ss.max_lod = 1e20;
+		alpha_source_sampler = RD::get_singleton()->sampler_create(ss);
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R8_UNORM;
+		tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		tf.width = 1;
+		tf.height = 1;
+		tf.array_layers = 1;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		Vector<uint8_t> white;
+		white.push_back(255);
+		alpha_masks_dummy = RD::get_singleton()->texture_create(tf, RD::TextureView(), Vector<Vector<uint8_t>>({ white }));
+	}
 	hit_vertex_pool.element_size = sizeof(uint32_t) * 8; // RT_HIT_VERTEX_WORDS.
 	hit_index_pool.element_size = sizeof(uint32_t);
 	hit_record_pool.element_size = 0; // CPU-side indices only.
@@ -103,6 +129,12 @@ RaytracingScene::~RaytracingScene() {
 	}
 	hit_vertex_pool.release();
 	hit_index_pool.release();
+	for (RID rid : { hit_alpha_table_buffer, alpha_masks, alpha_masks_dummy, alpha_sampler, alpha_source_sampler }) {
+		if (rid.is_valid()) {
+			RD::get_singleton()->free_rid(rid);
+		}
+	}
+	alpha_extract_shader.version_free(alpha_extract_shader_version);
 	for (RID rid : { hit_geometry_buffer, hit_material_table_buffer, dummy_buffer }) {
 		if (rid.is_valid()) {
 			RD::get_singleton()->free_rid(rid);
@@ -754,6 +786,7 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 	hit_material_slots.clear();
 	hit_material_dedupe.clear();
 	hit_material_table.clear();
+	hit_alpha_table.clear();
 	hit_materials_dropped = 0;
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
@@ -961,6 +994,17 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 							slot = _hit_material_slot(hm);
 						}
 						hit_material_table.push_back(slot);
+						// The surface's alpha mask, when its material is alpha-tested and names an albedo texture.
+						uint32_t alpha = HIT_INVALID;
+						RID alpha_texture;
+						float alpha_cut = 0.5f;
+						if ((inst->data->alpha_tested_shadow_surface_mask & (1u << surface_index)) && hit_material_resolver->resolve_alpha(inst, surface_index, alpha_texture, alpha_cut)) {
+							const uint32_t layer = _alpha_mask_layer(alpha_texture);
+							if (layer != HIT_INVALID) {
+								alpha = layer | (uint32_t(CLAMP(alpha_cut, 0.0f, 1.0f) * 255.0f + 0.5f) << 16);
+							}
+						}
+						hit_alpha_table.push_back(alpha);
 					}
 				}
 			}
@@ -1046,6 +1090,17 @@ bool RaytracingScene::update(const PagedArray<RenderGeometryInstance *> &p_insta
 		}
 		if (!hit_material_table.is_empty()) {
 			rd->buffer_update(hit_material_table_buffer, 0, hit_material_table.size() * sizeof(uint32_t), hit_material_table.ptr());
+		}
+		const uint32_t alpha_needed = MAX(hit_alpha_table.size(), 1u);
+		if (hit_alpha_table_buffer.is_null() || alpha_needed > hit_alpha_table_capacity) {
+			if (hit_alpha_table_buffer.is_valid()) {
+				rd->free_rid(hit_alpha_table_buffer);
+			}
+			hit_alpha_table_capacity = MAX(1024u, Math::next_power_of_2(alpha_needed));
+			hit_alpha_table_buffer = rd->storage_buffer_create(hit_alpha_table_capacity * sizeof(uint32_t));
+		}
+		if (!hit_alpha_table.is_empty()) {
+			rd->buffer_update(hit_alpha_table_buffer, 0, hit_alpha_table.size() * sizeof(uint32_t), hit_alpha_table.ptr());
 		}
 		if (hit_materials_dropped > 0) {
 			WARN_PRINT_ONCE(vformat("Ray-traced hit shading: more than %d distinct materials in view; the hits of %d of them fall back to the probes.", HIT_MAX_MATERIALS, hit_materials_dropped));
@@ -1431,6 +1486,56 @@ void RaytracingScene::_refit_deformed() {
 	}
 	deform_refits.clear();
 	deform_unpacks.clear();
+}
+
+// The layer of p_texture's alpha in the masks array, copied in on first use (rt_alpha_extract.glsl) at the mip
+// nearest ALPHA_MASK_SIZE; the array grows by doubling. A texture freed and its RID reused would keep the old mask.
+uint32_t RaytracingScene::_alpha_mask_layer(RID p_texture) {
+	if (const uint32_t *layer = alpha_mask_layers.getptr(p_texture)) {
+		return *layer;
+	}
+	RD *rd = RD::get_singleton();
+	if (!rd->texture_is_valid(p_texture) || alpha_mask_count >= ALPHA_MAX_LAYERS) {
+		return HIT_INVALID;
+	}
+	if (alpha_masks.is_null() || alpha_mask_count >= alpha_mask_capacity) {
+		const uint32_t capacity = MIN(alpha_mask_capacity == 0 ? 16u : alpha_mask_capacity * 2, ALPHA_MAX_LAYERS);
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R8_UNORM;
+		tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		tf.width = ALPHA_MASK_SIZE;
+		tf.height = ALPHA_MASK_SIZE;
+		tf.array_layers = capacity;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		RID grown = rd->texture_create(tf, RD::TextureView());
+		if (alpha_masks.is_valid()) {
+			for (uint32_t l = 0; l < alpha_mask_count; l++) {
+				rd->texture_copy(alpha_masks, grown, Vector3(), Vector3(), Vector3(ALPHA_MASK_SIZE, ALPHA_MASK_SIZE, 1), 0, 0, l, l);
+			}
+			rd->free_rid(alpha_masks);
+		}
+		alpha_masks = grown;
+		alpha_mask_capacity = capacity;
+	}
+	const uint32_t layer = alpha_mask_count++;
+	const RD::TextureFormat src = rd->texture_get_format(p_texture);
+	struct {
+		uint32_t layer;
+		uint32_t size;
+		float lod;
+		uint32_t pad;
+	} push = { layer, ALPHA_MASK_SIZE, MAX(0.0f, Math::log2(float(MAX(src.width, src.height)) / float(ALPHA_MASK_SIZE))), 0 };
+	RID shader = alpha_extract_shader.version_get_shader(alpha_extract_shader_version, 0);
+	RD::Uniform u_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ alpha_source_sampler, p_texture }));
+	RD::Uniform u_dst(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ alpha_masks }));
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, alpha_extract_pipeline);
+	rd->compute_list_bind_uniform_set(list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_src, u_dst), 0);
+	rd->compute_list_set_push_constant(list, &push, sizeof(push));
+	rd->compute_list_dispatch_threads(list, ALPHA_MASK_SIZE, ALPHA_MASK_SIZE, 1);
+	rd->compute_list_end();
+	alpha_mask_layers.insert(p_texture, layer);
+	return layer;
 }
 
 uint32_t RaytracingScene::get_blas_count() const {

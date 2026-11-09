@@ -2234,6 +2234,34 @@ bool RenderForwardClustered::HitMaterialResolver::resolve(RenderGeometryInstance
 	return true;
 }
 
+// An alpha-tested surface's coverage for the shadow rays: its material's "texture_albedo" and
+// "alpha_scissor_threshold", StandardMaterial3D's names (a ShaderMaterial gets the test by naming its uniforms so).
+bool RenderForwardClustered::HitMaterialResolver::resolve_alpha(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RID &r_texture, float &r_cut) {
+	GeometryInstanceForwardClustered *ginstance = static_cast<GeometryInstanceForwardClustered *>(p_instance);
+	SceneShaderForwardClustered::MaterialData *material = nullptr;
+	for (GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf != nullptr; surf = surf->next) {
+		if (surf->surface_index == p_surface && surf->material != nullptr) {
+			material = surf->material;
+		}
+	}
+	if (material == nullptr || material->get_self().is_null()) {
+		return false;
+	}
+	RendererRD::MaterialStorage *ms = RendererRD::MaterialStorage::get_singleton();
+	const Variant tex = ms->material_get_param(material->get_self(), SNAME("texture_albedo"));
+	if (tex.get_type() != Variant::RID || !RID(tex).is_valid()) {
+		return false;
+	}
+	const RID rd_texture = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(tex, false);
+	if (rd_texture.is_null()) {
+		return false;
+	}
+	const Variant cut = ms->material_get_param(material->get_self(), SNAME("alpha_scissor_threshold"));
+	r_cut = (cut.get_type() == Variant::FLOAT || cut.get_type() == Variant::INT) ? float(cut) : 0.5f;
+	r_texture = rd_texture;
+	return true;
+}
+
 RID RenderForwardClustered::get_ray_tracing_tlas() const {
 	if (raytracing == nullptr || !rt_scene_ready || !use_rt_sdfgi_probes) {
 		return RID();

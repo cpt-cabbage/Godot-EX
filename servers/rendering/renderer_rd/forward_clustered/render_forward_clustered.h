@@ -962,6 +962,7 @@ private:
 	class HitMaterialResolver : public RendererRD::RaytracingScene::HitMaterialResolver {
 	public:
 		virtual bool resolve(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RendererRD::RaytracingScene::HitMaterial &r_material) override;
+		virtual bool resolve_alpha(RenderGeometryInstanceBase *p_instance, uint32_t p_surface, RID &r_texture, float &r_cut) override;
 	};
 	HitMaterialResolver hit_material_resolver;
 	RendererRD::SurfaceCache::Settings surface_cache_settings;

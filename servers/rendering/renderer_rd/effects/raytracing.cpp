@@ -1038,6 +1038,26 @@ RID Raytracing::_update_movers_buffer(uint32_t p_view, const Projection &p_view_
 	return h.movers;
 }
 
+// Alpha-tested casters in the TLAS with records, geometry and masks to test them against (rt_alpha_inc.glsl).
+// GODOT_RT_ALPHA_SHADOWS=0 keeps their cards whole, as before (2026-11-09).
+bool Raytracing::_alpha_shadows_ready() const {
+	static const bool enabled = OS::get_singleton()->get_environment("GODOT_RT_ALPHA_SHADOWS") != "0";
+	return enabled && surface_cache != nullptr && surface_cache->is_ready() && scene.get_alpha_tested_instances() > 0 && scene.get_alpha_mask_count() > 0 &&
+			scene.get_hit_geometry_buffer().is_valid() && scene.get_hit_vertex_buffer().is_valid() && scene.get_hit_index_buffer().is_valid() && scene.get_hit_alpha_table_buffer().is_valid();
+}
+
+void Raytracing::_bind_alpha_shadows(RD::ComputeListID p_list, RID p_shader) {
+	const bool ready = _alpha_shadows_ready();
+	auto buffer = [&](RID p_rid) { return ready && p_rid.is_valid() ? p_rid : rt_gi_dummy_buffer; };
+	RD::Uniform u_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ buffer(surface_cache != nullptr ? surface_cache->get_instances_buffer() : RID()) }));
+	RD::Uniform u_geometry(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ buffer(scene.get_hit_geometry_buffer()) }));
+	RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ buffer(scene.get_hit_vertex_buffer()) }));
+	RD::Uniform u_indices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ buffer(scene.get_hit_index_buffer()) }));
+	RD::Uniform u_table(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ buffer(scene.get_hit_alpha_table_buffer()) }));
+	RD::Uniform u_masks(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ scene.get_alpha_sampler(), scene.get_alpha_masks() }));
+	RD::get_singleton()->compute_list_bind_uniform_set(p_list, UniformSetCacheRD::get_singleton()->get_cache(p_shader, 2, u_instances, u_geometry, u_vertices, u_indices, u_table, u_masks), 2);
+}
+
 void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity) {
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
@@ -1085,7 +1105,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.frame_index = rb_state->frame_index;
-	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
+	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8) | (_alpha_shadows_ready() ? (1u << 16) : 0u);
 
 	(void)view_count;
 
@@ -1101,6 +1121,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_mask), 1);
+	_bind_alpha_shadows(compute_list, shader_rid);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1218,7 +1239,7 @@ void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.frame_index = rb_state->frame_index;
-	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8);
+	push_constant.caster_mask_and_rays = (p_caster_mask & 0xFF) | (CLAMP(p_soft_shadow_rays, 1u, 16u) << 8) | (_alpha_shadows_ready() ? (1u << 16) : 0u);
 
 	RID area_shader_rid = shader.version_get_shader(shader_version, SHADER_VARIANT_AREA);
 
@@ -1232,6 +1253,7 @@ void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32
 	rd->compute_list_bind_compute_pipeline(compute_list, area_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 0, u_tlas, u_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 1, u_mask), 1);
+	_bind_alpha_shadows(compute_list, area_shader_rid);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();

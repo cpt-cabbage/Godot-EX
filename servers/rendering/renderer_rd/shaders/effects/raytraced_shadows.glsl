@@ -12,6 +12,33 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D shadow_mask;
 
+// Alpha-tested casters (rt_alpha_inc.glsl): the records, the hit shading's pools and the alpha masks.
+#include "../oct_inc.glsl"
+#include "rt_hit_inc.glsl"
+#include "surface_cache_inc.glsl"
+layout(set = 2, binding = 0, std430) restrict readonly buffer CardInstances {
+	CardInstance data[];
+}
+card_instances;
+layout(set = 2, binding = 1, std430) restrict readonly buffer AlphaGeometry {
+	HitGeometry data[];
+}
+rt_alpha_geometry;
+layout(set = 2, binding = 2, std430) restrict readonly buffer AlphaVertices {
+	uint data[];
+}
+rt_alpha_vertices;
+layout(set = 2, binding = 3, std430) restrict readonly buffer AlphaIndices {
+	uint data[];
+}
+rt_alpha_indices;
+layout(set = 2, binding = 4, std430) restrict readonly buffer AlphaTable {
+	uint data[];
+}
+rt_alpha_table;
+layout(set = 2, binding = 5) uniform sampler2DArray rt_alpha_masks;
+#include "rt_alpha_inc.glsl"
+
 layout(push_constant, std430) uniform Params {
 	mat4 inv_view_proj; // NDC -> world.
 #ifdef MODE_AREA
@@ -25,11 +52,14 @@ layout(push_constant, std430) uniform Params {
 #endif
 	ivec2 screen_size;
 	uint frame_index; // Varies the sampling pattern for temporal accumulation.
-	uint caster_mask_and_rays; // Bits 0..7 caster mask, 8..15 soft shadow rays.
+	uint caster_mask_and_rays; // Bits 0..7 caster mask, 8..15 soft shadow rays, 16 alpha-tested casters in the TLAS.
 }
 params;
 
 #define SOFT_SHADOW_SAMPLES max((params.caster_mask_and_rays >> 8) & 0xFFu, 1u)
+#define ALPHA_CASTERS ((params.caster_mask_and_rays & (1u << 16u)) != 0u)
+// Past this many leaves let through, a ray is deep in a crown: the next one stops it.
+#define ALPHA_MAX_PASSES 16u
 
 bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
 	uint caster_mask = params.caster_mask_and_rays & 0xFFu;
@@ -38,12 +68,32 @@ bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
 	}
 	// Back faces culled: the shadow-map convention, where only the faces a
 	// material draws occlude (see trace_visible in the stochastic pass).
-	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, tlas,
-			gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+	if (!ALPHA_CASTERS) {
+		rayQueryEXT rq;
+		rayQueryInitializeEXT(rq, tlas,
+				gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+				caster_mask, p_origin, params.axis_u.w, p_dir, p_max_dist);
+		rayQueryProceedEXT(rq);
+		return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	}
+	// Alpha-tested casters (non-opaque TLAS instances) hand back their hits as candidates: confirmed where the
+	// material's alpha mask covers the hit's UV, or where no mask is known (seen whole, as before).
+	rayQueryEXT rqa;
+	rayQueryInitializeEXT(rqa, tlas,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
 			caster_mask, p_origin, params.axis_u.w, p_dir, p_max_dist);
-	rayQueryProceedEXT(rq);
-	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	uint passed = 0u;
+	while (rayQueryProceedEXT(rqa)) {
+		if (rayQueryGetIntersectionTypeEXT(rqa, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			int covers = passed >= ALPHA_MAX_PASSES ? 1 : rt_alpha_test(rayQueryGetIntersectionInstanceCustomIndexEXT(rqa, false), rayQueryGetIntersectionGeometryIndexEXT(rqa, false), rayQueryGetIntersectionPrimitiveIndexEXT(rqa, false), rayQueryGetIntersectionBarycentricsEXT(rqa, false));
+			if (covers != 0) {
+				rayQueryConfirmIntersectionEXT(rqa);
+			} else {
+				passed++;
+			}
+		}
+	}
+	return rayQueryGetIntersectionTypeEXT(rqa, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }
 
 void main() {

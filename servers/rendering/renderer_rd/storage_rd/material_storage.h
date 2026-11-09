@@ -110,6 +110,8 @@ public:
 		// same material layout: a compute variant of the material.
 		RID create_secondary_uniform_set(RID p_shader, uint32_t p_shader_uniform_set, uint32_t p_ubo_size, const Vector<ShaderCompiler::GeneratedCode::Texture> &p_texture_uniforms, bool p_use_linear_color);
 		RID material_feedback_rid;
+		// The material this data belongs to (its parameters: MaterialStorage::material_get_param).
+		RID get_self() const { return self; }
 
 	private:
 		friend class MaterialStorage;
