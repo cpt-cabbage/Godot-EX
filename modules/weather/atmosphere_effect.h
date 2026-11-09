@@ -259,7 +259,7 @@ public:
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
 	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
-	static constexpr int FOG_FLOATS = 32 + 4 * 18; // air_volume.glsl's Fog block
+	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 20; // air_volume.glsl's Fog block
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();

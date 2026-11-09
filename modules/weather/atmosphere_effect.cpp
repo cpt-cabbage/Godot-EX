@@ -34,7 +34,10 @@
 #include "servers/rendering/renderer_rd/effects/raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+#include "core/config/project_settings.h"
 #include "core/os/os.h"
+#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
@@ -390,6 +393,15 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset);
 		v4(cloud_shadows_on ? 1.0f : 0.0f, 0, 0, 0);
 		v4(weather_mist_density, weather_mist_top, precipitation, 0);
+		// The world to the camera's view space, and whether the sun's cascades are there to read (no ray-traced shadows).
+		const Projection view(cam.affine_inverse());
+		for (int c = 0; c < 4; c++) {
+			for (int r = 0; r < 4; r++) {
+				f[o++] = view.columns[c][r];
+			}
+		}
+		const bool cascades = !use_rt && !bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled")) && RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture().is_valid();
+		v4(cascades ? 1.0f : 0.0f, 0, 0, 0);
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -466,6 +478,15 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));
+			} else {
+				// The sun's cascades (read when the block says so; white and an empty light otherwise).
+				RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();
+				RID atlas = ls->directional_shadow_get_texture();
+				if (!atlas.is_valid()) {
+					atlas = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+				}
+				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 10, Vector<RID>({ ls->get_directional_light_buffer() })));
+				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 11, Vector<RID>({ sampler, atlas })));
 			}
 			RID s_inject = fog_shader.version_get_shader(fog_version, inject);
 			rd->compute_list_bind_compute_pipeline(list, fog_pipelines[inject]);
