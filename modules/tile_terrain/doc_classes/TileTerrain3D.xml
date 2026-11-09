@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="TileTerrain3D" inherits="Node3D" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A large heightfield terrain read from files, drawn as real mesh chunks the ray tracer sees, with a Jolt heightfield that follows a target.
+	</brief_description>
+	<description>
+		Reads [code]valley.json[/code] in [member data_path] (the grid's [code]samples[/code] a side, [code]spacing[/code], [code]origin_north[/code] and [code]origin_east[/code] (the X and Z of sample 0), [code]height_min[/code], [code]height_max[/code], and the files [code]heights[/code], little-endian 16-bit, rows along Z and columns along X, and [code]masks[/code], RGBA8 on the same grid). Chunks of [member chunk_quads] quads are chosen by distance in a quadtree: level 0 (one sample a quad) within [member lod0_distance], level L between [member lod0_distance] times 2^(L-1) and 2^L. Their vertices hold the heights (no displacement in a shader), so ray-traced effects see the terrain as drawn; skirts hide the cracks between levels.
+		The [member material] receives the textures [code]heights[/code] (R16, mipmapped) and [code]masks[/code] and the floats [code]terrain_origin[/code], [code]terrain_spacing[/code], [code]terrain_samples[/code], [code]height_min[/code], [code]height_range[/code]: a texture coordinate is [code]((world.xz - terrain_origin) / terrain_spacing + 0.5) / terrain_samples[/code].
+		The collision is a heightfield of [member collision_samples] a side at the data's samples, moved when [member collision_target] strays a quarter of it from its centre. Each cell is split from (x+1, z) to (x, z+1), the same in the collision, the level-0 chunks and [method get_height].
+	</description>
+	<tutorials>
+	</tutorials>
+</class>
