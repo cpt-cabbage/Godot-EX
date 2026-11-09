@@ -10,8 +10,12 @@
 // MODE_TRANSMITTANCE  the transmittance to the top of the atmosphere by altitude and zenith angle (Bruneton's mapping)
 // MODE_MULTISCATTER   multiple scattering's contribution by altitude and sun angle (Hillaire's Psi = L2 / (1 - f_ms))
 // MODE_SKY_VIEW       the sky's radiance seen from the camera, by the view's azimuth from the light and its elevation
-// MODE_AERIAL         the in-scattering and transmittance from the camera to each froxel of a 32-slice view volume
-// MODE_APPLY          the scene's colour through the aerial perspective, by its depth (the sky's pixels left alone)
+// MODE_AERIAL         the in-scattering and transmittance from the camera to each froxel of the view volume, marched
+//                     once along each column, the sun's light in the air shadowed by the terrain; and for the sky, what
+//                     the shadows take from the light scattered toward the camera within the volume's reach
+// MODE_APPLY          the scene's colour through the aerial perspective, by its depth; the sky's pixels get the shadows
+// MODE_TERRAIN_SHADOW the terrain's shadow in the air: for each texel of a map turned to the light, the height below
+//                     which the light is hidden by the ground toward it (a running maximum along each row)
 // Radiance is for a light of illuminance 1; the caller scales by the light's.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -33,6 +37,12 @@ params;
 
 layout(set = 0, binding = 7, std140) uniform Camera {
 	mat4 inv_view_proj; // NDC to the world relative to the camera (rotation and projection only), metres
+	vec4 cam_pos; // xyz the camera in the world (m), w 1 when the terrain shadows the air
+	vec4 shadow_frame; // xy the shadow map's centre (world x, z), zw the direction toward the light (x, z), unit
+	vec4 shadow_params; // x the map's side (m), y the shadow edge's softness (m), z its texels a side, w tan(light elevation)
+	vec4 terrain_rect; // the height texture's world rectangle: x, z origin, x, z size (m)
+	vec4 terrain_h; // x height_min, y height_range (m), z the mip to read at the map's texel size
+	vec4 air_volume; // x the air volume's reach (m), y 1 when it is drawn (air_volume.glsl)
 }
 camera;
 
@@ -48,7 +58,17 @@ layout(set = 0, binding = 1) uniform sampler2D multiscatter_lut;
 #ifdef MODE_AERIAL
 layout(set = 0, binding = 3, rgba16f) uniform restrict writeonly image3D out_aerial;
 #endif
+#ifdef MODE_TERRAIN_SHADOW
+layout(set = 0, binding = 8) uniform sampler2D terrain_heights;
+layout(set = 0, binding = 9, r32f) uniform restrict writeonly image2D shadow_out;
+#endif
+#ifdef MODE_AERIAL
+layout(set = 0, binding = 10) uniform sampler2D terrain_shadow;
+layout(set = 0, binding = 11, rgba16f) uniform restrict writeonly image2D out_sky_shadow;
+#endif
 #ifdef MODE_APPLY
+layout(set = 0, binding = 12) uniform sampler2D sky_shadow;
+layout(set = 0, binding = 13) uniform sampler3D air_light;
 layout(set = 0, binding = 4) uniform sampler3D aerial_lut;
 layout(set = 0, binding = 5) uniform sampler2D depth_texture;
 layout(set = 0, binding = 6, rgba16f) uniform restrict image2D color_image;
@@ -131,6 +151,26 @@ float phase_mie(float c, float g) {
 	float g2 = g * g;
 	return 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + c * c)) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
 }
+
+#ifdef MODE_AERIAL
+vec2 shadow_perp() {
+	return vec2(-camera.shadow_frame.w, camera.shadow_frame.z);
+}
+
+// The light's visibility past the terrain at a world position (m): 1 above the shadow's height there, 0 below.
+float terrain_visibility(vec3 w) {
+	if (camera.cam_pos.w < 0.5) {
+		return 1.0;
+	}
+	vec2 rel = w.xz - camera.shadow_frame.xy;
+	vec2 uv = vec2(dot(rel, camera.shadow_frame.zw), dot(rel, shadow_perp())) / camera.shadow_params.x + 0.5;
+	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+		return 1.0;
+	}
+	float s = textureLod(terrain_shadow, uv, 0.0).r;
+	return smoothstep(-camera.shadow_params.y, camera.shadow_params.y, w.y - s);
+}
+#endif
 
 // The art's tint for a view direction d: a multiply, or (by tint.w) the light's luminance in the tint's colour, fading
 // with the view's elevation over misc.z radians.
@@ -270,23 +310,88 @@ void main() {
 
 #ifdef MODE_AERIAL
 	ivec3 size = imageSize(out_aerial);
-	ivec3 cell = ivec3(gl_GlobalInvocationID.xyz);
-	if (any(greaterThanEqual(cell, size))) {
+	ivec2 col = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(col, size.xy))) {
 		return;
 	}
-	vec2 uv = (vec2(cell.xy) + 0.5) / vec2(size.xy);
+	vec2 uv = (vec2(col) + 0.5) / vec2(size.xy);
 	vec4 far_p = camera.inv_view_proj * vec4(uv * 2.0 - 1.0, 0.5, 1.0);
 	vec3 d = normalize(far_p.xyz / far_p.w);
-	float w = (float(cell.z) + 0.5) / float(size.z);
-	float dist = w * w * params.radii.w; // km: finer near the camera
 	vec3 o = vec3(0.0, params.radii.z, 0.0);
 	vec3 l = params.light.xyz;
-	vec3 T;
-	vec3 L = integrate(o, d, dist, 8 + cell.z / 2, l, T);
-	imageStore(out_aerial, cell, vec4(art_tint(L, d), dot(T, vec3(1.0 / 3.0))));
+	float c = dot(d, l);
+	float pr = phase_rayleigh(c), pm = phase_mie(c, params.mie_extinction.w);
+	float m_per_km = 1.0 / max(params.misc.x, 1e-9); // the air's km in the world's metres (the aerial scale)
+	// Down the column, slice by slice (slice k holds the light from the camera to ((k + 0.5) / Z)^2 of the reach), the
+	// light scattered once from the light shadowed by the terrain where each sample is; the multiple scattering (the
+	// sky's own light in the air) is not. Lu, unshadowed, gives the sky its shadows' share at the far end.
+	vec3 L = vec3(0.0), Lu = vec3(0.0), T = vec3(1.0);
+	float t_prev = 0.0;
+	const int SUB = 2;
+	for (int k = 0; k < size.z; k++) {
+		float wk = (float(k) + 0.5) / float(size.z);
+		float t_end = wk * wk * params.radii.w;
+		float dt = (t_end - t_prev) / float(SUB);
+		for (int j = 0; j < SUB; j++) {
+			float t = t_prev + (float(j) + 0.5) * dt;
+			vec3 p = o + d * t;
+			float r = length(p);
+			Medium m = medium(r);
+			vec3 single = (m.scatter_r * pr + m.scatter_m * pm) * light_transmittance(p, l);
+			vec3 multi = (m.scatter_r + m.scatter_m) * multiscatter(r, dot(p / r, l)) * params.misc.y;
+			float vis = terrain_visibility(camera.cam_pos.xyz + d * (t * m_per_km));
+			vec3 step_t = exp(-m.extinction * dt);
+			vec3 k_int = (vec3(1.0) - step_t) / max(m.extinction, vec3(1e-7));
+			L += T * (single * vis + multi) * k_int;
+			Lu += T * (single + multi) * k_int;
+			T *= step_t;
+		}
+		t_prev = t_end;
+		imageStore(out_aerial, ivec3(col, k), vec4(art_tint(L, d), dot(T, vec3(1.0 / 3.0))));
+	}
+	imageStore(out_sky_shadow, col, vec4(art_tint(L, d) - art_tint(Lu, d), 1.0));
+#endif
+
+#ifdef MODE_TERRAIN_SHADOW
+	if (params.radii.x <= 0.0) {
+		return; // never: keeps the push constants in this variant's layout, as every pass sets them
+	}
+	int n = int(camera.shadow_params.z);
+	int row = int(gl_GlobalInvocationID.x);
+	if (gl_GlobalInvocationID.y != 0u || row >= n) {
+		return;
+	}
+	float side = camera.shadow_params.x;
+	float texel = side / float(n);
+	vec2 dir = camera.shadow_frame.zw;
+	vec2 perp = vec2(-dir.y, dir.x);
+	float v = ((float(row) + 0.5) / float(n) - 0.5) * side;
+	float drop = texel * camera.shadow_params.w; // how far the shadow's edge falls in a texel away from the light
+	float s = -1e9;
+	// From the light's side away from it: each texel is in shadow below the higher of its ground and the shadow coming
+	// from the texel before it, dropped by a texel's fall.
+	for (int i = n - 1; i >= 0; i--) {
+		float u = ((float(i) + 0.5) / float(n) - 0.5) * side;
+		vec2 p = camera.shadow_frame.xy + dir * u + perp * v;
+		vec2 tuv = (p - camera.terrain_rect.xy) / camera.terrain_rect.zw;
+		float h = -1e9;
+		if (all(greaterThanEqual(tuv, vec2(0.0))) && all(lessThanEqual(tuv, vec2(1.0)))) {
+			h = camera.terrain_h.x + camera.terrain_h.y * textureLod(terrain_heights, tuv, camera.terrain_h.z).r;
+		}
+		s = max(h, s - drop);
+		imageStore(shadow_out, ivec2(i, row), vec4(s));
+	}
 #endif
 
 #ifdef MODE_APPLY
+	// The air volume near the camera over a colour at a distance (m): its light scattered toward the camera and its
+	// transmittance, the reach and past it the whole column.
+#define AIR_VOLUME(c, dist) \
+	if (camera.air_volume.y > 0.5) { \
+		float aw = min(sqrt(max(dist, 0.0) / camera.air_volume.x), 1.0); \
+		vec4 av = textureLod(air_light, vec3(uv, aw), 0.0); \
+		c.rgb = c.rgb * av.a + av.rgb; \
+	}
 	ivec2 size = ivec2(params.misc.zw);
 	if (any(greaterThanEqual(px, size))) {
 		return;
@@ -294,7 +399,15 @@ void main() {
 	vec2 uv = (vec2(px) + 0.5) / vec2(size);
 	float depth = texelFetch(depth_texture, px, 0).r;
 	if (depth == 0.0) {
-		return; // the sky (reverse Z): its own shader drew the atmosphere
+		// The sky (reverse Z): its own shader drew the atmosphere, unshadowed; the terrain's shadows in the air are taken
+		// from it here (the crepuscular rays), as far as the volume reaches.
+		vec4 c = imageLoad(color_image, px);
+		if (camera.cam_pos.w > 0.5) {
+			c.rgb = max(c.rgb + textureLod(sky_shadow, uv, 0.0).rgb * params.light.w, vec3(0.0));
+		}
+		AIR_VOLUME(c, 1e9)
+		imageStore(color_image, px, c);
+		return;
 	}
 	vec4 rel = camera.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
 	float dist = length(rel.xyz / rel.w) * params.misc.x; // km, times the aerial scale
@@ -304,6 +417,7 @@ void main() {
 	float near = clamp(w * 32.0 - 0.5, 0.0, 1.0);
 	vec4 c = imageLoad(color_image, px);
 	c.rgb = c.rgb * mix(1.0, ap.a, near) + ap.rgb * params.light.w * near;
+	AIR_VOLUME(c, dist / max(params.misc.x, 1e-12)) // back to metres
 	imageStore(color_image, px, c);
 #endif
 }

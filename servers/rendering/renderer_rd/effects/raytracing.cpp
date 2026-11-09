@@ -1117,7 +1117,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	push_constant.light_pos[2] = p_to_sun.z;
 	push_constant.light_pos[3] = p_tan_half_angle;
 	push_constant.axis_u[3] = 0.08f; // Ray bias.
-	push_constant.axis_v[3] = 10000.0f; // Max distance.
+	push_constant.axis_v[3] = 40000.0f; // Max distance: a mountain's shadow at sunset runs past 10 km (1.5 km of relief under an 8.5 degree sun), and a ray above the terrain leaves the TLAS early.
 	push_constant.screen_size[0] = size.x;
 	push_constant.screen_size[1] = size.y;
 	push_constant.frame_index = rb_state->frame_index;

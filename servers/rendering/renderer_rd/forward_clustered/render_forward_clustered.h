@@ -1083,6 +1083,8 @@ public:
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }
+	// The ray tracer, or null (for module effects: the weather module's air volume traces the light's visibility).
+	RendererRD::Raytracing *get_raytracing() const { return raytracing; }
 
 	/* callback from updating our lighting UBOs, used to populate cluster builder */
 	virtual void setup_added_reflection_probe(const Transform3D &p_transform, const Vector3 &p_half_size) override;

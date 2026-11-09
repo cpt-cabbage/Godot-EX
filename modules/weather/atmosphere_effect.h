@@ -43,7 +43,22 @@
 // rest of it absorbed; `absorption_color` at `absorption_density` (per km at the ground, thinning as the haze) is other
 // matter that absorbs (smoke, dust), taking those colours out of the sunlight and the sky; `sky_tint` and `sky_luminance`
 // scale the sky's and the aerial perspective's light (not the discs) and need no new tables, so SkyLook (sky_look.h)
-// drives them by the sun's height every frame. `sky_recolor` (0 to 1) replaces that light's own colour by its luminance
+// drives them by the sun's height every frame.
+//
+// The terrain's shadow in the air (2026-11-09): set_terrain_heights() gives the terrain's height texture; a map turned
+// to the light (SHADOW_N a side over the terrain's diagonal) holds the height below which the ground hides the light,
+// rebuilt when the light moves. The aerial volume (AERIAL_W x AERIAL_H x AERIAL_Z, marched once down each column)
+// shadows its single scattering by it, so the mountains' shadows darken the haze and the light between them falls in
+// shafts; the sky's pixels lose the shadowed share of the light the volume holds (crepuscular rays). `air_shadows`
+// turns it off; `shadow_softness` (m) is the shadow edge's width in height.
+//
+// The air volume (air_volume.glsl): froxels (FOG_W x FOG_H x FOG_Z, finer near) out to `fog_distance` holding ground
+// haze (`ground_haze_density` per m at the ground, thinning over `ground_haze_height`) and valley mist (`mist_density`
+// below the world height `mist_top`, thinning over `mist_falloff` above it), broken by wind-carried noise; lit by
+// `light_color` (TimeOfDay3D sets it: the light's colour and energy) through the terrain's shadow map and, within
+// `fog_rt_distance`, ray-traced visibility with alpha-tested leaves (shafts through the trees), and by the sky (its
+// table's mean, times `fog_sky_light`). Each frame's point in a froxel is jittered and blended into the reprojected
+// last frame's (`fog_history`). Off with `fog_enabled`. `sky_recolor` (0 to 1) replaces that light's own colour by its luminance
 // times the tint, so a tint can make a blue sky orange rather than brown; `sky_tint_height` (radians of the view's
 // elevation) is how far up from the horizon the tint and recolour reach, fading as exp(-elevation / height): 10 is the
 // whole sky, 0.3 a band low down with the zenith left as it was.
@@ -52,6 +67,7 @@
 #include "scene/resources/texture_rd.h"
 #include "servers/rendering/renderer_rd/shader_rd.h"
 
+#include "air_volume.glsl.gen.h"
 #include "atmosphere.glsl.gen.h"
 
 class AtmosphereEffect : public CompositorEffect {
@@ -89,12 +105,53 @@ class AtmosphereEffect : public CompositorEffect {
 	float light_illuminance = 1.0;
 
 	// GPU.
+	// The terrain's shadow in the air.
+	Ref<Texture2D> terrain_heights;
+	Rect2 terrain_rect;
+	float terrain_height_min = 0.0;
+	float terrain_height_range = 1.0;
+	bool air_shadows = true;
+	float shadow_softness = 20.0;
+	Vector3 shadow_light; // the light the map was made for
+	bool shadow_dirty = true;
+
+	// The air volume.
+	bool fog_enabled = true;
+	float ground_haze_density = 0.0003;
+	float ground_haze_height = 40.0;
+	float mist_density = 0.0;
+	float mist_top = 0.0;
+	float mist_falloff = 60.0;
+	float fog_noise = 0.5;
+	float fog_noise_scale = 30.0;
+	Vector3 fog_wind;
+	Color fog_albedo = Color(0.95, 0.95, 0.95);
+	float fog_anisotropy = 0.6;
+	float fog_sky_light = 1.0;
+	float fog_distance = 800.0;
+	float fog_rt_distance = 400.0;
+	float fog_history = 0.9;
+	Color light_color = Color(1, 1, 1);
+	AirVolumeShaderRD fog_shader;
+	RID fog_version;
+	RID fog_pipelines[3];
+	RID fog_media[2];
+	RID fog_light;
+	RID fog_ubo;
+	int fog_frame = 0;
+	bool fog_rt_supported = false;
+	Projection prev_view_proj;
+	Vector3 prev_cam;
+	bool prev_valid = false;
+
 	bool initialized = false;
 	bool tables_dirty = true;
 	AtmosphereShaderRD shader;
 	RID shader_version;
-	RID pipelines[5];
+	RID pipelines[6];
 	RID sampler;
+	RID sampler_mip;
+	RID shadow_rd, sky_shadow_rd;
 	RID transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd;
 	RID camera_ubo;
 	Ref<Texture2DRD> transmittance_texture;
@@ -126,7 +183,11 @@ public:
 	static constexpr int TRANSMITTANCE_W = 256, TRANSMITTANCE_H = 64;
 	static constexpr int MULTISCATTER_N = 32;
 	static constexpr int SKY_VIEW_W = 192, SKY_VIEW_H = 108;
-	static constexpr int AERIAL_N = 32;
+	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
+	static constexpr int SHADOW_N = 2048;
+	static constexpr int CAMERA_FLOATS = 40; // atmosphere.glsl's Camera block
+	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
+	static constexpr int FOG_FLOATS = 32 + 4 * 15; // air_volume.glsl's Fog block
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
@@ -173,6 +234,33 @@ public:
 	float get_aerial_distance() const { return aerial_distance; }
 	void set_altitude_offset(float p_v) { altitude_offset = p_v; }
 	float get_altitude_offset() const { return altitude_offset; }
+	// The terrain's heights (a texture of height_min + height_range * value over `rect`, world x and z) for its shadow in
+	// the air; a null texture turns it off.
+	void set_terrain_heights(const Ref<Texture2D> &p_heights, const Rect2 &p_rect, float p_height_min, float p_height_range);
+	void set_air_shadows(bool p_v) { air_shadows = p_v; }
+	bool get_air_shadows() const { return air_shadows; }
+	void set_shadow_softness(float p_v) { shadow_softness = MAX(p_v, 0.01f); }
+	float get_shadow_softness() const { return shadow_softness; }
+#define FOGP(type, m)                        \
+	void set_##m(type p_v) { m = p_v; }         \
+	type get_##m() const { return m; }
+	FOGP(bool, fog_enabled)
+	FOGP(float, ground_haze_density)
+	FOGP(float, ground_haze_height)
+	FOGP(float, mist_density)
+	FOGP(float, mist_top)
+	FOGP(float, mist_falloff)
+	FOGP(float, fog_noise)
+	FOGP(float, fog_noise_scale)
+	FOGP(Vector3, fog_wind)
+	FOGP(Color, fog_albedo)
+	FOGP(float, fog_anisotropy)
+	FOGP(float, fog_sky_light)
+	FOGP(float, fog_distance)
+	FOGP(float, fog_rt_distance)
+	FOGP(float, fog_history)
+	FOGP(Color, light_color)
+#undef FOGP
 	void set_apply_aerial(bool p_v) { apply_aerial = p_v; }
 	bool get_apply_aerial() const { return apply_aerial; }
 	void set_light_direction(const Vector3 &p_dir) { light_direction = p_dir.normalized(); }

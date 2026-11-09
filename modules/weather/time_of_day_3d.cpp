@@ -134,12 +134,15 @@ void TimeOfDay3D::_apply() {
 		const float es = sun_illuminance * MAX(sun_direction.y + 0.1f, 0.0f);
 		const float em = moon_illuminance * full * MAX(moon_direction.y + 0.1f, 0.0f);
 		// The sky is lit by the sun until well after it sets (twilight), then by the moon.
+		// The air volume's light is the light's own colour and energy at the camera (its DirectionalLight3D's).
 		if (sun_direction.y > -0.2f || em <= 0.0f) {
 			atmosphere->set_light_direction(sun_direction);
 			atmosphere->set_light_illuminance(sun_illuminance);
+			atmosphere->set_light_color(Color(ts.x, ts.y, ts.z) * sun_illuminance);
 		} else {
 			atmosphere->set_light_direction(moon_direction);
 			atmosphere->set_light_illuminance(moon_illuminance * full);
+			atmosphere->set_light_color(Color(tm.x, tm.y, tm.z) * (moon_illuminance * full));
 		}
 		(void)es;
 	}

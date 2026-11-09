@@ -38,7 +38,8 @@
 // default to none (white): the physical sky. A super orange sunset is an orange stop near 0 degrees in both, with a little
 // orange in mie_tint so the haze around the sun glows, and `sky_recolor` (a curve over the same heights, 0 to 1) so the
 // tint replaces the sky's blue rather than darkening it to brown; `sky_tint_height` keeps them to a band above the
-// horizon (radians; 10 is the whole sky).
+// horizon (radians; 10 is the whole sky). The air volume's haze and mist (AtmosphereEffect's ground_haze_*, mist_*,
+// fog_anisotropy) are a look's too.
 
 #include "core/io/resource.h"
 #include "scene/resources/curve.h"
@@ -64,6 +65,13 @@ class SkyLook : public Resource {
 	Ref<Curve> sky_recolor;
 	float elevation_min = -12.0;
 	float elevation_max = 48.0;
+	// The air volume near the camera (AtmosphereEffect's): haze on the ground and mist pooled below a height.
+	float ground_haze_density = 0.0003;
+	float ground_haze_height = 40.0;
+	float mist_density = 0.0;
+	float mist_top = 0.0;
+	float mist_falloff = 60.0;
+	float fog_anisotropy = 0.6;
 
 protected:
 	static void _bind_methods();
@@ -97,5 +105,11 @@ public:
 	PROP(Ref<Curve>, sky_recolor)
 	PROP(float, elevation_min)
 	PROP(float, elevation_max)
+	PROP(float, ground_haze_density)
+	PROP(float, ground_haze_height)
+	PROP(float, mist_density)
+	PROP(float, mist_top)
+	PROP(float, mist_falloff)
+	PROP(float, fog_anisotropy)
 #undef PROP
 };
