@@ -65,6 +65,8 @@ protected:
 	void _validate_property(PropertyInfo &p_property) const;
 
 	void _call_render_callback(int p_effect_callback_type, const RenderData *p_render_data);
+	// Godot-EX: an effect written in C++ (a module's) overrides this; the script callback runs after it.
+	virtual void _render_callback_native(int p_effect_callback_type, const RenderData *p_render_data) {}
 
 	GDVIRTUAL2(_render_callback, int, const RenderData *)
 

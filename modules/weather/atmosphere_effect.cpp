@@ -1,0 +1,310 @@
+/**************************************************************************/
+/*  atmosphere_effect.cpp                                                 */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+#include "atmosphere_effect.h"
+
+#include "core/object/class_db.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
+#include "servers/rendering/rendering_device.h"
+#include "servers/rendering/rendering_server.h"
+#include "servers/rendering/storage/render_data.h"
+#include "servers/rendering/storage/render_scene_data.h"
+
+enum {
+	MODE_TRANSMITTANCE,
+	MODE_MULTISCATTER,
+	MODE_SKY_VIEW,
+	MODE_AERIAL,
+	MODE_APPLY,
+};
+
+AtmosphereEffect::Push AtmosphereEffect::_push(float p_camera_altitude_m, int p_width, int p_height) const {
+	Push p = {};
+	const Vector3 r = rayleigh_scattering * rayleigh_density;
+	p.rayleigh[0] = r.x;
+	p.rayleigh[1] = r.y;
+	p.rayleigh[2] = r.z;
+	p.rayleigh[3] = rayleigh_scale_height;
+	p.mie_scattering[0] = p.mie_scattering[1] = p.mie_scattering[2] = mie_scattering * mie_density;
+	p.mie_scattering[3] = mie_scale_height;
+	p.mie_extinction[0] = p.mie_extinction[1] = p.mie_extinction[2] = mie_extinction * mie_density;
+	p.mie_extinction[3] = mie_anisotropy;
+	p.ozone[0] = ozone_absorption.x;
+	p.ozone[1] = ozone_absorption.y;
+	p.ozone[2] = ozone_absorption.z;
+	p.ozone[3] = ground_albedo;
+	p.radii[0] = planet_radius;
+	p.radii[1] = planet_radius + atmosphere_height;
+	p.radii[2] = planet_radius + MAX(p_camera_altitude_m, 1.0f) * 0.001f;
+	p.radii[3] = aerial_distance;
+	p.light[0] = light_direction.x;
+	p.light[1] = light_direction.y;
+	p.light[2] = light_direction.z;
+	p.light[3] = light_illuminance;
+	p.misc[0] = 0.001f * aerial_perspective_scale;
+	p.misc[1] = multiscatter;
+	p.misc[2] = float(p_width);
+	p.misc[3] = float(p_height);
+	return p;
+}
+
+void AtmosphereEffect::_ensure() {
+	if (initialized) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	if (rd == nullptr) {
+		return;
+	}
+	Vector<String> modes;
+	modes.push_back("\n#define MODE_TRANSMITTANCE\n");
+	modes.push_back("\n#define MODE_MULTISCATTER\n");
+	modes.push_back("\n#define MODE_SKY_VIEW\n");
+	modes.push_back("\n#define MODE_AERIAL\n");
+	modes.push_back("\n#define MODE_APPLY\n");
+	shader.initialize(modes);
+	shader_version = shader.version_create();
+	for (int i = 0; i < 5; i++) {
+		pipelines[i] = rd->compute_pipeline_create(shader.version_get_shader(shader_version, i));
+	}
+	RD::SamplerState ss;
+	ss.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	ss.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	sampler = rd->sampler_create(ss);
+	auto tex2d = [rd](int w, int h) {
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		tf.width = w;
+		tf.height = h;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		RID t = rd->texture_create(tf, RD::TextureView());
+		rd->texture_clear(t, Color(0, 0, 0, 1), 0, 1, 0, 1);
+		return t;
+	};
+	transmittance_rd = tex2d(TRANSMITTANCE_W, TRANSMITTANCE_H);
+	multiscatter_rd = tex2d(MULTISCATTER_N, MULTISCATTER_N);
+	sky_view_rd = tex2d(SKY_VIEW_W, SKY_VIEW_H);
+	RD::TextureFormat tf3;
+	tf3.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	tf3.texture_type = RD::TEXTURE_TYPE_3D;
+	tf3.width = AERIAL_N;
+	tf3.height = AERIAL_N;
+	tf3.depth = AERIAL_N;
+	tf3.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	aerial_rd = rd->texture_create(tf3, RD::TextureView());
+	rd->texture_clear(aerial_rd, Color(0, 0, 0, 1), 0, 1, 0, 1);
+	camera_ubo = rd->uniform_buffer_create(sizeof(float) * 16);
+	transmittance_texture.instantiate();
+	transmittance_texture->set_texture_rd_rid(transmittance_rd);
+	sky_view_texture.instantiate();
+	sky_view_texture->set_texture_rd_rid(sky_view_rd);
+	initialized = true;
+	tables_dirty = true;
+}
+
+void AtmosphereEffect::_free() {
+	if (!initialized) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	transmittance_texture.unref();
+	sky_view_texture.unref();
+	for (RID r : { transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd, camera_ubo, sampler }) {
+		if (r.is_valid()) {
+			rd->free_rid(r);
+		}
+	}
+	shader.version_free(shader_version);
+	initialized = false;
+}
+
+Ref<Texture2D> AtmosphereEffect::get_transmittance_texture() {
+	_ensure();
+	return transmittance_texture;
+}
+
+Ref<Texture2D> AtmosphereEffect::get_sky_view_texture() {
+	_ensure();
+	return sky_view_texture;
+}
+
+void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const RenderData *p_render_data) {
+	if (p_effect_callback_type != EFFECT_CALLBACK_TYPE_POST_SKY) {
+		return;
+	}
+	_ensure();
+	if (!initialized) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	UniformSetCacheRD *cache = UniformSetCacheRD::get_singleton();
+	Ref<RenderSceneBuffersRD> rb = p_render_data->get_render_scene_buffers();
+	RenderSceneData *sd = p_render_data->get_render_scene_data();
+	if (rb.is_null() || sd == nullptr) {
+		return;
+	}
+	const Size2i size = rb->get_internal_size();
+	const Transform3D cam = sd->get_cam_transform();
+	camera_altitude = cam.origin.y + altitude_offset;
+	const Push push = _push(camera_altitude, size.x, size.y);
+
+	// NDC to the world relative to the camera. The scene data's projection is already the renderer's (depth-corrected,
+	// flipped, jittered): correcting it again put every pixel at the near plane.
+	const Projection inv = Projection(Transform3D(cam.basis, Vector3())) * sd->get_cam_projection().inverse();
+	float m[16];
+	for (int c = 0; c < 4; c++) {
+		for (int r = 0; r < 4; r++) {
+			m[c * 4 + r] = inv.columns[c][r];
+		}
+	}
+	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
+
+	RD::Uniform u_trans_sampled(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, transmittance_rd }));
+	RD::Uniform u_ms_sampled(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 1, Vector<RID>({ sampler, multiscatter_rd }));
+	RD::Uniform u_camera(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 7, Vector<RID>({ camera_ubo }));
+
+	rd->draw_command_begin_label("Atmosphere");
+	RD::ComputeListID list = rd->compute_list_begin();
+	auto run = [&](int p_mode, const LocalVector<RD::Uniform> &p_uniforms, int x, int y, int z) {
+		RID s = shader.version_get_shader(shader_version, p_mode);
+		// Declared samplers and blocks stay in a variant's layout whether it reads them or not: each set gets the
+		// shared ones it does not name (a binding the variant lacks is ignored).
+		LocalVector<RD::Uniform> u;
+		bool have[8] = {};
+		for (const RD::Uniform &x : p_uniforms) {
+			u.push_back(x);
+			have[x.binding] = true;
+		}
+		if (!have[0] && p_mode != MODE_TRANSMITTANCE) {
+			u.push_back(u_trans_sampled);
+		}
+		if (!have[1] && p_mode != MODE_MULTISCATTER && p_mode != MODE_TRANSMITTANCE) {
+			u.push_back(u_ms_sampled);
+		}
+		if (!have[7]) {
+			u.push_back(u_camera);
+		}
+		rd->compute_list_bind_compute_pipeline(list, pipelines[p_mode]);
+		rd->compute_list_bind_uniform_set(list, cache->get_cache_vec(s, 0, u), 0);
+		rd->compute_list_set_push_constant(list, &push, sizeof(Push));
+		rd->compute_list_dispatch_threads(list, x, y, z);
+		rd->compute_list_add_barrier(list);
+	};
+	if (tables_dirty) {
+		run(MODE_TRANSMITTANCE, { RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ transmittance_rd })) }, TRANSMITTANCE_W, TRANSMITTANCE_H, 1);
+		run(MODE_MULTISCATTER, { u_trans_sampled, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ multiscatter_rd })) }, MULTISCATTER_N, MULTISCATTER_N, 1);
+		tables_dirty = false;
+	}
+	run(MODE_SKY_VIEW, { u_trans_sampled, u_ms_sampled, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 2, Vector<RID>({ sky_view_rd })) }, SKY_VIEW_W, SKY_VIEW_H, 1);
+	if (apply_aerial) {
+		run(MODE_AERIAL, { u_trans_sampled, u_ms_sampled, u_camera, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, Vector<RID>({ aerial_rd })) }, AERIAL_N, AERIAL_N, AERIAL_N);
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			RID color = rb->get_internal_texture(v);
+			RID depth = rb->get_depth_texture(v);
+			run(MODE_APPLY, { u_camera, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ color })) }, size.x, size.y, 1);
+		}
+	}
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+}
+
+Vector3 AtmosphereEffect::transmittance(float p_altitude_m, const Vector3 &p_direction) const {
+	const float Rg = planet_radius, Rt = planet_radius + atmosphere_height;
+	const Vector3 o(0.0f, Rg + MAX(p_altitude_m, 1.0f) * 0.001f, 0.0f);
+	const Vector3 d = p_direction.normalized();
+	// Hidden by the planet.
+	const float b = o.dot(d);
+	const float cg = o.dot(o) - Rg * Rg;
+	if (b < 0.0f && b * b - cg > 0.0f) {
+		return Vector3();
+	}
+	const float ct = o.dot(o) - Rt * Rt;
+	const float t = -b + Math::sqrt(MAX(b * b - ct, 0.0f));
+	const int N = 64;
+	const float dt = t / N;
+	Vector3 depth;
+	const Vector3 rs = rayleigh_scattering * rayleigh_density;
+	for (int i = 0; i < N; i++) {
+		const float h = MAX((o + d * (i + 0.5f) * dt).length() - Rg, 0.0f);
+		const float dr = Math::exp(-h / rayleigh_scale_height);
+		const float dm = Math::exp(-h / mie_scale_height);
+		const float dz = MAX(0.0f, 1.0f - Math::abs(h - 25.0f) / 15.0f);
+		depth += (rs * dr + Vector3(1, 1, 1) * mie_extinction * mie_density * dm + ozone_absorption * dz) * dt;
+	}
+	return Vector3(Math::exp(-depth.x), Math::exp(-depth.y), Math::exp(-depth.z));
+}
+
+void AtmosphereEffect::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_transmittance_texture"), &AtmosphereEffect::get_transmittance_texture);
+	ClassDB::bind_method(D_METHOD("get_sky_view_texture"), &AtmosphereEffect::get_sky_view_texture);
+	ClassDB::bind_method(D_METHOD("transmittance", "altitude", "direction"), &AtmosphereEffect::transmittance);
+	ClassDB::bind_method(D_METHOD("get_camera_altitude"), &AtmosphereEffect::get_camera_altitude);
+#define B(type, m, vt, hint)                                                                    \
+	ClassDB::bind_method(D_METHOD("set_" #m, "value"), &AtmosphereEffect::set_##m);              \
+	ClassDB::bind_method(D_METHOD("get_" #m), &AtmosphereEffect::get_##m);                       \
+	ADD_PROPERTY(PropertyInfo(vt, #m, PROPERTY_HINT_RANGE, hint), "set_" #m, "get_" #m);
+	ADD_GROUP("Air", "");
+	B(Vector3, rayleigh_scattering, Variant::VECTOR3, "")
+	B(float, rayleigh_scale_height, Variant::FLOAT, "0.1,50,0.01,suffix:km")
+	B(float, mie_scattering, Variant::FLOAT, "0,0.1,0.0001,suffix:/km")
+	B(float, mie_extinction, Variant::FLOAT, "0,0.1,0.0001,suffix:/km")
+	B(float, mie_scale_height, Variant::FLOAT, "0.1,20,0.01,suffix:km")
+	B(Vector3, ozone_absorption, Variant::VECTOR3, "")
+	B(float, planet_radius, Variant::FLOAT, "100,100000,1,suffix:km")
+	B(float, atmosphere_height, Variant::FLOAT, "1,1000,1,suffix:km")
+	ADD_GROUP("Art", "");
+	B(float, rayleigh_density, Variant::FLOAT, "0,10,0.01")
+	B(float, mie_density, Variant::FLOAT, "0,100,0.01")
+	B(float, mie_anisotropy, Variant::FLOAT, "0,0.99,0.01")
+	B(float, ground_albedo, Variant::FLOAT, "0,1,0.01")
+	B(float, multiscatter, Variant::FLOAT, "0,4,0.01")
+	B(float, aerial_perspective_scale, Variant::FLOAT, "0,100,0.01")
+	B(float, aerial_distance, Variant::FLOAT, "1,500,1,suffix:km")
+	B(float, altitude_offset, Variant::FLOAT, "-10000,10000,1,suffix:m")
+	ADD_GROUP("Light", "");
+	B(Vector3, light_direction, Variant::VECTOR3, "")
+	B(float, light_illuminance, Variant::FLOAT, "0,100,0.001")
+#undef B
+	ClassDB::bind_method(D_METHOD("set_apply_aerial", "apply"), &AtmosphereEffect::set_apply_aerial);
+	ClassDB::bind_method(D_METHOD("get_apply_aerial"), &AtmosphereEffect::get_apply_aerial);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "apply_aerial"), "set_apply_aerial", "get_apply_aerial");
+}
+
+AtmosphereEffect::AtmosphereEffect() {
+	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_SKY);
+}
+
+AtmosphereEffect::~AtmosphereEffect() {
+	_free();
+}
