@@ -619,6 +619,7 @@ void Raytracing::update_surface_cache_lighting(const Transform3D &p_world_from_v
 	}
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	SurfaceCache::LightingInputs in;
+	in.alpha = _alpha_binding(4);
 	in.tlas = scene.get_tlas();
 	// The scene's lights near the camera when the cull provided them (see
 	// LightStorage::update_card_light_buffers), else the view's.
@@ -1046,16 +1047,31 @@ bool Raytracing::_alpha_shadows_ready() const {
 			scene.get_hit_geometry_buffer().is_valid() && scene.get_hit_vertex_buffer().is_valid() && scene.get_hit_index_buffer().is_valid() && scene.get_hit_alpha_table_buffer().is_valid();
 }
 
-void Raytracing::_bind_alpha_shadows(RD::ComputeListID p_list, RID p_shader) {
+// The alpha-tested casters' data for this frame's passes (the shadow rays in set 2, the GI's and the cards' rays in
+// set 3), its state 1 when _alpha_shadows_ready.
+RtAlphaBinding Raytracing::_alpha_binding(uint32_t p_pass) const {
+	RtAlphaBinding b;
 	const bool ready = _alpha_shadows_ready();
-	auto buffer = [&](RID p_rid) { return ready && p_rid.is_valid() ? p_rid : rt_gi_dummy_buffer; };
-	RD::Uniform u_instances(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, Vector<RID>({ buffer(surface_cache != nullptr ? surface_cache->get_instances_buffer() : RID()) }));
-	RD::Uniform u_geometry(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, Vector<RID>({ buffer(scene.get_hit_geometry_buffer()) }));
-	RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, Vector<RID>({ buffer(scene.get_hit_vertex_buffer()) }));
-	RD::Uniform u_indices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, Vector<RID>({ buffer(scene.get_hit_index_buffer()) }));
-	RD::Uniform u_table(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, Vector<RID>({ buffer(scene.get_hit_alpha_table_buffer()) }));
-	RD::Uniform u_masks(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ scene.get_alpha_sampler(), scene.get_alpha_masks() }));
-	RD::get_singleton()->compute_list_bind_uniform_set(p_list, UniformSetCacheRD::get_singleton()->get_cache(p_shader, 2, u_instances, u_geometry, u_vertices, u_indices, u_table, u_masks), 2);
+	b.records = ready ? surface_cache->get_instances_buffer() : RID();
+	b.geometry = ready ? scene.get_hit_geometry_buffer() : RID();
+	b.vertices = ready ? scene.get_hit_vertex_buffer() : RID();
+	b.indices = ready ? scene.get_hit_index_buffer() : RID();
+	b.table = ready ? scene.get_hit_alpha_table_buffer() : RID();
+	b.masks = scene.get_alpha_masks();
+	b.sampler = scene.get_alpha_sampler();
+	// The GI's and the cards' rays test the masks only with GODOT_RT_ALPHA_GI=1 (opt-in; the shadow rays always do).
+	// Measured 2026-11-09 in ProjectEX's valley at 4K: inside the forest 38.26 ms against 30.02 and the image 23 %
+	// darker (the bounce rays slip through leaf gaps to the shadowed understory, where before they stopped at a leaf
+	// card reading the cell's coarse, sunlit-topped surface cache; neither is right while a multimesh shares one card
+	// set), the ridge 15.84 against 14.37, the Protea slope 15.80 against 15.00, both unchanged to 0.2 %. The gather
+	// alone made the difference (GODOT_RT_ALPHA_GI_PASSES=1); its eye ray stays opaque (identical either way).
+	static const bool gi = OS::get_singleton()->get_environment("GODOT_RT_ALPHA_GI") == "1";
+	// GODOT_RT_ALPHA_GI_PASSES (diagnostics): which passes test, a bit each: 1 the gather, 2 ReSTIR GI, 4 the cards'
+	// lighting, 8 the stochastic direct light (all by default).
+	static const uint32_t passes = OS::get_singleton()->get_environment("GODOT_RT_ALPHA_GI_PASSES").is_empty() ? 0xFFu : uint32_t(OS::get_singleton()->get_environment("GODOT_RT_ALPHA_GI_PASSES").to_int());
+	b.state = scene.get_alpha_state(ready && gi && (p_pass & passes) != 0);
+	b.dummy_buffer = rt_gi_dummy_buffer;
+	return b;
 }
 
 void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_world_from_ndc, const Projection &p_reproject, const Vector3 &p_to_sun, float p_tan_half_angle, uint32_t p_caster_mask, uint32_t p_soft_shadow_rays, RID p_velocity) {
@@ -1121,7 +1137,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_mask), 1);
-	_bind_alpha_shadows(compute_list, shader_rid);
+	_alpha_binding(0xFF).bind(compute_list, shader_rid, 2);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1253,7 +1269,7 @@ void Raytracing::process_area(Ref<RenderSceneBuffersRD> p_render_buffers, uint32
 	rd->compute_list_bind_compute_pipeline(compute_list, area_pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 0, u_tlas, u_depth), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(area_shader_rid, 1, u_mask), 1);
-	_bind_alpha_shadows(compute_list, area_shader_rid);
+	_alpha_binding(0xFF).bind(compute_list, area_shader_rid, 2);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 	rd->compute_list_end();
@@ -1569,6 +1585,7 @@ RID Raytracing::get_composite_texture(Ref<RenderSceneBuffersRD> p_render_buffers
 }
 
 void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_gbuf_albedo, RID p_gbuf_f0, uint32_t p_omni_light_count, uint32_t p_spot_light_count, uint32_t p_area_light_count, RID p_cluster_buffer, float p_cluster_z0, uint32_t p_cluster_size, uint32_t p_max_cluster_elements, float p_z_near, float p_z_far, const StochasticQuality &p_quality, RID p_velocity) {
+	const RtAlphaBinding alpha = _alpha_binding(8);
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(scene.get_tlas().is_null());
@@ -1875,6 +1892,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+		alpha.bind(compute_list, shader_rid, 3);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out), 1);
 		rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 		rd->compute_list_end();
@@ -1922,6 +1940,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, has_area ? stochastic_select_pipeline : stochastic_select_pipeline_no_area);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(select_rid, 0, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			alpha.bind(list, select_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(select_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args, w_requests, w_state, w_visibility), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -1933,6 +1952,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, stochastic_trace_pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			alpha.bind(list, trace_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args_dummy, w_requests, w_state, w_visibility), 1);
 			rd->compute_list_dispatch_indirect(list, wavefront_args, 0);
 			rd->compute_list_end();
@@ -1944,6 +1964,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, stochastic_resolve_pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_tlas, u_depth, u_normal, u_omni, u_spot, u_list, u_params, u_cluster, u_stbn, u_area, u_ltc1, u_ltc2, u_atlas, u_material_sampler, u_decal_atlas, u_sc_instances, u_sc_sets, u_sc_depth, u_sc_albedo, u_gbuf_albedo, u_gbuf_f0), 0);
+			alpha.bind(list, resolve_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, u_diffuse, u_specular, u_visible, u_raw_meta_out, u_view_depth_out, u_analytic_d_out, u_analytic_s_out, u_analytic_image_d_out, u_analytic_image_s_out, w_count, w_args, w_requests, w_state, w_visibility), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -2151,6 +2172,7 @@ void Raytracing::process_stochastic(Ref<RenderSceneBuffersRD> p_render_buffers, 
 }
 
 void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject, RID p_normal_roughness, RID p_gbuf_albedo, RID p_gbuf_f0, RID p_velocity, RID p_screen_radiance, const GiCascades &p_cascades, const GiSky &p_sky, float p_z_near, float p_z_far, const GiQuality &p_quality) {
+	const RtAlphaBinding alpha = _alpha_binding(1);
 	// Selected by advance_frame(), which every caller runs first for this buffer.
 	ERR_FAIL_NULL(rb_state);
 	ERR_FAIL_COND(scene.get_tlas().is_null());
@@ -2777,6 +2799,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, rt_gi_pipeline);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
+		alpha.bind(compute_list, shader_rid, 3);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, u_out_spec_hit, u_reuse_rays), 1);
 		rd->compute_list_dispatch_threads(compute_list, size.x, size.y, 1);
 		rd->compute_list_end();
@@ -2819,6 +2842,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_setup_pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
+			alpha.bind(list, setup_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(setup_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records, u_out_spec_hit), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -2830,6 +2854,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_trace_pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 0, u_tlas, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
+			alpha.bind(list, trace_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(trace_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args_dummy, g_requests, g_records, u_out_spec_hit), 1);
 			rd->compute_list_dispatch_indirect(list, gather_args, 0);
 			rd->compute_list_end();
@@ -2841,6 +2866,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 			RD::ComputeListID list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(list, rt_gi_resolve_pipeline);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 0, u_depth, u_normal, u_params, u_stbn, u_sdf, u_light, u_aniso0, u_aniso1, u_sdfgi_ubo, u_sky, u_mip_sampler, u_screen, u_voxel_ubo, u_voxel_tex, u_lightprobe, u_occlusion, u_calibration, u_sc_instances, u_sc_sets, u_sc_requests, u_sc_lighting, u_sc_depth, u_sc_change, u_prev_hist, u_hit_materials, u_hit_packets, u_hit_counts, u_hit_results, u_prev_meta, u_sc_indirect, u_sc_indirect_dyn, u_sc_indirect_dyn2, u_sc_albedo_atlas, u_sc_normal_atlas, u_sc_dyn_lights, u_sc_static, u_sc_specular_atlas, u_sc_decal_atlas, u_gbuf_f0, u_gbuf_albedo, u_prev_hist_dyn, u_prev_signal_depth, u_spec_nr), 0);
+			alpha.bind(list, resolve_rid, 3);
 			rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(resolve_rid, 1, u_out_ambient, u_out_reflection, u_out_depth, u_out_directional, u_out_fallback, u_out_spec_ray, u_out_ambient_dyn, u_out_fallback_dyn, g_count, g_args, g_requests, g_records, u_out_spec_hit, u_reuse_rays), 1);
 			rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 			rd->compute_list_end();
@@ -3253,6 +3279,7 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 // stochastic_gi_restir.glsl), after the hit shading filled the deferred hits
 // in and before the temporal pass.
 void Raytracing::_process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size2i &p_size, uint32_t p_scale, const Projection &p_view_from_ndc, RID p_depth, RID p_normal_roughness, RID p_raw_ambient, RID p_raw_directional, RID p_raw_dyn, bool p_dyn_split, float p_z_far) {
+	const RtAlphaBinding alpha = _alpha_binding(2);
 	RenderingDevice *rd = RD::get_singleton();
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	while (rb_state->gi_restir.size() <= p_view) {
@@ -3348,6 +3375,7 @@ void Raytracing::_process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, gi_restir_temporal_pipeline);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(temporal_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_out, u_dup), 0);
+		alpha.bind(list, temporal_rid, 3);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(temporal_rid, 1, u_ambient), 1);
 		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
 		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
@@ -3362,6 +3390,7 @@ void Raytracing::_process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, gi_restir_spatial_pipeline);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(spatial_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_out, u_tlas), 0);
+		alpha.bind(list, spatial_rid, 3);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(spatial_rid, 1, u_ambient, u_directional, u_dyn), 1);
 		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
 		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
@@ -3374,6 +3403,7 @@ void Raytracing::_process_gi_restir(uint32_t p_view, uint32_t p_mode, const Size
 		RD::ComputeListID list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(list, gi_restir_dup_pipeline);
 		rd->compute_list_bind_uniform_set(list, uniform_set_cache->get_cache(dup_rid, 0, u_params, u_depth, u_nr, u_rays, u_in, u_dup), 0);
+		alpha.bind(list, dup_rid, 3);
 		rd->compute_list_set_push_constant(list, &push, sizeof(GiRestirPushConstant));
 		rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
 		rd->compute_list_end();

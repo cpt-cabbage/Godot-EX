@@ -86,6 +86,9 @@ RaytracingScene::RaytracingScene() {
 		Vector<uint8_t> white;
 		white.push_back(255);
 		alpha_masks_dummy = RD::get_singleton()->texture_create(tf, RD::TextureView(), Vector<Vector<uint8_t>>({ white }));
+		uint32_t on = 1, off = 0;
+		alpha_state_on = RD::get_singleton()->storage_buffer_create(4, Vector<uint8_t>({ uint8_t(on), 0, 0, 0 }));
+		alpha_state_off = RD::get_singleton()->storage_buffer_create(4, Vector<uint8_t>({ uint8_t(off), 0, 0, 0 }));
 	}
 	hit_vertex_pool.element_size = sizeof(uint32_t) * 8; // RT_HIT_VERTEX_WORDS.
 	hit_index_pool.element_size = sizeof(uint32_t);
@@ -129,7 +132,7 @@ RaytracingScene::~RaytracingScene() {
 	}
 	hit_vertex_pool.release();
 	hit_index_pool.release();
-	for (RID rid : { hit_alpha_table_buffer, alpha_masks, alpha_masks_dummy, alpha_sampler, alpha_source_sampler }) {
+	for (RID rid : { hit_alpha_table_buffer, alpha_masks, alpha_masks_dummy, alpha_sampler, alpha_source_sampler, alpha_state_on, alpha_state_off }) {
 		if (rid.is_valid()) {
 			RD::get_singleton()->free_rid(rid);
 		}

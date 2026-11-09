@@ -4482,6 +4482,14 @@ void RenderingDevice::_uniform_set_update_clears(UniformSet *p_uniform_set) {
 	p_uniform_set->pending_clear_textures.clear();
 }
 
+bool RenderingDevice::shader_uses_uniform_set(RID p_shader, uint32_t p_set) {
+	_THREAD_SAFE_METHOD_
+
+	Shader *shader = shader_owner.get_or_null(p_shader);
+	ERR_FAIL_NULL_V(shader, false);
+	return p_set < (uint32_t)shader->uniform_sets.size() && !shader->uniform_sets[p_set].is_empty();
+}
+
 RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniforms, RID p_shader, uint32_t p_shader_set, bool p_linear_pool) {
 	_THREAD_SAFE_METHOD_
 

@@ -1,3 +1,6 @@
+#ifndef OCT_INC_GLSL
+#define OCT_INC_GLSL
+
 
 vec3 oct_to_vec3(vec2 e) {
 	vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
@@ -49,3 +52,5 @@ float vec3_to_oct_lod(vec3 n_ddx, vec3 n_ddy, float pixel_size) {
 	float dd_sqr = max(ddx, ddy);
 	return 0.25 * log2(dd_sqr + 1e-6f);
 }
+
+#endif // OCT_INC_GLSL

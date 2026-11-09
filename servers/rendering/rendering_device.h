@@ -1045,6 +1045,8 @@ public:
 	void shader_destroy_modules(RID p_shader);
 
 	uint64_t shader_get_vertex_input_attribute_mask(RID p_shader);
+	// Godot-EX: whether p_shader has bindings in set p_set (a variant may have compiled them away).
+	bool shader_uses_uniform_set(RID p_shader, uint32_t p_set);
 
 	/******************/
 	/**** UNIFORMS ****/

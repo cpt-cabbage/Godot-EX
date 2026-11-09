@@ -50,6 +50,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "../light_data_inc.glsl"
 #include "../oct_inc.glsl"
 #include "surface_cache_inc.glsl"
+// Set 3: alpha-tested casters seen through their masks.
+#include "rt_alpha_inc.glsl"
 
 #define MAX_LIGHTS_PER_SET 32u
 #define M_PI 3.14159265359
@@ -1026,7 +1028,8 @@ bool occluded(vec3 origin, vec3 dir, float t_max, uint mask) {
 	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT, mask, origin, 0.0, dir, t_max);
 	while (rayQueryProceedEXT(rq)) {
 		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			if (card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), origin + dir * rayQueryGetIntersectionTEXT(rq, false), dir)) {
+			int masked = RT_ALPHA_CANDIDATE(rq);
+			if (masked == 1 || (masked == -1 && card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), origin + dir * rayQueryGetIntersectionTEXT(rq, false), dir))) {
 				rayQueryConfirmIntersectionEXT(rq);
 			}
 		}
@@ -1765,9 +1768,8 @@ void trace_dynamic(ivec2 texel, Texel t, uint k_tracer, float n_cosine, float n_
 			vec3 ray_origin = pos;
 			float d_base = 0.0;
 			for (uint layer = 0u; layer < 4u; layer++) {
-				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, range - d_base);
-				while (rayQueryProceedEXT(rq)) {
-				}
+				rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFFu, ray_origin, 0.0, dir, range - d_base);
+				RT_ALPHA_PROCEED(rq)
 				if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
 					break;
 				}
@@ -1905,9 +1907,8 @@ void trace_bounce(Texel t, uint r_slot, uint k, inout uint seed, float n_cosine,
 #elif !defined(SC_SETUP)
 		rayQueryEXT rq;
 		for (uint layer = 0u; layer < 4u; layer++) {
-			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
-			while (rayQueryProceedEXT(rq)) {
-			}
+			rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFFu, ray_origin, 0.0, ray_dir, 1e4);
+			RT_ALPHA_PROCEED(rq)
 			if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
 				break;
 			}
@@ -3133,9 +3134,8 @@ void landings_main() {
 			vec3 ray_origin = pos;
 			float d_base = 0.0;
 			for (uint layer = 0u; layer < 4u; layer++) {
-				rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, range - d_base);
-				while (rayQueryProceedEXT(rq)) {
-				}
+				rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFFu, ray_origin, 0.0, dir, range - d_base);
+				RT_ALPHA_PROCEED(rq)
 				if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
 					break;
 				}
@@ -3246,9 +3246,8 @@ void trace_main() {
 	vec3 ray_origin = pos;
 	float t_base = 0.0;
 	for (uint layer = 0u; layer < 4u; layer++) {
-		rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ray_origin, 0.0, dir, dynamic ? range - t_base : 1e4);
-		while (rayQueryProceedEXT(rq)) {
-		}
+		rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFFu, ray_origin, 0.0, dir, dynamic ? range - t_base : 1e4);
+		RT_ALPHA_PROCEED(rq)
 		if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
 			break;
 		}

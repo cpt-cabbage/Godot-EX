@@ -1,3 +1,6 @@
+#ifndef RT_HIT_INC_GLSL
+#define RT_HIT_INC_GLSL
+
 // Ray-traced hit shading: the geometry pool the BLAS surfaces are unpacked
 // into, the hit packets the GI gather defers to the materials, and the
 // per-ray result slots the resolve pass folds back. Mirrors the hit shading
@@ -117,3 +120,5 @@ uvec2 rt_hit_pack_radiance_normal(vec3 c, vec3 n) {
 vec3 rt_hit_unpack_radiance(uvec2 w) {
 	return vec3(unpackHalf2x16(w.x), unpackHalf2x16(w.y).x);
 }
+
+#endif // RT_HIT_INC_GLSL

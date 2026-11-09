@@ -12,31 +12,8 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D shadow_mask;
 
-// Alpha-tested casters (rt_alpha_inc.glsl): the records, the hit shading's pools and the alpha masks.
-#include "../oct_inc.glsl"
-#include "rt_hit_inc.glsl"
-#include "surface_cache_inc.glsl"
-layout(set = 2, binding = 0, std430) restrict readonly buffer CardInstances {
-	CardInstance data[];
-}
-card_instances;
-layout(set = 2, binding = 1, std430) restrict readonly buffer AlphaGeometry {
-	HitGeometry data[];
-}
-rt_alpha_geometry;
-layout(set = 2, binding = 2, std430) restrict readonly buffer AlphaVertices {
-	uint data[];
-}
-rt_alpha_vertices;
-layout(set = 2, binding = 3, std430) restrict readonly buffer AlphaIndices {
-	uint data[];
-}
-rt_alpha_indices;
-layout(set = 2, binding = 4, std430) restrict readonly buffer AlphaTable {
-	uint data[];
-}
-rt_alpha_table;
-layout(set = 2, binding = 5) uniform sampler2DArray rt_alpha_masks;
+// Alpha-tested casters (rt_alpha_inc.glsl): the records, the hit shading's pools and the alpha masks, in set 2.
+#define RT_ALPHA_SET 2
 #include "rt_alpha_inc.glsl"
 
 layout(push_constant, std430) uniform Params {
@@ -85,7 +62,7 @@ bool trace_occluded(vec3 p_origin, vec3 p_dir, float p_max_dist) {
 	uint passed = 0u;
 	while (rayQueryProceedEXT(rqa)) {
 		if (rayQueryGetIntersectionTypeEXT(rqa, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			int covers = passed >= ALPHA_MAX_PASSES ? 1 : rt_alpha_test(rayQueryGetIntersectionInstanceCustomIndexEXT(rqa, false), rayQueryGetIntersectionGeometryIndexEXT(rqa, false), rayQueryGetIntersectionPrimitiveIndexEXT(rqa, false), rayQueryGetIntersectionBarycentricsEXT(rqa, false));
+			int covers = passed >= ALPHA_MAX_PASSES ? 1 : RT_ALPHA_CANDIDATE(rqa);
 			if (covers != 0) {
 				rayQueryConfirmIntersectionEXT(rqa);
 			} else {

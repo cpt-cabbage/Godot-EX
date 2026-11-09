@@ -42,6 +42,22 @@
 
 namespace RendererRD {
 
+// The alpha-tested casters' data a ray query needs (rt_alpha_inc.glsl): the cache's instance records, the hit
+// shading's geometry and pools, the per-frame alpha table, the masks, and a one-word state (1: test, 0: opaque
+// queries). bind() binds it as p_set where the shader variant has that set (Godot-EX, 2026-11-09).
+struct RtAlphaBinding {
+	RID records;
+	RID geometry;
+	RID vertices;
+	RID indices;
+	RID table;
+	RID masks;
+	RID sampler;
+	RID state;
+	RID dummy_buffer;
+	void bind(RD::ComputeListID p_list, RID p_shader, uint32_t p_set) const;
+};
+
 // A surface cache for shading ray hits: material data captured per mesh
 // instance into small axis-aligned "cards", lit on the GPU with the frame's
 // lights, and read back by the ray-traced GI gather wherever a ray lands.
@@ -119,6 +135,7 @@ public:
 
 	struct LightingInputs {
 		RID tlas;
+		RtAlphaBinding alpha; // The bounce and shadow rays' alpha-tested casters (set 3).
 		// The scene's planar mirrors (RaytracingScene::get_mirror_planes), world space.
 		MirrorPlaneGPU mirrors[MAX_MIRROR_PLANES] = {};
 		uint32_t mirror_count = 0;

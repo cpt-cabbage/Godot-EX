@@ -1,3 +1,6 @@
+#ifndef SURFACE_CACHE_INC_GLSL
+#define SURFACE_CACHE_INC_GLSL
+
 // Surface cache: the card geometry shared by the lighting pass and the GI
 // gather's hit lookup. Mirrors SurfaceCache in surface_cache.cpp; the two
 // must agree on every constant here.
@@ -175,3 +178,5 @@ void card_project(CardSet s, uint p_card, vec3 local_pos, out vec2 r_uv01, out f
 	r_uv01 = vec2(dot(rel, u) / hu * 0.5 + 0.5, dot(rel, v) / hv * 0.5 + 0.5);
 	r_depth = ha - dot(rel, axis);
 }
+
+#endif // SURFACE_CACHE_INC_GLSL

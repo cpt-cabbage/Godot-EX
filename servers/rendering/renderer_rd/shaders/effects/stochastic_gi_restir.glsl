@@ -77,6 +77,8 @@
 #include "../normal_roughness_inc.glsl"
 #include "../oct_inc.glsl"
 #include "rt_hit_inc.glsl"
+// Set 3: alpha-tested casters seen through their masks.
+#include "rt_alpha_inc.glsl"
 #include "rt_sample_offset_inc.glsl"
 
 #define M_PI 3.14159265359
@@ -820,9 +822,8 @@ bool visible(Surface p, vec3 dir, float dist) {
 	if (t_max <= gi.ray_bias) {
 		return true;
 	}
-	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, gi.ray_bias, dir, t_max);
-	while (rayQueryProceedEXT(rq)) {
-	}
+	rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, gi.ray_bias, dir, t_max);
+	RT_ALPHA_PROCEED(rq)
 	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }
 

@@ -54,6 +54,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "../oct_inc.glsl"
 #include "rt_hit_inc.glsl"
 #include "surface_cache_inc.glsl"
+// Set 3: alpha-tested casters seen through their masks.
+#include "rt_alpha_inc.glsl"
 
 #define SDFGI_MAX_CASCADES 8
 
@@ -887,9 +889,8 @@ bool mirror_occluded(vec3 from_world, vec3 to_world) {
 		return false;
 	}
 	rayQueryEXT sq;
-	rayQueryInitializeEXT(sq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, from_world, 0.0, d / len, len);
-	while (rayQueryProceedEXT(sq)) {
-	}
+	rayQueryInitializeEXT(sq, tlas, RT_ALPHA_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, from_world, 0.0, d / len, len);
+	RT_ALPHA_PROCEED(sq)
 	return rayQueryGetIntersectionTypeEXT(sq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }
 #endif
@@ -1673,9 +1674,8 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 	// was measured: one ray in a hundred, and 0.5-0.8 ms on this
 	// register-bound pass for the code alone, as a loop or as a second
 	// trace.
-	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, bool(params.flags & FLAG_ABLATE_RAYS) ? params.ray_bias : t_max);
-	while (rayQueryProceedEXT(rq)) {
-	}
+	rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFF, origin + params.world_from_view[3].xyz, params.ray_bias, world_dir, bool(params.flags & FLAG_ABLATE_RAYS) ? params.ray_bias : t_max);
+	RT_ALPHA_PROCEED(rq)
 #endif
 	if (GATHER_HIT_COMMITTED) {
 		float t_hit = GATHER_HIT_T;
@@ -1775,9 +1775,8 @@ vec3 trace_radiance_chain(vec3 rel_origin, vec3 world_geo_normal, vec3 world_dir
 					float plane_alpha = params.mirrors[plane].params.y * params.mirrors[plane].params.y;
 					chain_cone_tan = max(chain_cone_tan, 2.0 * plane_alpha);
 					rayQueryEXT rq2;
-					rayQueryInitializeEXT(rq2, tlas, gl_RayFlagsOpaqueEXT, 0xFF, from + n * params.ray_bias, params.ray_bias, dir, t_max);
-					while (rayQueryProceedEXT(rq2)) {
-					}
+					rayQueryInitializeEXT(rq2, tlas, RT_ALPHA_RAY_FLAGS, 0xFF, from + n * params.ray_bias, params.ray_bias, dir, t_max);
+					RT_ALPHA_PROCEED(rq2)
 					if (rayQueryGetIntersectionTypeEXT(rq2, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
 						break; // The sky: nothing (the box has none; a real scene's sky is the cards' job).
 					}
@@ -2309,9 +2308,8 @@ void trace_main() {
 	// as in the single kernel.
 	float t_min = (record % GATHER_SLOTS) == params.ray_count + 1u ? 0.0 : params.ray_bias;
 	rayQueryEXT rq;
-	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, uintBitsToFloat(a.xyz), t_min, uintBitsToFloat(b.xyz), uintBitsToFloat(a.w));
-	while (rayQueryProceedEXT(rq)) {
-	}
+	rayQueryInitializeEXT(rq, tlas, RT_ALPHA_RAY_FLAGS, 0xFF, uintBitsToFloat(a.xyz), t_min, uintBitsToFloat(b.xyz), uintBitsToFloat(a.w));
+	RT_ALPHA_PROCEED(rq)
 	uvec4 answer = uvec4(0u);
 	if (GATHER_HIT_COMMITTED) {
 		answer = uvec4(GATHER_RECORD_HIT | (GATHER_HIT_FRONT_FACE ? GATHER_RECORD_FRONT_FACE : 0u) | (GATHER_HIT_GEOMETRY << 8u), floatBitsToUint(GATHER_HIT_T), GATHER_HIT_INSTANCE, GATHER_HIT_PRIMITIVE);

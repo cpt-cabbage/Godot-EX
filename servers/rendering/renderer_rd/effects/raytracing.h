@@ -290,7 +290,7 @@ private:
 	};
 
 	bool _alpha_shadows_ready() const;
-	void _bind_alpha_shadows(RD::ComputeListID p_list, RID p_shader);
+	RtAlphaBinding _alpha_binding(uint32_t p_pass) const;
 
 	RaytracedShadowsShaderRD shader;
 	RID shader_version;

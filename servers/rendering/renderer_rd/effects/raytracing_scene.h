@@ -299,6 +299,8 @@ private:
 	RID alpha_source_sampler; // linear with mipmaps, repeat
 	RID alpha_masks; // 2D array, R8
 	RID alpha_masks_dummy; // one layer, white: bound when there are none
+	RID alpha_state_on; // one word, 1: the queries test the masks
+	RID alpha_state_off; // one word, 0: opaque queries
 	uint32_t alpha_mask_capacity = 0;
 	uint32_t alpha_mask_count = 0;
 	HashMap<RID, uint32_t> alpha_mask_layers; // by source texture
@@ -372,6 +374,7 @@ public:
 	RID get_alpha_masks() const { return alpha_masks.is_valid() ? alpha_masks : alpha_masks_dummy; }
 	RID get_alpha_sampler() const { return alpha_sampler; }
 	uint32_t get_alpha_mask_count() const { return alpha_mask_count; }
+	RID get_alpha_state(bool p_on) const { return p_on ? alpha_state_on : alpha_state_off; }
 	const LocalVector<HitMaterial> &get_hit_materials() const { return hit_material_slots; }
 
 	RaytracingScene();

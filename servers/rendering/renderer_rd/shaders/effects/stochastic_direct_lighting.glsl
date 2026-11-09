@@ -181,6 +181,8 @@ layout(set = 0, binding = 14) uniform texture2D decal_atlas_srgb;
 
 // The surface cache's tables, for the coverage of alpha-tested casters.
 #include "surface_cache_inc.glsl"
+// Set 3: alpha-tested casters seen through their masks.
+#include "rt_alpha_inc.glsl"
 layout(set = 0, binding = 15, std430) restrict readonly buffer CardInstances {
 	CardInstance data[];
 }
@@ -921,7 +923,8 @@ bool trace_visible(vec3 world_origin, vec3 world_target, uint caster_mask) {
 	while (rayQueryProceedEXT(rq)) {
 		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 			vec3 hit = world_origin + dir * rayQueryGetIntersectionTEXT(rq, false);
-			if (passed >= 4u || card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), hit, dir)) {
+			int masked = passed >= 4u ? 1 : RT_ALPHA_CANDIDATE(rq);
+			if (masked == 1 || (masked == -1 && card_covers(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), hit, dir))) {
 				rayQueryConfirmIntersectionEXT(rq);
 			} else {
 				passed++;
