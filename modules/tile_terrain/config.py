@@ -7,7 +7,7 @@ def configure(env):
 
 
 def get_doc_classes():
-    return ["TileTerrain3D"]
+    return ["InstanceField3D", "TileTerrain3D"]
 
 
 def get_doc_path():

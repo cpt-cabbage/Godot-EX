@@ -30,6 +30,7 @@
 
 #include "register_types.h"
 
+#include "instance_field_3d.h"
 #include "tile_terrain_3d.h"
 
 #include "core/object/class_db.h"
@@ -38,6 +39,7 @@ void initialize_tile_terrain_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
+	GDREGISTER_CLASS(InstanceField3D);
 	GDREGISTER_CLASS(TileTerrain3D);
 }
 
