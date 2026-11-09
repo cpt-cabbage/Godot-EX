@@ -327,7 +327,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	m[44] = cloud_shadow_origin.x;
 	m[45] = cloud_shadow_origin.y;
 	m[46] = cloud_shadow_size;
-	m[47] = cloud_base - altitude_offset; // the base's world y
+	m[47] = get_cloud_shell().x - altitude_offset; // the shadow map's plane (the clouds' lowest base), world y
 	// For SunShadowEffect (the ground's sun shadow without ray tracing, next frame).
 	for (int i = 0; i < 8; i++) {
 		sun_shadow_params[i] = m[20 + i];
@@ -342,7 +342,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	sun_shadow_params[17] = m[41];
 	sun_shadow_ready = true;
 	// The ground's sun shadow (the ray-traced mask, next frame) takes the clouds' shadow too.
-	RendererRD::Raytracing::set_sun_shadow_modulator(cloud_shadow_rd, Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset), cloud_shadows_on);
+	RendererRD::Raytracing::set_sun_shadow_modulator(cloud_shadow_rd, Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset), cloud_shadows_on);
 	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
 	// Rebuilt when the light has moved by about 0.02 degrees.
 	const bool rebuild_shadow = shadows && (shadow_dirty || light_direction.distance_to(shadow_light) > 3e-4f);
@@ -390,7 +390,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		}
 		f[o - 1] = heights_rd.is_valid() ? 1.0f : 0.0f;
 		v4(light_illuminance, 0, 0, 0);
-		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset);
+		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset);
 		v4(cloud_shadows_on ? 1.0f : 0.0f, 0, 0, 0);
 		v4(weather_mist_density, weather_mist_top, precipitation, 0);
 		// The world to the camera's view space, and whether the sun's cascades are there to read (no ray-traced shadows).
@@ -641,7 +641,7 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "100,50000,1,suffix:m")
 	FB(cloud_detail_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "10,5000,1,suffix:m")
 	FB(cloud_weather_scale, Variant::FLOAT, PROPERTY_HINT_RANGE, "500,200000,1,suffix:m")
-	FB(cloud_erosion, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(cloud_erosion, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
 	FB(cloud_wind, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m/s")
 	FB(cloud_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.95,0.01")
 	FB(cloud_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
@@ -653,7 +653,13 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.97,0.01")
 	FB(cloud_shadows, Variant::BOOL, PROPERTY_HINT_NONE, "")
 	FB(cloud_shadow_size, Variant::FLOAT, PROPERTY_HINT_RANGE, "1000,200000,1,suffix:m")
+	FB(cloud_cell_size, Variant::FLOAT, PROPERTY_HINT_RANGE, "200,20000,1,suffix:m")
+	FB(cloud_type_spread, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.5,0.01")
+	FB(cloud_base_spread, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2000,1,suffix:m")
+	FB(cloud_lifetime, Variant::FLOAT, PROPERTY_HINT_RANGE, "30,20000,1,suffix:s")
+	FB(cloud_variation, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
 	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
+	ClassDB::bind_method(D_METHOD("get_cloud_shell"), &AtmosphereEffect::get_cloud_shell);
 	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);
 #undef FB
 	ClassDB::bind_method(D_METHOD("set_apply_aerial", "apply"), &AtmosphereEffect::set_apply_aerial);

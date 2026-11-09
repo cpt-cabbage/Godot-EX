@@ -45,14 +45,26 @@ enum {
 	CLOUD_MARCH,
 	CLOUD_PANORAMA,
 	CLOUD_SHADOW,
+	CLOUD_MAP,
 	CLOUD_MODES,
 };
 
+// By type: stratus a few hundred metres, fair cumulus about a kilometre (humilis is wider than tall), mediocris and
+// congestus a few, cumulonimbus 8 km (clouds.glsl's type_thickness: the same curve).
+float AtmosphereEffect::cloud_type_thickness(float p_type) {
+	const float t = CLAMP(p_type, 0.0f, 1.0f);
+	return t < 0.5f ? Math::lerp(300.0f, 1000.0f, t * 2.0f) : 1000.0f * Math::pow(8.0f, Math::pow((t - 0.5f) * 2.0f, 1.5f));
+}
+
 float AtmosphereEffect::get_cloud_thickness() const {
-	// By type: a layer of stratus, heaped cumulus, towers.
-	const float t = CLAMP(cloud_type, 0.0f, 1.0f);
-	const float h = t < 0.5f ? Math::lerp(500.0f, 2000.0f, t * 2.0f) : Math::lerp(2000.0f, 7000.0f, t * 2.0f - 1.0f);
-	return h * cloud_thickness_scale;
+	return cloud_type_thickness(cloud_type) * cloud_thickness_scale;
+}
+
+Vector2 AtmosphereEffect::get_cloud_shell() const {
+	// The tallest a cell can be: the type's spread, the cover's lift of it (0.1), the cell's own (1.3 times).
+	const float top = cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
+	const float bottom = cloud_base - cloud_base_spread - 60.0f;
+	return Vector2(bottom, cloud_base + cloud_base_spread + 60.0f + top - bottom);
 }
 
 void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
@@ -64,6 +76,7 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 		modes.push_back("\n#define MODE_MARCH\n");
 		modes.push_back("\n#define MODE_PANORAMA\n");
 		modes.push_back("\n#define MODE_SHADOW\n");
+		modes.push_back("\n#define MODE_MAP\n");
 		cloud_shader.initialize(modes);
 		cloud_version = cloud_shader.version_create();
 		for (int i = 0; i < CLOUD_MODES; i++) {
@@ -95,6 +108,14 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 		ts.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 		cloud_shadow_rd = rd->texture_create(ts, RD::TextureView());
 		rd->texture_clear(cloud_shadow_rd, Color(1, 1, 1, 1), 0, 1, 0, 1);
+		RD::TextureFormat tm;
+		tm.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+		tm.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		tm.width = CLOUD_MAP_N;
+		tm.height = CLOUD_MAP_N;
+		tm.array_layers = 2;
+		tm.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+		weather_map_rd = rd->texture_create(tm, RD::TextureView());
 		cloud_ubo = rd->uniform_buffer_create(sizeof(float) * CLOUD_FLOATS);
 		cloud_noise_ready = false;
 		cloud_noise_slice = -1;
@@ -128,7 +149,7 @@ void AtmosphereEffect::_clouds_free() {
 		return;
 	}
 	RendererRD::Raytracing::set_sun_shadow_modulator(RID(), Vector4(), false);
-	for (RID r : { noise_base_rd, noise_detail_rd, cloud_shadow_rd, cloud_ubo, sampler_repeat, clouds_rd[0], clouds_rd[1], cloud_depth_rd[0], cloud_depth_rd[1] }) {
+	for (RID r : { noise_base_rd, noise_detail_rd, cloud_shadow_rd, weather_map_rd, cloud_ubo, sampler_repeat, clouds_rd[0], clouds_rd[1], cloud_depth_rd[0], cloud_depth_rd[1] }) {
 		if (r.is_valid()) {
 			rd->free_rid(r);
 		}
@@ -150,6 +171,8 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	const double dt = cloud_last_ticks == 0 ? 0.0 : MIN(double(now - cloud_last_ticks) * 1e-6, 0.25);
 	cloud_last_ticks = now;
 	cloud_offset += cloud_wind * float(dt);
+	// The cells' life: a phase of `cloud_lifetime`, wrapped where it repeats (float precision).
+	cloud_time = Math::fmod(cloud_time + dt, double(MAX(cloud_lifetime, 1.0f)) * 64.0);
 
 	float f[CLOUD_FLOATS] = {};
 	for (int c = 0; c < 4; c++) {
@@ -173,7 +196,8 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(cloud_prev_cam.x, cloud_prev_cam.y, cloud_prev_cam.z, cloud_prev_valid && cloud_history > 0.0f ? 1.0f : 0.0f);
 	v4(light_direction.x, light_direction.y, light_direction.z, light_illuminance);
 	v4(light_color.r, light_color.g, light_color.b, cloud_anisotropy);
-	v4(cloud_base, get_cloud_thickness(), cloud_type, CLAMP(cloud_cover, 0.0f, 1.0f));
+	const Vector2 shell = get_cloud_shell();
+	v4(shell.x, shell.y, cloud_type, CLAMP(cloud_cover, 0.0f, 1.0f));
 	v4(cloud_density, cloud_scale, cloud_detail_scale, cloud_weather_scale);
 	v4(cloud_offset.x, cloud_offset.y, cloud_offset.z, cloud_erosion);
 	v4(planet_radius * 1000.0f, altitude_offset, cloud_reach, CLAMP(cloud_history, 0.0f, 0.97f));
@@ -184,6 +208,16 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
 	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, 0, 0);
 	v4(lightning_position.x, lightning_position.y, lightning_position.z, lightning_flash * lightning_energy);
+	// The weather map: near and far layers round the camera, their origins snapped to a texel.
+	const float far_side = MAX(cloud_reach * 2.0f, CLOUD_MAP_NEAR * 2.0f);
+	auto snap = [&](float p_side, float p_v) {
+		const float texel = p_side / CLOUD_MAP_N;
+		return Math::floor((p_v - p_side * 0.5f) / texel) * texel;
+	};
+	v4(cloud_base, cloud_thickness_scale, cloud_type_spread, cloud_base_spread);
+	v4(snap(CLOUD_MAP_NEAR, p_cam.origin.x), snap(CLOUD_MAP_NEAR, p_cam.origin.z), CLOUD_MAP_NEAR, far_side);
+	v4(snap(far_side, p_cam.origin.x), snap(far_side, p_cam.origin.z), float(cloud_time), MAX(cloud_cell_size, 100.0f));
+	v4(MAX(cloud_lifetime, 1.0f), CLAMP(cloud_variation, 0.0f, 1.0f), 0, 0);
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;
@@ -216,14 +250,17 @@ void AtmosphereEffect::_clouds_dispatch(int64_t p_list, RID p_depth, bool p_marc
 	RD::Uniform u_base(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler_repeat, noise_base_rd }));
 	RD::Uniform u_detail(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler_repeat, noise_detail_rd }));
 	RD::Uniform u_sky(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, sky_view_rd }));
+	RD::Uniform u_map(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 11, Vector<RID>({ sampler, weather_map_rd }));
 	if (!p_march) {
-		// Before the aerial pass: the shadow map (the haze and the air volume read it).
-		run(CLOUD_SHADOW, { u_ubo, u_base, u_detail, u_sky, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, Vector<RID>({ cloud_shadow_rd })) }, CLOUD_SHADOW_N, CLOUD_SHADOW_N);
+		// The weather map first (each frame: the cells drift and live), then before the aerial pass the shadow map (the
+		// haze and the air volume read it).
+		run(CLOUD_MAP, { u_ubo, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ weather_map_rd })) }, CLOUD_MAP_N, CLOUD_MAP_N);
+		run(CLOUD_SHADOW, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, Vector<RID>({ cloud_shadow_rd })) }, CLOUD_SHADOW_N, CLOUD_SHADOW_N);
 		return;
 	}
 	const int cur = cloud_frame & 1, prev = cur ^ 1;
-	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })) }, cloud_size.x, cloud_size.y);
-	run(CLOUD_PANORAMA, { u_ubo, u_base, u_detail, u_sky, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ cloud_panorama_rd })) }, CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
+	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })) }, cloud_size.x, cloud_size.y);
+	run(CLOUD_PANORAMA, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ cloud_panorama_rd })) }, CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
 	cloud_current = clouds_rd[cur];
 	cloud_current_depth = cloud_depth_rd[cur];
 	cloud_prev_view_proj = cloud_view_proj;

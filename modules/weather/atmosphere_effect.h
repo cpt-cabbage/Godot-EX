@@ -167,10 +167,10 @@ class AtmosphereEffect : public CompositorEffect {
 	float cloud_type = 0.5;
 	float cloud_thickness_scale = 1.0;
 	float cloud_density = 0.04;
-	float cloud_scale = 3000.0;
+	float cloud_scale = 1800.0;
 	float cloud_detail_scale = 280.0;
 	float cloud_weather_scale = 14000.0;
-	float cloud_erosion = 0.35;
+	float cloud_erosion = 1.0;
 	Vector3 cloud_wind = Vector3(6, 0, 3);
 	float cloud_anisotropy = 0.8;
 	float cloud_sky_light = 1.0;
@@ -182,14 +182,24 @@ class AtmosphereEffect : public CompositorEffect {
 	float cloud_history = 0.85;
 	bool cloud_shadows = true;
 	float cloud_shadow_size = 40000.0;
+	// The weather map (2026-11-09): the clouds as cells of `cloud_cell_size` (a cloud each, alive by the cover), their
+	// type and height varying by `cloud_type_spread` and `cloud_base_spread` m round the layer's, the cover by
+	// `cloud_variation` over `cloud_weather_scale`; each cell forms and dissolves over `cloud_lifetime` s.
+	float cloud_cell_size = 2000.0;
+	float cloud_type_spread = 0.15;
+	float cloud_base_spread = 150.0;
+	float cloud_lifetime = 1200.0;
+	float cloud_variation = 0.6;
 	CloudsShaderRD cloud_shader;
 	RID cloud_version;
-	RID cloud_pipelines[5];
+	RID cloud_pipelines[6];
 	RID sampler_repeat;
 	RID noise_base_rd, noise_detail_rd;
 	RID clouds_rd[2], cloud_depth_rd[2];
 	RID cloud_current, cloud_current_depth;
 	RID cloud_panorama_rd, cloud_shadow_rd;
+	RID weather_map_rd; // RGBA16F, two layers: near and far
+	double cloud_time = 0.0;
 	Ref<Texture2DRD> cloud_panorama_texture;
 	RID cloud_ubo;
 	bool cloud_noise_ready = false;
@@ -253,7 +263,9 @@ public:
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
 	static constexpr int CAMERA_FLOATS = 48; // atmosphere.glsl's Camera block
-	static constexpr int CLOUD_FLOATS = 32 + 4 * 14; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_FLOATS = 32 + 4 * 18; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_MAP_N = 512; // the weather map's side (texels), each layer
+	static constexpr float CLOUD_MAP_NEAR = 32000.0f; // the near layer's side (m); the far one's twice the reach
 	static constexpr int CLOUD_NOISE_SLICES = 8; // base noise slices made a frame
 	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
@@ -363,11 +375,19 @@ public:
 	FOGP(float, cloud_history)
 	FOGP(bool, cloud_shadows)
 	FOGP(float, cloud_shadow_size)
+	FOGP(float, cloud_cell_size)
+	FOGP(float, cloud_type_spread)
+	FOGP(float, cloud_base_spread)
+	FOGP(float, cloud_lifetime)
+	FOGP(float, cloud_variation)
 #undef FOGP
 	void set_cloud_resolution(float p_v) { cloud_resolution = CLAMP(p_v, 0.125f, 1.0f); }
 	float get_cloud_resolution() const { return cloud_resolution; }
-	// The layer's thickness (m) its type gives it.
+	// A cloud's thickness (m) at a type (0 layered, 0.5 heaped, 1 towering), and the layer's at its type.
+	static float cloud_type_thickness(float p_type);
 	float get_cloud_thickness() const;
+	// The shell the clouds can fill (m above sea level): x its bottom, y its height.
+	Vector2 get_cloud_shell() const;
 	// The clouds over the whole sky round the camera (equirectangular: rgb their light, a the transmittance).
 	Ref<Texture2D> get_cloud_panorama_texture();
 	void set_apply_aerial(bool p_v) { apply_aerial = p_v; }

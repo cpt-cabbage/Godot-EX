@@ -1141,7 +1141,8 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	const float mod_data[8] = { sun_modulator_frame.x, sun_modulator_frame.y, MAX(sun_modulator_frame.z, 1.0f), sun_modulator_frame.w, modulated ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
 	rd->buffer_update(sun_modulator_ubo, 0, sizeof(mod_data), mod_data);
 	RID mod_texture = modulated ? sun_modulator : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
-	RD::Uniform u_mod(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, mod_texture }));
+	// Filtered (the default sampler is nearest: the clouds' 78 m texels showed as squares in their shadow).
+	RD::Uniform u_mod(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ material_sampler.is_valid() ? material_sampler : sampler, mod_texture }));
 	RD::Uniform u_mod_ubo(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 3, Vector<RID>({ sun_modulator_ubo }));
 
 	RENDER_TIMESTAMP("RT Sun Shadows Trace");
