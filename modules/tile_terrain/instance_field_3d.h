@@ -42,6 +42,9 @@
 // level's band: Godot-EX's surface cache gives each its own cards (captured, and lit at its own place), where a
 // MultiMesh cell shares one set, captured whole, so a ray that hits a tree reads that tree's light, not the cell's.
 //
+// With `level_fade` the levels overlap and dither into each other (see set_level_fade), so a level change is a short
+// crossfade as the viewer moves, not a pop.
+//
 // A procedural type (add_procedural_type: grass and the like, too many to store) is made near the viewer: each base
 // cell, deterministically from its coordinates, gets density x area candidates at random places, kept with the
 // probability its weight map gives there, standing on the terrain (set_terrain) leaned toward its normal, turned and
@@ -49,6 +52,7 @@
 // copy has a random rank: a level draws only the copies whose rank is under its `thin` share, scaled up by
 // 1/sqrt(share) (at most 1.25x: larger, they read as coarse sticks) to keep some of the cover, so far levels draw fewer, larger tufts.
 
+#include "core/math/vector4.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "core/object/worker_thread_pool.h"
@@ -69,6 +73,8 @@ class InstanceField3D : public Node3D {
 		Ref<Mesh> mesh;
 		float begin = 0.0;
 		float end = 0.0;
+		float draw_end = 0.0; // copies are drawn to here: past `end` by the crossfade into the next level
+		Vector4 fade = Vector4(-1.0, -1.0, 1e18, 1e18); // the shader's lod_fade: fades in over x..y, out over z..w (m)
 		double cell = 64.0; // a draw cell's side
 		int cell_span = 1; // base cells a draw cell's side
 		bool shadows = true;
@@ -135,6 +141,7 @@ class InstanceField3D : public Node3D {
 	int grid_x = 0;
 	int grid_z = 0;
 	int per_copy_levels = 0;
+	float level_fade = 0.0;
 	bool follow_camera = true;
 	Vector3 focus_position;
 	Vector3 viewer; // in local space, for the jobs
@@ -185,6 +192,12 @@ public:
 	int get_instance_count(int p_type) const;
 	void clear();
 
+	// Levels crossfade instead of switching: each level but the last is drawn on past its end by this share of it, and
+	// every instance gets the shader parameter `lod_fade` (a vec4: the copy fades in from x to y metres from the viewer
+	// and out from z to w; a shader that declares `instance uniform vec4 lod_fade` dithers by it, world/valley's
+	// lod_fade.gdshaderinc). The last level fades out to nothing before its end. Set before adding types; 0 switches.
+	void set_level_fade(float p_fade);
+	float get_level_fade() const { return level_fade; }
 	void set_per_copy_levels(int p_levels);
 	int get_per_copy_levels() const { return per_copy_levels; }
 	void set_follow_camera(bool p_follow) { follow_camera = p_follow; }

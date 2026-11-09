@@ -130,6 +130,29 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		lv.cell_span = span;
 		lv.cell = span * base_cell;
 		lv.shadows = l < p_shadow_levels;
+		lv.draw_end = lv.end;
+	}
+	if (level_fade > 0.0f) {
+		// The crossfade's window past a level's end: inside the overlap by a margin each side, so a level whose cells
+		// were filled a little ago (a refill waits for the viewer to move 1 % of the level's end) still holds the copies
+		// the window needs.
+		const int last = p_meshes.size() - 1;
+		for (int l = 0; l <= last; l++) {
+			Level &lv = t.levels[l];
+			if (l > 0) {
+				const Level &prev = t.levels[l - 1];
+				lv.fade.x = prev.fade.z;
+				lv.fade.y = prev.fade.w;
+			}
+			if (l < last) {
+				lv.draw_end = lv.end * (1.0f + level_fade);
+				lv.fade.z = lv.end * (1.0f + 0.2f * level_fade);
+				lv.fade.w = lv.end * (1.0f + 0.9f * level_fade);
+			} else {
+				lv.fade.z = lv.end * (1.0f - 0.6f * level_fade);
+				lv.fade.w = lv.end * 0.98f;
+			}
+		}
 	}
 	return int(types.size()) - 1;
 }
@@ -316,6 +339,11 @@ void InstanceField3D::_free_copies(Level &p_level) {
 	p_level.copies.clear();
 }
 
+void InstanceField3D::set_level_fade(float p_fade) {
+	ERR_FAIL_COND_MSG(!types.is_empty(), "InstanceField3D: set the level fade before adding types.");
+	level_fade = CLAMP(p_fade, 0.0f, 1.0f);
+}
+
 void InstanceField3D::set_per_copy_levels(int p_levels) {
 	per_copy_levels = CLAMP(p_levels, 0, 8);
 	_free_all();
@@ -326,11 +354,11 @@ void InstanceField3D::set_per_copy_levels(int p_levels) {
 void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible) {
 	RenderingServer *rs = RS::get_singleton();
 	p_level.copies_frame++;
-	const float b2 = p_level.begin * p_level.begin, e2 = p_level.end * p_level.end;
-	const int x0 = MAX(0, int(Math::floor((viewer.x - p_level.end - grid_origin.x) / base_cell)));
-	const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + p_level.end - grid_origin.x) / base_cell)));
-	const int z0 = MAX(0, int(Math::floor((viewer.z - p_level.end - grid_origin.y) / base_cell)));
-	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + p_level.end - grid_origin.y) / base_cell)));
+	const float b2 = p_level.begin * p_level.begin, e2 = p_level.draw_end * p_level.draw_end;
+	const int x0 = MAX(0, int(Math::floor((viewer.x - p_level.draw_end - grid_origin.x) / base_cell)));
+	const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + p_level.draw_end - grid_origin.x) / base_cell)));
+	const int z0 = MAX(0, int(Math::floor((viewer.z - p_level.draw_end - grid_origin.y) / base_cell)));
+	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + p_level.draw_end - grid_origin.y) / base_cell)));
 	LocalVector<uint32_t> in_band;
 	for (int bz = z0; bz <= z1; bz++) {
 		for (int bx = x0; bx <= x1; bx++) {
@@ -357,6 +385,9 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 		const Transform3D t(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11]));
 		RID inst = rs->instance_create2(p_level.mesh.is_valid() ? p_level.mesh->get_rid() : RID(), p_scenario);
 		rs->instance_set_transform(inst, p_xf * t);
+		if (level_fade > 0.0f) {
+			rs->instance_geometry_set_shader_parameter(inst, SNAME("lod_fade"), p_level.fade);
+		}
 		rs->instance_geometry_set_cast_shadows_setting(inst, p_level.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
 		rs->instance_set_visible(inst, p_visible);
 		kept.insert(i, inst);
@@ -388,7 +419,7 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 	Job &j = p_jobs[p_index];
 	const Type &t = types[j.type];
 	const Level &lv = t.levels[j.level];
-	const float b2 = lv.begin * lv.begin, e2 = lv.end * lv.end;
+	const float b2 = lv.begin * lv.begin, e2 = lv.draw_end * lv.draw_end;
 	LocalVector<float> out;
 	uint64_t h = 1469598103934665603ULL;
 	int count = 0;
@@ -506,16 +537,16 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 			}
 			updated.push_back(Vector2i(ti, li));
 			const int ncx = (grid_x + lv.cell_span - 1) / lv.cell_span, ncz = (grid_z + lv.cell_span - 1) / lv.cell_span;
-			const int x0 = MAX(0, int(Math::floor((viewer.x - lv.end - grid_origin.x) / lv.cell)));
-			const int x1 = MIN(ncx - 1, int(Math::floor((viewer.x + lv.end - grid_origin.x) / lv.cell)));
-			const int z0 = MAX(0, int(Math::floor((viewer.z - lv.end - grid_origin.y) / lv.cell)));
-			const int z1 = MIN(ncz - 1, int(Math::floor((viewer.z + lv.end - grid_origin.y) / lv.cell)));
+			const int x0 = MAX(0, int(Math::floor((viewer.x - lv.draw_end - grid_origin.x) / lv.cell)));
+			const int x1 = MIN(ncx - 1, int(Math::floor((viewer.x + lv.draw_end - grid_origin.x) / lv.cell)));
+			const int z0 = MAX(0, int(Math::floor((viewer.z - lv.draw_end - grid_origin.y) / lv.cell)));
+			const int z1 = MIN(ncz - 1, int(Math::floor((viewer.z + lv.draw_end - grid_origin.y) / lv.cell)));
 			for (int cz = z0; cz <= z1; cz++) {
 				for (int cx = x0; cx <= x1; cx++) {
 					// The cell's nearest and farthest point in x, z against the band.
 					const double ax = grid_origin.x + cx * lv.cell, az = grid_origin.y + cz * lv.cell;
 					const double nx = CLAMP(double(viewer.x), ax, ax + lv.cell) - viewer.x, nz = CLAMP(double(viewer.z), az, az + lv.cell) - viewer.z;
-					if (nx * nx + nz * nz >= double(lv.end) * lv.end) {
+					if (nx * nx + nz * nz >= double(lv.draw_end) * lv.draw_end) {
 						continue;
 					}
 					const double fx = MAX(Math::abs(ax - viewer.x), Math::abs(ax + lv.cell - viewer.x));
@@ -574,6 +605,9 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 			rs->multimesh_set_mesh(nc.multimesh, lv.mesh.is_valid() ? lv.mesh->get_rid() : RID());
 			nc.instance = rs->instance_create2(nc.multimesh, scenario);
 			rs->instance_set_transform(nc.instance, xf);
+			if (level_fade > 0.0f) {
+				rs->instance_geometry_set_shader_parameter(nc.instance, SNAME("lod_fade"), lv.fade);
+			}
 			rs->instance_geometry_set_cast_shadows_setting(nc.instance, lv.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
 			rs->instance_set_visible(nc.instance, vis);
 			lv.cells.insert(j.key, nc);
@@ -706,6 +740,8 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_type_count"), &InstanceField3D::get_type_count);
 	ClassDB::bind_method(D_METHOD("get_instance_count", "type"), &InstanceField3D::get_instance_count);
 	ClassDB::bind_method(D_METHOD("clear"), &InstanceField3D::clear);
+	ClassDB::bind_method(D_METHOD("set_level_fade", "fade"), &InstanceField3D::set_level_fade);
+	ClassDB::bind_method(D_METHOD("get_level_fade"), &InstanceField3D::get_level_fade);
 	ClassDB::bind_method(D_METHOD("set_per_copy_levels", "levels"), &InstanceField3D::set_per_copy_levels);
 	ClassDB::bind_method(D_METHOD("get_per_copy_levels"), &InstanceField3D::get_per_copy_levels);
 	ClassDB::bind_method(D_METHOD("set_follow_camera", "follow"), &InstanceField3D::set_follow_camera);
@@ -715,6 +751,7 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_now", "position", "force"), &InstanceField3D::update_now, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_stats"), &InstanceField3D::get_stats);
 
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "level_fade", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_level_fade", "get_level_fade");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "per_copy_levels", PROPERTY_HINT_RANGE, "0,8,1"), "set_per_copy_levels", "get_per_copy_levels");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_camera"), "set_follow_camera", "get_follow_camera");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "focus_position", PROPERTY_HINT_NONE, "suffix:m"), "set_focus_position", "get_focus_position");
