@@ -166,9 +166,9 @@ class AtmosphereEffect : public CompositorEffect {
 	float cloud_base = 2600.0;
 	float cloud_type = 0.5;
 	float cloud_thickness_scale = 1.0;
-	float cloud_density = 0.04;
-	float cloud_scale = 1800.0;
-	float cloud_detail_scale = 280.0;
+	float cloud_density = 0.08;
+	float cloud_scale = 3000.0;
+	float cloud_detail_scale = 400.0;
 	float cloud_weather_scale = 14000.0;
 	float cloud_erosion = 1.0;
 	Vector3 cloud_wind = Vector3(6, 0, 3);
@@ -185,7 +185,7 @@ class AtmosphereEffect : public CompositorEffect {
 	// The weather map (2026-11-09): the clouds as cells of `cloud_cell_size` (a cloud each, alive by the cover), their
 	// type and height varying by `cloud_type_spread` and `cloud_base_spread` m round the layer's, the cover by
 	// `cloud_variation` over `cloud_weather_scale`; each cell forms and dissolves over `cloud_lifetime` s.
-	float cloud_cell_size = 2000.0;
+	float cloud_cell_size = 3500.0;
 	float cloud_type_spread = 0.15;
 	float cloud_base_spread = 150.0;
 	float cloud_lifetime = 1200.0;

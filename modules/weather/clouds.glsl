@@ -334,7 +334,10 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 	// Lean: the wind grows with height, so a cloud's top runs ahead of its base (read where it came from).
 	vec3 ws = w;
 	ws.xz -= clouds.motion.xy * (clouds.motion.z * max(a - clouds.layer.x, 0.0));
-	vec4 m = weather_at(ws);
+	// Torn outlines: where the map is read wanders by up to a quarter of a cell over a few kilometres (the map's cones
+	// alone gave every cloud a round, convex outline: blobs, against the photos' ragged masses).
+	vec3 wn = textureLod(noise_base, (ws - clouds.wind.xyz) / (clouds.shape.y * 2.5), 0.0).gba;
+	vec4 m = weather_at(ws + vec3(wn.x - 0.5, 0.0, wn.y - 0.5) * (clouds.map_far.w * 0.5));
 	float h = (a - m.b) / max(m.a, 1.0);
 	cs.h = clamp(h, 0.0, 1.0);
 	if (h < 0.0) {
@@ -364,7 +367,7 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 	// saturate(noise - (1 - profile)), so the noise's lumps make the outline and the profile its envelope.
 	float d;
 	if (cheap) {
-		d = clamp(dp - 0.45, 0.0, 1.0);
+		d = clamp(dp - 0.45, 0.0, 1.0) * smoothstep(0.0, 0.6, dp);
 	} else {
 		// Squashed: a lump of the noise wider than it is tall.
 		vec3 q = (ws - clouds.wind.xyz) / clouds.shape.y;
@@ -382,12 +385,15 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 		float fine = dot(textureLod(noise_detail, dq, 0.0).rgb, vec3(0.625, 0.25, 0.125)); // Worley cells, 1 at a cell's point
 		// Billows: the heaped lumps with smaller ones on them; wisps: Perlin-Worley frayed by inverted Worley (webs),
 		// finer inward.
-		float billowy = mix(heaped, fine, 0.3);
+		float billowy = mix(heaped, fine, 0.2);
 		float wispy = mix(n.r, 1.0 - fine, 0.35 + 0.3 * dp);
 		float detail_type = smoothstep(0.25, 0.55, t) * mix(0.6, 1.0, smoothstep(0.0, 0.25, h));
 		float noise = mix(1.0, mix(wispy, billowy, detail_type), clouds.wind.w);
-		d = clamp(noise - (1.0 - dp), 0.0, 1.0);
-		d = pow(d, 0.6); // sharpened: the thin edge made definite
+		// Billowed tops crisp (sharpened, as Nubis does), the rest thinner toward the outside of the profile: a base's and
+		// a layer's fringe translucent and wispy (the photos' clouds fade there; a dense fringe all round read as cotton).
+		float dl = clamp(noise - (1.0 - dp), 0.0, 1.0);
+		float crisp = detail_type * smoothstep(0.25, 0.6, h);
+		d = mix(dl * smoothstep(0.0, 0.6, dp), sqrt(dl), crisp);
 	}
 	cs.density = d * clouds.shape.x;
 	return cs;
@@ -466,9 +472,9 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 			// Deep in a thick cloud the light arrives diffused, not cut off: the diffusion's transmission through an
 			// optical depth tau, about 1 / (1 + 0.75 tau (1 - g)) for a forward-scattering medium.
 			S += sun * (ms / PI) / (1.0 + 0.75 * tau * (1.0 - g)); // the diffuse light leaving: its share over pi
-			// The powder effect: edges facing away from the light darker.
+			// The powder effect: thin edges facing away from the light darker (it brightened the cores by a third too).
 			float powder = 1.0 - exp(-sigma * 2.0 * 60.0);
-			S *= mix(1.0, powder * 2.0, 0.35);
+			S *= mix(1.0, powder, 0.35);
 			// The sky's light reaches the cloud's skin, less its core (Nubis: pow(1 - profile, 0.5)).
 			S += sky_ambient(h) * mix(0.4, 1.0, sqrt(1.0 - cs.profile));
 			// Lightning: the flash lights the cloud round it, falling off over a kilometre or so.
@@ -536,8 +542,8 @@ float high_density(vec2 xz) {
 	vec2 uv = vec2(dot(f, dir), dot(f, vec2(-dir.y, dir.x)));
 	float bend = (vfbm(uv / 9000.0 + 5.0) - 0.5) * 5000.0;
 	float streak = vfbm(vec2(uv.x / 9000.0, (uv.y + bend) / 2200.0));
-	float fibre = vfbm(vec2(uv.x / 2500.0, (uv.y + bend) / 250.0) + 13.0);
-	float cirrus = streak * 0.75 + fibre * 0.25;
+	float fibre = vfbm(vec2(uv.x / 3000.0, (uv.y + bend) / 450.0) + 13.0);
+	float cirrus = streak * 0.85 + fibre * 0.15;
 	float puffs = textureLod(noise_detail, vec3(f / 2400.0, 0.37), 0.0).r * 0.7 + vfbm(f / 4000.0 + 7.0) * 0.3;
 	float n = clamp((mix(cirrus, puffs, clouds.high.z) - 0.3) / 0.4, 0.0, 1.0);
 	float patches = vfbm(f / 25000.0 + 3.1);
