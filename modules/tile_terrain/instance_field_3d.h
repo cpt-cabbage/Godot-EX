@@ -41,6 +41,13 @@
 // The nearest `per_copy_levels` levels draw each copy as an instance of its own, kept while the copy stays in the
 // level's band: Godot-EX's surface cache gives each its own cards (captured, and lit at its own place), where a
 // MultiMesh cell shares one set, captured whole, so a ray that hits a tree reads that tree's light, not the cell's.
+//
+// A procedural type (add_procedural_type: grass and the like, too many to store) is made near the viewer: each base
+// cell, deterministically from its coordinates, gets density x area candidates at random places, kept with the
+// probability its weight map gives there, standing on the terrain (set_terrain) leaned toward its normal, turned and
+// scaled at random. Cells are made on the worker pool as they come within the type's reach and dropped past it. Each
+// copy has a random rank: a level draws only the copies whose rank is under its `thin` share, scaled up by
+// 1/sqrt(share) (at most 1.25x: larger, they read as coarse sticks) to keep some of the cover, so far levels draw fewer, larger tufts.
 
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
@@ -70,8 +77,39 @@ class InstanceField3D : public Node3D {
 		uint64_t copies_frame = 0;
 	};
 
+	struct ProcCell {
+		LocalVector<float> xf; // 12 floats a copy
+		LocalVector<float> rank;
+		uint64_t used = 0;
+	};
+
+	struct Procedural {
+		bool enabled = false;
+		float density = 0.0; // per square metre, before the weight map
+		float scale_min = 1.0;
+		float scale_max = 1.0;
+		float align = 1.0; // 0 upright, 1 the terrain's normal
+		uint32_t seed = 0;
+		PackedByteArray map; // weights 0-255, rows along Z, columns along X
+		int map_width = 0;
+		int map_height = 0;
+		Vector2 map_origin; // X, Z of sample (0, 0)
+		float map_spacing = 1.0;
+		float reach = 0.0; // the last level's end
+		LocalVector<float> thin; // per level: the share of copies drawn
+		LocalVector<float> thin_scale; // per level: their scale factor
+		HashMap<uint32_t, ProcCell> cells; // by base cell
+	};
+
+	struct GenJob {
+		uint32_t type = 0;
+		uint32_t cell = 0;
+		ProcCell out;
+	};
+
 	struct Type {
 		String name;
+		Procedural proc;
 		LocalVector<float> xf; // 12 floats a copy, MultiMesh's 3D layout (basis rows, each with the origin's component)
 		LocalVector<uint32_t> order; // copies sorted by base cell
 		LocalVector<uint32_t> cell_start; // base cell c's copies are order[cell_start[c] .. cell_start[c + 1]]
@@ -106,6 +144,9 @@ class InstanceField3D : public Node3D {
 
 	void _build_grid(Type &p_type);
 	void _job(uint32_t p_index, Job *p_jobs);
+	void _gen_cell(uint32_t p_index, GenJob *p_jobs);
+	void _update_procedural();
+	ObjectID terrain_id;
 	void _free_cell(DrawCell &p_cell);
 	void _free_copies(Level &p_level);
 	void _update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible);
@@ -124,6 +165,11 @@ public:
 	// `meshes`: one a level, nearest first; `ends`: the distance each level ends at (the last: where copies stop);
 	// `placements`: 8 floats a copy, x y z, a rotation quaternion x y z w, a uniform scale. Returns the type's index.
 	int add_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_placements);
+	// A type made near the viewer from a weight map (see above); `thin`, one per level, the share of copies it draws.
+	int add_procedural_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+			float p_density, float p_scale_min, float p_scale_max, float p_align, const PackedByteArray &p_map, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed);
+	// The ground procedural types stand on (a TileTerrain3D).
+	void set_terrain(Node *p_terrain);
 	void set_type_visible(int p_type, bool p_visible);
 	int get_type_count() const { return int(types.size()); }
 	int get_instance_count(int p_type) const;

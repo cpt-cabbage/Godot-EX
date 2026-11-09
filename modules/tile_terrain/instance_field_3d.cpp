@@ -30,6 +30,8 @@
 
 #include "instance_field_3d.h"
 
+#include "tile_terrain_3d.h"
+
 #include "core/object/class_db.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
@@ -130,6 +132,149 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		lv.shadows = l < p_shadow_levels;
 	}
 	return int(types.size()) - 1;
+}
+
+int InstanceField3D::add_procedural_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+		float p_density, float p_scale_min, float p_scale_max, float p_align, const PackedByteArray &p_map, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed) {
+	ERR_FAIL_COND_V(p_map_width <= 0 || p_map.size() % p_map_width != 0, -1);
+	const int index = add_type(p_name, p_meshes, p_ends, p_shadow_levels, PackedFloat32Array());
+	ERR_FAIL_COND_V(index < 0, -1);
+	Type &t = types[index];
+	Procedural &pr = t.proc;
+	pr.enabled = true;
+	pr.density = MAX(p_density, 0.0f);
+	pr.scale_min = p_scale_min;
+	pr.scale_max = MAX(p_scale_max, p_scale_min);
+	pr.align = CLAMP(p_align, 0.0f, 1.0f);
+	pr.seed = uint32_t(p_seed);
+	pr.map = p_map;
+	pr.map_width = p_map_width;
+	pr.map_height = p_map.size() / p_map_width;
+	pr.map_origin = p_map_origin;
+	pr.map_spacing = MAX(p_map_spacing, 0.01f);
+	pr.reach = p_ends.is_empty() ? 0.0f : p_ends[p_ends.size() - 1];
+	for (uint32_t l = 0; l < t.levels.size(); l++) {
+		const float share = CLAMP(int(l) < p_thin.size() ? p_thin[l] : 1.0f, 0.01f, 1.0f);
+		pr.thin.push_back(share);
+		pr.thin_scale.push_back(MIN(1.0f / Math::sqrt(share), 1.25f)); // larger, the far tufts read as coarse sticks
+	}
+	return index;
+}
+
+void InstanceField3D::set_terrain(Node *p_terrain) {
+	terrain_id = p_terrain != nullptr ? p_terrain->get_instance_id() : ObjectID();
+}
+
+static _FORCE_INLINE_ uint32_t pcg(uint32_t &r_state) {
+	r_state = r_state * 747796405u + 2891336453u;
+	uint32_t w = ((r_state >> ((r_state >> 28u) + 4u)) ^ r_state) * 277803737u;
+	return (w >> 22u) ^ w;
+}
+
+static _FORCE_INLINE_ float pcg01(uint32_t &r_state) {
+	return float(pcg(r_state) >> 8) * (1.0f / 16777216.0f);
+}
+
+// A procedural cell's copies (see the header): deterministic from the type's seed and the cell.
+void InstanceField3D::_gen_cell(uint32_t p_index, GenJob *p_jobs) {
+	GenJob &g = p_jobs[p_index];
+	const Type &t = types[g.type];
+	const Procedural &pr = t.proc;
+	const TileTerrain3D *terrain = Object::cast_to<TileTerrain3D>(ObjectDB::get_instance(terrain_id));
+	if (terrain == nullptr) {
+		return;
+	}
+	const int cx = int(g.cell % uint32_t(grid_x)), cz = int(g.cell / uint32_t(grid_x));
+	uint32_t state = hash_murmur3_one_32(pr.seed, hash_murmur3_one_32(uint32_t(cx), hash_murmur3_one_32(uint32_t(cz))));
+	const float expected = pr.density * float(base_cell * base_cell);
+	const int n = int(expected) + (pcg01(state) < expected - Math::floor(expected) ? 1 : 0);
+	const uint8_t *map = pr.map.ptr();
+	for (int i = 0; i < n; i++) {
+		const float px = float(grid_origin.x + (cx + pcg01(state)) * base_cell);
+		const float pz = float(grid_origin.y + (cz + pcg01(state)) * base_cell);
+		const float keep = pcg01(state);
+		const float yaw = pcg01(state) * Math::TAU;
+		const float sc = Math::lerp(pr.scale_min, pr.scale_max, pcg01(state));
+		const float rank = pcg01(state);
+		// The weight there, bilinear.
+		const float mx = (px - pr.map_origin.x) / pr.map_spacing, mz = (pz - pr.map_origin.y) / pr.map_spacing;
+		if (mx < 0.0f || mz < 0.0f || mx >= pr.map_width - 1 || mz >= pr.map_height - 1) {
+			continue;
+		}
+		const int ix = int(mx), iz = int(mz);
+		const float fx = mx - ix, fz = mz - iz;
+		const uint8_t *r0 = map + int64_t(iz) * pr.map_width + ix;
+		const uint8_t *r1 = r0 + pr.map_width;
+		const float w = (Math::lerp(Math::lerp(float(r0[0]), float(r0[1]), fx), Math::lerp(float(r1[0]), float(r1[1]), fx), fz)) * (1.0f / 255.0f);
+		if (keep >= w) {
+			continue;
+		}
+		const float y = terrain->get_height(px, pz);
+		if (Math::is_nan(y)) {
+			continue;
+		}
+		const Vector3 up = Vector3(0, 1, 0).lerp(terrain->get_normal(px, pz), pr.align).normalized();
+		Basis b(Quaternion(Vector3(0, 1, 0), up) * Quaternion(Vector3(0, 1, 0), yaw));
+		b.scale(Vector3(sc, sc, sc));
+		const float row[12] = { float(b.rows[0].x), float(b.rows[0].y), float(b.rows[0].z), px,
+			float(b.rows[1].x), float(b.rows[1].y), float(b.rows[1].z), y,
+			float(b.rows[2].x), float(b.rows[2].y), float(b.rows[2].z), pz };
+		for (int k = 0; k < 12; k++) {
+			g.out.xf.push_back(row[k]);
+		}
+		g.out.rank.push_back(rank);
+	}
+}
+
+// The procedural types' cells within reach made, those well past it dropped.
+void InstanceField3D::_update_procedural() {
+	LocalVector<GenJob> gen;
+	for (uint32_t ti = 0; ti < types.size(); ti++) {
+		Type &t = types[ti];
+		if (!t.proc.enabled || !t.visible) {
+			continue;
+		}
+		const float reach = t.proc.reach + float(base_cell);
+		const int x0 = MAX(0, int(Math::floor((viewer.x - reach - grid_origin.x) / base_cell)));
+		const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + reach - grid_origin.x) / base_cell)));
+		const int z0 = MAX(0, int(Math::floor((viewer.z - reach - grid_origin.y) / base_cell)));
+		const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + reach - grid_origin.y) / base_cell)));
+		for (int cz = z0; cz <= z1; cz++) {
+			for (int cx = x0; cx <= x1; cx++) {
+				const uint32_t c = uint32_t(cz * grid_x + cx);
+				if (ProcCell *pc = t.proc.cells.getptr(c)) {
+					pc->used = frame;
+				} else {
+					GenJob g;
+					g.type = ti;
+					g.cell = c;
+					gen.push_back(g);
+				}
+			}
+		}
+	}
+	if (!gen.is_empty()) {
+		WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_template_group_task(this, &InstanceField3D::_gen_cell, gen.ptr(), int(gen.size()), -1, true, "InstanceField3D procedural cells");
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
+		for (GenJob &g : gen) {
+			g.out.used = frame;
+			types[g.type].proc.cells.insert(g.cell, g.out);
+		}
+	}
+	for (Type &t : types) {
+		if (!t.proc.enabled) {
+			continue;
+		}
+		LocalVector<uint32_t> gone;
+		for (KeyValue<uint32_t, ProcCell> &E : t.proc.cells) {
+			if (frame - E.value.used > 120) {
+				gone.push_back(E.key);
+			}
+		}
+		for (uint32_t c : gone) {
+			t.proc.cells.erase(c);
+		}
+	}
 }
 
 void InstanceField3D::set_type_visible(int p_type, bool p_visible) {
@@ -248,6 +393,41 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 	uint64_t h = 1469598103934665603ULL;
 	int count = 0;
 	const int bx0 = j.cx * lv.cell_span, bz0 = j.cz * lv.cell_span;
+	if (t.proc.enabled) {
+		const float share = t.proc.thin[j.level], k_scale = t.proc.thin_scale[j.level];
+		for (int bz = bz0; bz < MIN(bz0 + lv.cell_span, grid_z); bz++) {
+			for (int bx = bx0; bx < MIN(bx0 + lv.cell_span, grid_x); bx++) {
+				const uint32_t c = uint32_t(bz * grid_x + bx);
+				const ProcCell *pc = t.proc.cells.getptr(c);
+				if (pc == nullptr) {
+					continue;
+				}
+				for (uint32_t i = 0; i < pc->rank.size(); i++) {
+					if (pc->rank[i] >= share) {
+						continue;
+					}
+					const float *x = pc->xf.ptr() + int64_t(i) * 12;
+					const float dx = x[3] - viewer.x, dy = x[7] - viewer.y, dz = x[11] - viewer.z;
+					const float d2 = dx * dx + dy * dy + dz * dz;
+					if (d2 < b2 || d2 >= e2) {
+						continue;
+					}
+					for (int m = 0; m < 12; m++) {
+						out.push_back((m % 4 == 3) ? x[m] : x[m] * k_scale);
+					}
+					h = (h ^ (uint64_t(c) << 20 ^ i)) * 1099511628211ULL;
+					count++;
+				}
+			}
+		}
+		j.count = count;
+		j.hash = h ^ uint64_t(count);
+		if (count > 0) {
+			j.buffer.resize(out.size());
+			memcpy(j.buffer.ptrw(), out.ptr(), out.size() * sizeof(float));
+		}
+		return;
+	}
 	for (int bz = bz0; bz < MIN(bz0 + lv.cell_span, grid_z); bz++) {
 		for (int bx = bx0; bx < MIN(bx0 + lv.cell_span, grid_x); bx++) {
 			const uint32_t c = uint32_t(bz * grid_x + bx);
@@ -282,6 +462,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
 	frame++;
 	viewer = get_global_transform().affine_inverse().xform(p_position);
+	_update_procedural();
 	LocalVector<Job> jobs;
 	LocalVector<Vector2i> updated; // (type, level) refilled this frame
 	for (uint32_t ti = 0; ti < types.size(); ti++) {
@@ -295,7 +476,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 				continue;
 			}
 			lv.last_update = viewer;
-			if (int(li) < per_copy_levels) {
+			if (int(li) < per_copy_levels && !t.proc.enabled) {
 				_update_copies(t, lv, get_global_transform(), get_world_3d()->get_scenario(), is_visible_in_tree());
 				continue;
 			}
@@ -411,6 +592,11 @@ Dictionary InstanceField3D::get_stats() const {
 	d["types"] = per_type;
 	d["cells_drawn"] = cells;
 	d["single_copies"] = single;
+	int proc_cells = 0;
+	for (const Type &t : types) {
+		proc_cells += t.proc.cells.size();
+	}
+	d["procedural_cells"] = proc_cells;
 	d["copies"] = copies;
 	d["update_ms"] = last_update_ms;
 	d["jobs_last"] = last_jobs;
@@ -474,6 +660,8 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_base_cell", "size"), &InstanceField3D::set_base_cell);
 	ClassDB::bind_method(D_METHOD("get_base_cell"), &InstanceField3D::get_base_cell);
 	ClassDB::bind_method(D_METHOD("add_type", "name", "meshes", "ends", "shadow_levels", "placements"), &InstanceField3D::add_type);
+	ClassDB::bind_method(D_METHOD("add_procedural_type", "name", "meshes", "ends", "shadow_levels", "thin", "density", "scale_min", "scale_max", "align", "map", "map_width", "map_origin", "map_spacing", "seed"), &InstanceField3D::add_procedural_type);
+	ClassDB::bind_method(D_METHOD("set_terrain", "terrain"), &InstanceField3D::set_terrain);
 	ClassDB::bind_method(D_METHOD("set_type_visible", "type", "visible"), &InstanceField3D::set_type_visible);
 	ClassDB::bind_method(D_METHOD("get_type_count"), &InstanceField3D::get_type_count);
 	ClassDB::bind_method(D_METHOD("get_instance_count", "type"), &InstanceField3D::get_instance_count);
