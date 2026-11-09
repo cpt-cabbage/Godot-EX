@@ -50,6 +50,7 @@
 // Collision: a Jolt heightfield of `collision_samples` a side, at the data's own samples, that follows
 // `collision_target` (the walker). Its triangles, the level-0 chunks' and get_height() split each cell the same way.
 
+#include "core/object/worker_thread_pool.h"
 #include "scene/3d/node_3d.h"
 #include "scene/resources/image_texture.h"
 #include "scene/resources/texture.h"
@@ -118,6 +119,18 @@ private:
 	double clip_update_ms = 0.0;
 	void _build_far();
 	void _update_clip(const Vector3 &p_local, bool p_force);
+	// A level's window being built off the main thread: its origin, the task, the images it made.
+	struct ClipBuild {
+		bool active = false;
+		int level = 0;
+		Vector2i origin;
+		WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+		Ref<Image> heights;
+		Ref<Image> masks;
+	};
+	ClipBuild clip_builds[3];
+	void _clip_job(void *p_build);
+	void _finish_clip_builds(bool p_wait_all);
 	Ref<Image> _clip_heights(int p_level, const Vector2i &p_origin) const;
 	Ref<Image> _clip_masks(int p_level, const Vector2i &p_origin) const;
 	void _publish_globals();
