@@ -103,6 +103,11 @@ void TileTerrain3D::set_lod0_distance(float p_distance) {
 	last_update_position = Vector3(Math::INF, Math::INF, Math::INF);
 }
 
+void TileTerrain3D::set_lod_error(float p_error) {
+	lod_error = MAX(p_error, 0.0f);
+	last_update_position = Vector3(Math::INF, Math::INF, Math::INF);
+}
+
 void TileTerrain3D::set_cast_shadows(bool p_cast) {
 	cast_shadows = p_cast;
 	for (KeyValue<ChunkKey, Chunk> &E : chunks) {
@@ -262,8 +267,80 @@ Error TileTerrain3D::_load() {
 			}
 		}
 	}
+	_build_errors();
 	print_verbose(vformat("TileTerrain3D: %d x %d samples at %.4f m, %d levels, loaded in %.2f s", samples, samples, spacing, max_lod + 1, (OS::get_singleton()->get_ticks_usec() - t0) / 1e6));
 	return OK;
+}
+
+// Each chunk's error at each level past 0 (see the header): at every sample of the next finer level that the level
+// drops, how far the data stands off the level's own surface there (an edge's midpoint off the edge, a quad's centre
+// off the nearer diagonal, as _build_chunk splits it), in parallel bands of chunks. The distance is to the edge's line,
+// not the height's difference: across a cliff the heights differ by half its drop at every level, which split every
+// cliff to 1 m quads kilometres away, while the surface is only ever half a quad out.
+void TileTerrain3D::_build_errors() {
+	chunk_error.clear();
+	chunk_error.resize(chunks_per_side.size());
+	chunk_error[0].resize(chunks_per_side[0] * chunks_per_side[0]);
+	for (float &e : chunk_error[0]) {
+		e = 0.0f;
+	}
+	for (int l = 1; l <= max_lod; l++) {
+		const int nc = chunks_per_side[l], nf = chunks_per_side[l - 1];
+		chunk_error[l].resize(nc * nc);
+		struct Ctx {
+			const TileTerrain3D *t;
+			LocalVector<float> *out;
+			const LocalVector<float> *finer;
+			int lod, nc, nf;
+		} ctx{ this, &chunk_error[l], &chunk_error[l - 1], l, nc, nf };
+		auto band = [](void *p_ctx, uint32_t p_z) {
+			Ctx *c = (Ctx *)p_ctx;
+			const TileTerrain3D *t = c->t;
+			const int step = 1 << c->lod, half = step >> 1;
+			const int span = t->chunk_quads * step;
+			const int last = t->samples - 1;
+			const uint16_t *h = t->heights.ptr();
+			const int64_t s = t->samples;
+			const float to_m = float(t->height_range / 65535.0);
+			// A midpoint's distance (squared) to the line through its edge's ends: the height's difference `dv`, the ends'
+			// `dh` (all metres), the edge `run` m long on the map.
+			const float run = float(step * t->spacing), run2 = run * run, diag2 = 2.0f * run2;
+#define TT_SQ(m_v) ((m_v) * (m_v))
+#define TT_OFF(m_mid, m_a, m_b, m_run2) (TT_SQ((float(m_mid) - 0.5f * float((m_a) + (m_b))) * to_m) * (m_run2) / ((m_run2) + TT_SQ(float((m_a) - (m_b)) * to_m)))
+			for (int x = 0; x < c->nc; x++) {
+				float worst = 0.0f; // squared, m
+				const int c0 = x * span, r0 = int(p_z) * span;
+				const int c1 = MIN(c0 + span, last), r1 = MIN(r0 + span, last);
+				for (int r = r0; r < r1; r += step) {
+					const int rm = MIN(r + half, last), rn = MIN(r + step, last);
+					for (int col = c0; col < c1; col += step) {
+						const int cm = MIN(col + half, last), cn = MIN(col + step, last);
+						const int a = h[r * s + col], b = h[r * s + cn], d = h[rn * s + col], e = h[rn * s + cn];
+						worst = MAX(worst, TT_OFF(h[r * s + cm], a, b, run2));
+						worst = MAX(worst, TT_OFF(h[rm * s + col], a, d, run2));
+						worst = MAX(worst, TT_OFF(h[rn * s + cm], d, e, run2));
+						worst = MAX(worst, TT_OFF(h[rm * s + cn], b, e, run2));
+						const int m = h[rm * s + cm];
+						worst = MAX(worst, MIN(TT_OFF(m, b, d, diag2), TT_OFF(m, a, e, diag2)));
+					}
+				}
+				float err = Math::sqrt(worst);
+				for (int dz = 0; dz < 2; dz++) {
+					for (int dx = 0; dx < 2; dx++) {
+						const int fx = x * 2 + dx, fz = int(p_z) * 2 + dz;
+						if (fx < c->nf && fz < c->nf) {
+							err = MAX(err, (*c->finer)[fz * c->nf + fx]);
+						}
+					}
+				}
+				(*c->out)[int(p_z) * c->nc + x] = err;
+			}
+#undef TT_OFF
+#undef TT_SQ
+		};
+		WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_native_group_task(band, &ctx, nc, -1, true, "TileTerrain3D errors");
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
+	}
 }
 
 void TileTerrain3D::register_globals() {
@@ -523,13 +600,21 @@ float TileTerrain3D::_distance_to_chunk(int p_lod, int p_x, int p_z, const Vecto
 }
 
 // A chunk of level L is split into its four children when the viewer is nearer than lod0_distance * 2^(L-1): level-0
-// quads (one sample) within lod0_distance, level L between lod0_distance * 2^(L-1) and * 2^L.
+// quads (one sample) within lod0_distance, level L between lod0_distance * 2^(L-1) and * 2^L. And, with lod_error,
+// when the level's surface stands farther off the data than lod_error times the distance: steep and broken ground
+// keeps finer levels farther out, smooth ground is as before. At 0.012 the 4K ridge draws about 700 chunks for 226 and
+// costs 0.8 ms more (measured rough, 2026-11-10); the tents on the high wall from 3 km go at 0.014, the last at 0.01.
 void TileTerrain3D::_select(int p_lod, int p_x, int p_z, const Vector3 &p_camera) {
 	const int n = chunks_per_side[p_lod];
 	if (p_x >= n || p_z >= n) {
 		return;
 	}
-	if (p_lod > 0 && _distance_to_chunk(p_lod, p_x, p_z, p_camera) < lod0_distance * float(1 << (p_lod - 1))) {
+	bool split = false;
+	if (p_lod > 0) {
+		const float dist = _distance_to_chunk(p_lod, p_x, p_z, p_camera);
+		split = dist < lod0_distance * float(1 << (p_lod - 1)) || (select_error > 0.0f && chunk_error[p_lod][p_z * n + p_x] > select_error * dist);
+	}
+	if (split) {
 		for (int dz = 0; dz < 2; dz++) {
 			for (int dx = 0; dx < 2; dx++) {
 				_select(p_lod - 1, p_x * 2 + dx, p_z * 2 + dz, p_camera);
@@ -587,13 +672,29 @@ void TileTerrain3D::_build_chunk(uint32_t p_index, Build *p_builds) {
 	for (int j = 0; j < q; j++) {
 		for (int i = 0; i < q; i++) {
 			const int a = j * side + i, bb = a + 1, c = a + side, dd = c + 1;
+			// Past level 0 the diagonal nearer the data at the quad's centre: the fixed one cut every rim and ridge that
+			// ran the other way into teeth. Level 0 keeps the collision's.
+			bool other = false;
+			if (step > 1) {
+				const float m = 2.0f * _sample(c0 + i * step + step / 2, r0 + j * step + step / 2);
+				other = Math::abs(m - v[a].y - v[dd].y) < Math::abs(m - v[bb].y - v[c].y);
+			}
 			// Godot's front faces wind clockwise seen from their side (from above here).
-			ix[k++] = a;
-			ix[k++] = bb;
-			ix[k++] = c;
-			ix[k++] = bb;
-			ix[k++] = dd;
-			ix[k++] = c;
+			if (other) {
+				ix[k++] = a;
+				ix[k++] = bb;
+				ix[k++] = dd;
+				ix[k++] = a;
+				ix[k++] = dd;
+				ix[k++] = c;
+			} else {
+				ix[k++] = a;
+				ix[k++] = bb;
+				ix[k++] = c;
+				ix[k++] = bb;
+				ix[k++] = dd;
+				ix[k++] = c;
+			}
 		}
 	}
 	for (int e = 0; e < 4; e++) {
@@ -619,8 +720,17 @@ void TileTerrain3D::update_lods(const Vector3 &p_position) {
 	_update_clip(camera, false);
 	last_update_position = p_position;
 	frame++;
-	selected.clear();
-	_select(max_lod, 0, 0, camera);
+	// The error rule under a budget: past max_drawn_chunks the error allowed doubles until the view fits (broken ground
+	// all round the viewer; distance alone, the last try, always fits).
+	select_error = lod_error;
+	for (int attempt = 0; attempt < 6; attempt++) {
+		selected.clear();
+		_select(max_lod, 0, 0, camera);
+		if (int(selected.size()) <= max_drawn_chunks || select_error <= 0.0f) {
+			break;
+		}
+		select_error = attempt < 4 ? select_error * 2.0f : 0.0f;
+	}
 
 	LocalVector<Build> builds;
 	for (const ChunkKey &key : selected) {
@@ -779,6 +889,7 @@ Dictionary TileTerrain3D::get_stats() const {
 	d["loaded"] = loaded;
 	d["levels"] = max_lod + 1;
 	d["chunks_drawn"] = int(selected.size());
+	d["lod_error_used"] = select_error;
 	d["chunks_cached"] = int(chunks.size());
 	d["chunks_built_last"] = last_built;
 	d["update_ms"] = last_update_ms;
@@ -850,6 +961,10 @@ void TileTerrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_chunk_quads"), &TileTerrain3D::get_chunk_quads);
 	ClassDB::bind_method(D_METHOD("set_lod0_distance", "distance"), &TileTerrain3D::set_lod0_distance);
 	ClassDB::bind_method(D_METHOD("get_lod0_distance"), &TileTerrain3D::get_lod0_distance);
+	ClassDB::bind_method(D_METHOD("set_lod_error", "error"), &TileTerrain3D::set_lod_error);
+	ClassDB::bind_method(D_METHOD("get_lod_error"), &TileTerrain3D::get_lod_error);
+	ClassDB::bind_method(D_METHOD("set_max_drawn_chunks", "count"), &TileTerrain3D::set_max_drawn_chunks);
+	ClassDB::bind_method(D_METHOD("get_max_drawn_chunks"), &TileTerrain3D::get_max_drawn_chunks);
 	ClassDB::bind_method(D_METHOD("set_max_cached_chunks", "count"), &TileTerrain3D::set_max_cached_chunks);
 	ClassDB::bind_method(D_METHOD("get_max_cached_chunks"), &TileTerrain3D::get_max_cached_chunks);
 	ClassDB::bind_method(D_METHOD("set_follow_camera", "follow"), &TileTerrain3D::set_follow_camera);
@@ -889,6 +1004,8 @@ void TileTerrain3D::_bind_methods() {
 	ADD_GROUP("Level of Detail", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "chunk_quads", PROPERTY_HINT_RANGE, "8,256,1"), "set_chunk_quads", "get_chunk_quads");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod0_distance", PROPERTY_HINT_RANGE, "8,4096,1,suffix:m"), "set_lod0_distance", "get_lod0_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod_error", PROPERTY_HINT_RANGE, "0,0.02,0.0001"), "set_lod_error", "get_lod_error");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_drawn_chunks", PROPERTY_HINT_RANGE, "64,8192,1"), "set_max_drawn_chunks", "get_max_drawn_chunks");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_cached_chunks", PROPERTY_HINT_RANGE, "64,100000,1"), "set_max_cached_chunks", "get_max_cached_chunks");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_camera"), "set_follow_camera", "get_follow_camera");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "focus_position", PROPERTY_HINT_NONE, "suffix:m"), "set_focus_position", "get_focus_position");

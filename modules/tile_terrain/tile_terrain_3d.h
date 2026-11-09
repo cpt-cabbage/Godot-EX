@@ -34,7 +34,10 @@
 //
 // The heights are one square grid of 16-bit samples (valley.json beside them says its size, spacing, origin and range),
 // drawn as real mesh chunks chosen by distance in a quadtree, each chunk a grid of `chunk_quads` quads at its level's
-// spacing (1, 2, 4 ... samples), with skirts that hide the cracks between levels. Real vertices, not a vertex shader's
+// spacing (1, 2, 4 ... samples), with skirts that hide the cracks between levels. A chunk is also split where its level
+// would stand too far off the data for its distance (`lod_error`, 2026-11-10): distance alone drew the high walls 3 to
+// 6 km off with 32 and 64 m quads, their rims as tents and saw teeth, while the plateau got the same triangles. Past
+// level 0 (the collision's and the grass's triangles) each quad is split along the diagonal nearer the data. Real vertices, not a vertex shader's
 // displacement, so the ray tracer's acceleration structures hold the terrain as it is drawn (Terrain3D's clipmap, the
 // reference for this node, displaces a flat mesh in its shader, which a BLAS never sees).
 //
@@ -88,6 +91,9 @@ private:
 	Ref<Material> material;
 	int chunk_quads = 64;
 	float lod0_distance = 160.0;
+	float lod_error = 0.012f; // m of error allowed a metre of distance (0 none: distance alone)
+	float select_error = 0.0f; // what the last selection used: lod_error, or more under max_drawn_chunks
+	int max_drawn_chunks = 1200;
 	int max_cached_chunks = 3000;
 	bool follow_camera = true;
 	Vector3 focus_position;
@@ -137,6 +143,10 @@ private:
 	int max_lod = 0;
 	// Each level's chunks' lowest and highest sample (metres), for their boxes: [lod][z * n + x].
 	LocalVector<LocalVector<Vector2>> chunk_range;
+	// Each level's chunks' error (m): the most the level's surface stands off the data inside the chunk, measured at
+	// the next finer level's samples and carried up as the larger of its own and its children's; level 0 has none.
+	LocalVector<LocalVector<float>> chunk_error;
+	void _build_errors();
 	LocalVector<int> chunks_per_side;
 
 	HashMap<ChunkKey, Chunk> chunks;
@@ -184,6 +194,10 @@ public:
 	int get_chunk_quads() const { return chunk_quads; }
 	void set_lod0_distance(float p_distance);
 	float get_lod0_distance() const { return lod0_distance; }
+	void set_lod_error(float p_error);
+	float get_lod_error() const { return lod_error; }
+	void set_max_drawn_chunks(int p_count) { max_drawn_chunks = MAX(p_count, 64); }
+	int get_max_drawn_chunks() const { return max_drawn_chunks; }
 	void set_max_cached_chunks(int p_count) { max_cached_chunks = MAX(p_count, 64); }
 	int get_max_cached_chunks() const { return max_cached_chunks; }
 	void set_follow_camera(bool p_follow) { follow_camera = p_follow; }
