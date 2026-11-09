@@ -132,6 +132,7 @@ void TileTerrain3D::set_collision_mask(uint32_t p_mask) {
 }
 
 void TileTerrain3D::_clear() {
+	_finish_clip_builds(true); // the heights the builds read go with a reload
 	RenderingServer *rs = RS::get_singleton();
 	for (KeyValue<ChunkKey, Chunk> &E : chunks) {
 		rs->free_rid(E.value.instance);
@@ -391,14 +392,33 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 	const double row = (p_local.z - origin_east) / spacing;
 	bool changed = false;
 	Vector<Ref<Image>> h_layers, m_layers;
+	const bool now = p_force || clip_heights.is_null();
+	if (!now) {
+		_finish_clip_builds(false);
+	}
 	for (int level = 0; level < CLIP_LEVELS; level++) {
 		const int step = 1 << level;
 		const int snap = step * (CLIP_SIZE / 8);
 		const Vector2i want(int(Math::round((col - CLIP_SIZE * step * 0.5) / snap)) * snap, int(Math::round((row - CLIP_SIZE * step * 0.5) / snap)) * snap);
-		if (p_force || clip_heights.is_null() || want != clip_origin[level]) {
-			clip_origin[level] = want;
-			changed = true;
+		if (now) {
+			if (want != clip_origin[level] || clip_heights.is_null() || p_force) {
+				clip_origin[level] = want;
+				changed = true;
+			}
+			continue;
 		}
+		// Running: a window re-centred off the main thread (building one took 20-30 ms: a frame's stall at every
+		// eighth of a window), the old one drawn meanwhile.
+		ClipBuild &b = clip_builds[level];
+		if (want != clip_origin[level] && !b.active) {
+			b.active = true;
+			b.level = level;
+			b.origin = want;
+			b.task = WorkerThreadPool::get_singleton()->add_template_task(this, &TileTerrain3D::_clip_job, (void *)&b, true, "TileTerrain3D window");
+		}
+	}
+	if (!now) {
+		return;
 	}
 	if (!changed) {
 		return;
@@ -407,22 +427,48 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 		h_layers.push_back(_clip_heights(level, clip_origin[level]));
 		m_layers.push_back(_clip_masks(level, clip_origin[level]));
 	}
-	// Re-made whole (a level a few times a minute at a walk): simpler than updating strips, and a layer's upload is a
-	// few MB.
-	if (clip_heights.is_null()) {
-		clip_heights.instantiate();
-		clip_heights->create_from_images(h_layers);
-		clip_masks.instantiate();
-		clip_masks->create_from_images(m_layers);
-	} else {
-		for (int level = 0; level < CLIP_LEVELS; level++) {
-			clip_heights->update_layer(h_layers[level], level);
-			clip_masks->update_layer(m_layers[level], level);
-		}
-	}
+	clip_heights.instantiate();
+	clip_heights->create_from_images(h_layers);
+	clip_masks.instantiate();
+	clip_masks->create_from_images(m_layers);
 	clip_updates++;
 	clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 	_publish_globals();
+}
+
+void TileTerrain3D::_clip_job(void *p_build) {
+	ClipBuild *b = (ClipBuild *)p_build;
+	b->heights = _clip_heights(b->level, b->origin);
+	b->masks = _clip_masks(b->level, b->origin);
+}
+
+// Finished builds go up, a level a frame (its two layers and its origin together, so a shader never reads one with the
+// other's frame); p_wait_all waits for every running one and drops them (a reload).
+void TileTerrain3D::_finish_clip_builds(bool p_wait_all) {
+	bool uploaded = false;
+	for (ClipBuild &b : clip_builds) {
+		if (!b.active) {
+			continue;
+		}
+		if (p_wait_all) {
+			WorkerThreadPool::get_singleton()->wait_for_task_completion(b.task);
+			b = ClipBuild();
+			continue;
+		}
+		if (uploaded || !WorkerThreadPool::get_singleton()->is_task_completed(b.task)) {
+			continue;
+		}
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(b.task);
+		const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
+		clip_heights->update_layer(b.heights, b.level);
+		clip_masks->update_layer(b.masks, b.level);
+		clip_origin[b.level] = b.origin;
+		_publish_globals();
+		clip_updates++;
+		clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
+		b = ClipBuild();
+		uploaded = true;
+	}
 }
 
 void TileTerrain3D::_publish_globals() {
@@ -776,6 +822,7 @@ void TileTerrain3D::_notification(int p_what) {
 			if (!loaded) {
 				break;
 			}
+			_finish_clip_builds(false); // windows built meanwhile go up even when the camera stands still
 			Vector3 p = focus_position;
 			if (follow_camera) {
 				const Camera3D *cam = get_viewport() ? get_viewport()->get_camera_3d() : nullptr;

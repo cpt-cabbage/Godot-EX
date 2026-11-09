@@ -51,6 +51,7 @@
 
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
+#include "core/object/worker_thread_pool.h"
 #include "scene/3d/node_3d.h"
 #include "scene/resources/mesh.h"
 
@@ -139,6 +140,15 @@ class InstanceField3D : public Node3D {
 	Vector3 viewer; // in local space, for the jobs
 	uint64_t frame = 0;
 	double last_update_ms = 0.0;
+	// A refill running on the worker threads (2026-11-10: waiting for it in the frame that started it was a 4-10 ms
+	// spike every few steps): applied on a later frame once done, no new one started meanwhile.
+	LocalVector<Job> pending_jobs;
+	LocalVector<Vector2i> pending_updated;
+	WorkerThreadPool::GroupID pending_group = -1;
+	uint64_t pending_frame = 0;
+	uint64_t pending_t0 = 0;
+	void _apply_jobs(LocalVector<Job> &p_jobs, const LocalVector<Vector2i> &p_updated, uint64_t p_frame, uint64_t p_t0);
+	void _wait_pending();
 	int last_jobs = 0;
 	int last_uploads = 0;
 

@@ -455,9 +455,33 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 	}
 }
 
+void InstanceField3D::_wait_pending() {
+	if (pending_group >= 0) {
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(pending_group);
+		pending_group = -1;
+		pending_jobs.clear();
+		pending_updated.clear();
+	}
+}
+
 void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 	if (!is_inside_tree() || types.is_empty()) {
 		return;
+	}
+	// A refill in flight: applied once its jobs are done; none started meanwhile (the jobs read the types' data). A
+	// forced update waits for it and runs whole.
+	if (pending_group >= 0) {
+		if (!p_force && !WorkerThreadPool::get_singleton()->is_group_task_completed(pending_group)) {
+			return;
+		}
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(pending_group);
+		pending_group = -1;
+		_apply_jobs(pending_jobs, pending_updated, pending_frame, pending_t0);
+		pending_jobs.clear();
+		pending_updated.clear();
+		if (!p_force) {
+			return; // this frame's work was the upload
+		}
 	}
 	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
 	frame++;
@@ -510,10 +534,25 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 			}
 		}
 	}
+	if (!jobs.is_empty() && !p_force) {
+		// Off the main thread: applied on a later frame.
+		pending_jobs = jobs;
+		pending_updated = updated;
+		pending_frame = frame;
+		pending_t0 = t0;
+		pending_group = WorkerThreadPool::get_singleton()->add_template_group_task(this, &InstanceField3D::_job, pending_jobs.ptr(), int(pending_jobs.size()), -1, true, "InstanceField3D cells");
+		return;
+	}
 	if (!jobs.is_empty()) {
 		WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_template_group_task(this, &InstanceField3D::_job, jobs.ptr(), int(jobs.size()), -1, true, "InstanceField3D cells");
 		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
 	}
+	_apply_jobs(jobs, updated, frame, t0);
+}
+
+// The refilled cells' multimeshes (made, filled where their copies changed, freed when empty) and the cells of a
+// refilled level that the refill no longer reached.
+void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vector2i> &updated, uint64_t p_frame, uint64_t t0) {
 	RenderingServer *rs = RS::get_singleton();
 	const RID scenario = get_world_3d()->get_scenario();
 	const Transform3D xf = get_global_transform();
@@ -540,7 +579,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 			lv.cells.insert(j.key, nc);
 			c = lv.cells.getptr(j.key);
 		}
-		c->used = frame;
+		c->used = p_frame;
 		if (c->hash != j.hash) {
 			rs->multimesh_allocate_data(c->multimesh, j.count, RSE::MULTIMESH_TRANSFORM_3D);
 			rs->multimesh_set_buffer(c->multimesh, j.buffer);
@@ -553,7 +592,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 		Level &lv = types[u.x].levels[u.y];
 		LocalVector<uint64_t> gone;
 		for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
-			if (E.value.used != frame) {
+			if (E.value.used != p_frame) {
 				_free_cell(E.value);
 				gone.push_back(E.key);
 			}
@@ -610,6 +649,7 @@ void InstanceField3D::_notification(int p_what) {
 			set_process_internal(true);
 		} break;
 		case NOTIFICATION_EXIT_WORLD: {
+			_wait_pending();
 			_free_all();
 			set_process_internal(false);
 		} break;
@@ -681,5 +721,6 @@ void InstanceField3D::_bind_methods() {
 }
 
 InstanceField3D::~InstanceField3D() {
+	_wait_pending();
 	_free_all();
 }
