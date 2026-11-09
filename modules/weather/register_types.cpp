@@ -53,6 +53,7 @@ void initialize_weather_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(TimeOfDay3D);
 	// The wind's global shader parameters exist before any shader that reads them compiles.
 	WindField3D::register_globals();
+	WeatherDirector::register_globals();
 }
 
 void uninitialize_weather_module(ModuleInitializationLevel p_level) {

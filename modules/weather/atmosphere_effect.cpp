@@ -364,6 +364,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(light_illuminance, 0, 0, 0);
 		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset);
 		v4(cloud_shadows_on ? 1.0f : 0.0f, 0, 0, 0);
+		v4(weather_mist_density, weather_mist_top, precipitation, 0);
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -576,6 +577,14 @@ void AtmosphereEffect::_bind_methods() {
 	FB(fog_rt_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,5000,1,suffix:m")
 	FB(fog_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.98,0.01")
 	FB(light_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
+	ADD_GROUP("Weather", "");
+	FB(weather_mist_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.5,0.0001,suffix:/m")
+	FB(weather_mist_top, Variant::FLOAT, PROPERTY_HINT_RANGE, "-5000,10000,0.1,suffix:m")
+	FB(precipitation, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(lightning_position, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m")
+	FB(lightning_flash, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(lightning_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
+	FB(lightning_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1000,0.1")
 	ADD_GROUP("Clouds", "");
 	FB(clouds_enabled, Variant::BOOL, PROPERTY_HINT_NONE, "")
 	FB(cloud_cover, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")

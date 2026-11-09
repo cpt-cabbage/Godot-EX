@@ -40,6 +40,7 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 sky; // x the sky table's light illuminance, yzw unused
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn
+	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1)
 }
 fog;
 
@@ -116,6 +117,9 @@ float density(vec3 w) {
 	float above = w.y - ground_height(w);
 	float d = fog.ground.x * exp(-max(above, 0.0) / max(fog.ground.y, 0.1));
 	d += fog.ground.z * exp(-max(w.y - fog.ground.w, 0.0) / max(fog.mist.x, 0.1));
+	// The weather's mist pools below its top, and rain thickens the air (a heavy shower: about 1 km of sight).
+	d += fog.weather.x * exp(-max(w.y - fog.weather.y, 0.0) / max(fog.mist.x, 0.1));
+	d += fog.weather.z * 0.0015;
 	if (fog.mist.y > 0.0 && d > 0.0) {
 		vec3 q = (w - fog.wind.xyz * fog.mist.w) / max(fog.mist.z, 0.01);
 		d *= mix(1.0, smoothstep(0.25, 0.75, fbm(q)) * 2.0, fog.mist.y);

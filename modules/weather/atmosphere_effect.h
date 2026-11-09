@@ -141,6 +141,15 @@ class AtmosphereEffect : public CompositorEffect {
 	float fog_rt_distance = 400.0;
 	float fog_history = 0.9;
 	Color light_color = Color(1, 1, 1);
+	// The weather's (WeatherDirector sets them): its own mist layer, precipitation (rain haze near, rain shafts under the
+	// clouds), and a lightning flash glowing in the clouds round a point.
+	float weather_mist_density = 0.0;
+	float weather_mist_top = 400.0; // world y
+	float precipitation = 0.0;
+	Vector3 lightning_position;
+	float lightning_flash = 0.0;
+	Color lightning_color = Color(0.75, 0.8, 1.0);
+	float lightning_energy = 40.0;
 	AirVolumeShaderRD fog_shader;
 	RID fog_version;
 	RID fog_pipelines[3];
@@ -242,13 +251,13 @@ public:
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
 	static constexpr int CAMERA_FLOATS = 48; // atmosphere.glsl's Camera block
-	static constexpr int CLOUD_FLOATS = 32 + 4 * 12; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_FLOATS = 32 + 4 * 14; // clouds.glsl's Clouds block
 	static constexpr int CLOUD_NOISE_SLICES = 8; // base noise slices made a frame
 	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
 	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
-	static constexpr int FOG_FLOATS = 32 + 4 * 17; // air_volume.glsl's Fog block
+	static constexpr int FOG_FLOATS = 32 + 4 * 18; // air_volume.glsl's Fog block
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
@@ -321,6 +330,13 @@ public:
 	FOGP(float, fog_rt_distance)
 	FOGP(float, fog_history)
 	FOGP(Color, light_color)
+	FOGP(float, weather_mist_density)
+	FOGP(float, weather_mist_top)
+	FOGP(float, precipitation)
+	FOGP(Vector3, lightning_position)
+	FOGP(float, lightning_flash)
+	FOGP(Color, lightning_color)
+	FOGP(float, lightning_energy)
 	FOGP(bool, clouds_enabled)
 	FOGP(float, cloud_cover)
 	FOGP(float, cloud_base)

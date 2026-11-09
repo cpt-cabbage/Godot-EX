@@ -46,6 +46,16 @@
 // wilder toward the top.
 // `current` is the weather now, surprises included, for everything that reads it.
 //
+// The weather on the ground (2026-11-09): the temperature falls `lapse_rate` degrees a km above the valley floor (where
+// `temperature` is), so snow lies above `get_snow_line()` (1 degree) and frost above `get_freeze_line()` (0), in world
+// y. `wetness` builds while it rains (`wet_build` seconds to soak at full rain) and dries over `dry_time` (slower under
+// cloud); `snow` builds while it snows (`snow_build`) and melts over `melt_time`; `frost` comes on clear, dry skies
+// over `frost_time`. Each can be set from the story. They are global shader parameters (weather_wet, weather_snow,
+// weather_snow_line, weather_frost, weather_freeze_line, weather_flash) for the materials. Lightning: at the
+// weather's `lightning` (0-1) strikes come every 30 s down to every 4 s, within `lightning_radius` m of the subject,
+// each a few flickers over half a second (`get_flash()`), and the `lightning_strike` signal (the position at the
+// cloud base, the distance from the subject: for the bolt, the thunder); strike() makes one where the story wants.
+// `atmosphere` also takes the mist (the weather's own layer), the precipitation (rain haze, rain shafts) and the flash.//
 // WeatherTrigger3D: a place (a cylinder, `radius` by `height`) that, when the director's subject enters it, calls
 // transition_to(`state`, `seconds`): once, or each time it enters.
 
@@ -128,6 +138,32 @@ class WeatherDirector : public Node {
 	NodePath wind;
 	Ref<AtmosphereEffect> atmosphere; // the clouds follow the weather: cover, base, type, carried by the wind aloft
 	float cloud_wind_factor = 1.8; // the wind at the clouds against the wind 10 m up
+
+	// The weather on the ground.
+	float lapse_rate = 6.5; // degrees C a km
+	float wetness = 0.0;
+	float snow = 0.0;
+	float frost = 0.0;
+	float wet_build = 90.0;
+	float dry_time = 900.0;
+	float snow_build = 240.0;
+	float melt_time = 1200.0;
+	float frost_time = 600.0;
+	float mist_density = 0.006; // the air volume's mist (1/m) at the weather's mist 1: about 500 m of sight
+	// Lightning.
+	struct Flicker {
+		float start = 0.0;
+		float length = 0.1;
+		float peak = 1.0;
+	};
+	LocalVector<Flicker> flickers;
+	float lightning_radius = 6000.0;
+	float next_strike = 0.0;
+	float flash = 0.0;
+	Vector3 strike_position;
+	void _ground(float p_delta);
+	void _lightning();
+	Vector3 _subject_position() const;
 	NodePath subject;
 	float volatility = 0.0;
 	Ref<Curve> volatility_by_altitude;
@@ -158,6 +194,33 @@ public:
 
 	void set_wind(const NodePath &p_path) { wind = p_path; }
 	NodePath get_wind() const { return wind; }
+	static void register_globals();
+	// Degrees C at an altitude (m above sea level).
+	float get_temperature_at(float p_altitude) const;
+	float get_snow_line() const; // world y
+	float get_freeze_line() const; // world y
+	float get_flash() const { return flash; }
+	Vector3 get_strike_position() const { return strike_position; }
+	// A strike at a world position (its flash at the cloud base above it), now.
+	void strike(const Vector3 &p_position);
+#define GROUND_PROP(m)                         \
+	void set_##m(float p_v) { m = p_v; }         \
+	float get_##m() const { return m; }
+	GROUND_PROP(lapse_rate)
+	GROUND_PROP(wet_build)
+	GROUND_PROP(dry_time)
+	GROUND_PROP(snow_build)
+	GROUND_PROP(melt_time)
+	GROUND_PROP(frost_time)
+	GROUND_PROP(mist_density)
+	GROUND_PROP(lightning_radius)
+#undef GROUND_PROP
+	void set_wetness(float p_v) { wetness = CLAMP(p_v, 0.0f, 1.0f); }
+	float get_wetness() const { return wetness; }
+	void set_snow(float p_v) { snow = CLAMP(p_v, 0.0f, 1.0f); }
+	float get_snow() const { return snow; }
+	void set_frost(float p_v) { frost = CLAMP(p_v, 0.0f, 1.0f); }
+	float get_frost() const { return frost; }
 	void set_atmosphere(const Ref<AtmosphereEffect> &p_a) { atmosphere = p_a; }
 	Ref<AtmosphereEffect> get_atmosphere() const { return atmosphere; }
 	void set_cloud_wind_factor(float p_v) { cloud_wind_factor = p_v; }
