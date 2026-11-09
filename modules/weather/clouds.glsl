@@ -443,14 +443,32 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 	float T = 1.0;
 	first = -1.0;
 	float wsum = 0.0, dsum = 0.0;
-	float dt = (t1 - t0) / float(steps);
 	float c = dot(d, clouds.light_dir.xyz);
 	float g = clouds.light_color.w;
 	float ms = clouds.sky.y;
 	vec3 sun = clouds.light_color.rgb;
-	for (int i = 0; i < steps; i++) {
-		float t = t0 + (float(i) + jitter) * dt;
+	// Adaptive (as Nubis): coarse steps through clear air, probing the profile only (no noise); on meeting a cloud a step
+	// back and a third of the step inside it, coarse again after four empty ones. The fine detail was undersampled at
+	// one step size (a grainy rim). Not while it rains: the rain shafts have no profile to find.
+	float dt_big = (t1 - t0) / float(steps);
+	float dt_fine = dt_big / 3.0;
+	bool adaptive = clouds.weather.x < 0.01;
+	bool fine = !adaptive;
+	int empty = 0;
+	float t = t0 + jitter * dt_big;
+	for (int i = 0; i < steps * 3 && t < t1; i++) {
 		vec3 p = o + d * t;
+		if (!fine) {
+			if (cloud_sample(p, true).profile <= 0.0) {
+				t += dt_big;
+				continue;
+			}
+			fine = true;
+			empty = 0;
+			t = max(t - dt_big + jitter * dt_fine, t0);
+			continue;
+		}
+		float dt = adaptive ? dt_fine : dt_big;
 		CloudSample cs = cloud_sample(p, false);
 		float sigma = cs.density;
 		if (sigma > 1e-6) {
@@ -494,6 +512,11 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 				break;
 			}
 		}
+		if (adaptive) {
+			empty = cs.profile > 0.0 ? 0 : empty + 1;
+			fine = empty < 4;
+		}
+		t += dt;
 	}
 	mean = wsum > 0.0 ? dsum / wsum : t1;
 	return vec4(L, T);
