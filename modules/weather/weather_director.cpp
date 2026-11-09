@@ -31,6 +31,7 @@
 #include "weather_director.h"
 
 #include "core/object/class_db.h"
+#include "servers/rendering/rendering_server.h"
 #include "wind_field_3d.h"
 
 // WeatherState
@@ -180,6 +181,107 @@ void WeatherDirector::_triggers() {
 	}
 }
 
+void WeatherDirector::register_globals() {
+	static bool registered = false;
+	RenderingServer *rs = RS::get_singleton();
+	if (registered || rs == nullptr) {
+		return;
+	}
+	registered = true;
+	rs->global_shader_parameter_add("weather_wet", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
+	rs->global_shader_parameter_add("weather_snow", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
+	rs->global_shader_parameter_add("weather_snow_line", RSE::GLOBAL_VAR_TYPE_FLOAT, 1e5f);
+	rs->global_shader_parameter_add("weather_frost", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
+	rs->global_shader_parameter_add("weather_freeze_line", RSE::GLOBAL_VAR_TYPE_FLOAT, 1e5f);
+	rs->global_shader_parameter_add("weather_flash", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
+}
+
+float WeatherDirector::get_temperature_at(float p_altitude) const {
+	return current->temperature - lapse_rate * (p_altitude - altitude_offset) * 0.001f;
+}
+
+float WeatherDirector::get_snow_line() const {
+	return (current->temperature - 1.0f) * 1000.0f / MAX(lapse_rate, 0.1f);
+}
+
+float WeatherDirector::get_freeze_line() const {
+	return current->temperature * 1000.0f / MAX(lapse_rate, 0.1f);
+}
+
+Vector3 WeatherDirector::_subject_position() const {
+	if (!subject.is_empty() && is_inside_tree()) {
+		const Node3D *s = Object::cast_to<Node3D>(get_node_or_null(subject));
+		if (s != nullptr) {
+			return s->get_global_position();
+		}
+	}
+	return Vector3();
+}
+
+// Wet ground, snow and frost build and go with the weather.
+void WeatherDirector::_ground(float p_delta) {
+	const float p = CLAMP(current->precipitation, 0.0f, 1.0f);
+	const float cover = CLAMP(current->cloud_cover, 0.0f, 1.0f);
+	if (p > 0.05f) {
+		wetness += p * p_delta / MAX(wet_build, 1.0f);
+		snow += p * p_delta / MAX(snow_build, 1.0f);
+	} else {
+		wetness -= p_delta / MAX(dry_time, 1.0f) * (1.0f - 0.6f * cover);
+		snow -= p_delta / MAX(melt_time, 1.0f) * CLAMP(current->temperature / 10.0f, 0.1f, 2.0f);
+	}
+	// Frost on clear, dry skies (only above the freezing line, as the materials draw it).
+	const float frost_target = (1.0f - cover) * (p > 0.05f ? 0.0f : 1.0f);
+	frost += CLAMP(frost_target - frost, -1.0f, 1.0f) * MIN(p_delta / MAX(frost_time, 1.0f) * 3.0f, 1.0f);
+	wetness = CLAMP(wetness, 0.0f, 1.0f);
+	snow = CLAMP(snow, 0.0f, 1.0f);
+	frost = CLAMP(frost, 0.0f, 1.0f);
+}
+
+void WeatherDirector::strike(const Vector3 &p_position) {
+	strike_position = Vector3(p_position.x, current->cloud_base - altitude_offset, p_position.z);
+	const float now = float(clock);
+	const int n = int(rng.random(2.0f, 4.99f)); // two to four flickers
+	float t = now;
+	for (int i = 0; i < n; i++) {
+		Flicker f;
+		f.start = t;
+		f.length = rng.random(0.05f, 0.12f);
+		f.peak = i == 0 ? 1.0f : rng.random(0.4f, 0.9f);
+		flickers.push_back(f);
+		t += f.length + rng.random(0.03f, 0.15f);
+	}
+	emit_signal(SNAME("lightning_strike"), p_position, p_position.distance_to(_subject_position()));
+}
+
+// Strikes at the weather's rate, and the flash their flickers make.
+void WeatherDirector::_lightning() {
+	const float now = float(clock);
+	const float rate = CLAMP(current->lightning, 0.0f, 1.0f);
+	if (rate > 0.01f && now >= next_strike) {
+		const Vector3 s = _subject_position();
+		const float a = rng.random(0.0f, float(Math::TAU));
+		const float d = rng.random(300.0f, MAX(lightning_radius, 400.0f));
+		strike(s + Vector3(Math::cos(a) * d, 0.0f, Math::sin(a) * d));
+		const float mean = Math::lerp(30.0f, 4.0f, rate);
+		next_strike = now + mean * rng.random(0.3f, 1.7f);
+	} else if (rate <= 0.01f) {
+		next_strike = now + 2.0f;
+	}
+	flash = 0.0f;
+	for (uint32_t i = 0; i < flickers.size();) {
+		const Flicker &f = flickers[i];
+		const float t = now - f.start;
+		if (t > f.length) {
+			flickers.remove_at_unordered(i);
+			continue;
+		}
+		if (t >= 0.0f) {
+			flash = MAX(flash, f.peak * (1.0f - t / f.length));
+		}
+		i++;
+	}
+}
+
 void WeatherDirector::_apply() {
 	current->copy_from(blended);
 	const float now = float(clock);
@@ -208,6 +310,20 @@ void WeatherDirector::_apply() {
 		atmosphere->set_cloud_type(current->cloud_type);
 		const float h = Math::deg_to_rad(current->wind_heading);
 		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
+		atmosphere->set_weather_mist_density(current->mist * mist_density);
+		atmosphere->set_weather_mist_top(current->mist_top - altitude_offset);
+		atmosphere->set_precipitation(current->precipitation);
+		atmosphere->set_lightning_position(strike_position);
+		atmosphere->set_lightning_flash(flash);
+	}
+	RenderingServer *rs = RS::get_singleton();
+	if (rs != nullptr && is_inside_tree()) {
+		rs->global_shader_parameter_set("weather_wet", wetness);
+		rs->global_shader_parameter_set("weather_snow", snow);
+		rs->global_shader_parameter_set("weather_snow_line", get_snow_line());
+		rs->global_shader_parameter_set("weather_frost", frost);
+		rs->global_shader_parameter_set("weather_freeze_line", get_freeze_line());
+		rs->global_shader_parameter_set("weather_flash", flash);
 	}
 }
 
@@ -224,6 +340,8 @@ void WeatherDirector::step(double p_delta) {
 		}
 	}
 	_surprises(get_effective_volatility());
+	_ground(float(p_delta));
+	_lightning();
 	_apply();
 }
 
@@ -261,6 +379,31 @@ void WeatherDirector::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_seed"), &WeatherDirector::get_seed);
 
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "wind", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "WindField3D"), "set_wind", "get_wind");
+	ClassDB::bind_method(D_METHOD("get_temperature_at", "altitude"), &WeatherDirector::get_temperature_at);
+	ClassDB::bind_method(D_METHOD("get_snow_line"), &WeatherDirector::get_snow_line);
+	ClassDB::bind_method(D_METHOD("get_freeze_line"), &WeatherDirector::get_freeze_line);
+	ClassDB::bind_method(D_METHOD("get_flash"), &WeatherDirector::get_flash);
+	ClassDB::bind_method(D_METHOD("get_strike_position"), &WeatherDirector::get_strike_position);
+	ClassDB::bind_method(D_METHOD("strike", "position"), &WeatherDirector::strike);
+	ADD_SIGNAL(MethodInfo("lightning_strike", PropertyInfo(Variant::VECTOR3, "position"), PropertyInfo(Variant::FLOAT, "distance")));
+	ADD_GROUP("Ground", "");
+#define GB(m, hint)                                                                    \
+	ClassDB::bind_method(D_METHOD("set_" #m, "value"), &WeatherDirector::set_##m);     \
+	ClassDB::bind_method(D_METHOD("get_" #m), &WeatherDirector::get_##m);              \
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, #m, PROPERTY_HINT_RANGE, hint), "set_" #m, "get_" #m);
+	GB(wetness, "0,1,0.001")
+	GB(snow, "0,1,0.001")
+	GB(frost, "0,1,0.001")
+	GB(lapse_rate, "0,15,0.01,suffix:C/km")
+	GB(wet_build, "1,3600,0.1,suffix:s")
+	GB(dry_time, "1,36000,1,suffix:s")
+	GB(snow_build, "1,36000,1,suffix:s")
+	GB(melt_time, "1,36000,1,suffix:s")
+	GB(frost_time, "1,36000,1,suffix:s")
+	GB(mist_density, "0,0.5,0.0001,suffix:/m")
+	GB(lightning_radius, "100,50000,1,suffix:m")
+#undef GB
+	ADD_GROUP("", "");
 	ClassDB::bind_method(D_METHOD("set_atmosphere", "atmosphere"), &WeatherDirector::set_atmosphere);
 	ClassDB::bind_method(D_METHOD("get_atmosphere"), &WeatherDirector::get_atmosphere);
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "atmosphere", PROPERTY_HINT_RESOURCE_TYPE, "AtmosphereEffect"), "set_atmosphere", "get_atmosphere");

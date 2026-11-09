@@ -181,6 +181,9 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, shadow_on ? 1.0f : 0.0f);
 	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
 	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), 0, 0);
+	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
+	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, 0, 0);
+	v4(lightning_position.x, lightning_position.y, lightning_position.z, lightning_flash * lightning_energy);
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;

@@ -37,6 +37,8 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 sky; // x the sky light's share, y the multiple scattering's strength, z the steps, w the light march's first step (m)
 	vec4 noise; // x the first slice the noise passes make this frame, y how many (spread over frames: a whole volume in one
 	// dispatch outlasted the driver's timeout)
+	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level)
+	vec4 lightning; // xyz the strike's flash (world, at the cloud base), w its strength now
 }
 clouds;
 
@@ -183,8 +185,23 @@ float weather_cover(vec3 w) {
 float cloud_density(vec3 w, bool cheap) {
 	float a = altitude(w);
 	float h = (a - clouds.layer.x) / max(clouds.layer.y, 1.0);
-	if (h < 0.0 || h > 1.0) {
+	if (h > 1.0) {
 		return 0.0;
+	}
+	if (h < 0.0) {
+		// Rain shafts: below the base where the cover is thick, streaked and drifting with the wind, thinning toward the
+		// ground.
+		if (cheap || clouds.weather.x < 0.01 || a < clouds.weather.y) {
+			return 0.0;
+		}
+		float wc = weather_cover(w);
+		if (wc < 0.3) {
+			return 0.0;
+		}
+		vec3 q = (w - clouds.wind.xyz) / vec3(600.0, 3000.0, 600.0);
+		float streak = textureLod(noise_base, q, 0.0).g;
+		float below = clamp((clouds.layer.x - a) / max(clouds.layer.x - clouds.weather.y, 1.0), 0.0, 1.0);
+		return clouds.weather.x * smoothstep(0.3, 0.8, wc) * smoothstep(0.35, 0.7, streak) * (1.0 - 0.6 * below) * 0.0012;
 	}
 	float wc = weather_cover(w);
 	if (wc <= 0.0) {
@@ -281,6 +298,11 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 			float powder = 1.0 - exp(-sigma * 2.0 * 60.0);
 			S *= mix(1.0, powder * 2.0, 0.35);
 			S += sky_ambient(h);
+			// Lightning: the flash lights the cloud round it, falling off over a kilometre or so.
+			if (clouds.lightning.w > 0.0) {
+				float r = length(p - clouds.lightning.xyz);
+				S += vec3(0.75, 0.8, 1.0) * clouds.lightning.w * exp(-r / 900.0) / (4.0 * PI);
+			}
 			float st = exp(-sigma * dt);
 			vec3 Sint = S * (1.0 - st); // albedo 1: scattering = extinction
 			L += T * Sint;
@@ -300,13 +322,14 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 
 // The ray's stretch through the layer (from the camera), at most reach m: x start, y end; y <= x when it misses.
 vec2 layer_span(vec3 o, vec3 d, float reach) {
-	float Rb = clouds.planet.x + clouds.layer.x;
-	float Rt = Rb + clouds.layer.y;
+	float base = clouds.weather.x > 0.01 ? clouds.weather.y : clouds.layer.x; // the rain shafts' bottom when it rains
+	float Rb = clouds.planet.x + base;
+	float Rt = clouds.planet.x + clouds.layer.x + clouds.layer.y;
 	float a = altitude(o);
 	vec2 hb = sphere_hits(o, d, Rb);
 	vec2 ht = sphere_hits(o, d, Rt);
 	float t0, t1;
-	if (a < clouds.layer.x) {
+	if (a < base) {
 		// Below: from the base up to the top (rays down never reach it, nor those the planet hides).
 		if (hb.y <= 0.0) {
 			return vec2(0.0, -1.0);
