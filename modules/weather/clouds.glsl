@@ -473,7 +473,8 @@ void main() {
 		float tau = 0.0;
 		for (int i = 0; i < N; i++) {
 			vec3 p = vec3(xz.x, base_y, xz.y) + l * ((float(i) + 0.5) * dt);
-			tau += cloud_density(p, true) * dt;
+			// The shapes the eye sees (eroded): the uneroded ones cast a fuller shadow than the clouds overhead.
+			tau += cloud_density(p, false) * dt;
 		}
 		T = exp(-tau);
 	}
