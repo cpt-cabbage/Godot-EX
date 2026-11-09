@@ -41,6 +41,8 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn
 	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1)
+	mat4 view; // the world to the camera's view space (the cascades' matrices start there)
+	vec4 cascades; // x 1 when the sun's shadow cascades are rendered (no ray-traced shadows)
 }
 fog;
 
@@ -57,6 +59,17 @@ layout(set = 0, binding = 6) uniform accelerationStructureEXT tlas;
 #define RT_ALPHA_SET 1
 #include "../../servers/rendering/renderer_rd/shaders/effects/rt_alpha_inc.glsl"
 #define ALPHA_MAX_PASSES 16u
+#endif
+#ifdef MODE_INJECT
+// The sun's shadow cascades (the raster tier: without ray-traced shadows they are rendered), read as Godot's own
+// volumetric fog reads them: the tree shafts without rays.
+#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS 8
+#include "../../servers/rendering/renderer_rd/shaders/light_data_inc.glsl"
+layout(set = 0, binding = 10, std140) uniform DirectionalLights {
+	DirectionalLightData data[MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS];
+}
+directional_lights;
+layout(set = 0, binding = 11) uniform sampler2D directional_shadow_atlas;
 #endif
 #ifdef MODE_INTEGRATE
 layout(set = 0, binding = 7) uniform sampler3D media;
@@ -139,6 +152,39 @@ float cloud_visibility(vec3 w) {
 	}
 	return textureLod(cloud_shadow_map, uv, 0.0).r;
 }
+
+#ifdef MODE_INJECT
+// The first directional light's (the sun's) cascades at a world position: 1 past them.
+float cascade_visibility(vec3 w) {
+	if (fog.cascades.x < 0.5 || directional_lights.data[0].shadow_opacity < 0.001) {
+		return 1.0;
+	}
+	vec4 v = fog.view * vec4(w, 1.0);
+	float depth_z = -v.z;
+	vec4 splits = directional_lights.data[0].shadow_split_offsets;
+	if (depth_z >= splits.w) {
+		return 1.0;
+	}
+	vec4 c;
+	float z_range;
+	if (depth_z < splits.x) {
+		c = directional_lights.data[0].shadow_matrix1 * v;
+		z_range = directional_lights.data[0].shadow_z_range.x;
+	} else if (depth_z < splits.y) {
+		c = directional_lights.data[0].shadow_matrix2 * v;
+		z_range = directional_lights.data[0].shadow_z_range.y;
+	} else if (depth_z < splits.z) {
+		c = directional_lights.data[0].shadow_matrix3 * v;
+		z_range = directional_lights.data[0].shadow_z_range.z;
+	} else {
+		c = directional_lights.data[0].shadow_matrix4 * v;
+		z_range = directional_lights.data[0].shadow_z_range.w;
+	}
+	c /= c.w;
+	float d = textureLod(directional_shadow_atlas, c.xy, 0.0).r;
+	return exp(min(0.0, c.z - d) * z_range * 10.0); // Godot's volumetric fog's fade
+}
+#endif
 
 float terrain_visibility(vec3 w) {
 	if (fog.wind.w < 0.5) {
@@ -251,6 +297,9 @@ void main() {
 		vec3 scatter = vec3(0.0);
 		if (sigma > 1e-7) {
 			float vis = terrain_visibility(p) * cloud_visibility(p);
+#ifdef MODE_INJECT
+			vis *= cascade_visibility(p);
+#endif
 #ifdef MODE_INJECT_RT
 			if (vis > 0.0 && dist < fog.range.y) {
 				vis *= rt_visibility(p, 2000.0);
