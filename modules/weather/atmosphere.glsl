@@ -398,8 +398,11 @@ void main() {
 		if (all(greaterThanEqual(tuv, vec2(0.0))) && all(lessThanEqual(tuv, vec2(1.0)))) {
 			h = camera.terrain_h.x + camera.terrain_h.y * textureLod(terrain_heights, tuv, camera.terrain_h.z).r;
 		}
-		s = max(h, s - drop);
-		imageStore(shadow_out, ivec2(i, row), vec4(s));
+		// Stored: the shadow arriving from the texels toward the light, without this texel's own ground (so the ground
+		// here is not in its own shadow; the air above the ground tests the same either way). Carried on: with it.
+		float arriving = s - drop;
+		s = max(h, arriving);
+		imageStore(shadow_out, ivec2(i, row), vec4(arriving));
 	}
 #endif
 

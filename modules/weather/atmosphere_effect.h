@@ -123,6 +123,8 @@ class AtmosphereEffect : public CompositorEffect {
 	float shadow_softness = 20.0;
 	Vector3 shadow_light; // the light the map was made for
 	bool shadow_dirty = true;
+	float sun_shadow_params[20] = {};
+	bool sun_shadow_ready = false;
 
 	// The air volume.
 	bool fog_enabled = true;
@@ -307,6 +309,10 @@ public:
 	// The terrain's heights (a texture of height_min + height_range * value over `rect`, world x and z) for its shadow in
 	// the air; a null texture turns it off.
 	void set_terrain_heights(const Ref<Texture2D> &p_heights, const Rect2 &p_rect, float p_height_min, float p_height_range);
+	// The terrain's and the clouds' shadow maps and their frames for SunShadowEffect (last frame's): p_params gets the
+	// terrain map's frame (4) and parameters (4), the clouds' map's frame (4), the light's direction (4), and whether
+	// each is drawn (2). False before the first frame.
+	bool get_sun_shadow_maps(RID &r_terrain, RID &r_clouds, float *r_params) const;
 	void set_air_shadows(bool p_v) { air_shadows = p_v; }
 	bool get_air_shadows() const { return air_shadows; }
 	void set_shadow_softness(float p_v) { shadow_softness = MAX(p_v, 0.01f); }

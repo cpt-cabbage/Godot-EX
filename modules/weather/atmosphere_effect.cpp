@@ -232,6 +232,18 @@ void AtmosphereEffect::set_terrain_heights(const Ref<Texture2D> &p_heights, cons
 	shadow_dirty = true;
 }
 
+bool AtmosphereEffect::get_sun_shadow_maps(RID &r_terrain, RID &r_clouds, float *r_params) const {
+	if (!initialized || !sun_shadow_ready) {
+		return false;
+	}
+	r_terrain = shadow_rd;
+	r_clouds = cloud_shadow_rd;
+	for (int i = 0; i < 20; i++) {
+		r_params[i] = sun_shadow_params[i];
+	}
+	return true;
+}
+
 Ref<Texture2D> AtmosphereEffect::get_transmittance_texture() {
 	_ensure();
 	return transmittance_texture;
@@ -313,6 +325,19 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	m[45] = cloud_shadow_origin.y;
 	m[46] = cloud_shadow_size;
 	m[47] = cloud_base - altitude_offset; // the base's world y
+	// For SunShadowEffect (the ground's sun shadow without ray tracing, next frame).
+	for (int i = 0; i < 8; i++) {
+		sun_shadow_params[i] = m[20 + i];
+	}
+	for (int i = 0; i < 4; i++) {
+		sun_shadow_params[8 + i] = m[44 + i];
+	}
+	sun_shadow_params[12] = light_direction.x;
+	sun_shadow_params[13] = light_direction.y;
+	sun_shadow_params[14] = light_direction.z;
+	sun_shadow_params[16] = m[19];
+	sun_shadow_params[17] = m[41];
+	sun_shadow_ready = true;
 	// The ground's sun shadow (the ray-traced mask, next frame) takes the clouds' shadow too.
 	RendererRD::Raytracing::set_sun_shadow_modulator(cloud_shadow_rd, Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, cloud_base - altitude_offset), cloud_shadows_on);
 	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
