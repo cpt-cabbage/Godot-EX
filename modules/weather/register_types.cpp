@@ -31,6 +31,7 @@
 #include "register_types.h"
 
 #include "atmosphere_effect.h"
+#include "sky_look.h"
 #include "time_of_day_3d.h"
 #include "weather_director.h"
 #include "wind_field_3d.h"
@@ -48,6 +49,7 @@ void initialize_weather_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(WeatherDirector);
 	GDREGISTER_CLASS(WeatherTrigger3D);
 	GDREGISTER_CLASS(AtmosphereEffect);
+	GDREGISTER_CLASS(SkyLook);
 	GDREGISTER_CLASS(TimeOfDay3D);
 	// The wind's global shader parameters exist before any shader that reads them compiles.
 	WindField3D::register_globals();

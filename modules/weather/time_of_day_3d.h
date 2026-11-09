@@ -40,9 +40,11 @@
 // DirectionalLight3D) to their bodies, colours them through `atmosphere`'s air (its transmittance from the camera's
 // altitude), dims each below its horizon, gives the atmosphere the brighter of the two as its light, and sets the sky
 // material's `sun_direction`, `moon_direction`, `moon_phase`, `star_rotation` and `night`. `night` (0 by day, 1 when the
-// sun is 12 degrees below the horizon) is for exposure and the stars.
+// sun is 12 degrees below the horizon) is for exposure and the stars. A `look` (SkyLook) sets the atmosphere's art
+// properties and its sky tint for the sun's height each frame, and tints the sunlight.
 
 #include "atmosphere_effect.h"
+#include "sky_look.h"
 #include "scene/3d/node_3d.h"
 #include "scene/resources/material.h"
 
@@ -62,6 +64,7 @@ class TimeOfDay3D : public Node {
 	NodePath moon_light;
 	Ref<AtmosphereEffect> atmosphere;
 	Ref<ShaderMaterial> sky_material;
+	Ref<SkyLook> look;
 	float sun_illuminance = 1.0; // the lights' energy for an unobstructed sun
 	float moon_illuminance = 0.03; // a full moon's (art: physically about 2e-6 of the sun's)
 
@@ -114,6 +117,8 @@ public:
 	Ref<AtmosphereEffect> get_atmosphere() const { return atmosphere; }
 	void set_sky_material(const Ref<ShaderMaterial> &p_m) { sky_material = p_m; }
 	Ref<ShaderMaterial> get_sky_material() const { return sky_material; }
+	void set_look(const Ref<SkyLook> &p_l) { look = p_l; }
+	Ref<SkyLook> get_look() const { return look; }
 	void set_sun_illuminance(float p_v) { sun_illuminance = MAX(p_v, 0.0f); }
 	float get_sun_illuminance() const { return sun_illuminance; }
 	void set_moon_illuminance(float p_v) { moon_illuminance = MAX(p_v, 0.0f); }

@@ -102,8 +102,13 @@ void TimeOfDay3D::_apply() {
 			cam_alt = 1400.0f;
 		}
 	}
-	auto light = [&](const NodePath &p_path, const Vector3 &p_dir, float p_e) {
+	const float sun_elevation = get_sun_elevation();
+	if (look.is_valid()) {
+		look->apply(atmosphere, sun_elevation);
+	}
+	auto light = [&](const NodePath &p_path, const Vector3 &p_dir, float p_e, const Color &p_tint) {
 		Vector3 t = atmosphere.is_valid() ? atmosphere->transmittance(cam_alt, p_dir) : Vector3(1, 1, 1);
+		t *= Vector3(p_tint.r, p_tint.g, p_tint.b);
 		// Fade out as the body sets (its disc and the planet's shadow), rather than leave a light from below.
 		const float above = CLAMP((p_dir.y + 0.02f) / 0.04f, 0.0f, 1.0f);
 		t *= above;
@@ -123,8 +128,8 @@ void TimeOfDay3D::_apply() {
 		return t;
 	};
 	const float full = 0.5f - 0.5f * Math::cos(moon_phase * 2.0f * Math::PI); // 0 new, 1 full
-	const Vector3 ts = light(sun_light, sun_direction, sun_illuminance);
-	const Vector3 tm = light(moon_light, moon_direction, moon_illuminance * full);
+	const Vector3 ts = light(sun_light, sun_direction, sun_illuminance, look.is_valid() ? look->get_sun_tint_at(sun_elevation) : Color(1, 1, 1));
+	const Vector3 tm = light(moon_light, moon_direction, moon_illuminance * full, Color(1, 1, 1));
 	if (atmosphere.is_valid()) {
 		const float es = sun_illuminance * MAX(sun_direction.y + 0.1f, 0.0f);
 		const float em = moon_illuminance * full * MAX(moon_direction.y + 0.1f, 0.0f);
@@ -209,8 +214,11 @@ void TimeOfDay3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_atmosphere"), &TimeOfDay3D::get_atmosphere);
 	ClassDB::bind_method(D_METHOD("set_sky_material", "material"), &TimeOfDay3D::set_sky_material);
 	ClassDB::bind_method(D_METHOD("get_sky_material"), &TimeOfDay3D::get_sky_material);
+	ClassDB::bind_method(D_METHOD("set_look", "look"), &TimeOfDay3D::set_look);
+	ClassDB::bind_method(D_METHOD("get_look"), &TimeOfDay3D::get_look);
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "sun_light", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "DirectionalLight3D"), "set_sun_light", "get_sun_light");
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "moon_light", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "DirectionalLight3D"), "set_moon_light", "get_moon_light");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "atmosphere", PROPERTY_HINT_RESOURCE_TYPE, "AtmosphereEffect"), "set_atmosphere", "get_atmosphere");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "sky_material", PROPERTY_HINT_RESOURCE_TYPE, "ShaderMaterial"), "set_sky_material", "get_sky_material");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "look", PROPERTY_HINT_RESOURCE_TYPE, "SkyLook"), "set_look", "get_look");
 }
