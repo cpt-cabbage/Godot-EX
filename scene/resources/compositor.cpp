@@ -92,6 +92,7 @@ void CompositorEffect::_validate_property(PropertyInfo &p_property) const {
 }
 
 void CompositorEffect::_call_render_callback(int p_effect_callback_type, const RenderData *p_render_data) {
+	_render_callback_native(p_effect_callback_type, p_render_data);
 	GDVIRTUAL_CALL(_render_callback, p_effect_callback_type, p_render_data);
 }
 
