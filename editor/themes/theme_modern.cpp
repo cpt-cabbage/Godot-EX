@@ -432,12 +432,12 @@ void ThemeModern::populate_standard_styles(const Ref<EditorTheme> &p_theme, Edit
 			// TooltipPanel is also used for custom tooltips, while TooltipLabel
 			// is only relevant for default tooltips.
 
-			p_theme->set_stylebox(CoreStringName(normal), "TooltipLabel", p_config.base_empty_style);
 			p_theme->set_color(SceneStringName(font_color), "TooltipLabel", p_config.font_hover_color);
 			p_theme->set_color("font_shadow_color", "TooltipLabel", Color(1, 1, 1, 0));
 
 			Ref<StyleBoxFlat> tooltip_style = p_config.base_style->duplicate();
 			tooltip_style->set_bg_color(p_config.surface_popup_color);
+			tooltip_style->set_content_margin_all(0);
 			tooltip_style->set_corner_radius_all(0);
 			if (p_config.draw_extra_borders) {
 				tooltip_style->set_border_width_all(EDSCALE_RND(1));
@@ -2022,6 +2022,12 @@ void ThemeModern::populate_editor_styles(const Ref<EditorTheme> &p_theme, Editor
 			p_theme->set_color("icon_pressed_color", "CheckBoxNoIconTint", p_config.icon_normal_color);
 			p_theme->set_color("icon_hover_color", "CheckBoxNoIconTint", p_config.dark_icon_and_font ? p_config.mono_color : p_config.mono_color_inv);
 			p_theme->set_color("icon_hover_pressed_color", "CheckBoxNoIconTint", p_config.dark_icon_and_font ? p_config.mono_color : p_config.mono_color_inv);
+
+			p_theme->set_type_variation("CheckBoxNoIconTintNoDim", "CheckBoxNoIconTint");
+			if (!p_config.dark_icon_and_font) {
+				// Overblown white to offset icon dimming.
+				p_theme->set_color("checkbox_unchecked_color", "CheckBoxNoIconTintNoDim", Color(3, 3, 3));
+			}
 		}
 
 		// Buttons styles that stand out against the panel background (e.g. AssetLib).
