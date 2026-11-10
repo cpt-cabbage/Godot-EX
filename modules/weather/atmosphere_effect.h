@@ -58,7 +58,8 @@
 // `light_color` (TimeOfDay3D sets it: the light's colour and energy) through the terrain's shadow map and, within
 // `fog_rt_distance`, ray-traced visibility with alpha-tested leaves (shafts through the trees), and by the sky (its
 // table's mean, times `fog_sky_light`). Each frame's point in a froxel is jittered and blended into the reprojected
-// last frame's (`fog_history`). Off with `fog_enabled`.
+// last frame's (`fog_history`); the ray-traced visibility alone is traced a froxel in four frames and carried between.
+// Off with `fog_enabled`.
 //
 // The clouds (clouds.glsl, atmosphere_clouds.cpp): a layer `cloud_base` m above sea level (it may lie below the peaks),
 // as thick as its `cloud_type` makes it (layered, heaped, towering; `cloud_thickness_scale`), `cloud_cover` of the sky,
@@ -164,6 +165,7 @@ class AtmosphereEffect : public CompositorEffect {
 	RID fog_version;
 	RID fog_pipelines[3];
 	RID fog_media[2];
+	RID fog_visibility[2];
 	RID fog_light;
 	RID fog_ubo;
 	int fog_frame = 0;

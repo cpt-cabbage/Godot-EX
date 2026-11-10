@@ -197,6 +197,12 @@ void AtmosphereEffect::_ensure() {
 		}
 		fog_light = rd->texture_create(tff, RD::TextureView());
 		rd->texture_clear(fog_light, Color(0, 0, 0, 1), 0, 1, 0, 1);
+		// The ray-traced visibility, carried between a froxel's turns to trace.
+		tff.format = RD::DATA_FORMAT_R8_UNORM;
+		for (int i = 0; i < 2; i++) {
+			fog_visibility[i] = rd->texture_create(tff, RD::TextureView());
+			rd->texture_clear(fog_visibility[i], Color(1, 1, 1, 1), 0, 1, 0, 1);
+		}
 		fog_ubo = rd->uniform_buffer_create(sizeof(float) * FOG_FLOATS);
 	}
 	transmittance_texture.instantiate();
@@ -218,7 +224,7 @@ void AtmosphereEffect::_free() {
 	transmittance_texture.unref();
 	sky_view_texture.unref();
 	cloud_panorama_texture.unref();
-	for (RID r : { cloud_panorama_rd, transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd, sky_shadow_rd, shadow_rd, camera_ubo, sampler, sampler_mip, fog_media[0], fog_media[1], fog_light, fog_ubo }) {
+	for (RID r : { cloud_panorama_rd, transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd, sky_shadow_rd, shadow_rd, camera_ubo, sampler, sampler_mip, fog_media[0], fog_media[1], fog_visibility[0], fog_visibility[1], fog_light, fog_ubo }) {
 		if (r.is_valid()) {
 			rd->free_rid(r);
 		}
@@ -524,6 +530,8 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));
+				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ fog_visibility[fog_frame & 1] })));
+				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, fog_visibility[(fog_frame + 1) & 1] })));
 			} else {
 				// The sun's cascades (read when the block says so; white and an empty light otherwise).
 				RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();

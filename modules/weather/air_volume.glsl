@@ -9,7 +9,8 @@
 // visibility (alpha-tested, so the light falls between the leaves in shafts), and by the sky. Three variants:
 // MODE_INJECT     each froxel's scattering and extinction at a jittered point in it, blended with the last frame's
 //                 (reprojected), no ray tracing
-// MODE_INJECT_RT  the same with the light's visibility ray-traced within `rt_distance`
+// MODE_INJECT_RT  the same with the light's visibility ray-traced within `rt_distance`: the one thing a froxel takes
+//                 in turns (a ray in four frames), kept in a volume of its own and carried between
 // MODE_INTEGRATE  front to back down each column: the light scattered toward the camera to each froxel, and the
 //                 transmittance (atmosphere.glsl's MODE_APPLY lays it over the scene)
 
@@ -56,6 +57,8 @@ layout(set = 0, binding = 9) uniform sampler2D cloud_shadow_map;
 #endif
 #ifdef MODE_INJECT_RT
 layout(set = 0, binding = 6) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 12, r8) uniform restrict writeonly image3D out_visibility;
+layout(set = 0, binding = 13) uniform sampler3D visibility_history;
 #define RT_ALPHA_SET 1
 #include "../../servers/rendering/renderer_rd/shaders/effects/rt_alpha_inc.glsl"
 #define ALPHA_MAX_PASSES 16u
@@ -247,69 +250,79 @@ void main() {
 	}
 	vec3 ambient = sky_ambient() * fog.albedo.w;
 	float frame = fog.cam_pos.w;
+	int k = cell.z;
+	// The last frame's value at the froxel's centre, where it was on last frame's grid.
+	vec4 h = vec4(0.0);
+	bool have = false;
+#ifdef MODE_INJECT_RT
+	float seen_before = 1.0;
+#endif
+	if (fog.prev_cam_pos.w > 0.5) {
+		vec2 uvc = (vec2(cell.xy) + 0.5) / vec2(size.xy);
+		float wc = (float(k) + 0.5) / float(size.z);
+		vec3 pc = fog.cam_pos.xyz + view_dir(uvc) * slice_distance(wc);
+		vec4 clip = fog.prev_view_proj * vec4(pc - fog.prev_cam_pos.xyz, 1.0);
+		if (clip.w > 0.0) {
+			vec2 puv = clip.xy / clip.w * 0.5 + 0.5;
+			float pw = sqrt(length(pc - fog.prev_cam_pos.xyz) / fog.range.x);
+			if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0))) && pw <= 1.0) {
+				h = textureLod(history, vec3(puv, pw), 0.0);
+#ifdef MODE_INJECT_RT
+				seen_before = textureLod(visibility_history, vec3(puv, pw), 0.0).r;
+#endif
+				have = true;
+			}
+		}
+	}
+	// A point in the froxel, moved each frame (R3), the history averaging them. (R2's first step with the golden ratio
+	// stood nearly still for a froxel traced every fourth frame: four of its steps come to 3.02.)
+	vec3 jitter = fract(vec3(0.5) + frame * vec3(0.8191725134, 0.6710436067, 0.5497004779) + hash13(vec3(cell))) - 0.5;
+	vec2 uv = (vec2(cell.xy) + 0.5 + jitter.xy) / vec2(size.xy);
+	float w = (float(k) + 0.5 + jitter.z) / float(size.z);
+	vec3 d = view_dir(uv);
+	float dist = slice_distance(w);
+	vec3 p = fog.cam_pos.xyz + d * dist;
+	float sigma = density(p);
+	vec3 scatter = vec3(0.0);
 #ifdef MODE_INJECT_RT
 	// The ray-traced light a froxel in four frames, by work group (8 x 8 columns: threads skipped within a group wait for
-	// its tracing ones), a 2 x 2 pattern of groups turning each frame: between, a group carries last frame's values where
-	// they reproject, and a fresh one blends in more strongly to make up. A ray each froxel each frame cost 2 ms in the
-	// forest at 4K (2026-11-09).
+	// its tracing ones), a 2 x 2 pattern of groups turning each frame: between, a group carries the visibility it had
+	// where it reprojects, and a fresh ray blends in more strongly to make up. A ray each froxel each frame cost 2 ms in
+	// the forest at 4K (2026-11-09). Only the visibility takes turns: the density, the shadow maps and the lighting are
+	// worked out for every froxel every frame and blended alike. While a group's whole value waited for its turn, a
+	// moving camera showed the groups as a board of blocks 8 froxels wide, the fresh one apart from the three carried
+	// (reprojection blurs what it carries), settling when the camera stopped (2026-11-10).
 	ivec2 grp = ivec2(gl_WorkGroupID.xy);
 	bool turn = ((grp.x & 1) + 2 * (grp.y & 1)) == (int(frame) & 3);
-	float fresh_history = 1.0 - (1.0 - fog.range.z) * 4.0;
-#else
-	bool turn = true;
-	float fresh_history = fog.range.z;
+	float seen = dist < fog.range.y ? seen_before : 1.0;
 #endif
-	{
-		int k = cell.z;
-		// The last frame's value at the froxel's centre, where it was on last frame's grid.
-		vec4 h = vec4(0.0);
-		bool have = false;
-		if (fog.prev_cam_pos.w > 0.5) {
-			vec2 uvc = (vec2(cell.xy) + 0.5) / vec2(size.xy);
-			float wc = (float(k) + 0.5) / float(size.z);
-			vec3 pc = fog.cam_pos.xyz + view_dir(uvc) * slice_distance(wc);
-			vec4 clip = fog.prev_view_proj * vec4(pc - fog.prev_cam_pos.xyz, 1.0);
-			if (clip.w > 0.0) {
-				vec2 puv = clip.xy / clip.w * 0.5 + 0.5;
-				float pw = sqrt(length(pc - fog.prev_cam_pos.xyz) / fog.range.x);
-				if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0))) && pw <= 1.0) {
-					h = textureLod(history, vec3(puv, pw), 0.0);
-					have = true;
-				}
-			}
-		}
-		if (!turn && have) {
-			imageStore(out_media, cell, h);
-			return;
-		}
-		// A point in the froxel, moved each frame (R2), the history averaging them.
-		vec3 jitter = fract(vec3(0.5) + frame * vec3(0.7548776662, 0.5698402910, 0.6180339887) + hash13(vec3(cell))) - 0.5;
-		vec2 uv = (vec2(cell.xy) + 0.5 + jitter.xy) / vec2(size.xy);
-		float w = (float(k) + 0.5 + jitter.z) / float(size.z);
-		vec3 d = view_dir(uv);
-		float dist = slice_distance(w);
-		vec3 p = fog.cam_pos.xyz + d * dist;
-		float sigma = density(p);
-		vec3 scatter = vec3(0.0);
-		if (sigma > 1e-7) {
-			float vis = terrain_visibility(p) * cloud_visibility(p);
+	if (sigma > 1e-7) {
+		float vis = terrain_visibility(p) * cloud_visibility(p);
 #ifdef MODE_INJECT
-			vis *= cascade_visibility(p);
+		vis *= cascade_visibility(p);
 #endif
 #ifdef MODE_INJECT_RT
-			if (vis > 0.0 && dist < fog.range.y) {
-				vis *= rt_visibility(p, 2000.0);
+		if (dist < fog.range.y) {
+			if (vis > 0.0 && (turn || !have)) {
+				seen = rt_visibility(p, 2000.0);
+				if (have) {
+					seen = mix(seen, seen_before, clamp(1.0 - (1.0 - fog.range.z) * 4.0, 0.0, 0.98));
+				}
 			}
+			vis *= seen;
+		}
 #endif
-			vec3 sun = fog.light_color.rgb * phase_hg(dot(d, fog.light_dir.xyz), fog.light_color.w) * vis;
-			scatter = fog.albedo.rgb * sigma * (sun + ambient);
-		}
-		vec4 cur = vec4(scatter, sigma);
-		if (have) {
-			cur = mix(cur, h, clamp(fresh_history, 0.0, 0.98));
-		}
-		imageStore(out_media, cell, cur);
+		vec3 sun = fog.light_color.rgb * phase_hg(dot(d, fog.light_dir.xyz), fog.light_color.w) * vis;
+		scatter = fog.albedo.rgb * sigma * (sun + ambient);
 	}
+#ifdef MODE_INJECT_RT
+	imageStore(out_visibility, cell, vec4(seen));
+#endif
+	vec4 cur = vec4(scatter, sigma);
+	if (have) {
+		cur = mix(cur, h, clamp(fog.range.z, 0.0, 0.98));
+	}
+	imageStore(out_media, cell, cur);
 #endif
 
 #ifdef MODE_INTEGRATE
