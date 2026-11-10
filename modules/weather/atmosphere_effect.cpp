@@ -41,6 +41,8 @@
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
+#include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/storage/camera_attributes_storage.h"
 #include "servers/rendering/storage/render_data.h"
 #include "servers/rendering/storage/render_scene_data.h"
 
@@ -350,6 +352,11 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	m[34] = MAX(0.0f, Math::floor(Math::log2(side / SHADOW_N / MAX(spacing, 1e-3f))));
 	m[36] = fog_distance;
 	m[37] = fog_enabled ? 1.0f : 0.0f;
+	// The camera's exposure (CameraAttributes: the renderer scales the lights, the sky and emission by it rather than
+	// the finished picture): the apply pass's own light takes it too. Without it the haze, the clouds and the air volume
+	// stayed as they were while a raised exposure_multiplier brightened everything else: at dusk a scene that lifts
+	// the exposure four-fold drew its clouds and haze at a quarter of their brightness against the ground.
+	m[38] = p_render_data->get_camera_attributes().is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->get_camera_attributes()) : 1.0f;
 	// The clouds: their block first (it sets the shadow map's origin).
 	const bool clouds_on = apply_aerial && _clouds_prepare(cam, inv, sd->get_cam_projection() * Projection(Transform3D(cam.basis, Vector3()).affine_inverse()), size);
 	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;

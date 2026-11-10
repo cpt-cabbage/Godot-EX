@@ -3440,6 +3440,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					} else if (bg == RSE::ENV_BG_SKY && radiance_texture.is_valid()) {
 						gi_sky.mode = 2;
 						gi_sky.radiance = radiance_texture;
+						// The radiance texture already holds the background's energy and the exposure it was
+						// rendered with (sky.cpp, update_radiance_buffers): what is left is the camera's exposure
+						// now over that one, the scene shader's IBL_exposure_normalization. Multiplied by the
+						// camera's exposure again, the bounce light's sky went as the exposure's square: at dusk,
+						// where a scene raises CameraAttributes.exposure_multiplier, the sky's light outweighed
+						// the sun's by that factor and the shade read as bright as the sunlit ground.
+						gi_sky.energy = 1.0f;
+						if (p_render_data->camera_attributes.is_valid()) {
+							float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * environment_get_bg_intensity(env) / rb->get_luminance_multiplier();
+							gi_sky.energy = current_exposure / MAX(0.001f, sky.sky_get_baked_exposure(environment_get_sky(env)));
+						}
 						gi_sky.orientation = environment_get_sky_orientation(env).get_quaternion().inverse();
 						RendererRD::SkyRD::Sky *sky_object = sky.sky_owner.get_or_null(environment_get_sky(env));
 						gi_sky.border_size = sky_object != nullptr ? sky_object->uv_border_size : 0.0f;

@@ -1384,7 +1384,16 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			}
 			sky->processing_layer = 1;
 		}
-		sky->baked_exposure = p_luminance_multiplier;
+		{
+			// The exposure the radiance was rendered with, for the scene shader's IBL_exposure_normalization
+			// (the camera's exposure now over this one). The radiance is rendered times p_brightness_multiplier:
+			// the background's energy, its intensity and the camera's exposure normalization. This held the
+			// luminance multiplier alone, so the normalization came out as the camera's whole exposure and the
+			// sky's light on the scene went as its square: with CameraAttributes.exposure_multiplier at 4 the
+			// sky's ambient light and reflections were 16 times brighter while the lights were 4 times.
+			const float bg_energy = RendererSceneRenderRD::get_singleton()->environment_get_bg_energy_multiplier(p_env);
+			sky->baked_exposure = p_luminance_multiplier * (bg_energy > 1e-6f ? p_brightness_multiplier / bg_energy : 1.0f);
+		}
 		sky->reflection.dirty = false;
 
 	} else {

@@ -42,7 +42,8 @@ layout(set = 0, binding = 7, std140) uniform Camera {
 	vec4 shadow_params; // x the map's side (m), y the shadow edge's softness (m), z its texels a side, w tan(light elevation)
 	vec4 terrain_rect; // the height texture's world rectangle: x, z origin, x, z size (m)
 	vec4 terrain_h; // x height_min, y height_range (m), z the mip to read at the map's texel size
-	vec4 air_volume; // x the air volume's reach (m), y 1 when it is drawn (air_volume.glsl)
+	vec4 air_volume; // x the air volume's reach (m), y 1 when it is drawn (air_volume.glsl), z the camera's exposure
+	// (MODE_APPLY: the scene's colour already holds it, so the light added here takes it too)
 	vec4 cloud_flags; // x 1 when the clouds are drawn, y 1 when their shadow map is
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 }
@@ -413,7 +414,7 @@ void main() {
 	if (camera.air_volume.y > 0.5) { \
 		float aw = min(sqrt(max(dist, 0.0) / camera.air_volume.x), 1.0); \
 		vec4 av = textureLod(air_light, vec3(uv, aw), 0.0); \
-		c.rgb = c.rgb * av.a + av.rgb; \
+		c.rgb = c.rgb * av.a + av.rgb * camera.air_volume.z; \
 	}
 	ivec2 size = ivec2(params.misc.zw);
 	if (any(greaterThanEqual(px, size))) {
@@ -451,7 +452,7 @@ void main() {
 		if (cl.a < 0.999) { \
 			float cw = sqrt(clamp(cmean * params.misc.x / params.radii.w, 0.0, 1.0)); \
 			vec4 apc = textureLod(aerial_lut, vec3(uv, cw), 0.0); \
-			c.rgb = c.rgb * cl.a + cl.rgb * apc.a + apc.rgb * params.light.w * (1.0 - cl.a); \
+			c.rgb = c.rgb * cl.a + (cl.rgb * apc.a + apc.rgb * params.light.w * (1.0 - cl.a)) * camera.air_volume.z; \
 		} \
 	}
 	float depth = texelFetch(depth_texture, px, 0).r;
@@ -460,7 +461,7 @@ void main() {
 		// from it here (the crepuscular rays), as far as the volume reaches.
 		vec4 c = imageLoad(color_image, px);
 		if (camera.cam_pos.w > 0.5) {
-			c.rgb = max(c.rgb + textureLod(sky_shadow, uv, 0.0).rgb * params.light.w, vec3(0.0));
+			c.rgb = max(c.rgb + textureLod(sky_shadow, uv, 0.0).rgb * params.light.w * camera.air_volume.z, vec3(0.0));
 		}
 		CLOUDS(c, 1e12)
 		AIR_VOLUME(c, 1e9)
@@ -474,7 +475,7 @@ void main() {
 	// Near the camera the first slice's values fade in from none.
 	float near = clamp(w * 32.0 - 0.5, 0.0, 1.0);
 	vec4 c = imageLoad(color_image, px);
-	c.rgb = c.rgb * mix(1.0, ap.a, near) + ap.rgb * params.light.w * near;
+	c.rgb = c.rgb * mix(1.0, ap.a, near) + ap.rgb * params.light.w * near * camera.air_volume.z;
 	float dist_m = dist / max(params.misc.x, 1e-12); // back to metres
 	CLOUDS(c, dist_m)
 	AIR_VOLUME(c, dist_m)
