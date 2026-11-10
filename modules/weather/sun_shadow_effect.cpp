@@ -58,7 +58,13 @@ void SunShadowEffect::_ensure() {
 	ss.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	ss.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	sampler = rd->sampler_create(ss);
-	ubo = rd->uniform_buffer_create(sizeof(float) * 36);
+	ubo = rd->uniform_buffer_create(sizeof(float) * 52);
+	RD::SamplerState cs;
+	cs.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	cs.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	cs.mip_filter = RD::SAMPLER_FILTER_LINEAR;
+	cs.max_lod = 16.0;
+	canopy_sampler = rd->sampler_create(cs);
 	initialized = true;
 }
 
@@ -90,7 +96,14 @@ void SunShadowEffect::_render_callback_native(int p_effect_callback_type, const 
 	}
 	RID mask = rb->get_texture(SNAME("rb_sun_shadow"), SNAME("mask"));
 	const Projection inv = Projection(sd->get_cam_transform()) * sd->get_cam_projection().inverse();
-	float u[36] = {};
+	float u[52] = {};
+	RID canopy, canopy_ground;
+	const bool canopied = atmosphere->get_sun_shadow_canopy(canopy, canopy_ground, u + 36);
+	if (!canopied) {
+		for (int i = 36; i < 52; i++) {
+			u[i] = 0.0f;
+		}
+	}
 	for (int c = 0; c < 4; c++) {
 		for (int r = 0; r < 4; r++) {
 			u[c * 4 + r] = inv.columns[c][r];
@@ -107,7 +120,7 @@ void SunShadowEffect::_render_callback_native(int p_effect_callback_type, const 
 	RID white = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 	RD::ComputeListID list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, pipeline);
-	rd->compute_list_bind_uniform_set(list, cache->get_cache(s, 0, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, rb->get_depth_texture(0) })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ mask })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, terrain.is_valid() ? terrain : white })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, clouds.is_valid() ? clouds : white })), RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 4, Vector<RID>({ ubo }))), 0);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(s, 0, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, rb->get_depth_texture(0) })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ mask })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, terrain.is_valid() ? terrain : white })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, clouds.is_valid() ? clouds : white })), RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 4, Vector<RID>({ ubo })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ canopy_sampler, canopied ? canopy : white })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 6, Vector<RID>({ canopy_sampler, canopied ? canopy_ground : white }))), 0);
 	rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 	rd->compute_list_end();
 }
@@ -127,6 +140,7 @@ SunShadowEffect::~SunShadowEffect() {
 		RD *rd = RD::get_singleton();
 		rd->free_rid(ubo);
 		rd->free_rid(sampler);
+		rd->free_rid(canopy_sampler);
 		shader.version_free(shader_version);
 	}
 }

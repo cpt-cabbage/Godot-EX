@@ -235,6 +235,37 @@ void AtmosphereEffect::set_terrain_heights(const Ref<Texture2D> &p_heights, cons
 	shadow_dirty = true;
 }
 
+void AtmosphereEffect::set_canopy(const Ref<Texture2D> &p_canopy, const Rect2 &p_rect, float p_height_scale, float p_from, float p_full, float p_tallest, float p_opacity) {
+	canopy_heights = p_canopy;
+	canopy_rect = p_rect;
+	canopy_height_scale = p_height_scale;
+	canopy_from = p_from;
+	canopy_full = MAX(p_full, p_from + 0.01f);
+	canopy_tallest = p_tallest;
+	canopy_opacity = CLAMP(p_opacity, 0.0f, 1.0f);
+}
+
+bool AtmosphereEffect::get_sun_shadow_canopy(RID &r_canopy, RID &r_ground, float *r_params) const {
+	if (canopy_heights.is_null() || terrain_heights.is_null() || canopy_height_scale <= 0.0f || canopy_rect.size.x <= 0.0f || canopy_rect.size.y <= 0.0f || terrain_rect.size.x <= 0.0f || terrain_rect.size.y <= 0.0f) {
+		return false;
+	}
+	r_canopy = RS::get_singleton()->texture_get_rd_texture(canopy_heights->get_rid());
+	r_ground = RS::get_singleton()->texture_get_rd_texture(terrain_heights->get_rid());
+	if (!r_canopy.is_valid() || !r_ground.is_valid()) {
+		return false;
+	}
+	const float p[16] = {
+		canopy_rect.position.x, canopy_rect.position.y, 1.0f / canopy_rect.size.x, 1.0f / canopy_rect.size.y,
+		canopy_height_scale, canopy_from, canopy_full, canopy_rect.size.x / MAX(canopy_heights->get_width(), 1),
+		terrain_rect.position.x, terrain_rect.position.y, 1.0f / terrain_rect.size.x, 1.0f / terrain_rect.size.y,
+		terrain_height_min, terrain_height_range, canopy_tallest, canopy_opacity
+	};
+	for (int i = 0; i < 16; i++) {
+		r_params[i] = p[i];
+	}
+	return true;
+}
+
 bool AtmosphereEffect::get_sun_shadow_maps(RID &r_terrain, RID &r_clouds, float *r_params) const {
 	if (!initialized || !sun_shadow_ready) {
 		return false;
@@ -343,6 +374,13 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	sun_shadow_ready = true;
 	// The ground's sun shadow (the ray-traced mask, next frame) takes the clouds' shadow too.
 	RendererRD::Raytracing::set_sun_shadow_modulator(cloud_shadow_rd, Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset), cloud_shadows_on);
+	{
+		// And the far trees' (set_canopy).
+		RID canopy_rd, ground_rd;
+		float canopy_p[16];
+		const bool canopied = get_sun_shadow_canopy(canopy_rd, ground_rd, canopy_p);
+		RendererRD::Raytracing::set_sun_shadow_canopy(canopy_rd, ground_rd, canopy_p, canopied);
+	}
 	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
 	// Rebuilt when the light has moved by about 0.02 degrees.
 	const bool rebuild_shadow = shadows && (shadow_dirty || light_direction.distance_to(shadow_light) > 3e-4f);
@@ -596,6 +634,7 @@ void AtmosphereEffect::_bind_methods() {
 	B(float, light_illuminance, Variant::FLOAT, "0,100,0.001")
 #undef B
 	ClassDB::bind_method(D_METHOD("set_terrain_heights", "heights", "rect", "height_min", "height_range"), &AtmosphereEffect::set_terrain_heights);
+	ClassDB::bind_method(D_METHOD("set_canopy", "canopy", "rect", "height_scale", "from", "full", "tallest", "opacity"), &AtmosphereEffect::set_canopy);
 	ClassDB::bind_method(D_METHOD("set_air_shadows", "enabled"), &AtmosphereEffect::set_air_shadows);
 	ClassDB::bind_method(D_METHOD("get_air_shadows"), &AtmosphereEffect::get_air_shadows);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_shadows"), "set_air_shadows", "get_air_shadows");

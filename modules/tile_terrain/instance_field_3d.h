@@ -74,6 +74,9 @@ class InstanceField3D : public Node3D {
 		float begin = 0.0;
 		float end = 0.0;
 		float draw_end = 0.0; // copies are drawn to here: past `end` by the crossfade into the next level
+		float keep_begin = 0.0; // the band of copies the level holds: what it draws and a slack each side (see add_type)
+		float keep_end = 0.0;
+		float refresh = 0.5; // the viewer's travel after which the level is refilled
 		Vector4 fade = Vector4(-1.0, -1.0, 1e18, 1e18); // the shader's lod_fade: fades in over x..y, out over z..w (m)
 		double cell = 64.0; // a draw cell's side
 		int cell_span = 1; // base cells a draw cell's side
@@ -142,6 +145,10 @@ class InstanceField3D : public Node3D {
 	int grid_z = 0;
 	int per_copy_levels = 0;
 	float level_fade = 0.0;
+	static constexpr float FADE_SLACK = 0.05f; // a crossfading level holds copies this share of the distance past its window
+	static constexpr float LEAD_FRAMES = 6.0f;
+	static constexpr int64_t LIGHT_LEVEL_TRIANGLES = 16;
+	float lead = 0.0; // the bands' widening for a viewer on the move, m
 	bool follow_camera = true;
 	Vector3 focus_position;
 	Vector3 viewer; // in local space, for the jobs
@@ -160,6 +167,7 @@ class InstanceField3D : public Node3D {
 	int last_uploads = 0;
 
 	void _build_grid(Type &p_type);
+	void _set_bands(Type &p_type, bool p_light_last);
 	void _job(uint32_t p_index, Job *p_jobs);
 	void _gen_cell(uint32_t p_index, GenJob *p_jobs);
 	void _update_procedural();
@@ -196,6 +204,8 @@ public:
 	// every instance gets the shader parameter `lod_fade` (a vec4: the copy fades in from x to y metres from the viewer
 	// and out from z to w; a shader that declares `instance uniform vec4 lod_fade` dithers by it, world/valley's
 	// lod_fade.gdshaderinc). The last level fades out to nothing before its end. Set before adding types; 0 switches.
+	// A level holds copies a little past its window at both sides, and a last level of a few triangles (an impostor) from
+	// the viewer out, so the shader must also draw nothing of a copy outside its window.
 	void set_level_fade(float p_fade);
 	float get_level_fade() const { return level_fade; }
 	void set_per_copy_levels(int p_levels);

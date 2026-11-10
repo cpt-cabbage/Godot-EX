@@ -1103,6 +1103,22 @@ public:
 	}
 	static RID sun_modulator;
 	static Vector4 sun_modulator_frame;
+	// The sun's light under tree crowns the TLAS does not hold (Godot-EX, 2026-11-10: far trees drawn as impostors cast no
+	// shadow): a map of the crowns' tops above the ground and the ground's heights, marched as a height field toward
+	// the sun for pixels past a distance (raytraced_shadows.glsl's canopy_visibility; p_params its four vec4s: the
+	// canopy's frame and parameters, the ground's). Set each frame by its owner, as the modulator. Render thread only.
+	static void set_sun_shadow_canopy(RID p_canopy, RID p_ground, const float *p_params, bool p_enabled) {
+		sun_canopy = p_enabled ? p_canopy : RID();
+		sun_canopy_ground = p_ground;
+		if (p_enabled) {
+			for (int i = 0; i < 16; i++) {
+				sun_canopy_params[i] = p_params[i];
+			}
+		}
+	}
+	static RID sun_canopy;
+	static RID sun_canopy_ground;
+	static float sun_canopy_params[16];
 	RID sun_modulator_ubo;
 
 	// The frame's acceleration structure (for consumers like volumetric fog).

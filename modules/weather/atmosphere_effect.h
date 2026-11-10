@@ -117,6 +117,14 @@ class AtmosphereEffect : public CompositorEffect {
 	// The terrain's shadow in the air.
 	Ref<Texture2D> terrain_heights;
 	Rect2 terrain_rect;
+	// The trees' crowns as a height map, for the sun's shadow of trees that cast none themselves (set_canopy).
+	Ref<Texture2D> canopy_heights;
+	Rect2 canopy_rect;
+	float canopy_height_scale = 0.0;
+	float canopy_from = 70.0;
+	float canopy_full = 110.0;
+	float canopy_tallest = 30.0;
+	float canopy_opacity = 0.85;
 	float terrain_height_min = 0.0;
 	float terrain_height_range = 1.0;
 	bool air_shadows = true;
@@ -337,6 +345,14 @@ public:
 	// terrain map's frame (4) and parameters (4), the clouds' map's frame (4), the light's direction (4), and whether
 	// each is drawn (2). False before the first frame.
 	bool get_sun_shadow_maps(RID &r_terrain, RID &r_clouds, float *r_params) const;
+	// The shadow of trees that cast none themselves (far ones, drawn as impostors), in the sun's shadow mask of either
+	// tier: `p_canopy` holds the crowns' tops above the ground over `p_rect` (world x, z; R times `p_height_scale` m,
+	// mipmapped), read with the terrain's heights (set_terrain_heights) as a height field toward the sun for pixels
+	// further than `p_from` m (in full from `p_full`); `p_tallest` the tallest crown (m), `p_opacity` the share of the
+	// sun a crown takes. A null texture: none.
+	void set_canopy(const Ref<Texture2D> &p_canopy, const Rect2 &p_rect, float p_height_scale, float p_from, float p_full, float p_tallest, float p_opacity);
+	// Render thread: the canopy's and the ground's textures and canopy_visibility's 16 parameters; false without a map.
+	bool get_sun_shadow_canopy(RID &r_canopy, RID &r_ground, float *r_params) const;
 	void set_air_shadows(bool p_v) { air_shadows = p_v; }
 	bool get_air_shadows() const { return air_shadows; }
 	void set_shadow_softness(float p_v) { shadow_softness = MAX(p_v, 0.01f); }

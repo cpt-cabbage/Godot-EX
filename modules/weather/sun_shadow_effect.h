@@ -49,6 +49,7 @@ class SunShadowEffect : public CompositorEffect {
 	RID shader_version;
 	RID pipeline;
 	RID sampler;
+	RID canopy_sampler;
 	RID ubo;
 	bool initialized = false;
 

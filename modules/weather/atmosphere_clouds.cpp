@@ -149,6 +149,7 @@ void AtmosphereEffect::_clouds_free() {
 		return;
 	}
 	RendererRD::Raytracing::set_sun_shadow_modulator(RID(), Vector4(), false);
+	RendererRD::Raytracing::set_sun_shadow_canopy(RID(), RID(), nullptr, false);
 	for (RID r : { noise_base_rd, noise_detail_rd, cloud_shadow_rd, weather_map_rd, cloud_ubo, sampler_repeat, clouds_rd[0], clouds_rd[1], cloud_depth_rd[0], cloud_depth_rd[1] }) {
 		if (r.is_valid()) {
 			rd->free_rid(r);

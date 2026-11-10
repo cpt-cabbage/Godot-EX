@@ -1043,6 +1043,9 @@ RID Raytracing::_update_movers_buffer(uint32_t p_view, const Projection &p_view_
 // GODOT_RT_ALPHA_SHADOWS=0 keeps their cards whole, as before (2026-11-09).
 RID Raytracing::sun_modulator;
 Vector4 Raytracing::sun_modulator_frame;
+RID Raytracing::sun_canopy;
+RID Raytracing::sun_canopy_ground;
+float Raytracing::sun_canopy_params[16] = {};
 
 bool Raytracing::_alpha_shadows_ready() const {
 	static const bool enabled = OS::get_singleton()->get_environment("GODOT_RT_ALPHA_SHADOWS") != "0";
@@ -1135,11 +1138,18 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	RD::Uniform u_mask(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ trace_target }));
 	// The sun's light through what the TLAS does not hold (set_sun_shadow_modulator), or white.
 	if (!sun_modulator_ubo.is_valid()) {
-		sun_modulator_ubo = rd->uniform_buffer_create(sizeof(float) * 8);
+		sun_modulator_ubo = rd->uniform_buffer_create(sizeof(float) * 24);
 	}
 	const bool modulated = sun_modulator.is_valid() && rd->texture_is_valid(sun_modulator);
-	const float mod_data[8] = { sun_modulator_frame.x, sun_modulator_frame.y, MAX(sun_modulator_frame.z, 1.0f), sun_modulator_frame.w, modulated ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+	const bool canopied = sun_canopy.is_valid() && rd->texture_is_valid(sun_canopy) && sun_canopy_ground.is_valid() && rd->texture_is_valid(sun_canopy_ground);
+	float mod_data[24] = { sun_modulator_frame.x, sun_modulator_frame.y, MAX(sun_modulator_frame.z, 1.0f), sun_modulator_frame.w, modulated ? 1.0f : 0.0f, canopied ? 1.0f : 0.0f, 0.0f, 0.0f };
+	for (int i = 0; i < 16; i++) {
+		mod_data[8 + i] = canopied ? sun_canopy_params[i] : 0.0f;
+	}
 	rd->buffer_update(sun_modulator_ubo, 0, sizeof(mod_data), mod_data);
+	RID white_texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+	RD::Uniform u_canopy(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ material_sampler.is_valid() ? material_sampler : sampler, canopied ? sun_canopy : white_texture }));
+	RD::Uniform u_canopy_ground(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ material_sampler.is_valid() ? material_sampler : sampler, canopied ? sun_canopy_ground : white_texture }));
 	RID mod_texture = modulated ? sun_modulator : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 	// Filtered (the default sampler is nearest: the clouds' 78 m texels showed as squares in their shadow).
 	RD::Uniform u_mod(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ material_sampler.is_valid() ? material_sampler : sampler, mod_texture }));
@@ -1149,7 +1159,7 @@ void Raytracing::process(Ref<RenderSceneBuffersRD> p_render_buffers, uint32_t p_
 	rd->draw_command_begin_label("RT Sun Shadows Trace");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_mod, u_mod_ubo), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 0, u_tlas, u_depth, u_mod, u_mod_ubo, u_canopy, u_canopy_ground), 0);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader_rid, 1, u_mask), 1);
 	_alpha_binding(0xFF).bind(compute_list, shader_rid, 2);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));

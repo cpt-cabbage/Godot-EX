@@ -22,8 +22,53 @@ layout(set = 0, binding = 4, std140) uniform Params {
 	vec4 cloud_frame; // xy the clouds' map's corner (world x, z), z its side (m), w the clouds' base (world y)
 	vec4 light; // xyz toward the light, w unused
 	vec4 flags; // x 1 the terrain shadows, y 1 the clouds shadow, zw the screen's size
+	vec4 canopy_frame; // see canopy_visibility; canopy_params.x 0 without a canopy map
+	vec4 canopy_params;
+	vec4 ground_frame;
+	vec4 ground_params;
 }
 params;
+layout(set = 0, binding = 5) uniform sampler2D sun_canopy;
+layout(set = 0, binding = 6) uniform sampler2D sun_canopy_ground;
+
+// The sun's light under the crowns of trees that cast no shadow of their own (far ones, drawn as impostors; Godot-EX,
+// 2026-11-10): a height field's shadow from a map of the crowns' tops above the ground (`canopy`, R times cp.x m; frames
+// are a corner in world x, z and one over the sides) and the ground's heights (gp.x + gp.y * R). A point `p` more than
+// cp.y m from the camera (in full from cp.z) is shaded where the ray to the sun passes under a crown before it clears
+// the tallest (gp.z m); gp.w is how much of the sun a crown takes. Eight taps along the ray, the ground between its
+// ends taken as a plane; nothing where a coarse read finds no crown along it.
+float canopy_visibility(sampler2D canopy, sampler2D ground, vec3 p, vec3 to_sun, vec3 cam, vec4 cf, vec4 cp, vec4 gf, vec4 gp) {
+	float dist = distance(p, cam);
+	float w = smoothstep(cp.y, cp.z, dist);
+	if (w <= 0.0 || to_sun.y < 0.03) {
+		return 1.0;
+	}
+	float g0 = gp.x + gp.y * textureLod(ground, (p.xz - gf.xy) * gf.zw, 0.0).r;
+	float above = max(p.y - g0, 0.0);
+	if (above >= gp.z) {
+		return 1.0;
+	}
+	float reach = min((gp.z - above) / to_sun.y, 160.0);
+	float across = reach * length(to_sun.xz);
+	vec2 mid = (p.xz + to_sun.xz * reach * 0.5 - cf.xy) * cf.zw;
+	if (any(lessThan(mid, vec2(0.0))) || any(greaterThan(mid, vec2(1.0)))) {
+		return 1.0;
+	}
+	if (textureLod(canopy, mid, log2(max(across, cp.w) / cp.w) + 2.0).r <= 0.0) {
+		return 1.0;
+	}
+	vec3 end = p + to_sun * reach;
+	float g1 = gp.x + gp.y * textureLod(ground, (end.xz - gf.xy) * gf.zw, 0.0).r;
+	float lod = log2(max(max(dist * 0.0015, across / 8.0) / cp.w, 1.0));
+	float occ = 0.0;
+	for (int i = 0; i < 8; i++) {
+		float f = (float(i) + 0.5) / 8.0;
+		vec3 q = p + to_sun * (reach * f);
+		float h = textureLod(canopy, (q.xz - cf.xy) * cf.zw, lod).r * cp.x;
+		occ = max(occ, smoothstep(0.5, 2.5, h) * smoothstep(0.0, 2.0, mix(g0, g1, f) + h - q.y));
+	}
+	return 1.0 - occ * w * gp.w;
+}
 
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -58,6 +103,10 @@ void main() {
 		if (all(greaterThanEqual(cuv, vec2(0.0))) && all(lessThanEqual(cuv, vec2(1.0)))) {
 			vis *= textureLod(cloud_shadow, cuv, 0.0).r;
 		}
+	}
+	if (params.canopy_params.x > 0.0 && vis > 0.0) {
+		vec4 cam = params.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0); // the near plane's middle: the camera, within centimetres
+		vis *= canopy_visibility(sun_canopy, sun_canopy_ground, w, params.light.xyz, cam.xyz / cam.w, params.canopy_frame, params.canopy_params, params.ground_frame, params.ground_params);
 	}
 	imageStore(out_mask, px, vec4(vis));
 }

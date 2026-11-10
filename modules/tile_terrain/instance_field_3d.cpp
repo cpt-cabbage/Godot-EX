@@ -65,6 +65,56 @@ void InstanceField3D::set_base_cell(double p_size) {
 	}
 }
 
+// The levels' crossfade windows, the bands of copies they hold and the travel they are refilled after.
+void InstanceField3D::_set_bands(Type &t, bool p_light_last) {
+	if (level_fade > 0.0f) {
+		// The crossfade's window past a level's end, inside the overlap.
+		const int last = int(t.levels.size()) - 1;
+		for (int l = 0; l <= last; l++) {
+			Level &lv = t.levels[l];
+			if (l > 0) {
+				const Level &prev = t.levels[l - 1];
+				lv.fade.x = prev.fade.z;
+				lv.fade.y = prev.fade.w;
+			}
+			if (l < last) {
+				lv.draw_end = lv.end * (1.0f + level_fade);
+				lv.fade.z = lv.end * (1.0f + 0.2f * level_fade);
+				lv.fade.w = lv.end * (1.0f + 0.9f * level_fade);
+			} else {
+				lv.fade.z = lv.end * (1.0f - 0.6f * level_fade);
+				lv.fade.w = lv.end * 0.98f;
+			}
+			// The copies a level holds: its window and FADE_SLACK of the distance more at each side (the shader folds
+			// away what the window leaves out), so a refill that comes late, by the distance it waits for or the frames
+			// its jobs take, still finds every copy the window shows. Before 2026-11-10 the slack was 1.4 to 2.8 % and a
+			// level refilled after 1 % of its end: the trees' impostors (to 1.8 km) came 18 m of travel late, long after
+			// the last mesh level had dissolved at 1.13 of its 130 m, and a wood seen flying sideways or back stood bare.
+			lv.keep_begin = l > 0 ? lv.fade.x * (1.0f - FADE_SLACK) : 0.0f;
+			lv.keep_end = l < last ? lv.draw_end * (1.0f + FADE_SLACK) : lv.end;
+			float margin = l < last ? lv.keep_end - lv.fade.w : lv.end - lv.fade.w;
+			if (l > 0) {
+				// A last level of a few triangles a copy (an impostor's quad) holds its cells' copies from the viewer
+				// out: its cells are the largest, and cutting them at the near edge refilled the cell around the viewer
+				// every few steps.
+				int64_t triangles = 0;
+				if (lv.mesh.is_valid()) {
+					for (int s = 0; s < lv.mesh->get_surface_count(); s++) {
+						const int64_t il = lv.mesh->surface_get_array_index_len(s);
+						triangles += (il > 0 ? il : lv.mesh->surface_get_array_len(s)) / 3;
+					}
+				}
+				if (p_light_last && l == last && triangles <= LIGHT_LEVEL_TRIANGLES) {
+					lv.keep_begin = 0.0f;
+				} else {
+					margin = MIN(margin, lv.fade.x - lv.keep_begin);
+				}
+			}
+			lv.refresh = MAX(0.25f, 0.3f * margin);
+		}
+	}
+}
+
 int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_placements) {
 	ERR_FAIL_COND_V_MSG(grid_x == 0, -1, "InstanceField3D: set_bounds first.");
 	ERR_FAIL_COND_V(p_meshes.is_empty() || p_meshes.size() != p_ends.size(), -1);
@@ -131,29 +181,11 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		lv.cell = span * base_cell;
 		lv.shadows = l < p_shadow_levels;
 		lv.draw_end = lv.end;
+		lv.keep_begin = lv.begin;
+		lv.keep_end = lv.end;
+		lv.refresh = MAX(0.5f, 0.01f * lv.end);
 	}
-	if (level_fade > 0.0f) {
-		// The crossfade's window past a level's end: inside the overlap by a margin each side, so a level whose cells
-		// were filled a little ago (a refill waits for the viewer to move 1 % of the level's end) still holds the copies
-		// the window needs.
-		const int last = p_meshes.size() - 1;
-		for (int l = 0; l <= last; l++) {
-			Level &lv = t.levels[l];
-			if (l > 0) {
-				const Level &prev = t.levels[l - 1];
-				lv.fade.x = prev.fade.z;
-				lv.fade.y = prev.fade.w;
-			}
-			if (l < last) {
-				lv.draw_end = lv.end * (1.0f + level_fade);
-				lv.fade.z = lv.end * (1.0f + 0.2f * level_fade);
-				lv.fade.w = lv.end * (1.0f + 0.9f * level_fade);
-			} else {
-				lv.fade.z = lv.end * (1.0f - 0.6f * level_fade);
-				lv.fade.w = lv.end * 0.98f;
-			}
-		}
-	}
+	_set_bands(t, true);
 	return int(types.size()) - 1;
 }
 
@@ -163,6 +195,7 @@ int InstanceField3D::add_procedural_type(const String &p_name, const TypedArray<
 	const int index = add_type(p_name, p_meshes, p_ends, p_shadow_levels, PackedFloat32Array());
 	ERR_FAIL_COND_V(index < 0, -1);
 	Type &t = types[index];
+	_set_bands(t, false); // every level cut at its near edge: the copies are made near the viewer
 	Procedural &pr = t.proc;
 	pr.enabled = true;
 	pr.density = MAX(p_density, 0.0f);
@@ -354,11 +387,12 @@ void InstanceField3D::set_per_copy_levels(int p_levels) {
 void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible) {
 	RenderingServer *rs = RS::get_singleton();
 	p_level.copies_frame++;
-	const float b2 = p_level.begin * p_level.begin, e2 = p_level.draw_end * p_level.draw_end;
-	const int x0 = MAX(0, int(Math::floor((viewer.x - p_level.draw_end - grid_origin.x) / base_cell)));
-	const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + p_level.draw_end - grid_origin.x) / base_cell)));
-	const int z0 = MAX(0, int(Math::floor((viewer.z - p_level.draw_end - grid_origin.y) / base_cell)));
-	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + p_level.draw_end - grid_origin.y) / base_cell)));
+	const float kb = MAX(0.0f, p_level.keep_begin - lead), ke = p_level.keep_end + lead;
+	const float b2 = kb * kb, e2 = ke * ke;
+	const int x0 = MAX(0, int(Math::floor((viewer.x - ke - grid_origin.x) / base_cell)));
+	const int x1 = MIN(grid_x - 1, int(Math::floor((viewer.x + ke - grid_origin.x) / base_cell)));
+	const int z0 = MAX(0, int(Math::floor((viewer.z - ke - grid_origin.y) / base_cell)));
+	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + ke - grid_origin.y) / base_cell)));
 	LocalVector<uint32_t> in_band;
 	for (int bz = z0; bz <= z1; bz++) {
 		for (int bx = x0; bx <= x1; bx++) {
@@ -419,7 +453,8 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 	Job &j = p_jobs[p_index];
 	const Type &t = types[j.type];
 	const Level &lv = t.levels[j.level];
-	const float b2 = lv.begin * lv.begin, e2 = lv.draw_end * lv.draw_end;
+	const float kb = MAX(0.0f, lv.keep_begin - lead), ke = lv.keep_end + lead;
+	const float b2 = kb * kb, e2 = ke * ke;
 	LocalVector<float> out;
 	uint64_t h = 1469598103934665603ULL;
 	int count = 0;
@@ -516,7 +551,12 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 	}
 	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
 	frame++;
+	const Vector3 was = viewer;
 	viewer = get_global_transform().affine_inverse().xform(p_position);
+	// A viewer on the move: the bands kept are wider by what it covers in LEAD_FRAMES frames, the time a refill takes to
+	// reach the screen (not on a jump: a forced update, or further than a frame of any flight).
+	const float step = was.distance_to(viewer);
+	lead = (p_force || step > 20.0f) ? 0.0f : MIN(step * LEAD_FRAMES, float(base_cell));
 	_update_procedural();
 	LocalVector<Job> jobs;
 	LocalVector<Vector2i> updated; // (type, level) refilled this frame
@@ -527,7 +567,7 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 		}
 		for (uint32_t li = 0; li < t.levels.size(); li++) {
 			Level &lv = t.levels[li];
-			if (!p_force && lv.last_update.distance_to(viewer) < MAX(0.5f, 0.01f * lv.end)) {
+			if (!p_force && lv.last_update.distance_to(viewer) < lv.refresh) {
 				continue;
 			}
 			lv.last_update = viewer;
@@ -537,21 +577,22 @@ void InstanceField3D::update_now(const Vector3 &p_position, bool p_force) {
 			}
 			updated.push_back(Vector2i(ti, li));
 			const int ncx = (grid_x + lv.cell_span - 1) / lv.cell_span, ncz = (grid_z + lv.cell_span - 1) / lv.cell_span;
-			const int x0 = MAX(0, int(Math::floor((viewer.x - lv.draw_end - grid_origin.x) / lv.cell)));
-			const int x1 = MIN(ncx - 1, int(Math::floor((viewer.x + lv.draw_end - grid_origin.x) / lv.cell)));
-			const int z0 = MAX(0, int(Math::floor((viewer.z - lv.draw_end - grid_origin.y) / lv.cell)));
-			const int z1 = MIN(ncz - 1, int(Math::floor((viewer.z + lv.draw_end - grid_origin.y) / lv.cell)));
+			const double kb = MAX(0.0f, lv.keep_begin - lead), ke = lv.keep_end + lead;
+			const int x0 = MAX(0, int(Math::floor((viewer.x - ke - grid_origin.x) / lv.cell)));
+			const int x1 = MIN(ncx - 1, int(Math::floor((viewer.x + ke - grid_origin.x) / lv.cell)));
+			const int z0 = MAX(0, int(Math::floor((viewer.z - ke - grid_origin.y) / lv.cell)));
+			const int z1 = MIN(ncz - 1, int(Math::floor((viewer.z + ke - grid_origin.y) / lv.cell)));
 			for (int cz = z0; cz <= z1; cz++) {
 				for (int cx = x0; cx <= x1; cx++) {
 					// The cell's nearest and farthest point in x, z against the band.
 					const double ax = grid_origin.x + cx * lv.cell, az = grid_origin.y + cz * lv.cell;
 					const double nx = CLAMP(double(viewer.x), ax, ax + lv.cell) - viewer.x, nz = CLAMP(double(viewer.z), az, az + lv.cell) - viewer.z;
-					if (nx * nx + nz * nz >= double(lv.draw_end) * lv.draw_end) {
+					if (nx * nx + nz * nz >= ke * ke) {
 						continue;
 					}
 					const double fx = MAX(Math::abs(ax - viewer.x), Math::abs(ax + lv.cell - viewer.x));
 					const double fz = MAX(Math::abs(az - viewer.z), Math::abs(az + lv.cell - viewer.z));
-					if (lv.begin > 0.0f && fx * fx + fz * fz < double(lv.begin) * lv.begin) {
+					if (kb > 0.0 && fx * fx + fz * fz < kb * kb) {
 						continue;
 					}
 					Job j;
