@@ -55,11 +55,19 @@ float canopy_visibility(sampler2D canopy, sampler2D ground, vec3 p, vec3 to_sun,
 	}
 	vec3 end = p + to_sun * reach;
 	float g1 = gp.x + gp.y * textureLod(ground, (end.xz - gf.xy) * gf.zw, 0.0).r;
-	float lod = log2(max(max(dist * 0.0015, across / 8.0) / cp.w, 1.0));
+	// The taps crowd toward the point (the square of an even spacing), each read as coarsely as the gap to the next: a
+	// small tree's shadow is short and needs the map's own texels, a tall one's long and its crown wide. Evenly spaced
+	// over the tallest tree's reach, a 6 m Protea alone cast a third of the shadow its meshes did.
+	// A point up in a crown starts beyond it (0.7 of its height above the ground along the ray): the map's dome is
+	// no measure of which leaves of its own crown shade it, and the taps at its foot put every far crown in shade
+	// (leaves at 0.16 of the grass's luminance against 0.34 for the same tree's meshes).
+	float near = min(0.7 * above, reach);
 	float occ = 0.0;
 	for (int i = 0; i < 8; i++) {
-		float f = (float(i) + 0.5) / 8.0;
-		vec3 q = p + to_sun * (reach * f);
+		float e = (float(i) + 0.5) / 8.0;
+		float f = e * e;
+		vec3 q = p + to_sun * mix(near, reach, f);
+		float lod = log2(max(max(dist * 0.0015, across * e / 6.0) / cp.w, 1.0));
 		float h = textureLod(canopy, (q.xz - cf.xy) * cf.zw, lod).r * cp.x;
 		occ = max(occ, smoothstep(0.5, 2.5, h) * smoothstep(0.0, 2.0, mix(g0, g1, f) + h - q.y));
 	}
