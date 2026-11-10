@@ -38,8 +38,10 @@
 //
 // Each frame it is baked into a 3D texture (`extent` m, `resolution` cells; RGBA half: velocity in m/s and the
 // turbulence) centred on the camera and snapped to its cells, set as the global shader parameters `wind_field`,
-// `wind_field_origin`, `wind_field_size` and `wind_global` (the global wind 10 m up, x and z; its gust strength; the
-// field's clock), so any shader samples it. get_wind() gives the same wind anywhere, for scripts and physics. The ground
+// `wind_field_origin`, `wind_field_size`, `wind_global` (the global wind 10 m up, x and z; its gust strength; the
+// field's clock) and `wind_advect` (how far the wind has carried the gusts, x and z; the shader TIME that is true at;
+// the speed it moves on at), so any shader samples it, or works the same gusts out for itself (the noise is integer
+// hashed: a shader's copy gives the same values) at its own TIME, which gives its motion vectors the frame before. get_wind() gives the same wind anywhere, for scripts and physics. The ground
 // for the shear is `terrain`'s (a TileTerrain3D, by its get_height), else y = 0.
 
 #include "core/templates/local_vector.h"
@@ -66,6 +68,12 @@ class WindField3D : public Node3D {
 	bool publish = true;
 
 	double time = 0.0;
+	// How far the wind has carried its gusts and turbulence (m, x and z): the wind summed over time, so a change of
+	// speed or heading changes where the pattern goes next, not where it is (time x speed x direction swept the whole
+	// pattern across the valley whenever the weather turned the wind).
+	double advect_x = 0.0;
+	double advect_z = 0.0;
+	double last_step = 0.0;
 	Vector3 origin;
 	Ref<ImageTexture3D> texture;
 	Vector<Ref<Image>> slices;
@@ -93,6 +101,9 @@ public:
 	Ref<Texture3D> get_texture() const { return texture; }
 	Vector3 get_field_origin() const { return origin; }
 	double get_time() const { return time; }
+	Vector2 get_advect() const { return Vector2(advect_x, advect_z); }
+	// The gusts' factor on the global wind at a world position (0 and up, 1 without gusts).
+	float get_gust(const Vector3 &p_world) const;
 	void bake_now(const Vector3 &p_center);
 	double get_last_bake_ms() const { return last_bake_ms; }
 

@@ -30,14 +30,17 @@
 
 #include "wind_field_3d.h"
 
+#include "core/config/project_settings.h"
 #include "core/object/class_db.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "modules/tile_terrain/tile_terrain_3d.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/main/viewport.h"
+#include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_enums.h"
+#include "servers/rendering/rendering_server_globals.h"
 
 // Value noise, -1 to 1, smooth.
 static _FORCE_INLINE_ float hash3(int x, int y, int z) {
@@ -72,6 +75,7 @@ void WindField3D::register_globals() {
 	rs->global_shader_parameter_add("wind_field_origin", RSE::GLOBAL_VAR_TYPE_VEC3, Vector3());
 	rs->global_shader_parameter_add("wind_field_size", RSE::GLOBAL_VAR_TYPE_VEC3, Vector3(1, 1, 1));
 	rs->global_shader_parameter_add("wind_global", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
+	rs->global_shader_parameter_add("wind_advect", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
 }
 
 void WindField3D::set_extent(const Vector3 &p_extent) {
@@ -106,7 +110,7 @@ Vector3 WindField3D::_global(const Vector3 &p, float p_ground, float &r_turb) co
 	const float ang = Math::deg_to_rad(heading + veer * hh / 1000.0f);
 	const Vector3 dir(Math::cos(ang), 0.0f, Math::sin(ang));
 	// Gusts: a noise carried along with the wind, large and slow; turbulence: a small fast one.
-	const Vector3 carried = p - dir * float(time) * MAX(speed, 0.5f);
+	const Vector3 carried = p - Vector3(float(advect_x), 0.0f, float(advect_z));
 	const float g = noise3(carried.x / gust_scale, carried.y / (gust_scale * 0.5f), carried.z / gust_scale) * 0.7f +
 			noise3(carried.x / (gust_scale * 0.4f), float(time) * 0.1f, carried.z / (gust_scale * 0.4f)) * 0.3f;
 	const float n1 = noise3(carried.x / turbulence_scale, carried.y / turbulence_scale + float(time) * 0.7f, carried.z / turbulence_scale);
@@ -131,6 +135,14 @@ Vector3 WindField3D::get_wind(const Vector3 &p_world) const {
 		w += z.sample(p_world, noise3(p_world.x * 0.2f, float(time) * 1.3f, p_world.z * 0.2f));
 	}
 	return w;
+}
+
+float WindField3D::get_gust(const Vector3 &p_world) const {
+	const Vector3 p = get_global_transform().affine_inverse().xform(p_world);
+	const Vector3 carried = p - Vector3(float(advect_x), 0.0f, float(advect_z));
+	const float g = noise3(carried.x / gust_scale, carried.y / (gust_scale * 0.5f), carried.z / gust_scale) * 0.7f +
+			noise3(carried.x / (gust_scale * 0.4f), float(time) * 0.1f, carried.z / (gust_scale * 0.4f)) * 0.3f;
+	return MAX(0.0f, 1.0f + gust_strength * g);
 }
 
 Vector3 WindField3D::get_wind_at_height(float p_height) const {
@@ -196,6 +208,14 @@ void WindField3D::_bake(const Vector3 &p_center) {
 		rs->global_shader_parameter_set("wind_field_size", extent);
 		const Vector3 w10 = get_wind_at_height(10.0f);
 		rs->global_shader_parameter_set("wind_global", Vector4(w10.x, w10.z, gust_strength, float(time)));
+		// The shader TIME of the frame about to be drawn: the renderer's clock as the last frame left it, and this
+		// frame's step.
+		double shader_time = RSG::rasterizer != nullptr ? RSG::rasterizer->get_total_time() + last_step : 0.0;
+		const double roll = GLOBAL_GET("rendering/limits/time/time_rollover_secs");
+		if (roll > 0.0) {
+			shader_time = Math::fmod(shader_time, roll);
+		}
+		rs->global_shader_parameter_set("wind_advect", Vector4(float(advect_x), float(advect_z), float(shader_time), gust_scale));
 	}
 	last_bake_ms = (OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 }
@@ -214,7 +234,15 @@ void WindField3D::_notification(int p_what) {
 			set_process_internal(false);
 		} break;
 		case NOTIFICATION_INTERNAL_PROCESS: {
-			time += get_process_delta_time();
+			last_step = get_process_delta_time();
+			time += last_step;
+			{
+				const float ang = Math::deg_to_rad(heading);
+				const double go = MAX(speed, 0.5f) * last_step;
+				// Kept under 2^20 m, where a float still places the pattern to a few centimetres.
+				advect_x = Math::fmod(advect_x + Math::cos(ang) * go, 1048576.0);
+				advect_z = Math::fmod(advect_z + Math::sin(ang) * go, 1048576.0);
+			}
 			Vector3 p = focus_position;
 			if (follow_camera) {
 				const Camera3D *cam = get_viewport() ? get_viewport()->get_camera_3d() : nullptr;
@@ -233,6 +261,8 @@ void WindField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_texture"), &WindField3D::get_texture);
 	ClassDB::bind_method(D_METHOD("get_field_origin"), &WindField3D::get_field_origin);
 	ClassDB::bind_method(D_METHOD("get_time"), &WindField3D::get_time);
+	ClassDB::bind_method(D_METHOD("get_advect"), &WindField3D::get_advect);
+	ClassDB::bind_method(D_METHOD("get_gust", "position"), &WindField3D::get_gust);
 	ClassDB::bind_method(D_METHOD("bake_now", "center"), &WindField3D::bake_now);
 	ClassDB::bind_method(D_METHOD("get_last_bake_ms"), &WindField3D::get_last_bake_ms);
 	ClassDB::bind_method(D_METHOD("set_heading", "degrees"), &WindField3D::set_heading);
