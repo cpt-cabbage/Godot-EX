@@ -283,6 +283,7 @@ public:
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
 		float baked_exposure = 1.0;
+		float baked_exposure_normalization = 1.0; // The camera's exposure normalization alone in the radiance (for SDFGI's probes).
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material_data = nullptr;

@@ -1410,8 +1410,19 @@ void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky, RID p_tlas) {
 	}
 
 	int32_t probe_divisor = cascade_size / SDFGI::PROBE_DIVISOR;
+	const float sky_energy = push_constant.sky_energy;
 	for (uint32_t i = 0; i < cascades.size(); i++) {
 		push_constant.cascade = i;
+		if (bool(push_constant.sky_flags & SDFGIShader::IntegratePushConstant::SKY_FLAGS_MODE_SKY) && p_sky != nullptr) {
+			// The sky's radiance holds the camera's exposure it was rendered with; the cascade's probes are read back
+			// times the camera's exposure over the cascade's. So the sky goes in at the cascade's exposure over its own:
+			// taken as it is, it kept the exposure of its last rendering through any change (a sky that stands still
+			// while the exposure moves), and took a change twice once it was rendered again.
+			push_constant.sky_energy = sky_energy * cascades[i].baked_exposure_normalization / MAX(p_sky->baked_exposure_normalization, 1e-6f);
+		} else if (bool(push_constant.sky_flags & SDFGIShader::IntegratePushConstant::SKY_FLAGS_MODE_COLOR)) {
+			// A background colour holds no exposure: it takes the cascade's (1 without camera attributes).
+			push_constant.sky_energy = sky_energy * cascades[i].baked_exposure_normalization;
+		}
 		push_constant.world_offset[0] = cascades[i].position.x / probe_divisor;
 		push_constant.world_offset[1] = cascades[i].position.y / probe_divisor;
 		push_constant.world_offset[2] = cascades[i].position.z / probe_divisor;
@@ -1963,7 +1974,11 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 			}
 
 			if (p_render_data->camera_attributes.is_valid()) {
-				lights[idx].energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				// At the exposure the cascade was rendered with, not the camera's now: what the cascade holds is read
+				// back times the camera's exposure over the cascade's (exposure_normalization above). Stored at the
+				// camera's, a change of exposure with the cascade standing still (a still camera while a scene's eye
+				// adaptation moves) reached this light twice.
+				lights[idx].energy *= cascade.baked_exposure_normalization;
 			}
 
 			lights[idx].has_shadow = RSG::light_storage->light_has_shadow(light);
@@ -2031,7 +2046,7 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 			}
 
 			if (p_render_data->camera_attributes.is_valid()) {
-				lights[idx].energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				lights[idx].energy *= cascade.baked_exposure_normalization; // As the directional lights above.
 			}
 
 			lights[idx].has_shadow = RSG::light_storage->light_has_shadow(light);

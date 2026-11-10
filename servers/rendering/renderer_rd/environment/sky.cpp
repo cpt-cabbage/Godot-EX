@@ -1393,6 +1393,8 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			// sky's ambient light and reflections were 16 times brighter while the lights were 4 times.
 			const float bg_energy = RendererSceneRenderRD::get_singleton()->environment_get_bg_energy_multiplier(p_env);
 			sky->baked_exposure = p_luminance_multiplier * (bg_energy > 1e-6f ? p_brightness_multiplier / bg_energy : 1.0f);
+			const float bg_light = bg_energy * RendererSceneRenderRD::get_singleton()->environment_get_bg_intensity(p_env);
+			sky->baked_exposure_normalization = bg_light > 1e-6f ? p_brightness_multiplier / bg_light : 1.0f;
 		}
 		sky->reflection.dirty = false;
 
