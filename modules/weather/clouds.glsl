@@ -693,6 +693,14 @@ void main() {
 		scene = length(rel.xyz / rel.w);
 	}
 	vec2 span = layer_span(o, d, min(clouds.planet.z, scene));
+	// Cut short by the scene: every pixel under this texel holds something nearer than where the clouds go on to (a
+	// crown close by, a ridge). Kept with the texel (the sign of its mean distance): what it holds is not the sky's
+	// cloud, for the apply pass's sky pixels beside it and for the history of a texel the sky shows through later.
+	bool cut = false;
+	if (scene < 1e11) {
+		vec2 whole = layer_span(o, d, clouds.planet.z);
+		cut = whole.y > max(whole.x, scene) || d.y > 0.0;
+	}
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
 	float first = -1.0, mean = 1e9;
 	if (span.y > span.x) {
@@ -713,10 +721,28 @@ void main() {
 			vec2 puv = clip.xy / clip.w * 0.5 + 0.5;
 			if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
 				vec4 h = textureLod(history, puv, 0.0);
-				vec2 hd = textureLod(history_depth, puv, 0.0).rg;
+				// The history's distances, bilinear by hand: the mean's sign is a flag.
+				vec2 hsz = vec2(textureSize(history_depth, 0));
+				vec2 hp = puv * hsz - 0.5;
+				ivec2 h0 = ivec2(floor(hp));
+				vec2 hf = hp - vec2(h0);
+				vec2 hd = vec2(0.0);
+				bool hcut = false;
+				for (int hj = 0; hj < 4; hj++) {
+					vec2 t = texelFetch(history_depth, clamp(h0 + ivec2(hj & 1, hj >> 1), ivec2(0), ivec2(hsz) - 1), 0).rg;
+					float hb = ((hj & 1) != 0 ? hf.x : 1.0 - hf.x) * ((hj >> 1) != 0 ? hf.y : 1.0 - hf.y);
+					hd += vec2(t.r, abs(t.g)) * hb;
+					hcut = hcut || t.g < 0.0;
+				}
 				// Where the scene stands in front of last frame's clouds now, their history does not count.
 				float w = clouds.planet.w;
 				if (hd.r > scene + 50.0) {
+					w = 0.0;
+				}
+				// Nor does what the scene cut short then, where the sky shows now: a leaf that swayed aside left its "no
+				// cloud" in the history, and blended in for a second it trailed a streak of clear sky behind every moving
+				// crown (2026-11-10).
+				if (hcut && !cut) {
 					w = 0.0;
 				}
 				cur = mix(cur, h, w);
@@ -726,7 +752,7 @@ void main() {
 		}
 	}
 	imageStore(out_clouds, px, cur);
-	imageStore(out_depth, px, vec4(front, mean, 0.0, 0.0));
+	imageStore(out_depth, px, vec4(front, cut ? -max(mean, 1.0) : mean, 0.0, 0.0));
 #endif
 
 #ifdef MODE_PANORAMA

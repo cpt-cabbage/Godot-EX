@@ -418,7 +418,9 @@ void main() {
 	}
 	vec2 uv = (vec2(px) + 0.5) / vec2(size);
 // The four march texels round the pixel, each weighted by its bilinear share and by whether its first cloud lies in
-// front of the pixel's scene (so a ridge's edge does not take the clouds behind it).
+// front of the pixel's scene (so a ridge's edge does not take the clouds behind it). A texel whose march the scene cut
+// short (the sign of its mean distance: clouds.glsl) holds no sky: a sky pixel leaves it out, or every crown and ridge
+// against a cloud had a rim of clear sky half a march texel wide (2026-11-10).
 #define CLOUDS(c, dist) \
 	if (camera.cloud_flags.x > 0.5) { \
 		vec2 csz = vec2(textureSize(cloud_light, 0)); \
@@ -431,9 +433,9 @@ void main() {
 			ivec2 ct = clamp(c0 + ivec2(cj & 1, cj >> 1), ivec2(0), ivec2(csz) - 1); \
 			float cb = ((cj & 1) != 0 ? cf.x : 1.0 - cf.x) * ((cj >> 1) != 0 ? cf.y : 1.0 - cf.y); \
 			vec2 ctd = texelFetch(cloud_depth, ct, 0).rg; \
-			float cwt = cb * (dist > ctd.r ? 1.0 : 0.0); \
+			float cwt = cb * (dist > ctd.r ? 1.0 : 0.0) * ((ctd.g < 0.0 && dist > 1e11) ? 0.0 : 1.0); \
 			cl += texelFetch(cloud_light, ct, 0) * cwt; \
-			cmean += ctd.g * cwt; \
+			cmean += abs(ctd.g) * cwt; \
 			cwsum += cwt; \
 		} \
 		/* No texel's cloud stands in front of the scene here: none is drawn. (Each had a token weight, which the */ \
