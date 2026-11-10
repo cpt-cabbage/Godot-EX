@@ -102,12 +102,12 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 		noise_base_rd = tex3d(CLOUD_NOISE_BASE_N);
 		noise_detail_rd = tex3d(CLOUD_NOISE_DETAIL_N);
 		RD::TextureFormat ts;
-		ts.format = RD::DATA_FORMAT_R16_SFLOAT;
+		ts.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT; // clouds.glsl's MODE_SHADOW: the transmittance and where the cloud stands
 		ts.width = CLOUD_SHADOW_N;
 		ts.height = CLOUD_SHADOW_N;
 		ts.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 		cloud_shadow_rd = rd->texture_create(ts, RD::TextureView());
-		rd->texture_clear(cloud_shadow_rd, Color(1, 1, 1, 1), 0, 1, 0, 1);
+		rd->texture_clear(cloud_shadow_rd, Color(1, 0, 0, 1), 0, 1, 0, 1);
 		RD::TextureFormat tm;
 		tm.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 		tm.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;

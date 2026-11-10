@@ -31,6 +31,8 @@ params;
 layout(set = 0, binding = 5) uniform sampler2D sun_canopy;
 layout(set = 0, binding = 6) uniform sampler2D sun_canopy_ground;
 
+#include "../../servers/rendering/renderer_rd/shaders/effects/sun_modulator_inc.glsl"
+
 // The sun's light under the crowns of trees that cast no shadow of their own (far ones, drawn as impostors; Godot-EX,
 // 2026-11-10): a height field's shadow from a map of the crowns (`canopy`: R their tops above the ground, times cp.x m;
 // G how far from the camera that tree's last shadow-casting level ends, times cp.y m; frames are a corner in world x, z
@@ -114,12 +116,7 @@ void main() {
 		}
 	}
 	if (params.flags.y > 0.5) {
-		vec3 l = params.light.xyz;
-		vec3 q = w + l * (max(params.cloud_frame.w - w.y, 0.0) / max(l.y, 0.02));
-		vec2 cuv = (q.xz - params.cloud_frame.xy) / params.cloud_frame.z;
-		if (all(greaterThanEqual(cuv, vec2(0.0))) && all(lessThanEqual(cuv, vec2(1.0)))) {
-			vis *= textureLod(cloud_shadow, cuv, 0.0).r;
-		}
+		vis *= sun_modulator_visibility(cloud_shadow, w, params.light.xyz, params.cloud_frame, 1e9);
 	}
 	if (params.canopy_params.x > 0.0 && vis > 0.0) {
 		vec4 cam = params.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0); // the near plane's middle: the camera, within centimetres

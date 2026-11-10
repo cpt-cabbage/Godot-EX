@@ -1096,7 +1096,9 @@ public:
 	// The sun's light through what the TLAS does not hold (Godot-EX, 2026-11-09: the weather module's clouds): a texture
 	// of transmittance (R) on a horizontal plane at world height p_frame.w, over a square with its corner at (p_frame.x,
 	// p_frame.y) in world x, z and side p_frame.z; the sun shadow mask multiplies by it where a pixel reaches the plane
-	// along the light. Set each frame by its owner (an invalid RID or p_enabled false: none). Render thread only.
+	// along the light. G, B and A say where along the light's ray the shade stands, so a pixel above the plane takes
+	// only what is still between it and the sun (sun_modulator_inc.glsl; a one-channel texture is a sheet in the plane).
+	// Set each frame by its owner (an invalid RID or p_enabled false: none). Render thread only.
 	static void set_sun_shadow_modulator(RID p_texture, const Vector4 &p_frame, bool p_enabled) {
 		sun_modulator = p_enabled ? p_texture : RID();
 		sun_modulator_frame = p_frame;

@@ -362,6 +362,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;
 	m[40] = clouds_on ? 1.0f : 0.0f;
 	m[41] = cloud_shadows_on ? 1.0f : 0.0f;
+	m[42] = cloud_high_altitude - altitude_offset; // the air above the high layer is clear of its shadow
 	m[44] = cloud_shadow_origin.x;
 	m[45] = cloud_shadow_origin.y;
 	m[46] = cloud_shadow_size;

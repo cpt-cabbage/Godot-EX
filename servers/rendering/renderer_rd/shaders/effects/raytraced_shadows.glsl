@@ -13,7 +13,7 @@ layout(set = 0, binding = 1) uniform sampler2D depth_texture;
 #ifndef MODE_AREA
 // The sun's light through something the TLAS does not hold, set by a module (Raytracing::set_sun_shadow_modulator):
 // the weather module's clouds, their transmittance on a plane (`frame.w`, world y) that a point reaches along the
-// light, over a square (`frame.xy` its corner in world x, z, `frame.z` its side).
+// light, over a square (`frame.xy` its corner in world x, z, `frame.z` its side); sun_modulator_inc.glsl reads it.
 layout(set = 0, binding = 2) uniform sampler2D sun_modulator;
 layout(set = 0, binding = 3, std140) uniform SunModulator {
 	vec4 frame;
@@ -26,6 +26,8 @@ layout(set = 0, binding = 3, std140) uniform SunModulator {
 sun_mod;
 layout(set = 0, binding = 4) uniform sampler2D sun_canopy;
 layout(set = 0, binding = 5) uniform sampler2D sun_canopy_ground;
+
+#include "sun_modulator_inc.glsl"
 
 // The sun's light under the crowns of trees that cast no shadow of their own (far ones, drawn as impostors; Godot-EX,
 // 2026-11-10): a height field's shadow from a map of the crowns (`canopy`: R their tops above the ground, times cp.x m;
@@ -214,11 +216,7 @@ void main() {
 		visibility = trace_occluded(world.xyz, to_sun, params.axis_v.w) ? 0.0 : 1.0;
 	}
 	if (sun_mod.flags.x > 0.5) {
-		vec3 q = world.xyz + to_sun * (max(sun_mod.frame.w - world.y, 0.0) / max(to_sun.y, 0.02));
-		vec2 muv = (q.xz - sun_mod.frame.xy) / sun_mod.frame.z;
-		if (all(greaterThanEqual(muv, vec2(0.0))) && all(lessThanEqual(muv, vec2(1.0)))) {
-			visibility *= textureLod(sun_modulator, muv, 0.0).r;
-		}
+		visibility *= sun_modulator_visibility(sun_modulator, world.xyz, to_sun, sun_mod.frame, 1e9);
 	}
 	if (sun_mod.flags.y > 0.5 && visibility > 0.0) {
 		vec4 cam = params.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0); // the near plane's middle: the camera, within centimetres

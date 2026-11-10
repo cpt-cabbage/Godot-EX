@@ -140,17 +140,13 @@ float density(vec3 w) {
 	return d;
 }
 
+#include "../../servers/rendering/renderer_rd/shaders/effects/sun_modulator_inc.glsl"
+
 float cloud_visibility(vec3 w) {
 	if (fog.cloud_flags.x < 0.5) {
 		return 1.0;
 	}
-	vec3 l = fog.light_dir.xyz;
-	vec3 q = w + l * (max(fog.cloud_shadow.w - w.y, 0.0) / max(l.y, 0.02));
-	vec2 uv = (q.xz - fog.cloud_shadow.xy) / fog.cloud_shadow.z;
-	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
-		return 1.0;
-	}
-	return textureLod(cloud_shadow_map, uv, 0.0).r;
+	return sun_modulator_visibility(cloud_shadow_map, w, fog.light_dir.xyz, fog.cloud_shadow, 1e9);
 }
 
 #ifdef MODE_INJECT

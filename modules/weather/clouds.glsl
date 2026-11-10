@@ -15,7 +15,8 @@
 // MODE_MARCH         the clouds seen from the camera at the march resolution, blended with the reprojected last frame:
 //                    light (rgb) and transmittance (a), and the distances to the first cloud and the light's mean
 // MODE_PANORAMA      the same over the whole sky round the camera (equirectangular), for the sky's light probe
-// MODE_SHADOW        the clouds' transmittance to the light from a plane at their base, around the camera
+// MODE_SHADOW        the clouds' transmittance to the light from a plane at their base, around the camera, and where
+//                    along each ray they stand (sun_modulator_inc.glsl reads it)
 // MODE_MAP           the weather map round the camera, near and far layers (each frame): R the cover (0 at a cloud's
 //                    edge, 1 at its core), G its type, B its base (m above sea level), A its thickness (m)
 // Over time the cells form and dissolve, the regions change (cross-faded noise), clouds lean downwind with height and
@@ -74,7 +75,7 @@ layout(set = 0, binding = 9) uniform sampler2D history_depth;
 layout(set = 0, binding = 6, rgba16f) uniform restrict writeonly image2D out_clouds;
 #endif
 #ifdef MODE_SHADOW
-layout(set = 0, binding = 10, r16f) uniform restrict writeonly image2D out_shadow;
+layout(set = 0, binding = 10, rgba16f) uniform restrict writeonly image2D out_shadow;
 #endif
 
 uint hash_u(uvec3 v) {
@@ -760,7 +761,10 @@ void main() {
 	vec2 xz = clouds.shadow.xy + (vec2(px) + 0.5) / vec2(size) * clouds.shadow.z;
 	float base_y = clouds.layer.x - clouds.planet.y;
 	vec3 l = clouds.light_dir.xyz;
-	float T = 1.0;
+	// R the transmittance along the whole ray, G the mean height above the plane of the cloud on it and B half the height
+	// it takes up (m; the optical depth's mean and spread, a slab's half height being its deviation times root 3), A the
+	// high layer's transmittance: a point above the base is shaded only by the cloud still between it and the light.
+	vec4 shade = vec4(1.0, 0.0, 0.0, 1.0);
 	if (l.y > 0.02) {
 		float len = clouds.layer.y / l.y;
 		// Jittered per texel (fixed in the world, as the map's origin snaps): steps aligned across texels showed as
@@ -768,14 +772,24 @@ void main() {
 		const int N = 40;
 		float dt = len / float(N);
 		float jitter = hash1(uvec3(uvec2(ivec2(floor(xz / (clouds.shadow.z / vec2(size))))), 29u));
-		float tau = 0.0;
+		float tau = 0.0, tau_u = 0.0, tau_uu = 0.0;
 		for (int i = 0; i < N; i++) {
-			vec3 p = vec3(xz.x, base_y, xz.y) + l * ((float(i) + jitter) * dt);
+			float u = (float(i) + jitter) / float(N); // the share of the layer's height
+			vec3 p = vec3(xz.x, base_y, xz.y) + l * (u * len);
 			// The shapes the eye sees (eroded): the uneroded ones cast a fuller shadow than the clouds overhead.
-			tau += cloud_density(p, false) * dt;
+			float dtau = cloud_density(p, false) * dt;
+			tau += dtau;
+			tau_u += dtau * u;
+			tau_uu += dtau * u * u;
 		}
-		T = exp(-tau) * high_shadow(vec3(xz.x, base_y, xz.y));
+		shade.r = exp(-tau);
+		if (tau > 1e-4) {
+			float mean_u = tau_u / tau;
+			shade.g = mean_u * clouds.layer.y;
+			shade.b = (sqrt(3.0 * max(tau_uu / tau - mean_u * mean_u, 0.0)) + 0.5 / float(N)) * clouds.layer.y;
+		}
+		shade.a = high_shadow(vec3(xz.x, base_y, xz.y));
 	}
-	imageStore(out_shadow, px, vec4(T));
+	imageStore(out_shadow, px, shade);
 #endif
 }

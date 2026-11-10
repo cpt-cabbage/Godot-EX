@@ -44,7 +44,7 @@ layout(set = 0, binding = 7, std140) uniform Camera {
 	vec4 terrain_h; // x height_min, y height_range (m), z the mip to read at the map's texel size
 	vec4 air_volume; // x the air volume's reach (m), y 1 when it is drawn (air_volume.glsl), z the camera's exposure
 	// (MODE_APPLY: the scene's colour already holds it, so the light added here takes it too)
-	vec4 cloud_flags; // x 1 when the clouds are drawn, y 1 when their shadow map is
+	vec4 cloud_flags; // x 1 when the clouds are drawn, y 1 when their shadow map is, z the high layer's height (world y)
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 }
 camera;
@@ -177,18 +177,14 @@ float terrain_visibility(vec3 w) {
 	return smoothstep(-camera.shadow_params.y, camera.shadow_params.y, w.y - s);
 }
 
+#include "../../servers/rendering/renderer_rd/shaders/effects/sun_modulator_inc.glsl"
+
 // The clouds' transmittance to the light from a world position (1 off their map).
 float cloud_visibility(vec3 w) {
 	if (camera.cloud_flags.y < 0.5) {
 		return 1.0;
 	}
-	vec3 l = params.light.xyz;
-	vec3 q = w + l * (max(camera.cloud_shadow.w - w.y, 0.0) / max(l.y, 0.02));
-	vec2 uv = (q.xz - camera.cloud_shadow.xy) / camera.cloud_shadow.z;
-	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
-		return 1.0;
-	}
-	return textureLod(cloud_shadow_map, uv, 0.0).r;
+	return sun_modulator_visibility(cloud_shadow_map, w, params.light.xyz, camera.cloud_shadow, camera.cloud_flags.z);
 }
 #endif
 
