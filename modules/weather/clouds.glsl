@@ -728,11 +728,13 @@ void main() {
 				vec2 hf = hp - vec2(h0);
 				vec2 hd = vec2(0.0);
 				bool hcut = false;
+				bool hwhole = false;
 				for (int hj = 0; hj < 4; hj++) {
 					vec2 t = texelFetch(history_depth, clamp(h0 + ivec2(hj & 1, hj >> 1), ivec2(0), ivec2(hsz) - 1), 0).rg;
 					float hb = ((hj & 1) != 0 ? hf.x : 1.0 - hf.x) * ((hj >> 1) != 0 ? hf.y : 1.0 - hf.y);
 					hd += vec2(t.r, abs(t.g)) * hb;
 					hcut = hcut || t.g < 0.0;
+					hwhole = hwhole || t.g >= 0.0;
 				}
 				// Where the scene stands in front of last frame's clouds now, their history does not count.
 				float w = clouds.planet.w;
@@ -743,6 +745,13 @@ void main() {
 				// cloud" in the history, and blended in for a second it trailed a streak of clear sky behind every moving
 				// crown (2026-11-10).
 				if (hcut && !cut) {
+					w = 0.0;
+				}
+				// And the other way: a texel the scene cuts short now takes nothing from a history that held the whole
+				// sky's cloud, or more of it than lies in front of the scene. In a storm the camera stands in the rain
+				// under the cloud, so every texel's cloud starts at the lens: a crown the view turned onto kept the sky's
+				// whole column for a second, drawn over its leaves (the user, 2026-11-10: "it streaks badly").
+				if (cut && (hwhole || hd.g > scene)) {
 					w = 0.0;
 				}
 				cur = mix(cur, h, w);

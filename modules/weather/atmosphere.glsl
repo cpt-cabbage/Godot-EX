@@ -434,7 +434,12 @@ void main() {
 			float cb = ((cj & 1) != 0 ? cf.x : 1.0 - cf.x) * ((cj >> 1) != 0 ? cf.y : 1.0 - cf.y); \
 			vec2 ctd = texelFetch(cloud_depth, ct, 0).rg; \
 			float cwt = cb * (dist > ctd.r ? 1.0 : 0.0) * ((ctd.g < 0.0 && dist > 1e11) ? 0.0 : 1.0); \
-			cl += texelFetch(cloud_light, ct, 0) * cwt; \
+			/* How much of the texel's cloud lies in front of the pixel's scene: all of it for the sky; for the scene, by */ \
+			/* where the pixel stands between the cloud's first metre and twice its mean distance. Its first metre alone */ \
+			/* said "in front" for everything once the camera stood inside the layer (in rain, under the cloud): a leaf */ \
+			/* beside the sky was painted with the sky's whole column, a bright rim round every crown in a storm. */ \
+			float cfr = dist > 1e11 ? 1.0 : clamp((dist - ctd.r) / max(2.0 * (abs(ctd.g) - ctd.r), 1.0), 0.0, 1.0); \
+			cl += mix(vec4(0.0, 0.0, 0.0, 1.0), texelFetch(cloud_light, ct, 0), cfr) * cwt; \
 			cmean += abs(ctd.g) * cwt; \
 			cwsum += cwt; \
 		} \
