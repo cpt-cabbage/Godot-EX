@@ -129,7 +129,12 @@ void TimeOfDay3D::_apply() {
 	};
 	const float full = 0.5f - 0.5f * Math::cos(moon_phase * 2.0f * Math::PI); // 0 new, 1 full
 	const Vector3 ts = light(sun_light, sun_direction, sun_illuminance, look.is_valid() ? look->get_sun_tint_at(sun_elevation) : Color(1, 1, 1));
-	const Vector3 tm = light(moon_light, moon_direction, moon_illuminance * full, Color(1, 1, 1));
+	// The moon's light comes on once the atmosphere's light is the moon's (the sun 11.5 degrees down, below), over three
+	// degrees more: until then the terrain's, the clouds' and the canopy's shadow maps are the sun's, and a low moon
+	// lit the ground behind every ridge and under every tree (a wet trail shining at moonrise, 2026-11-10). Twilight's
+	// own light is far above the moon's in any case.
+	const float moon_on = CLAMP((-0.2f - sun_direction.y) / 0.05f, 0.0f, 1.0f);
+	const Vector3 tm = light(moon_light, moon_direction, moon_illuminance * full * moon_on, Color(1, 1, 1));
 	if (atmosphere.is_valid()) {
 		const float es = sun_illuminance * MAX(sun_direction.y + 0.1f, 0.0f);
 		const float em = moon_illuminance * full * MAX(moon_direction.y + 0.1f, 0.0f);
