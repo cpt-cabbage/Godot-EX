@@ -235,12 +235,12 @@ void AtmosphereEffect::set_terrain_heights(const Ref<Texture2D> &p_heights, cons
 	shadow_dirty = true;
 }
 
-void AtmosphereEffect::set_canopy(const Ref<Texture2D> &p_canopy, const Rect2 &p_rect, float p_height_scale, float p_from, float p_full, float p_tallest, float p_opacity) {
+void AtmosphereEffect::set_canopy(const Ref<Texture2D> &p_canopy, const Rect2 &p_rect, float p_height_scale, float p_distance_scale, float p_nearest, float p_tallest, float p_opacity) {
 	canopy_heights = p_canopy;
 	canopy_rect = p_rect;
 	canopy_height_scale = p_height_scale;
-	canopy_from = p_from;
-	canopy_full = MAX(p_full, p_from + 0.01f);
+	canopy_distance_scale = p_distance_scale;
+	canopy_nearest = p_nearest;
 	canopy_tallest = p_tallest;
 	canopy_opacity = CLAMP(p_opacity, 0.0f, 1.0f);
 }
@@ -256,7 +256,7 @@ bool AtmosphereEffect::get_sun_shadow_canopy(RID &r_canopy, RID &r_ground, float
 	}
 	const float p[16] = {
 		canopy_rect.position.x, canopy_rect.position.y, 1.0f / canopy_rect.size.x, 1.0f / canopy_rect.size.y,
-		canopy_height_scale, canopy_from, canopy_full, canopy_rect.size.x / MAX(canopy_heights->get_width(), 1),
+		canopy_height_scale, canopy_distance_scale, canopy_nearest, canopy_rect.size.x / MAX(canopy_heights->get_width(), 1),
 		terrain_rect.position.x, terrain_rect.position.y, 1.0f / terrain_rect.size.x, 1.0f / terrain_rect.size.y,
 		terrain_height_min, terrain_height_range, canopy_tallest, canopy_opacity
 	};
@@ -634,7 +634,7 @@ void AtmosphereEffect::_bind_methods() {
 	B(float, light_illuminance, Variant::FLOAT, "0,100,0.001")
 #undef B
 	ClassDB::bind_method(D_METHOD("set_terrain_heights", "heights", "rect", "height_min", "height_range"), &AtmosphereEffect::set_terrain_heights);
-	ClassDB::bind_method(D_METHOD("set_canopy", "canopy", "rect", "height_scale", "from", "full", "tallest", "opacity"), &AtmosphereEffect::set_canopy);
+	ClassDB::bind_method(D_METHOD("set_canopy", "canopy", "rect", "height_scale", "distance_scale", "nearest", "tallest", "opacity"), &AtmosphereEffect::set_canopy);
 	ClassDB::bind_method(D_METHOD("set_air_shadows", "enabled"), &AtmosphereEffect::set_air_shadows);
 	ClassDB::bind_method(D_METHOD("get_air_shadows"), &AtmosphereEffect::get_air_shadows);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_shadows"), "set_air_shadows", "get_air_shadows");

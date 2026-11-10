@@ -28,15 +28,17 @@ layout(set = 0, binding = 4) uniform sampler2D sun_canopy;
 layout(set = 0, binding = 5) uniform sampler2D sun_canopy_ground;
 
 // The sun's light under the crowns of trees that cast no shadow of their own (far ones, drawn as impostors; Godot-EX,
-// 2026-11-10): a height field's shadow from a map of the crowns' tops above the ground (`canopy`, R times cp.x m; frames
-// are a corner in world x, z and one over the sides) and the ground's heights (gp.x + gp.y * R). A point `p` more than
-// cp.y m from the camera (in full from cp.z) is shaded where the ray to the sun passes under a crown before it clears
-// the tallest (gp.z m); gp.w is how much of the sun a crown takes. Eight taps along the ray, the ground between its
-// ends taken as a plane; nothing where a coarse read finds no crown along it.
+// 2026-11-10): a height field's shadow from a map of the crowns (`canopy`: R their tops above the ground, times cp.x m;
+// G how far from the camera that tree's last shadow-casting level ends, times cp.y m; frames are a corner in world x, z
+// and one over the sides) and the ground's heights (gp.x + gp.y * R). A point `p` is shaded where the ray to the sun
+// passes under a crown before it clears the tallest (gp.z m), and a crown counts only once its own tree is past that
+// distance from the camera: nearer, the tree casts its real shadow, and a second one from the map put every tree still
+// drawn as a mesh in deeper shade the further off it stood (a Protea's crown 1.3 times brighter 15 m nearer). No
+// pixel nearer than cp.z less the ray's reach is touched; gp.w is how much of the sun a crown takes. Eight taps
+// along the ray, the ground between its ends taken as a plane; nothing where a coarse read finds no crown along it.
 float canopy_visibility(sampler2D canopy, sampler2D ground, vec3 p, vec3 to_sun, vec3 cam, vec4 cf, vec4 cp, vec4 gf, vec4 gp) {
 	float dist = distance(p, cam);
-	float w = smoothstep(cp.y, cp.z, dist);
-	if (w <= 0.0 || to_sun.y < 0.03) {
+	if (to_sun.y < 0.03) {
 		return 1.0;
 	}
 	float g0 = gp.x + gp.y * textureLod(ground, (p.xz - gf.xy) * gf.zw, 0.0).r;
@@ -46,6 +48,9 @@ float canopy_visibility(sampler2D canopy, sampler2D ground, vec3 p, vec3 to_sun,
 	}
 	float reach = min((gp.z - above) / to_sun.y, 160.0);
 	float across = reach * length(to_sun.xz);
+	if (dist + across < cp.z) {
+		return 1.0;
+	}
 	vec2 mid = (p.xz + to_sun.xz * reach * 0.5 - cf.xy) * cf.zw;
 	if (any(lessThan(mid, vec2(0.0))) || any(greaterThan(mid, vec2(1.0)))) {
 		return 1.0;
@@ -68,10 +73,14 @@ float canopy_visibility(sampler2D canopy, sampler2D ground, vec3 p, vec3 to_sun,
 		float f = e * e;
 		vec3 q = p + to_sun * mix(near, reach, f);
 		float lod = log2(max(max(dist * 0.0015, across * e / 6.0) / cp.w, 1.0));
-		float h = textureLod(canopy, (q.xz - cf.xy) * cf.zw, lod).r * cp.x;
-		occ = max(occ, smoothstep(0.5, 2.5, h) * smoothstep(0.0, 2.0, mix(g0, g1, f) + h - q.y));
+		vec2 c = textureLod(canopy, (q.xz - cf.xy) * cf.zw, lod).rg;
+		float h = c.r * cp.x;
+		// Past its last shadow-casting level, over the stretch that level's crossfade and the engine's slack take.
+		float own = c.g * cp.y;
+		float far = smoothstep(own, own * 1.15, distance(q, cam));
+		occ = max(occ, far * smoothstep(0.5, 2.5, h) * smoothstep(0.0, 2.0, mix(g0, g1, f) + h - q.y));
 	}
-	return 1.0 - occ * w * gp.w;
+	return 1.0 - occ * gp.w;
 }
 #endif
 layout(set = 1, binding = 0, r8) uniform restrict writeonly image2D shadow_mask;
