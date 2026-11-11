@@ -145,6 +145,12 @@ class InstanceField3D : public Node3D {
 	int grid_z = 0;
 	int per_copy_levels = 0;
 	float level_fade = 0.0;
+	// A level's draw cells are the first power of two of base cells at least this share of the level's end across. A cell
+	// is one MultiMesh, drawn whole when any of it is in view: at a half (to 2026-11-11) a level was four to nine cells
+	// round the viewer and a view 90 degrees wide drew 26 M triangles of the 19 M inside it; at a quarter the valley's
+	// ridge costs 2.2 ms less at 4K, its forest 0.8, the cliff's foot 2.7, for a third of a millisecond of CPU (half as
+	// many draws again). At a sixteenth the cells outnumber the renderer's instance uniforms (4,096).
+	float cell_share = 0.25f;
 	static constexpr float FADE_SLACK = 0.05f; // a crossfading level holds copies this share of the distance past its window
 	static constexpr float LEAD_FRAMES = 6.0f;
 	static constexpr int64_t LIGHT_LEVEL_TRIANGLES = 16;
@@ -187,6 +193,8 @@ public:
 	Rect2 get_bounds() const;
 	void set_base_cell(double p_size);
 	double get_base_cell() const { return base_cell; }
+	void set_cell_share(float p_share);
+	float get_cell_share() const { return cell_share; }
 	// `meshes`: one a level, nearest first; `ends`: the distance each level ends at (the last: where copies stop);
 	// `placements`: 8 floats a copy, x y z, a rotation quaternion x y z w, a uniform scale. Returns the type's index.
 	int add_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_placements);

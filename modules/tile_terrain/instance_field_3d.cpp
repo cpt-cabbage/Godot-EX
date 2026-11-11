@@ -65,6 +65,11 @@ void InstanceField3D::set_base_cell(double p_size) {
 	}
 }
 
+void InstanceField3D::set_cell_share(float p_share) {
+	ERR_FAIL_COND_MSG(!types.is_empty(), "InstanceField3D: set the cell share before adding types.");
+	cell_share = CLAMP(p_share, 0.1f, 1.0f);
+}
+
 // The levels' crossfade windows, the bands of copies they hold and the travel they are refilled after.
 void InstanceField3D::_set_bands(Type &t, bool p_light_last) {
 	if (level_fade > 0.0f) {
@@ -174,7 +179,7 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		lv.begin = l == 0 ? 0.0f : p_ends[l - 1];
 		lv.end = p_ends[l];
 		int span = 1;
-		while (span * base_cell < 0.5 * lv.end && span < 1024) {
+		while (span * base_cell < cell_share * lv.end && span < 1024) {
 			span *= 2;
 		}
 		lv.cell_span = span;
@@ -774,6 +779,8 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_bounds"), &InstanceField3D::get_bounds);
 	ClassDB::bind_method(D_METHOD("set_base_cell", "size"), &InstanceField3D::set_base_cell);
 	ClassDB::bind_method(D_METHOD("get_base_cell"), &InstanceField3D::get_base_cell);
+	ClassDB::bind_method(D_METHOD("set_cell_share", "share"), &InstanceField3D::set_cell_share);
+	ClassDB::bind_method(D_METHOD("get_cell_share"), &InstanceField3D::get_cell_share);
 	ClassDB::bind_method(D_METHOD("add_type", "name", "meshes", "ends", "shadow_levels", "placements"), &InstanceField3D::add_type);
 	ClassDB::bind_method(D_METHOD("add_procedural_type", "name", "meshes", "ends", "shadow_levels", "thin", "density", "scale_min", "scale_max", "align", "map", "map_width", "map_origin", "map_spacing", "seed"), &InstanceField3D::add_procedural_type);
 	ClassDB::bind_method(D_METHOD("set_terrain", "terrain"), &InstanceField3D::set_terrain);

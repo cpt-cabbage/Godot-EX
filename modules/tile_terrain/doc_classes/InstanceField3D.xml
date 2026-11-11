@@ -4,7 +4,7 @@
 		Many copies of a few meshes over a large area, each drawn at the level of detail its own distance from the viewer falls in.
 	</brief_description>
 	<description>
-		Call [method set_bounds], then [method add_type] per kind of copy: one mesh a level, the distance each level ends at, how many of the nearest levels cast shadows, and 8 floats a copy (position, rotation quaternion, uniform scale). Copies are grouped into cells whose side is the smallest power of two times the base cell reaching half the level's end distance, one MultiMesh a cell; a level's cells are refilled when the viewer has moved 1 % of its end distance, and a cell's buffer is sent only when its copies changed. Levels that cast no shadows also stay out of Godot-EX's ray-traced scene.
+		Call [method set_bounds], then [method add_type] per kind of copy: one mesh a level, the distance each level ends at, how many of the nearest levels cast shadows, and 8 floats a copy (position, rotation quaternion, uniform scale). Copies are grouped into cells whose side is the smallest power of two times the base cell reaching a share of the level's end distance (a quarter; [code]set_cell_share[/code], before any type is added), one MultiMesh a cell, culled and drawn whole; a level's cells are refilled when the viewer has moved 1 % of its end distance, and a cell's buffer is sent only when its copies changed. Levels that cast no shadows also stay out of Godot-EX's ray-traced scene.
 	</description>
 	<tutorials>
 	</tutorials>
