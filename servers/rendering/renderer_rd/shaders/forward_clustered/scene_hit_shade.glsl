@@ -913,6 +913,7 @@ struct HitSceneDataBlock {
 };
 HitSceneDataBlock scene_data_block;
 #define SCENE_DATA_FLAGS_IN_SHADOW_PASS 0u
+#define IN_DEPTH_PASS false
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 #define OUTPUT_IS_MULTIVIEW false

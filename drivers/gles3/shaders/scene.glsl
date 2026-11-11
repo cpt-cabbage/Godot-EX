@@ -64,6 +64,12 @@ USE_LIGHTMAP_SPECULAR = false
 #define IN_SHADOW_PASS false
 #endif
 
+#ifdef MODE_RENDER_DEPTH
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
+#endif
+
 #include "stdlib_inc.glsl"
 
 #if !defined(MODE_RENDER_DEPTH) || defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(BENT_NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED) || defined(LIGHT_CLEARCOAT_USED)
@@ -1072,6 +1078,12 @@ void main() {
 #define IN_SHADOW_PASS true
 #else
 #define IN_SHADOW_PASS false
+#endif
+
+#ifdef MODE_RENDER_DEPTH
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
 #endif
 
 #define FLAGS_NON_UNIFORM_SCALE (1 << 4)

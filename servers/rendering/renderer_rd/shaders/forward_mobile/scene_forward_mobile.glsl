@@ -19,6 +19,12 @@
 #define IN_SHADOW_PASS false
 #endif
 
+#if defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL)
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
+#endif
+
 #ifdef USE_MULTIVIEW
 #define OUTPUT_IS_MULTIVIEW true
 #else
@@ -830,6 +836,12 @@ void main() {
 #define IN_SHADOW_PASS true
 #else
 #define IN_SHADOW_PASS false
+#endif
+
+#if defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL)
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
 #endif
 
 #ifdef USE_MULTIVIEW

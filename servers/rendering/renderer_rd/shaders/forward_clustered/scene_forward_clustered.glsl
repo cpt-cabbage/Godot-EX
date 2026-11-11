@@ -11,6 +11,15 @@
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
+// IN_DEPTH_PASS (Godot-EX): true where the pass keeps no colour (a shadow map, the depth pre-pass with or without normals and
+// roughness), so a material's fragment() can leave out what only its colour needs; the compiler drops the other branch.
+#if defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL) && !defined(MODE_RENDER_SDF)
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
+#endif
+
+
 #ifdef USE_MULTIVIEW
 #define OUTPUT_IS_MULTIVIEW true
 #else
@@ -875,6 +884,15 @@ void main() {
 
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
+
+// IN_DEPTH_PASS (Godot-EX): true where the pass keeps no colour (a shadow map, the depth pre-pass with or without normals and
+// roughness), so a material's fragment() can leave out what only its colour needs; the compiler drops the other branch.
+#if defined(MODE_RENDER_DEPTH) && !defined(MODE_RENDER_MATERIAL) && !defined(MODE_RENDER_SDF)
+#define IN_DEPTH_PASS true
+#else
+#define IN_DEPTH_PASS false
+#endif
+
 
 #ifdef USE_MULTIVIEW
 #define OUTPUT_IS_MULTIVIEW true
