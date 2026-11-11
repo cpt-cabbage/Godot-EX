@@ -171,6 +171,12 @@ class InstanceField3D : public Node3D {
 	void _wait_pending();
 	int last_jobs = 0;
 	int last_uploads = 0;
+	int64_t total_refills = 0;
+	int64_t total_jobs = 0;
+	int64_t total_uploads = 0;
+	int64_t total_upload_bytes = 0;
+	int64_t total_copies_made = 0;
+	uint64_t total_main_usec = 0;
 
 	void _build_grid(Type &p_type);
 	void _set_bands(Type &p_type, bool p_light_last);

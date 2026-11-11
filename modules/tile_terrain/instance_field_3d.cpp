@@ -423,6 +423,7 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 		const float *x = p_type.xf.ptr() + int64_t(i) * 12;
 		const Transform3D t(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11]));
 		RID inst = rs->instance_create2(p_level.mesh.is_valid() ? p_level.mesh->get_rid() : RID(), p_scenario);
+		total_copies_made++;
 		rs->instance_set_transform(inst, p_xf * t);
 		if (level_fade > 0.0f) {
 			rs->instance_geometry_set_shader_parameter(inst, SNAME("lod_fade"), p_level.fade);
@@ -662,9 +663,19 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 		c->used = p_frame;
 		if (c->hash != j.hash) {
 			rs->multimesh_allocate_data(c->multimesh, j.count, RSE::MULTIMESH_TRANSFORM_3D);
+			if (lv.shadows) {
+				// A level that casts shadows is in the ray-traced scene, which asks a MultiMesh for each copy's transform.
+				// The renderer keeps no copy of a buffer set whole: at the first such question it read the buffer back
+				// from the GPU, flushing the frame and waiting for every frame in flight, once for each cell a refill
+				// had sent: three or four waits a frame flying through the valley's forest, over a third of the time.
+				// Setting one copy by itself while the buffer is still empty makes the renderer keep its copy from the
+				// start (nothing to read back yet), and set_buffer then fills both.
+				rs->multimesh_instance_set_transform(c->multimesh, 0, Transform3D());
+			}
 			rs->multimesh_set_buffer(c->multimesh, j.buffer);
 			c->hash = j.hash;
 			uploads++;
+			total_upload_bytes += int64_t(j.count) * 48;
 		}
 	}
 	// A refilled level's cells left out of reach this time.
@@ -683,6 +694,9 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 	}
 	last_jobs = int(jobs.size());
 	last_uploads = uploads;
+	total_jobs += int64_t(jobs.size());
+	total_uploads += uploads;
+	total_refills += jobs.is_empty() ? 0 : 1;
 	if (!jobs.is_empty()) {
 		last_update_ms = (OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 	}
@@ -720,6 +734,14 @@ Dictionary InstanceField3D::get_stats() const {
 	d["update_ms"] = last_update_ms;
 	d["jobs_last"] = last_jobs;
 	d["uploads_last"] = last_uploads;
+	// Since the start: the refills applied, their cells looked at and sent, the bytes sent, the copies given an instance
+	// of their own, and the main thread's time in update_now (ms).
+	d["refills"] = total_refills;
+	d["jobs"] = total_jobs;
+	d["uploads"] = total_uploads;
+	d["upload_bytes"] = total_upload_bytes;
+	d["copies_made"] = total_copies_made;
+	d["main_ms"] = total_main_usec / 1000.0;
 	return d;
 }
 
@@ -769,7 +791,9 @@ void InstanceField3D::_notification(int p_what) {
 				}
 				p = cam->get_global_position();
 			}
+			const uint64_t main_t0 = OS::get_singleton()->get_ticks_usec();
 			update_now(p);
+			total_main_usec += OS::get_singleton()->get_ticks_usec() - main_t0;
 		} break;
 	}
 }
