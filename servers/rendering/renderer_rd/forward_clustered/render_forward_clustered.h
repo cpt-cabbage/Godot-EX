@@ -662,6 +662,8 @@ private:
 
 		uint32_t gi_offset_cache = 0;
 		bool store_transform_cache = true;
+		// The layer of depth this instance sorts in when a list is drawn front to back (_fill_render_list).
+		uint8_t depth_bucket = 0;
 		RID transforms_uniform_set;
 		uint32_t instance_count = 0;
 		uint32_t trail_steps = 1;
@@ -804,6 +806,33 @@ private:
 			sorter.sort(elements.ptr() + p_from, p_size);
 		}
 
+		// Front to back before state (Godot-EX): by priority, then by the instance's layer of depth, then by the key.
+		// The key alone orders by shader, material and mesh, with depth last of all (and its 16 layers linear to the far
+		// plane: one layer for everything within 2.5 km of a camera that sees 40 km). A pass whose fragments are dear
+		// and overlap (cut-out leaves in a depth pass that also writes normals and roughness, a shadow map's leaves) then
+		// shades every layer of them; nearest first, the depth test drops what is hidden before it is shaded.
+		struct SortByDepthBucketAndKey {
+			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
+				if (A->sort.priority != B->sort.priority) {
+					return A->sort.priority < B->sort.priority;
+				}
+				if (A->owner->depth_bucket != B->owner->depth_bucket) {
+					return A->owner->depth_bucket < B->owner->depth_bucket;
+				}
+				return (A->sort.sort_key2 == B->sort.sort_key2) ? (A->sort.sort_key1 < B->sort.sort_key1) : (A->sort.sort_key2 < B->sort.sort_key2);
+			}
+		};
+
+		void sort_front_to_back() {
+			SortArray<GeometryInstanceSurfaceDataCache *, SortByDepthBucketAndKey> sorter;
+			sorter.sort(elements.ptr(), elements.size());
+		}
+
+		void sort_front_to_back_range(uint32_t p_from, uint32_t p_size) {
+			SortArray<GeometryInstanceSurfaceDataCache *, SortByDepthBucketAndKey> sorter;
+			sorter.sort(elements.ptr() + p_from, p_size);
+		}
+
 		struct SortByDepth {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
 				return (A->owner->depth < B->owner->depth);
@@ -834,6 +863,9 @@ private:
 	};
 
 	RenderList render_list[RENDER_LIST_MAX];
+	// Opaque, motion and shadow lists drawn front to back (RenderList::sort_front_to_back); GODOT_SORT_FRONT_TO_BACK=0
+	// in the environment keeps the key's order (by shader, material and mesh).
+	bool sort_front_to_back = true;
 
 	uint32_t _partition_editor_overlay_surfaces(RenderList &p_list);
 

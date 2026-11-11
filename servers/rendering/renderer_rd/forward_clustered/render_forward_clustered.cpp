@@ -1273,6 +1273,8 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 	near_plane.d += p_render_data->scene_data->cam_projection.get_z_near();
 	float z_max = p_render_data->scene_data->cam_projection.get_z_far() - p_render_data->scene_data->cam_projection.get_z_near();
 
+	// A shadow pass does not set cam_orthogonal; the sun's is parallel all the same.
+	const bool sort_parallel = p_render_data->scene_data->cam_orthogonal || p_render_data->scene_data->cam_projection.is_orthogonal();
 	RenderList *rl = &render_list[p_render_list];
 	_update_dirty_geometry_instances();
 
@@ -1307,6 +1309,21 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 			inst->depth = p_render_data->scene_data->cam_transform.origin.distance_to(center) - inst->sorting_offset;
 		}
 		uint32_t depth_layer = CLAMP(int(inst->depth * 16 / z_max), 0, 15);
+		if (sort_front_to_back) {
+			// The layer it sorts in, front to back: in a perspective view by the nearest point of its bounds (a terrain
+			// chunk or a cell of plants reaches far in front of its middle), a quarter of an octave a layer from 1 m out
+			// (64 layers reach 55 km); in a parallel one (a shadow map) 64 even layers of its depth.
+			if (sort_parallel) {
+				const float nearest = near_plane.distance_to(inst->transformed_aabb.get_support(-near_plane.normal)) - inst->sorting_offset;
+				inst->depth_bucket = uint8_t(CLAMP(int(nearest * 64 / z_max), 0, 63));
+			} else {
+				const Vector3 eye = p_render_data->scene_data->cam_transform.origin;
+				const Vector3 lo = inst->transformed_aabb.position;
+				const Vector3 hi = lo + inst->transformed_aabb.size;
+				const float nearest = eye.distance_to(Vector3(CLAMP(eye.x, lo.x, hi.x), CLAMP(eye.y, lo.y, hi.y), CLAMP(eye.z, lo.z, hi.z))) - inst->sorting_offset;
+				inst->depth_bucket = nearest <= 1.0f ? 0 : uint8_t(CLAMP(int(Math::log2(nearest) * 4.0f), 0, 63));
+			}
+		}
 
 		uint32_t flags = inst->base_flags; //fill flags if appropriate
 
@@ -2972,8 +2989,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	_update_render_base_uniform_set();
 
 	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
-	render_list[RENDER_LIST_OPAQUE].sort_by_key();
-	render_list[RENDER_LIST_MOTION].sort_by_key();
+	if (sort_front_to_back) {
+		render_list[RENDER_LIST_OPAQUE].sort_front_to_back();
+		render_list[RENDER_LIST_MOTION].sort_front_to_back();
+	} else {
+		render_list[RENDER_LIST_OPAQUE].sort_by_key();
+		render_list[RENDER_LIST_MOTION].sort_by_key();
+	}
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 	// Editor overlay surfaces move to the tail of the alpha list so they can be
 	// drawn after the SSR/SSIL frame copy (must happen before instance data fill).
@@ -4577,7 +4599,11 @@ void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const Page
 	uint32_t render_list_from = render_list[RENDER_LIST_SECONDARY].elements.size();
 	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode, false, false, false, true);
 	uint32_t render_list_size = render_list[RENDER_LIST_SECONDARY].elements.size() - render_list_from;
-	render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
+	if (sort_front_to_back) {
+		render_list[RENDER_LIST_SECONDARY].sort_front_to_back_range(render_list_from, render_list_size);
+	} else {
+		render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
+	}
 	_fill_instance_data(RENDER_LIST_SECONDARY, p_render_info ? p_render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW] : (int *)nullptr, render_list_from, render_list_size, false);
 
 	{
@@ -7045,6 +7071,7 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 }
 
 RenderForwardClustered::RenderForwardClustered() {
+	sort_front_to_back = OS::get_singleton()->get_environment("GODOT_SORT_FRONT_TO_BACK") != "0";
 	singleton = this;
 
 	/* SCENE SHADER */
