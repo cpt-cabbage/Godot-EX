@@ -344,6 +344,8 @@ private:
 		DENOISE_FLAG_SPATIAL_SIGMA = 524288, // Spatial (GI, GODOT_GI_ATROUS_SIGMA): clamp_gamma carries the luminance stop's width in standard deviations.
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
+		DENOISE_FLAG_MOVER_NEAR = 67108864, // Temporal (GI; GODOT_GI_MOVER_NEAR=0 reverts): a surface beside something that moves keeps a short diffuse history, so the mover's contact shade follows it.
+		DENOISE_FLAG_NO_CARRIED_DEPTH = 33554432, // Temporal (experiment, GODOT_GI_CARRIED_DEPTH=0): a history tap must hold the camera reprojection's depth; the surface's own depth now does not pass it.
 		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.
 		DENOISE_FLAG_SPEC_YOUNG = 16777216, // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail (the spatial pass carries the power in spec_restart_min, the temporal in the reprojection UBO).
 		DENOISE_FLAG_SPEC_AA = 8388608, // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size, read at the pixel (the temporal pass's normal-roughness binding; the spatial pass's binding 13).
@@ -382,8 +384,9 @@ private:
 		uint32_t set;
 		uint32_t pad[3];
 		float previous_from_current[12]; // Three rows of a 3x4, view space.
+		float sphere[4]; // A sphere round it: the center (view space) and the radius.
 	};
-	static_assert(sizeof(MoverRecord) == 64, "MoverRecord layout must match the shader.");
+	static_assert(sizeof(MoverRecord) == 80, "MoverRecord layout must match the shader.");
 	RID _update_movers_buffer(uint32_t p_view, const Projection &p_view_from_ndc, const Transform3D &p_world_from_view, const Projection &p_reproject);
 
 	// Spatio-temporal blue noise (64x64x16, RG8) for the stochastic pass.

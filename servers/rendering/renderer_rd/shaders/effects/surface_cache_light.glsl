@@ -2132,6 +2132,24 @@ void trace_bounce_young(uint n_cosine, float n_light, Texel t, uint k, inout uin
 // A ray that finds the same surface at the same distance gives nothing,
 // whatever its radiance did. Off for a fresh texel and when the set has no
 // previous relight.
+//
+// A set that itself moved since the frame before (SURFACE_CACHE_SET_FLAG_MOVED)
+// finds the world at another distance along nearly every ray, every relight,
+// for as long as it moves: the verdict is true and never ends, and restarting
+// to one sample each time left a car's cards at one ray's noise for the whole
+// of a drive, its cabin grainy and boiling while its screen history (now kept:
+// stochastic_denoise.glsl's carried depth) held. Its verdict is scaled to
+// MOVED_SET_GRADIENT, which leaves about seven relights (and the screen
+// history of the pixels that read these cards as many frames, by the mark):
+// the bounce follows the passing world a few relights late and is that much
+// quieter (the cabin's roof in a drive through a storm at 30 Hz: the
+// picture's change from frame to frame 6.5% of its light with the whole
+// verdict, 4.6% here, and the same at 0.0625, so the rest is not this;
+// standing still 0.7%). Still, it reads as before.
+// GODOT_CARD_ABLATE=movedgrad keeps the whole verdict.
+#define MOVED_SET_GRADIENT 0.15
+float moved_set_gradient = 1.0;
+
 float bounce_gradient(ivec2 texel, Texel t, uint k, uint prev_seed, bool have_prev) {
 	if (!have_prev || (params.debug & 16u) != 0u) {
 		return -1.0;
@@ -2177,7 +2195,7 @@ float bounce_gradient(ivec2 texel, Texel t, uint k, uint prev_seed, bool have_pr
 			return 0.0;
 		}
 	}
-	return smoothstep(0.05, 0.3, rel);
+	return smoothstep(0.05, 0.3, rel) * moved_set_gradient;
 }
 
 // A verdict is one ray's, and one ray's verdict restarts nothing on its
@@ -2784,6 +2802,7 @@ void light_main() {
 	uint lod = (item >> SURFACE_CACHE_ITEM_LOD_SHIFT) & 7u;
 	uint set = active_sets.list[entry] & 0x7FFFFFFFu;
 	CardSet s = sets.data[set];
+	moved_set_gradient = ((s.flags & SURFACE_CACHE_SET_FLAG_MOVED) != 0u && (params.debug & 2097152u) == 0u) ? MOVED_SET_GRADIENT : 1.0;
 	// The workgroup tiles 8x8 texels, so a set under eight an edge cannot
 	// be lit here; min_card_size is clamped to 8 (surface_cache.cpp), so
 	// none is ever captured smaller, and the lookups gate at the same edge.

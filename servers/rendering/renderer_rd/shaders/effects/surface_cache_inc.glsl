@@ -9,6 +9,7 @@
 #define SURFACE_CACHE_CARDS 6u
 #define SURFACE_CACHE_SET_FLAG_CAPTURED 1u
 #define SURFACE_CACHE_SET_FLAG_RESET 2u
+#define SURFACE_CACHE_SET_FLAG_MOVED 4u // The set's transform changed since the frame before.
 #define SURFACE_CACHE_MAX_SETS 8192u
 
 // The relight requests. A read of a card texel asks for its 16x16 tile to be

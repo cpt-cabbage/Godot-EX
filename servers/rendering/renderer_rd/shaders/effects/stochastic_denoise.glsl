@@ -49,6 +49,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_CAUSE_STATS 4194304u // Diagnostics (GI temporal; GODOT_GI_TIER_PRINT / GODOT_RT_STATE_PRINT): count why this frame's young pixels are young into the gather's calibration buffer (see cause_stats).
 #define FLAG_SPEC_YOUNG 16777216u // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail, its normal stop at that power (the spatial pass's taps, the reveal's 5x5), tightening to the usual as its history fills.
 #define FLAG_SPEC_AA 8388608u // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size (rt_denoise_guide.glsl SPEC_AA), read at the pixel: the temporal pass's normal_roughness_texture, the spatial pass's spec_normal_roughness_texture.
+#define FLAG_MOVER_NEAR 67108864u // Temporal (GI; GODOT_GI_MOVER_NEAR=0 reverts): a surface beside a card set that moved keeps a short diffuse history (see the cap before the blend).
+#define FLAG_NO_CARRIED_DEPTH 33554432u // Experiment (GODOT_GI_CARRIED_DEPTH=0): a history tap must hold the camera reprojection's depth (see the disocclusion check).
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
 // Frame-edge history borrowing (temporal pass, see the reprojection block):
@@ -212,7 +214,7 @@ layout(set = 1, binding = 10, std430) restrict readonly buffer Movers {
 	uint pad0;
 	uint pad1;
 	uint pad2;
-	vec4 records[]; // Four per object: the set (x, as bits), the three rows.
+	vec4 records[]; // Five per object: the set (x, as bits), the three rows, a sphere round it (the center in view space, the radius).
 }
 movers;
 layout(set = 1, binding = 11, r32ui) uniform restrict readonly uimage2D spec_hit_image;
@@ -671,11 +673,11 @@ void main() {
 					uint hit_set = hit_id & 0x3FFFFFFFu;
 					uint n_movers = min(movers.count, 32u);
 					for (uint i = 0u; i < n_movers; i++) {
-						if (floatBitsToUint(movers.records[i * 4u].x) != hit_set) {
+						if (floatBitsToUint(movers.records[i * 5u].x) != hit_set) {
 							continue;
 						}
 						vec4 hit4 = vec4(hit, 1.0);
-						hit_before = vec3(dot(movers.records[i * 4u + 1u], hit4), dot(movers.records[i * 4u + 2u], hit4), dot(movers.records[i * 4u + 3u], hit4));
+						hit_before = vec3(dot(movers.records[i * 5u + 1u], hit4), dot(movers.records[i * 5u + 2u], hit4), dot(movers.records[i * 5u + 3u], hit4));
 						hit_moved = true;
 						break;
 					}
@@ -767,6 +769,22 @@ void main() {
 			// with nothing downstream to reject it. Taps that fail drop out and
 			// the rest renormalise; when every tap fails the pixel is revealed.
 			float predicted_depth = linearize_depth(prev_ndc.z / prev_ndc.w);
+			// The prediction is the camera's reprojection: the depth a point
+			// that stood still had a frame ago. The motion vector that placed
+			// prev_uv (FLAG_VELOCITY_CURRENT) carries no depth, and for
+			// something that travels with the camera -- the cabin of a car
+			// the player drives, a thing held in the hand -- the two part by
+			// the camera's own travel along the view: a pillar 0.7 m off in a
+			// car at 10 m/s was "predicted" 0.33 m further away at 30 Hz,
+			// failed every tap every frame, and was drawn from one frame's
+			// rays and the spatial pass alone, which filled it from the scene
+			// beside it (a tree's shape passing through the pillar, the
+			// cabin boiling). A tap is also the surface's own where it holds
+			// the depth the surface has now: what moved with the camera kept
+			// it, and for what stood still the second window lies the
+			// camera's travel beside the first, no wider than that.
+			// GODOT_GI_CARRIED_DEPTH=0 keeps the prediction alone.
+			float carried_depth = ((params.flags & FLAG_VELOCITY_CURRENT) != 0u && (params.flags & FLAG_HAS_VELOCITY) != 0u && (params.flags & FLAG_NO_CARRIED_DEPTH) == 0u) ? linearize_depth(center_depth) : predicted_depth;
 			vec2 hist_pos = prev_uv * vec2(params.screen_size) - 0.5;
 			ivec2 hist_base = ivec2(floor(hist_pos));
 			vec2 hist_fr = hist_pos - vec2(hist_base);
@@ -783,7 +801,7 @@ void main() {
 					continue;
 				}
 				float prev_depth = texelFetch(prev_view_depth_texture, tp, 0).r;
-				if (prev_depth <= 0.0 || abs(prev_depth - predicted_depth) > depth_tolerance * max(predicted_depth, 1.0)) {
+				if (prev_depth <= 0.0 || (abs(prev_depth - predicted_depth) > depth_tolerance * max(predicted_depth, 1.0) && abs(prev_depth - carried_depth) > depth_tolerance * max(carried_depth, 1.0))) {
 					continue;
 				}
 				hist_d4 += texelFetch(history_diffuse, tp, 0) * w;
@@ -1184,6 +1202,63 @@ void main() {
 			// glossy lobe, one noisy sample a frame, keeps the followed history.
 			if (spec_mover) {
 				frames_s = min(frames_s, mix(frames_cap, 1.0, smoothstep(0.9, 1.0, virtual_weight)));
+			}
+#endif
+#ifdef HAS_DIRECTIONAL
+			// FLAG_MOVER_NEAR: a surface beside something that moves keeps a
+			// short history. What a walking animal or a passing car takes of
+			// the light on the ground by it -- the contact shade under and
+			// beside it -- is in the ground's rays, and the ground's history,
+			// which nothing restarts (no card's lighting changed, no depth
+			// tap failed: the ground was in view all along), kept it for the
+			// accumulation's whole window: a dark line on the ground behind
+			// a running dog, a second long at 32 frames. The card sets that
+			// moved this frame (the movers) each come with a sphere round
+			// them and where a point on them was a frame ago: a pixel
+			// within 0.8 m of a mover's sphere that the mover moves across
+			// -- the mover's travel at the pixel against the pixel's own,
+			// which its motion vector and last frame's depth there give --
+			// has its diffuse history capped, 6 frames at the sphere to 16
+			// at the reach, so the shade follows the mover and is gone a
+			// few frames after it. By the travel in space and not on
+			// screen: a dog running straight away from the viewer hardly
+			// moves in the motion vectors. What moves with the mover is
+			// not capped (a car's cabin: every part and the pixel at one
+			// travel). A still scene has no movers and pays nothing.
+			// GODOT_GI_MOVER_NEAR=0 leaves the history whole.
+			if ((params.flags & FLAG_MOVER_NEAR) != 0u && movers.count > 0u && frames_d > 6.0) {
+				vec4 own4 = movers.view_from_ndc * vec4(uv * 2.0 - 1.0, center_depth, 1.0);
+				vec3 own = own4.xyz / own4.w;
+				// The pixel's own travel: where its history lies, at the depth
+				// held there, brought to this frame's view space.
+				vec3 own_travel = vec3(0.0);
+				ivec2 before_px = clamp(ivec2(prev_uv * vec2(params.screen_size)), ivec2(0), params.screen_size - 1);
+				float before_depth = texelFetch(prev_view_depth_texture, before_px, 0).r;
+				if (before_depth > 0.0) {
+					vec4 before4 = movers.view_from_prev_ndc * vec4(prev_uv * 2.0 - 1.0, depth_from_linear(before_depth), 1.0);
+					own_travel = before4.xyz / before4.w - own;
+				}
+				// The depth history is a half float and the signal's pixel a
+				// block of the frame's: a still pixel's travel reads up to
+				// this much.
+				float slack = 0.01 + 0.004 * length(own);
+				float nearest = 2.0;
+				uint n_movers = min(movers.count, 32u);
+				for (uint i = 0u; i < n_movers; i++) {
+					vec4 sphere = movers.records[i * 5u + 4u];
+					float off = (distance(own, sphere.xyz) - sphere.w) / 0.8;
+					if (off >= nearest) {
+						continue;
+					}
+					vec4 own1 = vec4(own, 1.0);
+					vec3 mover_travel = vec3(dot(movers.records[i * 5u + 1u], own1), dot(movers.records[i * 5u + 2u], own1), dot(movers.records[i * 5u + 3u], own1)) - own;
+					if (distance(mover_travel, own_travel) > slack) {
+						nearest = off;
+					}
+				}
+				if (nearest < 1.0) {
+					frames_d = min(frames_d, mix(6.0, 16.0, clamp(nearest, 0.0, 1.0)));
+				}
 			}
 #endif
 			// Never past 1: a restart below (the change mark, a borrow) can

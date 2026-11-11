@@ -925,7 +925,11 @@ uint32_t Raytracing::_velocity_flags(RID p_velocity) const {
 	if (p_velocity.is_null()) {
 		return 0;
 	}
-	return DENOISE_FLAG_HAS_VELOCITY | (velocity_current ? DENOISE_FLAG_VELOCITY_CURRENT : 0);
+	// GODOT_GI_CARRIED_DEPTH=0: a history tap is tested against the camera
+	// reprojection's depth alone, as before 2026-11-11 (stochastic_denoise.glsl,
+	// the disocclusion check).
+	static const bool no_carried_depth = OS::get_singleton()->get_environment("GODOT_GI_CARRIED_DEPTH") == "0";
+	return DENOISE_FLAG_HAS_VELOCITY | (velocity_current ? DENOISE_FLAG_VELOCITY_CURRENT : 0) | (no_carried_depth ? DENOISE_FLAG_NO_CARRIED_DEPTH : 0);
 }
 
 // A young rough reflection averages over the normal map's detail, its normal
@@ -1032,6 +1036,11 @@ RID Raytracing::_update_movers_buffer(uint32_t p_view, const Projection &p_view_
 				}
 				r.previous_from_current[i * 4 + 3] = t.origin[i];
 			}
+			const Vector3 center = view_from_world.xform(m.center);
+			r.sphere[0] = center.x;
+			r.sphere[1] = center.y;
+			r.sphere[2] = center.z;
+			r.sphere[3] = m.radius;
 		}
 	}
 	header->count = count;
@@ -3119,6 +3128,13 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		static const bool no_objects = OS::get_singleton()->get_environment("GODOT_GI_OBJECTS") == "0";
 		if (no_objects) {
 			denoise_push_constant.flags |= DENOISE_FLAG_NO_OBJECTS;
+		}
+		// GODOT_GI_MOVER_NEAR=0: a surface beside a moving object keeps its
+		// whole history (the contact shade trailing behind the mover, as
+		// before 2026-11-11).
+		static const bool mover_near = OS::get_singleton()->get_environment("GODOT_GI_MOVER_NEAR") != "0";
+		if (mover_near) {
+			denoise_push_constant.flags |= DENOISE_FLAG_MOVER_NEAR;
 		}
 		// GODOT_GI_SPEC_RESTART_MIN=<frames>: a floor under the change mark's
 		// restart of the reflection (measured, off by default: 8 took the

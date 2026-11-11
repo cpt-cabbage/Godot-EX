@@ -569,10 +569,13 @@ uint32_t SurfaceCache::add_instance(RenderGeometryInstanceBase *p_instance, bool
 	if (s->last_seen_frame != frame) {
 		s->previous_transform = seen_last_frame ? s->transform : p_instance->transform;
 	}
-	if ((seen_last_frame || s->last_seen_frame == frame) && movers.size() < MAX_MOVERS && !s->previous_transform.is_equal_approx(p_instance->transform)) {
+	s->moved = (seen_last_frame || s->last_seen_frame == frame) && !s->previous_transform.is_equal_approx(p_instance->transform);
+	if (s->moved && movers.size() < MAX_MOVERS) {
 		Mover m;
 		m.set = set_index;
 		m.previous_from_current = s->previous_transform * p_instance->transform.affine_inverse();
+		m.center = p_instance->transformed_aabb.get_center();
+		m.radius = 0.5f * p_instance->transformed_aabb.size.length();
 		movers.push_back(m);
 	}
 	s->last_seen_frame = frame;
@@ -1100,7 +1103,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		r.world_aabb_size[0] = s.world_aabb.size.x;
 		r.world_aabb_size[1] = s.world_aabb.size.y;
 		r.world_aabb_size[2] = s.world_aabb.size.z;
-		r.flags = (s.captured && s.size > 0 ? SET_FLAG_CAPTURED : 0) | (s.reset ? SET_FLAG_RESET : 0);
+		r.flags = (s.captured && s.size > 0 ? SET_FLAG_CAPTURED : 0) | (s.reset ? SET_FLAG_RESET : 0) | (s.moved ? SET_FLAG_MOVED : 0);
 		r.captured_frame = s.captured_frame;
 		s.reset = false;
 		for (uint32_t c = 0; c < CARDS_PER_SET; c++) {
@@ -1247,6 +1250,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 		print_line(vformat("Surface cache lights: %d omni, %d spot, %d area, %d directional, radius %.1f, grid %s (cell %.1f m)", p_inputs.omni_light_count, p_inputs.spot_light_count, p_inputs.area_light_count, p_inputs.directional_light_count, p_inputs.light_radius, use_grid ? "on" : "off", grid_cell));
 	}
 	// Profiling: GODOT_CARD_ABLATE=bounce,shadow,lights,sun,gradient,restart,visrestart,strict;
+	// movedgrad (a moving set's bounce gradient at its whole size, as before 2026-11-11);
 	// diagnostics paint,paint2,paint3,paint5,paint8,paintn,paintl,stats (see the shader's debug bits).
 	// switches parts of the texel shading off (gradient: the bounce ray
 	// re-traced for the temporal gradient; restart: the bounce accumulation's
@@ -1272,6 +1276,7 @@ void SurfaceCache::update_lighting(const LightingInputs &p_inputs) {
 					: name == "paint8"						? 131072
 					: name == "paintn"						? 262144
 					: name == "paintl"						? 524288
+					: name == "movedgrad"					? 2097152
 															: 0;
 		}
 		if (bits != 0) {

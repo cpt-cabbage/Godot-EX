@@ -270,6 +270,7 @@ private:
 	enum SetFlags {
 		SET_FLAG_CAPTURED = 1, // Cards hold a capture; hits may read them.
 		SET_FLAG_RESET = 2, // Freshly captured this frame: the lighting starts over.
+		SET_FLAG_MOVED = 4, // Its transform changed since the frame before: its bounce gradient, true at every relight while it moves, is scaled down (surface_cache_light.glsl).
 	};
 
 	struct CardSet {
@@ -286,6 +287,7 @@ private:
 		bool captured = false;
 		bool pending_capture = false;
 		bool reset = false;
+		bool moved = false; // The transform changed since the frame before (SET_FLAG_MOVED).
 		bool skinned = false;
 		uint64_t skeleton_version = 0; // The skeleton's version the cards were captured with (skinned instances).
 		uint32_t last_seen_frame = 0;
@@ -632,6 +634,10 @@ public:
 	struct Mover {
 		uint32_t set = INVALID_ID;
 		Transform3D previous_from_current;
+		// A sphere round it, world space (the GI temporal pass keeps the
+		// history short on what stands beside a mover: its FLAG_MOVER_NEAR).
+		Vector3 center;
+		float radius = 0.0f;
 	};
 	static constexpr uint32_t MAX_MOVERS = 32;
 	const LocalVector<Mover> &get_movers() const { return movers; }
