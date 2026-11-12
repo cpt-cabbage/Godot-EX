@@ -63,6 +63,8 @@ void WeatherState::blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &
 	L(cloud_type_spread)
 	L(cloud_multiscatter)
 	L(exposure_compensation)
+	L(sky_light)
+	L(cloud_shadow_density)
 #undef L
 }
 
@@ -103,6 +105,9 @@ void WeatherState::_bind_methods() {
 	P(cloud_variation, "0,1,0.01")
 	P(cloud_type_spread, "0,0.5,0.01")
 	P(cloud_multiscatter, "0,2,0.01")
+	ADD_GROUP("Light", "");
+	P(sky_light, "0,2,0.01")
+	P(cloud_shadow_density, "0,4,0.01")
 	ADD_GROUP("Exposure", "");
 	P(exposure_compensation, "-4,2,0.01,suffix:EV")
 #undef P
@@ -339,6 +344,8 @@ void WeatherDirector::_apply() {
 		atmosphere->set_cloud_variation(current->cloud_variation);
 		atmosphere->set_cloud_type_spread(current->cloud_type_spread);
 		atmosphere->set_cloud_multiscatter(current->cloud_multiscatter);
+		atmosphere->set_weather_sky_light(current->sky_light);
+		atmosphere->set_cloud_shadow_density(current->cloud_shadow_density);
 		const float h = Math::deg_to_rad(current->wind_heading);
 		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
 		atmosphere->set_weather_mist_density(current->mist * mist_density);

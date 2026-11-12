@@ -157,6 +157,13 @@ class AtmosphereEffect : public CompositorEffect {
 	float weather_mist_density = 0.0;
 	float weather_mist_top = 400.0; // world y
 	float precipitation = 0.0;
+	// The weather's light (2026-11-12, WeatherDirector sets them from WeatherState): `weather_sky_light` scales the light
+	// the sky and the clouds give (the sky table, the aerial perspective's in-scattered light, the light the clouds take
+	// from the sun), so the sky as seen, the haze, the clouds and what the sky lights (ambient, reflections, the bounce
+	// light's sky) together, and not the sun's direct light; `cloud_shadow_density` scales the clouds' optical depth for
+	// their shadow on the ground and in the air (1 as they are, 2 a deeper shade, 0.5 a lighter one).
+	float weather_sky_light = 1.0;
+	float cloud_shadow_density = 1.0;
 	Vector3 lightning_position;
 	float lightning_flash = 0.0;
 	Color lightning_color = Color(0.75, 0.8, 1.0);
@@ -383,6 +390,8 @@ public:
 	FOGP(float, weather_mist_density)
 	FOGP(float, weather_mist_top)
 	FOGP(float, precipitation)
+	FOGP(float, weather_sky_light)
+	FOGP(float, cloud_shadow_density)
 	FOGP(Vector3, lightning_position)
 	FOGP(float, lightning_flash)
 	FOGP(Color, lightning_color)

@@ -88,9 +88,10 @@ AtmosphereEffect::Push AtmosphereEffect::_push(float p_camera_altitude_m, int p_
 	p.misc[1] = multiscatter;
 	p.misc[2] = float(p_width);
 	p.misc[3] = float(p_height);
-	p.tint[0] = sky_tint.r * sky_luminance;
-	p.tint[1] = sky_tint.g * sky_luminance;
-	p.tint[2] = sky_tint.b * sky_luminance;
+	const float luminance = sky_luminance * MAX(weather_sky_light, 0.0f);
+	p.tint[0] = sky_tint.r * luminance;
+	p.tint[1] = sky_tint.g * luminance;
+	p.tint[2] = sky_tint.b * luminance;
 	p.tint[3] = sky_recolor;
 	return p;
 }
@@ -682,6 +683,8 @@ void AtmosphereEffect::_bind_methods() {
 	FB(weather_mist_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.5,0.0001,suffix:/m")
 	FB(weather_mist_top, Variant::FLOAT, PROPERTY_HINT_RANGE, "-5000,10000,0.1,suffix:m")
 	FB(precipitation, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(weather_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
+	FB(cloud_shadow_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
 	FB(lightning_position, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m")
 	FB(lightning_flash, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
 	FB(lightning_color, Variant::COLOR, PROPERTY_HINT_NONE, "")

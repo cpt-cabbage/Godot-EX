@@ -27,6 +27,9 @@
 		<member name="cloud_shear" type="float" setter="set_cloud_shear" getter="get_cloud_shear" default="0.25">
 			How far a cloud's top leans downwind, in metres per metre up. [member AtmosphereEffect.cloud_shear].
 		</member>
+		<member name="cloud_shadow_density" type="float" setter="set_cloud_shadow_density" getter="get_cloud_shadow_density" default="1.0">
+			How much sun the clouds take out of the light on the ground and in the air: a multiplier on their optical depth for the shadow. 1 as they are, 2 a deeper shade, 0.5 a lighter one. Their look is unchanged. [member AtmosphereEffect.cloud_shadow_density].
+		</member>
 		<member name="cloud_thickness_scale" type="float" setter="set_cloud_thickness_scale" getter="get_cloud_thickness_scale" default="1.0">
 			Multiplies the thickness [member cloud_type] gives (a few hundred metres for a layer, about a kilometre for fair cumulus, 8 km for a storm tower). [member AtmosphereEffect.cloud_thickness_scale].
 		</member>
@@ -40,7 +43,7 @@
 			How unevenly the cover is spread over the sky: 0 the same everywhere, 1 clumps and clear gaps. [member AtmosphereEffect.cloud_variation].
 		</member>
 		<member name="exposure_compensation" type="float" setter="set_exposure_compensation" getter="get_exposure_compensation" default="0.0">
-			The picture's exposure in this weather, in stops (EV); negative is darker. The engine does not use it: the game's camera reads it, so a grey day is seen as grey and a storm as dark, though the eye adapts to both.
+			The picture's exposure in this weather, in stops (EV); negative is darker. The engine does not use it: the game's camera reads it. It darkens or brightens everything, lamps and the flashlight too: for a darker storm, prefer [member sky_light].
 		</member>
 		<member name="gust_strength" type="float" setter="set_gust_strength" getter="get_gust_strength" default="0.4">
 			How strong the gusts are against the wind's speed.
@@ -62,6 +65,9 @@
 		</member>
 		<member name="precipitation" type="float" setter="set_precipitation" getter="get_precipitation" default="0.0">
 			Rain or snow: how hard it falls and how wet the ground gets. [member temperature] says which.
+		</member>
+		<member name="sky_light" type="float" setter="set_sky_light" getter="get_sky_light" default="1.0">
+			How bright the light from the sky and the clouds is: the sky as seen, the haze, the clouds' glow, and through the sky the ambient light, reflections and bounce light on everything. Not the sun's direct light (see [member cloud_shadow_density]), lamps, the flashlight or lightning, so a darker storm sky leaves them as bright as they are. [member AtmosphereEffect.weather_sky_light].
 		</member>
 		<member name="temperature" type="float" setter="set_temperature" getter="get_temperature" default="15.0">
 			Degrees C on the valley floor: rain or snow, frost, and the snow and freezing lines.

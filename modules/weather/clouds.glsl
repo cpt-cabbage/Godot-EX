@@ -43,7 +43,7 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 sky; // x the sky light's share, y the multiple scattering's strength, z the steps, w the light march's first step (m)
 	vec4 noise; // x the first slice the noise passes make this frame, y how many (spread over frames: a whole volume in one
 	// dispatch outlasted the driver's timeout)
-	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level)
+	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level), z the shadow's density scale
 	vec4 lightning; // xyz the strike's flash (world, at the cloud base), w its strength now
 	vec4 field; // x the layer's base (m above sea level), y the thickness scale, z the type's spread, w the base's (m)
 	vec4 map_near; // xy the near weather map's origin (world x, z), z its side (m), w the far map's side (m)
@@ -817,13 +817,13 @@ void main() {
 			tau_u += dtau * u;
 			tau_uu += dtau * u * u;
 		}
-		shade.r = exp(-tau);
+		shade.r = exp(-tau * clouds.weather.z); // the weather's shadow density scales the optical depth
 		if (tau > 1e-4) {
 			float mean_u = tau_u / tau;
 			shade.g = mean_u * clouds.layer.y;
 			shade.b = (sqrt(3.0 * max(tau_uu / tau - mean_u * mean_u, 0.0)) + 0.5 / float(N)) * clouds.layer.y;
 		}
-		shade.a = high_shadow(vec3(xz.x, base_y, xz.y));
+		shade.a = pow(high_shadow(vec3(xz.x, base_y, xz.y)), clouds.weather.z);
 	}
 	imageStore(out_shadow, px, shade);
 #endif

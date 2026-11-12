@@ -196,7 +196,10 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(p_cam.origin.x, p_cam.origin.y, p_cam.origin.z, float(cloud_frame % 4096));
 	v4(cloud_prev_cam.x, cloud_prev_cam.y, cloud_prev_cam.z, cloud_prev_valid && cloud_history > 0.0f ? 1.0f : 0.0f);
 	v4(light_direction.x, light_direction.y, light_direction.z, light_illuminance);
-	v4(light_color.r, light_color.g, light_color.b, cloud_anisotropy);
+	// The light the clouds take from the sun, scaled with the sky's by the weather (the sky table, read for their skylight,
+	// is scaled through the tint).
+	const float sky_light = MAX(weather_sky_light, 0.0f);
+	v4(light_color.r * sky_light, light_color.g * sky_light, light_color.b * sky_light, cloud_anisotropy);
 	const Vector2 shell = get_cloud_shell();
 	v4(shell.x, shell.y, cloud_type, CLAMP(cloud_cover, 0.0f, 1.0f));
 	v4(cloud_density, cloud_scale, cloud_detail_scale, cloud_weather_scale);
@@ -207,7 +210,7 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
 	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), 0, 0);
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
-	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, 0, 0);
+	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, MAX(cloud_shadow_density, 0.0f), 0);
 	v4(lightning_position.x, lightning_position.y, lightning_position.z, lightning_flash * lightning_energy);
 	// The weather map: near and far layers round the camera, their origins snapped to a texel.
 	const float far_side = MAX(cloud_reach * 2.0f, CLOUD_MAP_NEAR * 2.0f);

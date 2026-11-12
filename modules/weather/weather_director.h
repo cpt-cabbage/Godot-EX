@@ -97,6 +97,12 @@ public:
 	// The picture's exposure in this weather, in stops (EV): negative is darker. The engine does not use it; the game's
 	// camera does (a grey day seen as grey, a storm as dark, though the eye adapts to both).
 	float exposure_compensation = 0.0;
+	// The weather's natural light (2026-11-12): `sky_light` scales the light the sky and the clouds give (the sky as seen,
+	// the haze, the clouds' glow, and through the sky the ambient light, reflections and bounce light), not the sun's direct
+	// light, lamps or lightning; `cloud_shadow_density` scales how much sun the clouds take out of the light on the ground
+	// (their optical depth for the shadow). AtmosphereEffect's weather_sky_light and cloud_shadow_density.
+	float sky_light = 1.0;
+	float cloud_shadow_density = 1.0;
 
 protected:
 	static void _bind_methods();
@@ -131,6 +137,8 @@ public:
 	WEATHER_PROP(cloud_type_spread)
 	WEATHER_PROP(cloud_multiscatter)
 	WEATHER_PROP(exposure_compensation)
+	WEATHER_PROP(sky_light)
+	WEATHER_PROP(cloud_shadow_density)
 #undef WEATHER_PROP
 };
 
