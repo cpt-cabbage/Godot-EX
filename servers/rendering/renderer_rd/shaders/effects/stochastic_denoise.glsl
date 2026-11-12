@@ -50,6 +50,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define FLAG_SPEC_YOUNG 16777216u // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail, its normal stop at that power (the spatial pass's taps, the reveal's 5x5), tightening to the usual as its history fills.
 #define FLAG_SPEC_AA 8388608u // GI (GODOT_GI_SPEC_AA): the reflection's lobe at the signal's size (rt_denoise_guide.glsl SPEC_AA), read at the pixel: the temporal pass's normal_roughness_texture, the spatial pass's spec_normal_roughness_texture.
 #define FLAG_MOVER_NEAR 67108864u // Temporal (GI; GODOT_GI_MOVER_NEAR=0 reverts): a surface beside a card set that moved keeps a short diffuse history (see the cap before the blend).
+#define FLAG_STANDIN_AGREE 134217728u // Spatial (GI; GODOT_GI_STANDIN_AGREE=0 reverts): the cards' stand-in at every age where it agrees with the filtered rays (see store_result).
 #define FLAG_NO_CARRIED_DEPTH 33554432u // Experiment (GODOT_GI_CARRIED_DEPTH=0): a history tap must hold the camera reprojection's depth (see the disocclusion check).
 #define FLAG_VELOCITY_CURRENT 1048576u // The velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, camera and objects alike, no classification.
 
@@ -72,6 +73,11 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // hit-distance term (a ray or two's worth) is not trusted to shape the
 // kernel, and the luminance stop stays off.
 #define YOUNG_FRAMES 8.0
+// Spatial pass (GI, FLAG_STANDIN_AGREE): how far apart in luminance, as a
+// share of the larger, the cards' stand-in and the filtered rays may be for
+// the stand-in to be shown whole, and where it is not shown at all.
+#define STANDIN_AGREE_FROM 0.25
+#define STANDIN_AGREE_TO 0.55
 // Borrowed taps are compared against the depth of a surface point up to a
 // pan's width away, so a wall at a grazing angle needs more room than the
 // same-texel test; a different surface still fails.
@@ -1568,8 +1574,45 @@ void store_result(ivec2 pixel, vec3 d, vec3 s, vec4 dir, float p_confidence, flo
 	if ((params.flags & FLAG_FALLBACK_ALL) != 0u) {
 		vec4 fb = texelFetch(fallback_texture, pixel, 0);
 		d = fb.a > 0.0 ? fb.rgb : vec3(0.0);
-	} else if (p_fallback_weight > 0.0 || p_fallback_weight_dyn > 0.0) {
+	} else if (p_fallback_weight > 0.0 || p_fallback_weight_dyn > 0.0 || (params.flags & FLAG_STANDIN_AGREE) != 0u) {
 		vec4 fb = texelFetch(fallback_texture, pixel, 0);
+		if ((params.flags & FLAG_STANDIN_AGREE) != 0u) {
+			// FLAG_STANDIN_AGREE: the stand-in at every age where it agrees
+			// with the rays. A room lit by one lamp: a wall five metres from
+			// it takes its bounce light from the square metre of wall and
+			// table the lamp stands at, a small part of the wall's
+			// hemisphere, and one ray a frame over thirty-two frames leaves
+			// each pixel a mean of its own, a few percent apart from the
+			// next pixel's; the a-trous pass spreads those into blotches a
+			// hand across that crawl as the view turns ("it boils
+			// everywhere"). More rays, a third iteration, a longer window, a
+			// ceiling on the cache's radiance at a hit and the screen reads
+			// off each moved it a little or not at all (the wall's picture
+			// less its own blur, a share of its light: 0.74% as it was,
+			// 0.97% at four rays, 0.31% with every pixel filtered over three
+			// iterations, 0.59% under a ceiling of half a white). The card
+			// under the surface holds the same bounce accumulated over the
+			// card and filtered there, in the world and not on screen: 0.19%
+			// shown alone, the same brightness (47.0 against 45.5 of 255),
+			// still as the view turns. So where the stand-in and the filtered
+			// rays agree in luminance (within STANDIN_AGREE_FROM, fading out
+			// by STANDIN_AGREE_TO) the pixel shows the stand-in, at the
+			// card's own trust as for the young. Where they differ the rays
+			// stay: leaves, whose cards are a multimesh's few and read a
+			// quarter dark, a contact shade the card is too coarse for, light
+			// a card has not caught up with. Three views of a valley outdoors
+			// (a forest, a ridge of grass, a trail) differ by 0.9 of 255 or
+			// less in the mean with it. A stand-in keyed to the signal's
+			// variance instead was tried first and not kept: by the filtered
+			// moments it took the forest's leaves too (7% darker), by the
+			// unfiltered ones it was a patchwork (0.98-1.03% on the wall).
+			float l_fb = luminance(fb.rgb);
+			float l_d = luminance(d);
+			float apart = abs(l_fb - l_d) / max(max(l_fb, l_d), 1e-12);
+			float agree = 1.0 - smoothstep(STANDIN_AGREE_FROM, STANDIN_AGREE_TO, apart);
+			p_fallback_weight = max(p_fallback_weight, agree);
+			p_fallback_weight_dyn = max(p_fallback_weight_dyn, agree);
+		}
 		// The card's own accumulation counts too: a texel relit once is no
 		// better than the pixel's sample.
 		float trust = clamp(fb.a * 64.0 / max(params.fallback_ramp, 1.0), 0.0, 1.0);

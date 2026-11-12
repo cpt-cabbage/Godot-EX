@@ -165,7 +165,7 @@ params;
 #define FLAG_HIT_ALL 4096u // Every hit is, cards or not.
 #define FLAG_HIT_MIRROR 8192u // The mirror ray's hits are, cards or not.
 #define FLAG_HIT_DEBUG_CONSTANT 16384u // Debug: a constant radiance in place of the deferral, to check the resolve against.
-#define FLAG_FALLBACK_ALL 32768u // Diagnostics: the cards' fallback for every pixel, not only the young.
+#define FLAG_FALLBACK_ALL 32768u // The cards' fallback for every pixel, not only the young: the spatial pass's FLAG_STANDIN_AGREE reads it at every age (and the diagnostic GODOT_GI_FALLBACK=all).
 #define FLAG_FALLBACK_OFF 65536u // Diagnostics: no fallback, the young keep their own filtered history.
 #define FLAG_SPEC_SOURCE_PAINT 524288u // Diagnostics (GODOT_GI_SPEC_SOURCE_PAINT=1): the reflection painted by what answered its ray (see the end of main).
 #define FLAG_SRAD_PREV_DEPTH 8388608u // GODOT_GI_SRAD_PREV_DEPTH=0 reverts: a screen read is validated against last frame's depth where it reads last frame's colour.

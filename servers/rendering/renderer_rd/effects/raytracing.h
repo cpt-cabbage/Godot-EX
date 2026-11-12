@@ -345,6 +345,7 @@ private:
 		DENOISE_FLAG_NO_OBJECTS = 65536, // Temporal (GI, experiment, GODOT_GI_OBJECTS=0): no moving-object classification from the velocity buffer.
 		DENOISE_FLAG_VELOCITY_CURRENT = 1048576, // Temporal: the velocity buffer is this frame's (the motion-vector prepass): every history at uv + velocity, no classification.
 		DENOISE_FLAG_MOVER_NEAR = 67108864, // Temporal (GI; GODOT_GI_MOVER_NEAR=0 reverts): a surface beside something that moves keeps a short diffuse history, so the mover's contact shade follows it.
+		DENOISE_FLAG_STANDIN_AGREE = 134217728, // Spatial (GI; GODOT_GI_STANDIN_AGREE=0 reverts): the cards' stand-in at every age where it agrees with the filtered rays, not only while the pixel is young.
 		DENOISE_FLAG_NO_CARRIED_DEPTH = 33554432, // Temporal (experiment, GODOT_GI_CARRIED_DEPTH=0): a history tap must hold the camera reprojection's depth; the surface's own depth now does not pass it.
 		DENOISE_FLAG_CAUSE_STATS = 4194304, // Temporal (GI, diagnostics): count why the young pixels are young into the gather's calibration buffer.
 		DENOISE_FLAG_SPEC_YOUNG = 16777216, // GI (GODOT_GI_SPEC_YOUNG=<power>): a young rough reflection averages over the normal map's detail (the spatial pass carries the power in spec_restart_min, the temporal in the reprojection UBO).

@@ -2583,7 +2583,14 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 	if (fallback_coverage) {
 		params.fallback_parts |= 8u;
 	}
-	if (fallback_all && use_cards) {
+	// The stand-in at every age where it agrees with the rays (the spatial
+	// pass's DENOISE_FLAG_STANDIN_AGREE, see stochastic_denoise.glsl): the
+	// gather then finds it for every pixel, a primary ray and a tent each
+	// (the valley's ridge, forest and Protea slope +0.3 ms each at 4K, 1 % of
+	// the frame, alternating arms).
+	// GODOT_GI_STANDIN_AGREE=0: only for the young, as before 2026-11-12.
+	static const bool standin_agree = OS::get_singleton()->get_environment("GODOT_GI_STANDIN_AGREE") != "0";
+	if ((fallback_all || standin_agree) && use_cards) {
 		params.flags |= 32768; // FLAG_FALLBACK_ALL
 	}
 	// Deferred hit shading: a packet per gather ray is the room (every hit
@@ -3230,6 +3237,9 @@ void Raytracing::process_rt_gi(Ref<RenderSceneBuffersRD> p_render_buffers, uint3
 		// GI filters radiance directly: no analytic modulation, the bindings
 		// are dummies that are never fetched.
 		denoise_push_constant.flags = (fallback_all && use_cards) ? DENOISE_FLAG_FALLBACK_ALL : 0;
+		if (standin_agree && use_cards) {
+			denoise_push_constant.flags |= DENOISE_FLAG_STANDIN_AGREE;
+		}
 		if (dyn_split) {
 			denoise_push_constant.flags |= DENOISE_FLAG_DYN_SPLIT;
 		}
