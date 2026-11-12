@@ -494,8 +494,12 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 			// The powder effect: thin edges facing away from the light darker (it brightened the cores by a third too).
 			float powder = 1.0 - exp(-sigma * 2.0 * 60.0);
 			S *= mix(1.0, powder, 0.35);
-			// The sky's light reaches the cloud's skin, less its core (Nubis: pow(1 - profile, 0.5)).
-			S += sky_ambient(h) * mix(0.4, 1.0, sqrt(1.0 - cs.profile));
+			// The sky's light reaches the cloud's skin, less its core (Nubis: pow(1 - profile, 0.5)), and arrives through the
+			// cloud above it diffused as the sun's does (2026-11-12): the optical depth up taken from the one toward the
+			// light, made vertical. Before, a storm's base 8 km under its top took a third of the open sky's light and lit
+			// the mist and the valley under it as brightly as a fair day's.
+			float tau_up = tau * max(clouds.light_dir.y, 0.2);
+			S += sky_ambient(h) * mix(0.4, 1.0, sqrt(1.0 - cs.profile)) / (1.0 + 0.75 * tau_up * (1.0 - g));
 			// Lightning: the flash lights the cloud round it, falling off over a kilometre or so.
 			if (clouds.lightning.w > 0.0) {
 				float r = length(p - clouds.lightning.xyz);

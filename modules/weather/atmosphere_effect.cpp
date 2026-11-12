@@ -444,7 +444,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		f[o - 1] = heights_rd.is_valid() ? 1.0f : 0.0f;
 		v4(light_illuminance, 0, 0, 0);
 		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset);
-		v4(cloud_shadows_on ? 1.0f : 0.0f, 0, 0, 0);
+		v4(cloud_shadows_on ? 1.0f : 0.0f, clouds_on && cloud_panorama_rd.is_valid() ? 1.0f : 0.0f, 0, 0);
 		v4(weather_mist_density, weather_mist_top, precipitation, 0);
 		// The world to the camera's view space, and whether the sun's cascades are there to read (no ray-traced shadows).
 		const Projection view(cam.affine_inverse());
@@ -528,6 +528,8 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, shadow_rd })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, sky_view_rd })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_shadow_rd.is_valid() ? cloud_shadow_rd : shadow_rd })));
+			// The clouds' panorama: the sky's light from above under them (a frame late: the march makes it after this).
+			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, cloud_panorama_rd.is_valid() ? cloud_panorama_rd : shadow_rd })));
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));

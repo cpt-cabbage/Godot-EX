@@ -40,7 +40,7 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 terrain_h; // x height_min, y height_range, z the mip for the shadow map, w 1 when the heights are bound
 	vec4 sky; // x the sky table's light illuminance, yzw unused
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
-	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn
+	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn, y 1 when the clouds' panorama is (the sky's light from above)
 	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1)
 	mat4 view; // the world to the camera's view space (the cascades' matrices start there)
 	vec4 cascades; // x 1 when the sun's shadow cascades are rendered (no ray-traced shadows)
@@ -54,6 +54,9 @@ layout(set = 0, binding = 3) uniform sampler2D terrain_heights;
 layout(set = 0, binding = 4) uniform sampler2D terrain_shadow;
 layout(set = 0, binding = 5) uniform sampler2D sky_view;
 layout(set = 0, binding = 9) uniform sampler2D cloud_shadow_map;
+#if defined(MODE_INJECT) || defined(MODE_INJECT_RT)
+layout(set = 0, binding = 14) uniform sampler2D cloud_panorama;
+#endif
 #endif
 #ifdef MODE_INJECT_RT
 layout(set = 0, binding = 6) uniform accelerationStructureEXT tlas;
@@ -227,7 +230,10 @@ float phase_hg(float c, float g) {
 }
 
 // The sky's light reaching the air, a mean over the upper sky in the sky table (u: azimuth from the light, v: elevation,
-// the horizon at 0.5), as radiance.
+// the horizon at 0.5), as radiance. Under clouds (2026-11-12) the light from above is theirs and the clear sky's only
+// where it shows through them: the clouds' panorama (rgb their light, a the sky's transmittance; u azimuth, v the angle
+// from the zenith) over the upper sky, weighted by solid angle. Before, a storm's mist was lit by the clear sky above
+// its cloud: blue, and as bright as a fair day's haze, it hid the cloud.
 vec3 sky_ambient() {
 	vec3 s = vec3(0.0);
 	for (int i = 0; i < 4; i++) {
@@ -235,7 +241,23 @@ vec3 sky_ambient() {
 			s += textureLod(sky_view, vec2((float(i) + 0.5) / 4.0, 0.5 + 0.5 * (float(j) + 0.5) / 3.0), 0.0).rgb;
 		}
 	}
-	return s / 12.0 * fog.sky.x;
+	s *= fog.sky.x / 12.0;
+	if (fog.cloud_flags.y > 0.5) {
+		vec3 c = vec3(0.0);
+		float a = 0.0, wsum = 0.0;
+		for (int j = 0; j < 3; j++) {
+			float v = (float(j) + 0.5) / 6.0; // 15, 45 and 75 degrees from the zenith
+			float w = sin(v * PI);
+			for (int i = 0; i < 8; i++) {
+				vec4 cp = textureLod(cloud_panorama, vec2((float(i) + 0.5) / 8.0, v), 0.0);
+				c += cp.rgb * w;
+				a += cp.a * w;
+				wsum += w;
+			}
+		}
+		s = s * (a / wsum) + c / wsum;
+	}
+	return s;
 }
 #endif
 
