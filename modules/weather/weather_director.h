@@ -84,6 +84,19 @@ public:
 	float precipitation = 0.0;
 	float temperature = 15.0; // degrees C at the valley floor (rain or snow, frost)
 	float lightning = 0.0;
+	// The clouds' look in this weather (2026-11-12), AtmosphereEffect's settings of the same names, applied by the
+	// director and blended with the rest. The defaults are AtmosphereEffect's, so a state that sets none looks as before.
+	// cloud_scale and cloud_detail_scale stay the atmosphere's: blended over a change they would zoom the whole sky.
+	float cloud_density = 0.08; // per m: how much light a metre of cloud takes (dark bases, solid towers)
+	float cloud_thickness_scale = 1.0; // times the type's thickness
+	float cloud_erosion = 1.0; // 0 smooth blobs, 2 frayed, wispy edges
+	float cloud_shear = 0.25; // m downwind per m up: how far the tops lean
+	float cloud_variation = 0.6; // how unevenly the cover is spread (clear gaps and clumps)
+	float cloud_type_spread = 0.15; // how much one cloud's type differs from the next
+	float cloud_multiscatter = 1.0; // light carried inside the cloud: lower is greyer, darker cores
+	// The picture's exposure in this weather, in stops (EV): negative is darker. The engine does not use it; the game's
+	// camera does (a grey day seen as grey, a storm as dark, though the eye adapts to both).
+	float exposure_compensation = 0.0;
 
 protected:
 	static void _bind_methods();
@@ -110,6 +123,14 @@ public:
 	WEATHER_PROP(precipitation)
 	WEATHER_PROP(temperature)
 	WEATHER_PROP(lightning)
+	WEATHER_PROP(cloud_density)
+	WEATHER_PROP(cloud_thickness_scale)
+	WEATHER_PROP(cloud_erosion)
+	WEATHER_PROP(cloud_shear)
+	WEATHER_PROP(cloud_variation)
+	WEATHER_PROP(cloud_type_spread)
+	WEATHER_PROP(cloud_multiscatter)
+	WEATHER_PROP(exposure_compensation)
 #undef WEATHER_PROP
 };
 

@@ -1,10 +1,79 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <class name="WeatherState" inherits="Resource" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
 	<brief_description>
+		One weather: wind, clouds and their look, mist, precipitation, lightning and the picture's exposure, which [WeatherDirector] blends toward.
 	</brief_description>
 	<description>
-		See the comment at the top of modules/weather/weather_director.h.
+		See the comment at the top of modules/weather/weather_director.h. Every value is blended over a change of weather.
 	</description>
 	<tutorials>
 	</tutorials>
+	<members>
+		<member name="cloud_base" type="float" setter="set_cloud_base" getter="get_cloud_base" default="2600.0">
+			Height of the clouds' underside, in metres above sea level. It may lie below the peaks, which then stand in the cloud.
+		</member>
+		<member name="cloud_cover" type="float" setter="set_cloud_cover" getter="get_cloud_cover" default="0.3">
+			Share of the sky the clouds cover.
+		</member>
+		<member name="cloud_density" type="float" setter="set_cloud_density" getter="get_cloud_density" default="0.08">
+			How much light a metre of cloud takes. Higher gives darker bases and more solid towers; lower, thinner and brighter clouds. [member AtmosphereEffect.cloud_density].
+		</member>
+		<member name="cloud_erosion" type="float" setter="set_cloud_erosion" getter="get_cloud_erosion" default="1.0">
+			How much the detail noise eats into the clouds' edges: 0 smooth, rounded blobs, 2 frayed, wispy edges. [member AtmosphereEffect.cloud_erosion].
+		</member>
+		<member name="cloud_multiscatter" type="float" setter="set_cloud_multiscatter" getter="get_cloud_multiscatter" default="1.0">
+			Light carried round inside the clouds. Lower gives greyer clouds with darker cores; higher, brighter and softer. [member AtmosphereEffect.cloud_multiscatter].
+		</member>
+		<member name="cloud_shear" type="float" setter="set_cloud_shear" getter="get_cloud_shear" default="0.25">
+			How far a cloud's top leans downwind, in metres per metre up. [member AtmosphereEffect.cloud_shear].
+		</member>
+		<member name="cloud_thickness_scale" type="float" setter="set_cloud_thickness_scale" getter="get_cloud_thickness_scale" default="1.0">
+			Multiplies the thickness [member cloud_type] gives (a few hundred metres for a layer, about a kilometre for fair cumulus, 8 km for a storm tower). [member AtmosphereEffect.cloud_thickness_scale].
+		</member>
+		<member name="cloud_type" type="float" setter="set_cloud_type" getter="get_cloud_type" default="0.5">
+			The clouds' kind: 0 a flat layer (stratus), about 0.6 fair-weather heaps (cumulus), 1 towering storm clouds with an anvil (cumulonimbus).
+		</member>
+		<member name="cloud_type_spread" type="float" setter="set_cloud_type_spread" getter="get_cloud_type_spread" default="0.15">
+			How much one cloud's kind differs from the next round [member cloud_type]. [member AtmosphereEffect.cloud_type_spread].
+		</member>
+		<member name="cloud_variation" type="float" setter="set_cloud_variation" getter="get_cloud_variation" default="0.6">
+			How unevenly the cover is spread over the sky: 0 the same everywhere, 1 clumps and clear gaps. [member AtmosphereEffect.cloud_variation].
+		</member>
+		<member name="exposure_compensation" type="float" setter="set_exposure_compensation" getter="get_exposure_compensation" default="0.0">
+			The picture's exposure in this weather, in stops (EV); negative is darker. The engine does not use it: the game's camera reads it, so a grey day is seen as grey and a storm as dark, though the eye adapts to both.
+		</member>
+		<member name="gust_strength" type="float" setter="set_gust_strength" getter="get_gust_strength" default="0.4">
+			How strong the gusts are against the wind's speed.
+		</member>
+		<member name="high_cover" type="float" setter="set_high_cover" getter="get_high_cover" default="0.1">
+			Share of the sky the high, thin layer covers.
+		</member>
+		<member name="high_type" type="float" setter="set_high_type" getter="get_high_type" default="0.2">
+			The high layer's kind: 0 streaks (cirrus), 1 small puffs (altocumulus).
+		</member>
+		<member name="lightning" type="float" setter="set_lightning" getter="get_lightning" default="0.0">
+			How often lightning strikes.
+		</member>
+		<member name="mist" type="float" setter="set_mist" getter="get_mist" default="0.0">
+			How thick the mist in the valley is.
+		</member>
+		<member name="mist_top" type="float" setter="set_mist_top" getter="get_mist_top" default="1800.0">
+			Height the mist reaches, in metres above sea level.
+		</member>
+		<member name="precipitation" type="float" setter="set_precipitation" getter="get_precipitation" default="0.0">
+			Rain or snow: how hard it falls and how wet the ground gets. [member temperature] says which.
+		</member>
+		<member name="temperature" type="float" setter="set_temperature" getter="get_temperature" default="15.0">
+			Degrees C on the valley floor: rain or snow, frost, and the snow and freezing lines.
+		</member>
+		<member name="turbulence" type="float" setter="set_turbulence" getter="get_turbulence" default="0.25">
+			How churned the wind is.
+		</member>
+		<member name="wind_heading" type="float" setter="set_wind_heading" getter="get_wind_heading" default="30.0">
+			The direction the wind blows toward, in degrees from north (+X) toward east (+Z).
+		</member>
+		<member name="wind_speed" type="float" setter="set_wind_speed" getter="get_wind_speed" default="5.0">
+			Wind speed 10 m above the ground, in m/s.
+		</member>
+	</members>
 </class>
