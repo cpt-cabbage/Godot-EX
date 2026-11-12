@@ -376,6 +376,10 @@ void WeatherDirector::step(double p_delta) {
 			transitioning = false;
 			emit_signal(SNAME("transition_finished"));
 		}
+	} else if (target.is_valid()) {
+		// The weather held follows its state as it is edited (in the Inspector, in the editor's view or a running game;
+		// 2026-11-12): to then it took a copy as it arrived, and an edit showed only once the weather was set again.
+		blended->copy_from(target);
 	}
 	_surprises(get_effective_volatility());
 	_ground(float(p_delta));
