@@ -26,7 +26,6 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #include "../light_data_inc.glsl"
 #include "surface_cache_inc.glsl"
 
-#define STREAMS 2u
 #define M_PI 3.14159265359
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
@@ -224,6 +223,70 @@ bool card_lookup(uint p_instance_id, vec3 p_world_hit, vec3 p_world_dir, out vec
 	return true;
 }
 
+// What a froxel holds is light: finite, and nowhere near what a 16-bit
+// float can hold (65504; a froxel a hand's width from a lamp holds
+// hundreds). A value outside that is not light, whatever made it, and it
+// must not be stored: the history carries a froxel's value into every
+// froxel it is next blended into, an infinity or a NaN for good. One frame
+// of bad sums in a few froxels by the camera (see the streams in main) took
+// the valley's rain through a flare of every colour, which put the exposure
+// out for ten seconds, and then left every blended surface without its
+// local lights until the game was started again (2026-11-12).
+#define TV_LIGHT_MAX 16384.0
+
+bool tv_finite(vec3 v) {
+	return !(any(isnan(v)) || any(isinf(v)));
+}
+
+bool sane_light(vec3 a, vec3 bx, vec3 by, vec3 bz) {
+	return tv_finite(a) && tv_finite(bx) && tv_finite(by) && tv_finite(bz);
+}
+
+// A stream of the froxel's local lights (two of them, the lights dealt by
+// their index): their summed light and its directional parts, and the one
+// light, picked by its share of the sum, whose shadow ray stands for them all.
+struct Stream {
+	vec3 a;
+	vec3 bx;
+	vec3 by;
+	vec3 bz;
+	float weight_sum;
+	vec3 sel_pos;
+	float sel_opacity;
+	uint sel_mask;
+};
+
+void stream_add(inout Stream st, vec3 c, vec3 l, float w, float pick, vec3 light_pos, float light_opacity, uint light_mask) {
+	st.a += c;
+	st.bx += c * l.x;
+	st.by += c * l.y;
+	st.bz += c * l.z;
+	st.weight_sum += w;
+	if (pick * st.weight_sum < w) {
+		st.sel_pos = light_pos;
+		st.sel_opacity = light_opacity;
+		st.sel_mask = light_mask;
+	}
+}
+
+void stream_resolve(Stream st, vec3 view_pos, vec3 world_pos, mat3 world_basis, bool shadow_rays, inout vec3 total_a, inout vec3 total_bx, inout vec3 total_by, inout vec3 total_bz) {
+	if (!(st.weight_sum > 0.0)) {
+		return;
+	}
+	float vis = 1.0;
+	if (shadow_rays && st.sel_opacity > 0.001 && st.sel_mask != 0u) {
+		vec3 to_light = world_basis * (st.sel_pos - view_pos);
+		float dist = length(to_light);
+		if (dist > params.ray_bias) {
+			vis = mix(1.0, occluded(world_pos, to_light / dist, dist - params.ray_bias, st.sel_mask) ? 0.0 : 1.0, clamp(st.sel_opacity, 0.0, 1.0));
+		}
+	}
+	total_a += st.a * vis;
+	total_bx += st.bx * vis;
+	total_by += st.by * vis;
+	total_bz += st.bz * vis;
+}
+
 // A froxel's view position from its unit coordinates: xy across the
 // frustum at the depth, z exponential in depth.
 vec3 view_from_unit(vec3 unit) {
@@ -250,25 +313,16 @@ void main() {
 	mat3 world_basis = mat3(params.world_from_view);
 	bool shadow_rays = (params.flags & FLAG_NO_SHADOW_RAYS) == 0u;
 
-	// The lights of the froxel's cluster cell, dealt to the streams.
-	vec3 a[STREAMS];
-	vec3 bx[STREAMS];
-	vec3 by[STREAMS];
-	vec3 bz[STREAMS];
-	float weight_sum[STREAMS];
-	vec3 sel_pos[STREAMS];
-	float sel_opacity[STREAMS];
-	uint sel_mask[STREAMS];
-	for (uint s = 0u; s < STREAMS; s++) {
-		a[s] = vec3(0.0);
-		bx[s] = vec3(0.0);
-		by[s] = vec3(0.0);
-		bz[s] = vec3(0.0);
-		weight_sum[s] = 0.0;
-		sel_pos[s] = vec3(0.0);
-		sel_opacity[s] = 0.0;
-		sel_mask[s] = 0u;
-	}
+	// The lights of the froxel's cluster cell, dealt to the two streams. Each
+	// stream is a variable of its own, not an element of arrays picked by the
+	// light's index, as this was first written: on the PC's NVIDIA (RTX 5080,
+	// Vulkan 1.4.351, 2026-11-13) those arrays came back with single
+	// components changed, in a few froxels of an odd frame, with every
+	// light's data sound and before any ray was traced (two runs in three of
+	// the valley's opening; none in eighteen as it stands). What one such
+	// value did is at sane_light.
+	Stream stream_0 = Stream(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0), 0.0, vec3(0.0), 0.0, 0u);
+	Stream stream_1 = stream_0;
 
 	uvec2 screen_pos = uvec2(clamp(unit.xy, vec2(0.0), vec2(0.9999)) * vec2(params.screen_size));
 	uvec2 cluster_pos = screen_pos >> params.cluster_shift;
@@ -304,20 +358,15 @@ void main() {
 				}
 				vec3 c = ld.color * attenuation;
 				float w = luminance(c);
-				if (w <= 0.0) {
+				if (!(w > 0.0)) {
 					continue;
 				}
-				uint s = light_index % STREAMS;
-				a[s] += c;
-				bx[s] += c * l.x;
-				by[s] += c * l.y;
-				bz[s] += c * l.z;
-				weight_sum[s] += w;
 				seed = pcg_hash(seed);
-				if (hash_to_float(seed) * weight_sum[s] < w) {
-					sel_pos[s] = ld.position;
-					sel_opacity[s] = ld.shadow_opacity;
-					sel_mask[s] = ld.shadow_caster_mask & 0xFFu;
+				float pick = hash_to_float(seed);
+				if ((light_index & 1u) == 0u) {
+					stream_add(stream_0, c, l, w, pick, ld.position, ld.shadow_opacity, ld.shadow_caster_mask & 0xFFu);
+				} else {
+					stream_add(stream_1, c, l, w, pick, ld.position, ld.shadow_opacity, ld.shadow_caster_mask & 0xFFu);
 				}
 			}
 		}
@@ -327,23 +376,8 @@ void main() {
 	vec3 total_bx = vec3(0.0);
 	vec3 total_by = vec3(0.0);
 	vec3 total_bz = vec3(0.0);
-	for (uint s = 0u; s < STREAMS; s++) {
-		if (weight_sum[s] <= 0.0) {
-			continue;
-		}
-		float vis = 1.0;
-		if (shadow_rays && sel_opacity[s] > 0.001 && sel_mask[s] != 0u) {
-			vec3 to_light = world_basis * (sel_pos[s] - view_pos);
-			float dist = length(to_light);
-			if (dist > params.ray_bias) {
-				vis = mix(1.0, occluded(world_pos, to_light / dist, dist - params.ray_bias, sel_mask[s]) ? 0.0 : 1.0, sel_opacity[s]);
-			}
-		}
-		total_a += a[s] * vis;
-		total_bx += bx[s] * vis;
-		total_by += by[s] * vis;
-		total_bz += bz[s] * vis;
-	}
+	stream_resolve(stream_0, view_pos, world_pos, world_basis, shadow_rays, total_a, total_bx, total_by, total_bz);
+	stream_resolve(stream_1, view_pos, world_pos, world_basis, shadow_rays, total_a, total_bx, total_by, total_bz);
 
 	// The directional lights; the first traces its shadow like the
 	// transparent fragments did (hard).
@@ -414,7 +448,21 @@ void main() {
 		}
 	}
 
-	// Against last frame's volume where the froxel's point was inside it.
+	// Only light goes on (sane_light): a froxel whose sums are not finite
+	// holds none this frame, and one out of range holds the range's end.
+	if (!sane_light(total_a, total_bx, total_by, total_bz)) {
+		total_a = vec3(0.0);
+		total_bx = vec3(0.0);
+		total_by = vec3(0.0);
+		total_bz = vec3(0.0);
+	}
+	total_a = clamp(total_a, vec3(-TV_LIGHT_MAX), vec3(TV_LIGHT_MAX));
+	total_bx = clamp(total_bx, vec3(-TV_LIGHT_MAX), vec3(TV_LIGHT_MAX));
+	total_by = clamp(total_by, vec3(-TV_LIGHT_MAX), vec3(TV_LIGHT_MAX));
+	total_bz = clamp(total_bz, vec3(-TV_LIGHT_MAX), vec3(TV_LIGHT_MAX));
+
+	// Against last frame's volume where the froxel's point was inside it,
+	// and where what it holds there is light.
 	if (bool(params.flags & FLAG_HISTORY)) {
 		vec3 prev_view = (params.prev_view_from_world * vec4(world_pos, 1.0)).xyz;
 		float d = -prev_view.z;
@@ -424,10 +472,16 @@ void main() {
 			prev_unit.z = pow(d / params.prev_length, 1.0 / params.prev_spread);
 			if (all(greaterThan(prev_unit, vec3(0.0))) && all(lessThan(prev_unit, vec3(1.0)))) {
 				float alpha = params.temporal_alpha;
-				total_a = mix(textureLod(history_a, prev_unit, 0.0).rgb, total_a, alpha);
-				total_bx = mix(textureLod(history_bx, prev_unit, 0.0).rgb, total_bx, alpha);
-				total_by = mix(textureLod(history_by, prev_unit, 0.0).rgb, total_by, alpha);
-				total_bz = mix(textureLod(history_bz, prev_unit, 0.0).rgb, total_bz, alpha);
+				vec3 prev_a = textureLod(history_a, prev_unit, 0.0).rgb;
+				vec3 prev_bx = textureLod(history_bx, prev_unit, 0.0).rgb;
+				vec3 prev_by = textureLod(history_by, prev_unit, 0.0).rgb;
+				vec3 prev_bz = textureLod(history_bz, prev_unit, 0.0).rgb;
+				if (sane_light(prev_a, prev_bx, prev_by, prev_bz)) {
+					total_a = mix(prev_a, total_a, alpha);
+					total_bx = mix(prev_bx, total_bx, alpha);
+					total_by = mix(prev_by, total_by, alpha);
+					total_bz = mix(prev_bz, total_bz, alpha);
+				}
 			}
 		}
 	}
