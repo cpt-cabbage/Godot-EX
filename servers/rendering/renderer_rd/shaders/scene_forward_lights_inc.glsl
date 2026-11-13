@@ -370,7 +370,17 @@ half sample_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec3 coord, flo
 	return half(avg * (1.0 / float(sc_soft_shadow_samples())));
 }
 
-half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4 uv_rect, vec2 flip_offset, float depth, float taa_frame_count) {
+// `plane_normal`, `plane_side`, `plane_len`: the receiver's plane, for the taps. A tap away from the centre looks along
+// another direction, and on a surface the light grazes the surface itself is nearer the light there than the fragment
+// is: by the fragment's distance times the tangent of the angle of incidence for each radian the tap is off, 30 cm a
+// texel on a ceiling 0.85 m over a lamp and 5 m along it. Compared at the fragment's own depth, the taps on the light's
+// side called the surface its own blocker and a plain wall drew bands, arcs round the lamp's foot on it, wider with
+// the filter's radius (the valley's room at dawn, the user 2026-11-13). Each tap is compared at the depth the
+// receiver's plane has along the tap's own direction, where that is nearer than the fragment; never farther, so a tap
+// shadows no more than it did, and what a tap lets through is within the filter's own footprint on the surface.
+// `plane_normal` in the light's space (zero: no plane, every tap at `depth`), `plane_side` the sign of the fragment's
+// direction along the paraboloids' axis, `plane_len` the fragment's distance over the light's range.
+half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4 uv_rect, vec2 flip_offset, float depth, float taa_frame_count, vec3 plane_normal, float plane_side, float plane_len) {
 	//if only one sample is taken, take it from the center
 	if (sc_soft_shadow_samples() == 0) {
 		vec2 pos = coord * 0.5 + 0.5;
@@ -389,6 +399,10 @@ half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4
 	float avg = 0.0;
 	vec2 offset_scale = blur_scale * 2.0 * scene_data_block.data.shadow_atlas_pixel_size / uv_rect.zw;
 
+	// The fragment's own direction, as the map has it (the centre tap's), against the plane.
+	float coord_length_squared = dot(coord, coord);
+	float plane_dot = dot(plane_normal, vec3(2.0 * coord, plane_side * (1.0 - coord_length_squared)) / (1.0 + coord_length_squared));
+
 	SPEC_CONSTANT_LOOP_ANNOTATION
 	for (uint i = 0; i < sc_soft_shadow_samples(); i++) {
 		vec2 offset = offset_scale * (disk_rotation * scene_data_block.data.soft_shadow_kernel[i].xy);
@@ -396,6 +410,14 @@ half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4
 
 		float sample_coord_length_squared = dot(sample_coord, sample_coord);
 		bool do_flip = sample_coord_length_squared > 1.0;
+
+		// The tap's direction (past the paraboloid's rim the same expression is the other half's) and the plane's
+		// depth along it over the fragment's: under 1 toward the plane's foot, where the plane is nearer.
+		float tap_dot = dot(plane_normal, vec3(2.0 * sample_coord, plane_side * (1.0 - sample_coord_length_squared)) / (1.0 + sample_coord_length_squared));
+		float tap_depth = depth;
+		if (plane_dot * tap_dot > 0.0) {
+			tap_depth += plane_len * (1.0 - min(plane_dot / tap_dot, 1.0));
+		}
 
 		if (do_flip) {
 			float len = sqrt(sample_coord_length_squared);
@@ -408,7 +430,7 @@ half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4
 		if (do_flip) {
 			sample_coord += flip_offset;
 		}
-		avg += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(sample_coord, depth, 1.0));
+		avg += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(sample_coord, tap_depth, 1.0));
 	}
 
 	return half(avg * (1.0 / float(sc_soft_shadow_samples())));
@@ -620,6 +642,7 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			vec4 uv_rect = base_uv_rect;
 
 			vec3 shadow_sample = normalize(shadow_dir + normal_bias);
+			float shadow_side = shadow_sample.z >= 0.0 ? 1.0 : -1.0;
 			if (shadow_sample.z >= 0.0) {
 				uv_rect.xy += flip_offset;
 				flip_offset *= -1.0;
@@ -630,7 +653,7 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			float depth = shadow_len - omni_lights.data[idx].shadow_bias;
 			depth *= omni_lights.data[idx].inv_radius;
 			depth = 1.0 - depth;
-			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, omni_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, flip_offset, depth, taa_frame_count), half(omni_lights.data[idx].shadow_opacity));
+			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, omni_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, flip_offset, depth, taa_frame_count, local_normal, shadow_side, shadow_len * omni_lights.data[idx].inv_radius), half(omni_lights.data[idx].shadow_opacity));
 		}
 	}
 #endif
@@ -1159,7 +1182,7 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			float depth = shadow_len - area_lights.data[idx].shadow_bias;
 			depth *= inv_center_range;
 			depth = 1.0 - depth;
-			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, area_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, vec2(0), depth, taa_frame_count), half(area_lights.data[idx].shadow_opacity));
+			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, area_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, vec2(0), depth, taa_frame_count, vec3(0.0), 1.0, 0.0), half(area_lights.data[idx].shadow_opacity));
 		}
 	}
 #endif
