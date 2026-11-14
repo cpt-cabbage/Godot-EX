@@ -221,6 +221,7 @@ void WeatherDirector::register_globals() {
 	rs->global_shader_parameter_add("weather_frost", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
 	rs->global_shader_parameter_add("weather_freeze_line", RSE::GLOBAL_VAR_TYPE_FLOAT, 1e5f);
 	rs->global_shader_parameter_add("weather_flash", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
+	rs->global_shader_parameter_add("weather_rain", RSE::GLOBAL_VAR_TYPE_FLOAT, 0.0f);
 }
 
 float WeatherDirector::get_temperature_at(float p_altitude) const {
@@ -362,6 +363,8 @@ void WeatherDirector::_apply() {
 		rs->global_shader_parameter_set("weather_frost", frost);
 		rs->global_shader_parameter_set("weather_freeze_line", get_freeze_line());
 		rs->global_shader_parameter_set("weather_flash", flash);
+		// The rain falling now (0-1; snow above the snow line): the rings on puddles.
+		rs->global_shader_parameter_set("weather_rain", current.is_valid() ? CLAMP(current->precipitation, 0.0f, 1.0f) : 0.0f);
 	}
 }
 

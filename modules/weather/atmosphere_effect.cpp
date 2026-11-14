@@ -463,7 +463,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(light_illuminance, 0, 0, 0);
 		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset);
 		v4(cloud_shadows_on ? 1.0f : 0.0f, clouds_on && cloud_panorama_rd.is_valid() ? 1.0f : 0.0f, 0, 0);
-		v4(weather_mist_density, weather_mist_top, precipitation, 0);
+		v4(weather_mist_density, weather_mist_top, precipitation, MAX(rain_haze, 0.0f));
 		// The world to the camera's view space, and whether the sun's cascades are there to read (no ray-traced shadows).
 		const Projection view(cam.affine_inverse());
 		for (int c = 0; c < 4; c++) {
@@ -708,6 +708,7 @@ void AtmosphereEffect::_bind_methods() {
 	FB(weather_mist_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.5,0.0001,suffix:/m")
 	FB(weather_mist_top, Variant::FLOAT, PROPERTY_HINT_RANGE, "-5000,10000,0.1,suffix:m")
 	FB(precipitation, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(rain_haze, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.0001,suffix:/m")
 	FB(weather_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
 	FB(cloud_shadow_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
 	FB(lightning_position, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m")

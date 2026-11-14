@@ -41,7 +41,7 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 sky; // x the sky table's light illuminance, yzw unused
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn, y 1 when the clouds' panorama is (the sky's light from above)
-	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1)
+	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1), w the rain's haze (1/m at 1)
 	mat4 view; // the world to the camera's view space (the cascades' matrices start there)
 	vec4 cascades; // x 1 when the sun's shadow cascades are rendered (no ray-traced shadows)
 }
@@ -179,12 +179,30 @@ float density(vec3 w) {
 	float above = w.y - ground_height(w);
 	float d = fog.ground.x * exp(-max(above, 0.0) / max(fog.ground.y, 0.1));
 	d += fog.ground.z * exp(-max(w.y - fog.ground.w, 0.0) / max(fog.mist.x, 0.1));
-	// The weather's mist pools below its top, and rain thickens the air (a heavy shower: about 1 km of sight).
+	// The weather's mist pools below its top.
 	d += fog.weather.x * exp(-max(w.y - fog.weather.y, 0.0) / max(fog.mist.x, 0.1));
-	d += fog.weather.z * 0.0015;
 	if (fog.mist.y > 0.0 && d > 0.0) {
 		vec3 q = (w - fog.wind.xyz * fog.mist.w) / max(fog.mist.z, 0.01);
 		d *= mix(1.0, smoothstep(0.25, 0.75, fbm(q)) * 2.0, fog.mist.y);
+	}
+	// Rain thickens the air (the user, 2026-11-14: "use volumetrics closer range to sell the effect ... you're relying
+	// on particles too much"): a veil everywhere, curtains tens of metres across that fall at the drops' speed and
+	// sweep with the wind (the grey sheets crossing a hillside in a downpour), and close to the camera, from a few
+	// metres to a few tens, a fine falling grain under a metre across and several tall, the rain's texture where it is
+	// too dense to see drop by drop. The drops themselves are rain.glsl's, over the picture; here they are a medium,
+	// lit and shadowed with the rest of the air.
+	if (fog.weather.z > 0.0 && fog.weather.w > 0.0) {
+		vec3 fall = vec3(fog.wind.x, -7.0, fog.wind.z) * fog.mist.w;
+		vec3 q1 = (w - fall) / vec3(22.0, 80.0, 22.0);
+		float sheets = smoothstep(0.3, 0.75, 0.7 * value_noise(q1) + 0.3 * value_noise(q1 * 2.3 + 5.1));
+		float dist = length(w - fog.cam_pos.xyz);
+		float grain = 0.0;
+		float near = smoothstep(2.0, 6.0, dist) * (1.0 - smoothstep(15.0, 45.0, dist));
+		if (near > 0.0) {
+			vec3 q2 = (w - fall) / vec3(0.9, 7.0, 0.9);
+			grain = smoothstep(0.4, 0.85, 0.75 * value_noise(q2) + 0.25 * value_noise(q2 * 2.6 + 3.3)) * near;
+		}
+		d += fog.weather.z * fog.weather.w * (0.35 + 1.6 * sheets + 6.0 * grain);
 	}
 	return d;
 }

@@ -51,7 +51,7 @@
 // y. `wetness` builds while it rains (`wet_build` seconds to soak at full rain) and dries over `dry_time` (slower under
 // cloud); `snow` builds while it snows (`snow_build`) and melts over `melt_time`; `frost` comes on clear, dry skies
 // over `frost_time`. Each can be set from the story. They are global shader parameters (weather_wet, weather_snow,
-// weather_snow_line, weather_frost, weather_freeze_line, weather_flash) for the materials. Lightning: at the
+// weather_snow_line, weather_frost, weather_freeze_line, weather_flash, weather_rain: the precipitation now) for the materials. Lightning: at the
 // weather's `lightning` (0-1) strikes come every 30 s down to every 4 s, within `lightning_radius` m of the subject,
 // each a few flickers over half a second (`get_flash()`), and the `lightning_strike` signal (the position at the
 // cloud base, the distance from the subject: for the bolt, the thunder); strike() makes one where the story wants.

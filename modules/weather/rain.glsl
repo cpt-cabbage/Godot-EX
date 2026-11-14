@@ -14,10 +14,15 @@
 // the clouds' light from above, the light's glint through it and the spot lights (a torch, headlights), and it is
 // seen through the air volume's light and transmittance to its distance, as the scene behind it is. Laid over the
 // upscaled picture before tonemapping, so the temporal upscaler never smears or drops the thin moving streaks.
-// Besides the drops (the user, 2026-11-14: "rain effect should be more than just shap particles"; after Tatarchuk's
-// ToyShop rain, SIGGRAPH 2006, and Lagarde's for Remember Me): splashes where the scene faces up under the open sky (a
-// ring and droplets thrown up, from the depth, so never on a crown or in the air), and a rain mist in sheets that
-// fall with the rain and drift with the wind, with spray where the view meets the ground.
+// The drops are faint and soft, as filmed rain is: a streak is the drop's light spread over its exposure, a few
+// hundredths opaque, and near ones are out of focus (a lens of `aperture` focused at `focus_distance`), wider and
+// fainter still. A drop is a wide-angle lens: what it shows is mostly the scene round it, so its light is part the
+// scene's behind it (`scene_share`) and part the sky's from above, and against a bright sky a streak is barely there,
+// against a dark wood a little brighter (Garg and Nayar, "Photorealistic Rendering of Rain Streaks", 2006). The rain's
+// body, the grey veil and the sheets near the camera, is the air volume's (air_volume.glsl, AtmosphereEffect's
+// precipitation): lit and shadowed with the rest of the air. Splashes and a rain mist marched here were tried and
+// removed (2026-11-14, the user: "please just remove the splashes for now they look really bad"; the mist's 8 samples
+// a pixel were noise in the distance).
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -31,7 +36,6 @@ layout(set = 0, binding = 2) uniform sampler2D sky_view;
 layout(set = 0, binding = 3) uniform sampler2D cloud_panorama;
 layout(set = 0, binding = 4) uniform sampler3D air_light;
 layout(set = 0, binding = 5) uniform sampler2D cover_map;
-layout(set = 0, binding = 7) uniform sampler3D mist_noise; // 32^3 random values, repeating, filtered: value noise
 layout(set = 0, binding = 6, std140) uniform Params {
 	mat4 inv_proj; // NDC (unjittered) to the world relative to the camera (m)
 	vec4 cam; // xyz the camera (world), w the near fade's end (m)
@@ -53,9 +57,7 @@ layout(set = 0, binding = 6, std140) uniform Params {
 	vec4 spot_color[MAX_SPOTS]; // rgb colour times energy, w the cosine of its inner edge
 	vec4 counts; // x spot lights, y the colour's tint share
 	vec4 tint; // rgb the drops' own tint
-	vec4 splash; // x splashes a cell a second at density 1, y a cell's side (m), z their reach (m), w their size's scale
-	vec4 mist; // x the rain mist's density (1/m) at density 1, y its noise's scale across (m), z up and down (m), w its reach (m)
-	vec4 mist_offset; // xyz the rain's fall so far (m, wrapped at the noise's period: 32 of its cells), w the time (s, wrapped)
+	vec4 lens; // x the aperture (m), y the focus distance (m), z the scene's share of a drop's light
 }
 params;
 
@@ -218,10 +220,21 @@ void main() {
 	vec3 sv = params.streak.xyz;
 	float half_len = params.streak.w * 0.5;
 	float radius = params.rain.y;
+	// The light's glint, as much as the clouds let through toward it (their panorama's transmittance that way): in a
+	// storm under a cumulonimbus the sun is gone, and its full light made every streak white.
 	vec3 sun = params.light_color.rgb * params.sky.z;
+	if (params.air.w > 0.5) {
+		vec3 ld = params.light_dir.xyz;
+		vec2 puv = vec2(atan(ld.x, -ld.z) / (2.0 * PI) + 0.5, acos(clamp(ld.y, -1.0, 1.0)) / PI);
+		sun *= textureLod(cloud_panorama, puv, 0.0).a;
+	}
 	float g = params.light_dir.w;
 	float hg = (1.0 - g * g) / (4.0 * PI * pow(max(1.0 + g * g - 2.0 * g * dot(dir, params.light_dir.xyz), 1e-4), 1.5));
 	vec3 drop_lit = (ambient + sun * hg * 4.0 * PI) * mix(vec3(1.0), params.tint.rgb, params.counts.y);
+
+	// What lies behind the drops (this pixel's own colour, read before it is written).
+	vec4 bg = imageLoad(color_image, px);
+	drop_lit = mix(drop_lit, bg.rgb / max(params.air.z, 1e-6), params.lens.z);
 
 	vec3 acc = vec3(0.0);
 	float trans = 1.0;
@@ -269,7 +282,7 @@ void main() {
 			vec3 local = margin + r.yzw * (1.0 - 2.0 * margin);
 			vec3 cr = (vec3(c) + local - ofs) * cs;
 			float along_ray = dot(dir, cr);
-			float reach = half_len * 1.4 + 3.0 * max(radius, params.rain.w * along_ray * 0.8) + 1e-3;
+			float reach = half_len * 1.4 + 3.0 * max(max(radius, params.rain.w * along_ray * 0.8), params.lens.x * abs(1.0 - along_ray / params.lens.y)) + 1e-3;
 			bool near_ray = dot(cr, cr) - along_ray * along_ray <= reach * reach && along_ray >= t_min - reach && along_ray <= scene + reach;
 			if (r.x < chance && near_ray) {
 				// Each drop its own length and brightness (from the hash's spare bits).
@@ -283,10 +296,10 @@ void main() {
 				float near_fade = smoothstep(0.25, params.cam.w, tc);
 				float lf = smoothstep(range.x - range.z, range.x + range.z, tc) * (1.0 - smoothstep(range.y - range.z, range.y + range.z, tc));
 				if (tc > t_min && tc < scene && lf * near_fade > 0.0) {
-					// Soft across (a Gaussian, at least 0.8 of a pixel: the streaks were hard lines), and as much fainter as
-					// it is wider than the drop, so its light is kept; brighter in bands along its length, as an
-					// oscillating drop's streak is (Garg and Nayar 2006).
-					float sigma = max(radius, params.rain.w * tc * 0.8);
+					// Soft across (a Gaussian, at least 0.8 of a pixel: the streaks were hard lines, and as wide as the
+					// lens blurs it, out of focus), and as much fainter as it is wider than the drop, so its light is kept;
+					// brighter in bands along its length, as an oscillating drop's streak is (Garg and Nayar 2006).
+					float sigma = max(max(radius, params.rain.w * tc * 0.8), params.lens.x * abs(1.0 - tc / params.lens.y) * 0.5);
 					float across = exp(-0.5 * (dist * dist) / (sigma * sigma));
 					if (dist < 3.0 * sigma && !covered(params.cam.xyz + cr)) {
 						float along = s / max(len, 1e-4);
@@ -328,126 +341,6 @@ void main() {
 			}
 		}
 	}
-	// Splashes on open ground: a drop's crown rising from where it lands and a ring opening on the surface, from cells
-	// on the ground round the pixel's surface (and back toward the camera, at a grazing view, for crowns standing in
-	// front of it), each with splashes coming at random times. Only on surfaces facing up, under the open sky.
-	vec4 splash = vec4(0.0); // premultiplied light and coverage
-	if (params.splash.x > 0.0 && params.rain.x > 0.0 && scene < params.splash.z && normal.y > 0.7) {
-		vec3 pw = params.cam.xyz + surface;
-		if (!covered(pw + vec3(0.0, 0.05, 0.0))) {
-			float cs = params.splash.y;
-			float rate = params.splash.x * params.rain.x; // a cell's splashes a second
-			const float DUR = 0.2; // s a splash lasts
-			float time = params.mist_offset.w;
-			float px_m = params.rain.w * scene; // a pixel's width at the surface
-			vec2 back = length(dir.xz) > 1e-3 ? normalize(dir.xz) : vec2(0.0);
-			vec2 centres[2] = vec2[2](pw.xz, pw.xz - back * min(0.12 / max(-dir.y, 0.08), 0.8));
-			ivec2 first = ivec2(floor(centres[0] / cs));
-			for (int k = 0; k < 2; k++) {
-				ivec2 cc = ivec2(floor(centres[k] / cs));
-				if (k == 1 && all(lessThanEqual(abs(cc - first), ivec2(1)))) {
-					continue;
-				}
-				for (int j = 0; j < 9; j++) {
-					ivec2 cell = cc + ivec2(j % 3 - 1, j / 3 - 1);
-					vec4 r = rand4(ivec3(cell, 0), 7);
-					float phase = time * rate + r.x;
-					float age = fract(phase) / rate;
-					if (age > DUR) {
-						continue;
-					}
-					vec4 e = rand4(ivec3(cell.x, int(floor(phase)) & 65535, cell.y), 8);
-					vec2 ixz = (vec2(cell) + e.xy) * cs;
-					// On the surface's plane through the pixel's point.
-					float iy = pw.y - (normal.x * (ixz.x - pw.x) + normal.z * (ixz.y - pw.z)) / normal.y;
-					vec3 ic = vec3(ixz.x, iy, ixz.y) - params.cam.xyz;
-					float f = age / DUR;
-					float size = params.splash.w * mix(0.6, 1.4, e.z);
-					float a = 0.0;
-					// The ring on the surface (only where the pixel is that surface).
-					float ds = length((surface - ic).xz);
-					if (k == 0 && ds < size * 0.07 + 2.0 * px_m) {
-						float rr = size * (0.01 + 0.05 * sqrt(f));
-						float rw = max(0.003 * size, px_m * 0.7);
-						float dr = ds - rr;
-						a = exp(-0.5 * dr * dr / (rw * rw)) * min(0.003 * size / rw, 1.0) * 0.18 * (1.0 - f) * (1.0 - f);
-					}
-					// The crown: droplets thrown up and out from where the drop landed, falling back on their arcs, each a
-					// short streak over the drops' exposure. Drawn as a solid sheet a crown read as a white blob, and as a
-					// thin-walled cylinder as a little tombstone; a filmed splash would do better still.
-					// Whether the view passes near the crown at all (its droplets stay within about 8 cm of where it
-					// landed), before any droplet.
-					vec3 r0 = ray_segment(dir, ic + vec3(0.0, 0.04 * size, 0.0), vec3(0.0, 1.0, 0.0), 0.04 * size);
-					bool near_crown = r0.x < 0.08 * size + 3.0 * params.rain.w * r0.y && r0.y < scene + 0.1;
-					for (int m = 0; m < 4 && near_crown; m++) {
-						vec4 dk = fract(e.wzyx * vec4(1.6180, 2.4142, 3.3028, 4.2361) * float(m + 1) + vec4(0.123, 0.456, 0.789, 0.321) * float(m));
-						float ang = (dk.x + float(m)) * (PI * 0.5);
-						float vo = size * mix(0.25, 0.6, dk.y); // m/s out
-						float vu = size * mix(0.7, 1.3, dk.z); // m/s up
-						float ta = age;
-						float y = vu * ta - 4.9 * ta * ta;
-						if (y < 0.0) {
-							continue;
-						}
-						vec3 pos = ic + vec3(cos(ang) * vo * ta, y, sin(ang) * vo * ta);
-						vec3 vel = vec3(cos(ang) * vo, vu - 9.8 * ta, sin(ang) * vo);
-						float vl = length(vel);
-						float hl = max(vl * 0.01, 1e-4); // half its streak over 0.02 s
-						vec3 rs = ray_segment(dir, pos - vel * 0.01, vel / max(vl, 1e-4), hl);
-						float rad = 0.0012 * size * mix(0.6, 1.2, dk.w);
-						float sg = max(rad, params.rain.w * rs.y * 0.7);
-						if (rs.y < scene + 0.02 && rs.x < 3.0 * sg) {
-							a = max(a, exp(-0.5 * rs.x * rs.x / (sg * sg)) * min(rad / sg, 1.0) * 1.6 * (1.0 - f * f));
-						}
-					}
-					// Fading out with distance: a crown below a pixel, drawn a pixel wide, reads as glitter.
-					a = clamp(a * params.rain.z * mix(0.5, 1.0, e.w) * (1.0 - smoothstep(params.splash.z * 0.3, params.splash.z, scene)), 0.0, 0.9);
-					splash += (1.0 - splash.a) * vec4(a * (drop_lit + spot_light(params.cam.xyz + ic, dir) * params.sky.w), a);
-				}
-			}
-			splash.rgb *= params.air.z;
-		}
-	}
-
-	// The rain mist: curtains of rain too far and too many to draw drop by drop, a thin medium along the view ray from
-	// a few metres out to its reach whose density follows a noise that falls with the rain and drifts with the wind
-	// (sheets sweeping across a hillside), and spray where the view meets the ground. Lit as the drops are; 8 samples,
-	// spaced finer near, each pixel's offset by its own interleaved noise.
-	float mist_t = 1.0;
-	vec3 mist_l = vec3(0.0);
-	if (params.mist.x > 0.0 && params.rain.x > 0.0) {
-		float t_start = max(t_min, 4.0);
-		float t_end = min(scene, params.mist.w);
-		if (t_end > t_start) {
-			float jitter = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
-			float sa = sqrt(t_start), sb = sqrt(t_end);
-			vec3 scale = vec3(params.mist.y, params.mist.z, params.mist.y);
-			for (int i = 0; i < 8; i++) {
-				float ta = mix(sa, sb, float(i) / 8.0);
-				float tb = mix(sa, sb, float(i + 1) / 8.0);
-				ta *= ta;
-				tb *= tb;
-				float t = mix(ta, tb, jitter);
-				vec3 w = params.cam.xyz + dir * t;
-				vec3 q = (w - params.mist_offset.xyz) / scale;
-				float n = 0.65 * textureLod(mist_noise, q / 32.0, 0.0).r + 0.35 * textureLod(mist_noise, q * (2.7 / 32.0) + 0.37, 0.0).r;
-				float d = params.mist.x * params.rain.x * smoothstep(0.5, 0.85, n);
-				// Spray in the last metre or so before the view meets the ground.
-				if (scene < 1e8 && normal.y > 0.5) {
-					d += params.mist.x * params.rain.x * 6.0 * exp(-(scene - t) / 1.0);
-				}
-				if (covered(w)) {
-					d = 0.0;
-				}
-				float tau = d * (tb - ta);
-				float tr = exp(-tau);
-				mist_l += mist_t * (1.0 - tr) * drop_lit;
-				mist_t *= tr;
-			}
-			mist_l *= params.air.z;
-		}
-	}
-
 	if (params.counts.z > 4.5) {
 		// GODOT_RAIN_DEBUG=5: red where a point 0.3 m above the scene's surface is under the cover, green the cover map's
 		// height there (0 at its box's foot, 1 at its top), blue 1 when the map is bound.
@@ -469,12 +362,8 @@ void main() {
 		imageStore(color_image, px, vec4(min(scene / 10.0, 1.0), 1.0 - trans, float(debug_steps) / 100.0, 1.0));
 		return;
 	}
-	if (trans > 0.999 && splash.a <= 0.0 && mist_t > 0.999) {
+	if (trans > 0.999) {
 		return;
 	}
-	// Splashes on the surface, the mist in front of them, the drops in front of all.
-	vec4 bg = imageLoad(color_image, px);
-	vec3 c = bg.rgb * (1.0 - splash.a) + splash.rgb;
-	c = c * mist_t + mist_l;
-	imageStore(color_image, px, vec4(c * trans + acc, bg.a));
+	imageStore(color_image, px, vec4(bg.rgb * trans + acc, bg.a));
 }

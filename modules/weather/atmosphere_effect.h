@@ -157,6 +157,10 @@ class AtmosphereEffect : public CompositorEffect {
 	float weather_mist_density = 0.0;
 	float weather_mist_top = 400.0; // world y
 	float precipitation = 0.0;
+	// The air's extinction (1/m) from rain at full precipitation, its mean: in curtains that fall and sweep with the
+	// wind, and a fine falling grain a few metres to a few tens from the camera (air_volume.glsl's density()). 0.004 is
+	// a downpour's 750 m of sight; it was a flat 0.0015 to 2026-11-14.
+	float rain_haze = 0.004;
 	// The weather's light (2026-11-12, WeatherDirector sets them from WeatherState): `weather_sky_light` scales the light
 	// the sky and the clouds give (the sky table, the aerial perspective's in-scattered light, the light the clouds take
 	// from the sun), so the sky as seen, the haze, the clouds and what the sky lights (ambient, reflections, the bounce
@@ -395,6 +399,7 @@ public:
 	FOGP(float, weather_mist_density)
 	FOGP(float, weather_mist_top)
 	FOGP(float, precipitation)
+	FOGP(float, rain_haze)
 	FOGP(float, weather_sky_light)
 	FOGP(float, cloud_shadow_density)
 	FOGP(Vector3, lightning_position)
