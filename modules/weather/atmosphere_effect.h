@@ -251,6 +251,7 @@ class AtmosphereEffect : public CompositorEffect {
 	bool prev_valid = false;
 
 	bool initialized = false;
+	bool rain_clouds_on = false; // this frame's clouds were drawn (get_rain_light)
 	bool tables_dirty = true;
 	AtmosphereShaderRD shader;
 	RID shader_version;
@@ -442,6 +443,19 @@ public:
 	Vector2 get_cloud_shell() const;
 	// The clouds over the whole sky round the camera (equirectangular: rgb their light, a the transmittance).
 	Ref<Texture2D> get_cloud_panorama_texture();
+	// For RainEffect (rain_effect.h), after this frame's pass: what lights a drop (the sky's and the clouds' light from
+	// above, the light) and what lies between it and the camera (the air volume's light and transmittance, by the
+	// screen's uv and sqrt(distance / reach)). False before the atmosphere's first frame.
+	struct RainLight {
+		RID sampler, sky_view, cloud_panorama, air_light;
+		bool clouds = false;
+		bool air = false;
+		float air_reach = 1.0f;
+		float sky_illuminance = 1.0f;
+		Vector3 light_direction;
+		Color light_color;
+	};
+	bool get_rain_light(RainLight &r_light) const;
 	void set_apply_aerial(bool p_v) { apply_aerial = p_v; }
 	bool get_apply_aerial() const { return apply_aerial; }
 	void set_light_direction(const Vector3 &p_dir) { light_direction = p_dir.normalized(); }

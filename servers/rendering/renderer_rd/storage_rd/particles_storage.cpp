@@ -1869,6 +1869,14 @@ void ParticlesStorage::particles_collision_free(RID p_rid) {
 	particles_collision_owner.free(p_rid);
 }
 
+RID ParticlesStorage::particles_collision_get_heightfield_texture(RID p_particles_collision) const {
+	ParticlesCollision *particles_collision = particles_collision_owner.get_or_null(p_particles_collision);
+	if (particles_collision == nullptr || particles_collision->type != RSE::PARTICLES_COLLISION_TYPE_HEIGHTFIELD_COLLIDE) {
+		return RID();
+	}
+	return particles_collision->heightfield_texture;
+}
+
 RID ParticlesStorage::particles_collision_get_heightfield_framebuffer(RID p_particles_collision) const {
 	ParticlesCollision *particles_collision = particles_collision_owner.get_or_null(p_particles_collision);
 	ERR_FAIL_NULL_V(particles_collision, RID());

@@ -297,6 +297,23 @@ Ref<Texture2D> AtmosphereEffect::get_sky_view_texture() {
 	return sky_view_texture;
 }
 
+bool AtmosphereEffect::get_rain_light(RainLight &r_light) const {
+	if (!initialized || !sky_view_rd.is_valid()) {
+		return false;
+	}
+	r_light.sampler = sampler;
+	r_light.sky_view = sky_view_rd;
+	r_light.cloud_panorama = cloud_panorama_rd;
+	r_light.clouds = rain_clouds_on;
+	r_light.air_light = fog_light;
+	r_light.air = fog_enabled && apply_aerial && fog_light.is_valid();
+	r_light.air_reach = fog_distance;
+	r_light.sky_illuminance = light_illuminance;
+	r_light.light_direction = light_direction;
+	r_light.light_color = light_color;
+	return true;
+}
+
 void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const RenderData *p_render_data) {
 	if (p_effect_callback_type != EFFECT_CALLBACK_TYPE_POST_SKY) {
 		return;
@@ -368,6 +385,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	const bool clouds_on = apply_aerial && _clouds_prepare(cam, inv, sd->get_cam_projection() * Projection(Transform3D(cam.basis, Vector3()).affine_inverse()), size);
 	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;
 	m[40] = clouds_on ? 1.0f : 0.0f;
+	rain_clouds_on = clouds_on && cloud_panorama_rd.is_valid();
 	m[41] = cloud_shadows_on ? 1.0f : 0.0f;
 	m[42] = cloud_high_altitude - altitude_offset; // the air above the high layer is clear of its shadow
 	m[44] = cloud_shadow_origin.x;

@@ -46,6 +46,7 @@ public:
 		EFFECT_CALLBACK_TYPE_POST_SKY,
 		EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT,
 		EFFECT_CALLBACK_TYPE_POST_TRANSPARENT,
+		EFFECT_CALLBACK_TYPE_POST_UPSCALE, // Godot-EX: after the temporal upscaler or TAA, at the output size, before tonemapping
 		EFFECT_CALLBACK_TYPE_MAX
 	};
 

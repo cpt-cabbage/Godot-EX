@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="RainEffect" inherits="CompositorEffect" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Rain drawn per pixel over the upscaled picture: drops that stand in the world, hidden behind the scene and under a cover map.
+	</brief_description>
+	<description>
+		See the comment at the top of modules/weather/rain_effect.h.
+	</description>
+	<tutorials>
+	</tutorials>
+</class>

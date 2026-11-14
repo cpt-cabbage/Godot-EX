@@ -5786,6 +5786,9 @@
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT" value="4" enum="CompositorEffectCallbackType">
 			The callback is called after our transparent rendering pass, but before any built-in post-processing effects and output to our render target.
 		</constant>
+		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE" value="5" enum="CompositorEffectCallbackType">
+			The callback is called after the temporal upscaler (FSR 2, DLSS, MetalFX temporal) or TAA has resolved the picture, at the output size when upscaling, before tonemapping and other post-processing. Its color is the upscaled texture when a temporal upscaler ran, otherwise the internal texture. Forward+ only.
+		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY" value="-1" enum="CompositorEffectCallbackType">
 		</constant>
 		<constant name="ENV_BG_CLEAR_COLOR" value="0" enum="EnvironmentBG">

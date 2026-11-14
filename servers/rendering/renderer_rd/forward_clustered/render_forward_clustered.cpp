@@ -4248,6 +4248,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 
 	if (rb_data.is_valid()) {
+		// Godot-EX: what is drawn over the finished, upscaled picture before tonemapping (the valley's rain: thin moving
+		// streaks the temporal upscaler would smear or drop, having no motion vectors).
+		RENDER_TIMESTAMP("Process Post Upscale Compositor Effects");
+		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, p_render_data);
+	}
+
+	if (rb_data.is_valid()) {
 		_debug_draw_cluster(rb);
 
 		RENDER_TIMESTAMP("Tonemap");
