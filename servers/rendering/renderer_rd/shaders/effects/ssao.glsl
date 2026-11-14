@@ -23,6 +23,10 @@
 
 #VERSION_DEFINES
 
+// Godot-EX: the normal-roughness buffer is A2B10G10R10 with the normal octahedral (normal_roughness_inc.glsl); read as
+// RGBA8 best-fit, as upstream's, every normal here was wrong.
+#include "../normal_roughness_inc.glsl"
+
 #define INTELSSAO_MAIN_DISK_SAMPLE_COUNT (32)
 const vec4 sample_pattern[INTELSSAO_MAIN_DISK_SAMPLE_COUNT] = {
 	vec4(0.78488064, 0.56661671, 1.500000, -0.126083), vec4(0.26022232, -0.29575172, 1.500000, -1.064030), vec4(0.10459357, 0.08372527, 1.110000, -2.730563), vec4(-0.68286800, 0.04963045, 1.090000, -0.498827),
@@ -70,7 +74,7 @@ const int num_taps[5] = { 3, 5, 12, 0, 0 };
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2DArray source_depth_mipmaps;
-layout(rgba8, set = 0, binding = 1) uniform restrict readonly image2D source_normal;
+layout(rgb10_a2, set = 0, binding = 1) uniform restrict readonly image2D source_normal;
 layout(set = 0, binding = 2) uniform Constants { //get into a lower set
 	vec4 rotation_matrices[20];
 }
@@ -162,13 +166,13 @@ vec4 calculate_edges(const float p_center_z, const float p_left_z, const float p
 }
 
 vec3 load_normal(ivec2 p_pos) {
-	vec3 encoded_normal = normalize(imageLoad(source_normal, p_pos).xyz * 2.0 - 1.0);
+	vec3 encoded_normal = nr_normal(imageLoad(source_normal, p_pos));
 	encoded_normal.z = -encoded_normal.z;
 	return encoded_normal;
 }
 
 vec3 load_normal(ivec2 p_pos, ivec2 p_offset) {
-	vec3 encoded_normal = normalize(imageLoad(source_normal, p_pos + p_offset).xyz * 2.0 - 1.0);
+	vec3 encoded_normal = nr_normal(imageLoad(source_normal, p_pos + p_offset));
 	encoded_normal.z = -encoded_normal.z;
 	return encoded_normal;
 }
