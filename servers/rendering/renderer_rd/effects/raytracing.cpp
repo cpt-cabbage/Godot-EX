@@ -992,6 +992,15 @@ RID Raytracing::_update_reproject_ubo(uint32_t p_view, const Projection &p_repro
 		static const float reveal_frames = reveal_env.is_empty() ? 4.0f : MAX(float(reveal_env.to_float()), 0.0f);
 		ubo.reveal_frames = reveal_frames;
 		ubo.spec_young_power = gi_spec_young_power();
+		// A light's change of intensity or colour this frame, taken by every
+		// pixel at once (the temporal pass). The cards' marks reach a pixel
+		// only through a ray landing on a card relit since the change, and a
+		// light falling to nothing raises none: a lightning flash's bounce
+		// stayed on the ground for half a second where the view had been
+		// when it struck, a window that slid away as the view turned (the
+		// user, 2026-11-14). GODOT_GI_LIGHT_CHANGE=0 reverts.
+		static const bool light_change = OS::get_singleton()->get_environment("GODOT_GI_LIGHT_CHANGE") != "0";
+		ubo.light_change = light_change ? CLAMP(LightStorage::get_singleton()->get_card_dynamic_change(), 0.0f, 1.0f) : 0.0f;
 		RD::get_singleton()->buffer_update(h.ubo, 0, sizeof(ubo), &ubo);
 	}
 	return h.ubo;

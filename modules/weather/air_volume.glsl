@@ -7,12 +7,12 @@
 // The air near the camera as a volume (Godot-EX, 2026-11-09; atmosphere_effect.h): ground haze and valley mist in
 // froxels out to `fog_distance`, lit by the light through the terrain's shadow map and, near the camera, by ray-traced
 // visibility (alpha-tested, so the light falls between the leaves in shafts), and by the sky. Three variants:
-// MODE_INJECT     each froxel's scattering and extinction at a jittered point in it, blended with the last frame's
-//                 (reprojected), no ray tracing
+// MODE_INJECT     each froxel's extinction and the sun's visibility at a jittered point in it, blended with the last
+//                 frame's (reprojected), no ray tracing
 // MODE_INJECT_RT  the same with the light's visibility ray-traced within `rt_distance`: the one thing a froxel takes
 //                 in turns (a ray in four frames), kept in a volume of its own and carried between
-// MODE_INTEGRATE  front to back down each column: the light scattered toward the camera to each froxel, and the
-//                 transmittance (atmosphere.glsl's MODE_APPLY lays it over the scene)
+// MODE_INTEGRATE  front to back down each column, lit by this frame's sun and sky: the light scattered toward the
+//                 camera to each froxel, and the transmittance (atmosphere.glsl's MODE_APPLY lays it over the scene)
 
 #ifdef MODE_INJECT_RT
 #extension GL_EXT_ray_query : require
@@ -80,7 +80,17 @@ layout(set = 0, binding = 11) uniform sampler2D directional_shadow_atlas;
 #ifdef MODE_INTEGRATE
 layout(set = 0, binding = 7) uniform sampler3D media;
 layout(set = 0, binding = 8, rgba16f) uniform restrict writeonly image3D out_light;
+layout(set = 0, binding = 5) uniform sampler2D sky_view;
+layout(set = 0, binding = 14) uniform sampler2D cloud_panorama;
 #endif
+
+// What a froxel keeps from frame to frame (out_media, blended with its reprojected history): r the sun's share, the
+// extinction times the light's visibility and phase (times MEDIA_SUN_SCALE, for half floats), a the extinction. No
+// light: the integrate pass lights them with this frame's sun and sky. While the history held the light itself, a
+// lightning flash (the sky's light through the clouds' panorama) stayed in the froxels the view had held when it struck,
+// fading over half a second, and turning the camera showed it as a lit window in the air, with the wet ground's
+// reflection of it (the user, 2026-11-14).
+#define MEDIA_SUN_SCALE 1024.0
 
 // The froxel distribution: distance along the view ray = reach * w^2, w = (slice + 0.5) / Z at a slice's centre.
 float slice_distance(float w) {
@@ -91,6 +101,39 @@ vec3 view_dir(vec2 uv) {
 	vec4 p = fog.inv_view_proj * vec4(uv * 2.0 - 1.0, 0.5, 1.0);
 	return normalize(p.xyz / p.w);
 }
+
+#if defined(MODE_INJECT) || defined(MODE_INJECT_RT) || defined(MODE_INTEGRATE)
+// The sky's light reaching the air, a mean over the upper sky in the sky table (u: azimuth from the light, v: elevation,
+// the horizon at 0.5), as radiance. Under clouds (2026-11-12) the light from above is theirs and the clear sky's only
+// where it shows through them: the clouds' panorama (rgb their light, a the sky's transmittance; u azimuth, v the angle
+// from the zenith) over the upper sky, weighted by solid angle. Before, a storm's mist was lit by the clear sky above
+// its cloud: blue, and as bright as a fair day's haze, it hid the cloud.
+vec3 sky_ambient() {
+	vec3 s = vec3(0.0);
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 3; j++) {
+			s += textureLod(sky_view, vec2((float(i) + 0.5) / 4.0, 0.5 + 0.5 * (float(j) + 0.5) / 3.0), 0.0).rgb;
+		}
+	}
+	s *= fog.sky.x / 12.0;
+	if (fog.cloud_flags.y > 0.5) {
+		vec3 c = vec3(0.0);
+		float a = 0.0, wsum = 0.0;
+		for (int j = 0; j < 3; j++) {
+			float v = (float(j) + 0.5) / 6.0; // 15, 45 and 75 degrees from the zenith
+			float w = sin(v * PI);
+			for (int i = 0; i < 8; i++) {
+				vec4 cp = textureLod(cloud_panorama, vec2((float(i) + 0.5) / 8.0, v), 0.0);
+				c += cp.rgb * w;
+				a += cp.a * w;
+				wsum += w;
+			}
+		}
+		s = s * (a / wsum) + c / wsum;
+	}
+	return s;
+}
+#endif
 
 #if defined(MODE_INJECT) || defined(MODE_INJECT_RT)
 float hash13(vec3 p) {
@@ -229,36 +272,6 @@ float phase_hg(float c, float g) {
 	return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
 }
 
-// The sky's light reaching the air, a mean over the upper sky in the sky table (u: azimuth from the light, v: elevation,
-// the horizon at 0.5), as radiance. Under clouds (2026-11-12) the light from above is theirs and the clear sky's only
-// where it shows through them: the clouds' panorama (rgb their light, a the sky's transmittance; u azimuth, v the angle
-// from the zenith) over the upper sky, weighted by solid angle. Before, a storm's mist was lit by the clear sky above
-// its cloud: blue, and as bright as a fair day's haze, it hid the cloud.
-vec3 sky_ambient() {
-	vec3 s = vec3(0.0);
-	for (int i = 0; i < 4; i++) {
-		for (int j = 0; j < 3; j++) {
-			s += textureLod(sky_view, vec2((float(i) + 0.5) / 4.0, 0.5 + 0.5 * (float(j) + 0.5) / 3.0), 0.0).rgb;
-		}
-	}
-	s *= fog.sky.x / 12.0;
-	if (fog.cloud_flags.y > 0.5) {
-		vec3 c = vec3(0.0);
-		float a = 0.0, wsum = 0.0;
-		for (int j = 0; j < 3; j++) {
-			float v = (float(j) + 0.5) / 6.0; // 15, 45 and 75 degrees from the zenith
-			float w = sin(v * PI);
-			for (int i = 0; i < 8; i++) {
-				vec4 cp = textureLod(cloud_panorama, vec2((float(i) + 0.5) / 8.0, v), 0.0);
-				c += cp.rgb * w;
-				a += cp.a * w;
-				wsum += w;
-			}
-		}
-		s = s * (a / wsum) + c / wsum;
-	}
-	return s;
-}
 #endif
 
 void main() {
@@ -270,7 +283,6 @@ void main() {
 	if (any(greaterThanEqual(cell, size))) {
 		return;
 	}
-	vec3 ambient = sky_ambient() * fog.albedo.w;
 	float frame = fog.cam_pos.w;
 	int k = cell.z;
 	// The last frame's value at the froxel's centre, where it was on last frame's grid.
@@ -305,7 +317,7 @@ void main() {
 	float dist = slice_distance(w);
 	vec3 p = fog.cam_pos.xyz + d * dist;
 	float sigma = density(p);
-	vec3 scatter = vec3(0.0);
+	float sun_share = 0.0;
 #ifdef MODE_INJECT_RT
 	// The ray-traced light a froxel in four frames, by work group (8 x 8 columns: threads skipped within a group wait for
 	// its tracing ones), a 2 x 2 pattern of groups turning each frame: between, a group carries the visibility it had
@@ -334,13 +346,12 @@ void main() {
 			vis *= seen;
 		}
 #endif
-		vec3 sun = fog.light_color.rgb * phase_hg(dot(d, fog.light_dir.xyz), fog.light_color.w) * vis;
-		scatter = fog.albedo.rgb * sigma * (sun + ambient);
+		sun_share = sigma * vis * phase_hg(dot(d, fog.light_dir.xyz), fog.light_color.w) * MEDIA_SUN_SCALE;
 	}
 #ifdef MODE_INJECT_RT
 	imageStore(out_visibility, cell, vec4(seen));
 #endif
-	vec4 cur = vec4(scatter, sigma);
+	vec4 cur = vec4(sun_share, 0.0, 0.0, sigma);
 	if (have) {
 		cur = mix(cur, h, clamp(fog.range.z, 0.0, 0.98));
 	}
@@ -353,6 +364,9 @@ void main() {
 	if (any(greaterThanEqual(col, size.xy))) {
 		return;
 	}
+	// This frame's light on what the froxels keep (MEDIA_SUN_SCALE's note).
+	vec3 sun = fog.light_color.rgb / MEDIA_SUN_SCALE;
+	vec3 ambient = sky_ambient() * fog.albedo.w;
 	vec3 L = vec3(0.0);
 	float T = 1.0;
 	float prev = 0.0;
@@ -361,8 +375,9 @@ void main() {
 		float dt = dist - prev;
 		prev = dist;
 		vec4 m = texelFetch(media, ivec3(col, k), 0);
+		vec3 scatter = fog.albedo.rgb * (sun * m.r + ambient * m.a);
 		float st = exp(-m.a * dt);
-		L += T * (m.a > 1e-7 ? m.rgb * (1.0 - st) / m.a : m.rgb * dt);
+		L += T * (m.a > 1e-7 ? scatter * (1.0 - st) / m.a : scatter * dt);
 		T *= st;
 		imageStore(out_light, ivec3(col, k), vec4(L, T));
 	}

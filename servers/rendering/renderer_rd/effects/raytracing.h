@@ -656,9 +656,11 @@ private:
 		float spec_smear_lobe; // The share of the lobe's screen blur the reflection's parallax smear may reach (0.5; GODOT_GI_SPEC_SMEAR, 0: the fixed pixels only).
 		float jitter_delta[2]; // Half the previous frame's TAA jitter minus this frame's, NDC: added to uv + velocity when the velocity is this frame's.
 		float reveal_frames; // The frames a revealed rough reflection's 5x5 start is worth (GODOT_GI_REVEAL_FIX; 0: its one sample).
-		float spec_young_power; // A young rough reflection's normal stop in the reveal's 5x5 (GODOT_GI_SPEC_YOUNG; with DENOISE_FLAG_SPEC_YOUNG). The std140 block rounds to 96 bytes.
+		float spec_young_power; // A young rough reflection's normal stop in the reveal's 5x5 (GODOT_GI_SPEC_YOUNG; with DENOISE_FLAG_SPEC_YOUNG).
+		float light_change; // The most a light's intensity or colour changed this frame, relative (LightStorage::get_card_dynamic_change): the moving lights' history and the reflection restart to its inverse everywhere.
+		float pad[3]; // The std140 block rounds to 112 bytes.
 	};
-	static_assert(sizeof(ReprojectUBO) == 96, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
+	static_assert(sizeof(ReprojectUBO) == 112, "ReprojectUBO must match the std140 block in stochastic_denoise.glsl");
 
 public:
 	struct GiCascades;

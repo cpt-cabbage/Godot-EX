@@ -126,6 +126,7 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 			if (clouds_rd[i].is_valid()) {
 				rd->free_rid(clouds_rd[i]);
 				rd->free_rid(cloud_depth_rd[i]);
+				rd->free_rid(cloud_flash_rd[i]);
 			}
 			RD::TextureFormat tf;
 			tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
@@ -137,6 +138,9 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 			tf.format = RD::DATA_FORMAT_R32G32_SFLOAT;
 			cloud_depth_rd[i] = rd->texture_create(tf, RD::TextureView());
 			rd->texture_clear(cloud_depth_rd[i], Color(1e9, 1e9, 0, 0), 0, 1, 0, 1);
+			tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+			cloud_flash_rd[i] = rd->texture_create(tf, RD::TextureView());
+			rd->texture_clear(cloud_flash_rd[i], Color(0, 0, 0, 0), 0, 1, 0, 1);
 		}
 		cloud_size = march;
 		cloud_prev_valid = false;
@@ -150,7 +154,7 @@ void AtmosphereEffect::_clouds_free() {
 	}
 	RendererRD::Raytracing::set_sun_shadow_modulator(RID(), Vector4(), false);
 	RendererRD::Raytracing::set_sun_shadow_canopy(RID(), RID(), nullptr, false);
-	for (RID r : { noise_base_rd, noise_detail_rd, cloud_shadow_rd, weather_map_rd, cloud_ubo, sampler_repeat, clouds_rd[0], clouds_rd[1], cloud_depth_rd[0], cloud_depth_rd[1] }) {
+	for (RID r : { noise_base_rd, noise_detail_rd, cloud_shadow_rd, weather_map_rd, cloud_ubo, sampler_repeat, clouds_rd[0], clouds_rd[1], cloud_depth_rd[0], cloud_depth_rd[1], cloud_flash_rd[0], cloud_flash_rd[1] }) {
 		if (r.is_valid()) {
 			rd->free_rid(r);
 		}
@@ -210,8 +214,12 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
 	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), 0, 0);
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
-	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, MAX(cloud_shadow_density, 0.0f), 0);
-	v4(lightning_position.x, lightning_position.y, lightning_position.z, lightning_flash * lightning_energy);
+	// Last frame's flash and whether the strike stands where it stood (clouds.glsl's FLASH_COLOR: the history keeps the
+	// flash apart).
+	const float flash_now = MAX(lightning_flash * lightning_energy, 0.0f);
+	const bool flash_history = cloud_prev_valid && cloud_prev_flash > 0.0f && lightning_position.is_equal_approx(cloud_prev_lightning);
+	v4(CLAMP(precipitation, 0.0f, 1.0f), altitude_offset - 400.0f, MAX(cloud_shadow_density, 0.0f), cloud_prev_valid ? cloud_prev_flash : 0.0f);
+	v4(lightning_position.x, lightning_position.y, lightning_position.z, flash_now);
 	// The weather map: near and far layers round the camera, their origins snapped to a texel.
 	const float far_side = MAX(cloud_reach * 2.0f, CLOUD_MAP_NEAR * 2.0f);
 	auto snap = [&](float p_side, float p_v) {
@@ -221,13 +229,14 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(cloud_base, cloud_thickness_scale, cloud_type_spread, cloud_base_spread);
 	v4(snap(CLOUD_MAP_NEAR, p_cam.origin.x), snap(CLOUD_MAP_NEAR, p_cam.origin.z), CLOUD_MAP_NEAR, far_side);
 	v4(snap(far_side, p_cam.origin.x), snap(far_side, p_cam.origin.z), float(cloud_time), MAX(cloud_cell_size, 100.0f));
-	v4(MAX(cloud_lifetime, 1.0f), CLAMP(cloud_variation, 0.0f, 1.0f), 0, 0);
+	v4(MAX(cloud_lifetime, 1.0f), CLAMP(cloud_variation, 0.0f, 1.0f), flash_history ? 1.0f : 0.0f, 0);
 	const Vector2 wdir = Vector2(cloud_wind.x, cloud_wind.z).length() > 0.01f ? Vector2(cloud_wind.x, cloud_wind.z).normalized() : Vector2(1, 0);
 	v4(wdir.x, wdir.y, cloud_shear, cloud_rise);
 	v4(CLAMP(cloud_high_cover, 0.0f, 1.0f), cloud_high_altitude, CLAMP(cloud_high_type, 0.0f, 1.0f), cloud_high_density);
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;
+	cloud_flash_now = flash_now;
 	return true;
 }
 
@@ -266,12 +275,14 @@ void AtmosphereEffect::_clouds_dispatch(int64_t p_list, RID p_depth, bool p_marc
 		return;
 	}
 	const int cur = cloud_frame & 1, prev = cur ^ 1;
-	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })) }, cloud_size.x, cloud_size.y);
+	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ cloud_flash_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, cloud_flash_rd[prev] })) }, cloud_size.x, cloud_size.y);
 	run(CLOUD_PANORAMA, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ cloud_panorama_rd })) }, CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
 	cloud_current = clouds_rd[cur];
 	cloud_current_depth = cloud_depth_rd[cur];
 	cloud_prev_view_proj = cloud_view_proj;
 	cloud_prev_cam = cloud_cam;
+	cloud_prev_flash = cloud_flash_now;
+	cloud_prev_lightning = lightning_position;
 	cloud_prev_valid = true;
 	cloud_frame++;
 }

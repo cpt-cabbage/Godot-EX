@@ -225,6 +225,7 @@ class AtmosphereEffect : public CompositorEffect {
 	RID sampler_repeat;
 	RID noise_base_rd, noise_detail_rd;
 	RID clouds_rd[2], cloud_depth_rd[2];
+	RID cloud_flash_rd[2]; // the march's flash per unit of its strength (clouds.glsl's FLASH_COLOR), kept apart in the history
 	RID cloud_current, cloud_current_depth;
 	RID cloud_panorama_rd, cloud_shadow_rd;
 	RID weather_map_rd; // RGBA16F, two layers: near and far
@@ -241,6 +242,9 @@ class AtmosphereEffect : public CompositorEffect {
 	Projection cloud_view_proj, cloud_prev_view_proj;
 	Vector3 cloud_cam, cloud_prev_cam;
 	bool cloud_prev_valid = false;
+	float cloud_flash_now = 0.0f;
+	float cloud_prev_flash = 0.0f; // last frame's flash strength in the march (lightning_flash * lightning_energy)
+	Vector3 cloud_prev_lightning; // and where it stood
 	void _clouds_ensure(const Size2i &p_full);
 	void _clouds_free();
 	bool _clouds_prepare(const Transform3D &p_cam, const Projection &p_inv_rot, const Projection &p_view_proj, const Size2i &p_full);

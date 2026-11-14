@@ -298,6 +298,10 @@ layout(set = 1, binding = 4, std140) uniform ReprojectUBO {
 	// FLAG_SPEC_YOUNG: the normal stop's power for a young rough reflection
 	// (GODOT_GI_SPEC_YOUNG; the spatial pass carries it in spec_restart_min).
 	float spec_young_power;
+	// The most a light's intensity or colour changed this frame, relative
+	// (0-1): the moving lights' history and the reflection keep no more
+	// than its inverse in frames, on every pixel. The block is 112 bytes.
+	float light_change;
 }
 reprojection;
 #endif
@@ -1079,6 +1083,18 @@ void main() {
 					frames_dyn = min(frames_dyn, max(1.0, 1.0 / change_age_dyn));
 				}
 				change_age_s = max(change_age, change_age_dyn);
+			}
+			// A light's change of intensity or colour this frame, everywhere at
+			// once (raytracing.cpp's light_change): the cards' marks reach only
+			// the pixels whose rays land on a card relit since, and a light gone
+			// out raises none.
+			if (reprojection.light_change > 0.02) {
+				if (dyn_split) {
+					frames_dyn = min(frames_dyn, max(1.0, 1.0 / reprojection.light_change));
+				} else {
+					frames_d = min(frames_d, max(1.0, 1.0 / reprojection.light_change));
+				}
+				change_age_s = max(change_age_s, reprojection.light_change);
 			}
 			if (changed && mark_new) {
 				frames_d = min(frames_d, max(1.0, 1.0 / change_age));

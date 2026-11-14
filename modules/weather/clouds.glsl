@@ -43,12 +43,13 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 sky; // x the sky light's share, y the multiple scattering's strength, z the steps, w the light march's first step (m)
 	vec4 noise; // x the first slice the noise passes make this frame, y how many (spread over frames: a whole volume in one
 	// dispatch outlasted the driver's timeout)
-	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level), z the shadow's density scale
+	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level), z the shadow's density scale,
+	// w last frame's flash strength (lightning.w)
 	vec4 lightning; // xyz the strike's flash (world, at the cloud base), w its strength now
 	vec4 field; // x the layer's base (m above sea level), y the thickness scale, z the type's spread, w the base's (m)
 	vec4 map_near; // xy the near weather map's origin (world x, z), z its side (m), w the far map's side (m)
 	vec4 map_far; // xy the far map's origin, z the time (s), w the cells' size (m)
-	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1)
+	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1), z 1 when the strike stands where it did last frame
 	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
 	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
 }
@@ -70,6 +71,9 @@ layout(set = 0, binding = 6, rgba16f) uniform restrict writeonly image2D out_clo
 layout(set = 0, binding = 7, rg32f) uniform restrict writeonly image2D out_depth;
 layout(set = 0, binding = 8) uniform sampler2D history;
 layout(set = 0, binding = 9) uniform sampler2D history_depth;
+// The flash's light per unit of its strength, kept apart (FLASH_COLOR's note).
+layout(set = 0, binding = 12, r32f) uniform restrict writeonly image2D out_flash;
+layout(set = 0, binding = 13) uniform sampler2D history_flash;
 #endif
 #ifdef MODE_PANORAMA
 layout(set = 0, binding = 6, rgba16f) uniform restrict writeonly image2D out_clouds;
@@ -437,6 +441,14 @@ float light_depth(vec3 w) {
 	return tau;
 }
 
+// The lightning's light in the clouds is FLASH_COLOR times the flash's strength (clouds.lightning.w) times march_flash, the
+// march's sum of the flash's falloff over the cloud it lit. The march's history keeps march_flash apart and the rest of
+// the light without the flash, each blended with its own last frame, and the flash is put back at this frame's strength.
+// While the history held the light with the flash in it, a flash stayed in the clouds the view had held when it struck,
+// fading over half a second, and turning the camera showed it as a lit window in the sky (the user, 2026-11-14).
+#define FLASH_COLOR vec3(0.75, 0.8, 1.0)
+float march_flash = 0.0;
+
 // The light scattered toward the camera along a ray (o, d) between t0 and t1 (m), and its transmittance; first: the
 // distance to the first cloud, mean: the light's mean distance.
 vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out float first, out float mean) {
@@ -501,11 +513,14 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 			float tau_up = tau * max(clouds.light_dir.y, 0.2);
 			S += sky_ambient(h) * mix(0.4, 1.0, sqrt(1.0 - cs.profile)) / (1.0 + 0.75 * tau_up * (1.0 - g));
 			// Lightning: the flash lights the cloud round it, falling off over a kilometre or so.
+			float flash_unit = 0.0;
 			if (clouds.lightning.w > 0.0) {
 				float r = length(p - clouds.lightning.xyz);
-				S += vec3(0.75, 0.8, 1.0) * clouds.lightning.w * exp(-r / 900.0) / (4.0 * PI);
+				flash_unit = exp(-r / 900.0) / (4.0 * PI);
+				S += FLASH_COLOR * clouds.lightning.w * flash_unit;
 			}
 			float st = exp(-sigma * dt);
+			march_flash += T * flash_unit * (1.0 - st);
 			vec3 Sint = S * (1.0 - st); // albedo 1: scattering = extinction
 			L += T * Sint;
 			float wgt = T * (1.0 - st);
@@ -758,7 +773,14 @@ void main() {
 				if (cut && (hwhole || hd.g > scene)) {
 					w = 0.0;
 				}
-				cur = mix(cur, h, w);
+				// The flash apart (FLASH_COLOR's note): its share taken out of both, blended on its own (not across
+				// strikes, nor from a frame without one), and put back at this frame's strength.
+				float h_flash = textureLod(history_flash, puv, 0.0).r;
+				float w_flash = clouds.weather.w > 0.0 && clouds.life.z > 0.5 ? w : 0.0;
+				vec3 own = max(cur.rgb - FLASH_COLOR * clouds.lightning.w * march_flash, vec3(0.0));
+				vec3 h_own = max(h.rgb - FLASH_COLOR * clouds.weather.w * h_flash, vec3(0.0));
+				march_flash = mix(march_flash, h_flash, w_flash);
+				cur = vec4(mix(own, h_own, w) + FLASH_COLOR * clouds.lightning.w * march_flash, mix(cur.a, h.a, w));
 				front = min(front, mix(front, hd.r, w));
 				mean = mix(mean, hd.g, w);
 			}
@@ -766,6 +788,7 @@ void main() {
 	}
 	imageStore(out_clouds, px, cur);
 	imageStore(out_depth, px, vec4(front, cut ? -max(mean, 1.0) : mean, 0.0, 0.0));
+	imageStore(out_flash, px, vec4(march_flash));
 #endif
 
 #ifdef MODE_PANORAMA

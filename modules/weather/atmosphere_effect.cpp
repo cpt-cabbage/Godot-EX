@@ -544,10 +544,12 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, prev })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler_mip, heights_or_dummy })));
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, shadow_rd })));
-			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, sky_view_rd })));
+			const RD::Uniform u_sky_view(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, sky_view_rd }));
+			u.push_back(u_sky_view);
 			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_shadow_rd.is_valid() ? cloud_shadow_rd : shadow_rd })));
 			// The clouds' panorama: the sky's light from above under them (a frame late: the march makes it after this).
-			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, cloud_panorama_rd.is_valid() ? cloud_panorama_rd : shadow_rd })));
+			const RD::Uniform u_panorama(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, cloud_panorama_rd.is_valid() ? cloud_panorama_rd : shadow_rd }));
+			u.push_back(u_panorama);
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));
@@ -575,6 +577,9 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 0, Vector<RID>({ fog_ubo })));
 			ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler, cur })));
 			ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 8, Vector<RID>({ fog_light })));
+			// The light, applied here (air_volume.glsl's MEDIA_SUN_SCALE): the sky table and the clouds' panorama.
+			ui.push_back(u_sky_view);
+			ui.push_back(u_panorama);
 			RID s_int = fog_shader.version_get_shader(fog_version, 2);
 			rd->compute_list_bind_compute_pipeline(list, fog_pipelines[2]);
 			rd->compute_list_bind_uniform_set(list, cache->get_cache_vec(s_int, 0, ui), 0);
