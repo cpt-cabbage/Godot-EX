@@ -40,6 +40,10 @@
 // the camera over an exposure: a car's speed slants and lengthens them). Each level's cells: `set_level_cell` (x a
 // cell's side across, y its height, m; z the chance a cell holds a drop at density 1; w the opacity's scale) and
 // `set_level_range` (x from, y to, z the crossfade's half-width, m; w the cells walked at most).
+// The splashes (`splash_*`) are drawn where the scene faces up under the open sky within `splash_reach`: a ring on the
+// surface and a crown of spray, in cells of `splash_cell` m, `splash_rate` a cell a second at density 1, on `time`.
+// The rain mist (`mist_*`): a thin medium along the view ray to `mist_reach`, its density `mist_density` per m in
+// sheets of noise `mist_scale` m across and up that fall with the rain, and spray where the view meets the ground.
 // Under cover itself (a car's cab, a room), a pixel's drops start 0.6 m past where its view leaves the cover: glass is
 // not in the cover's map. GODOT_RAIN_DEBUG: 1 the scene's distance, the drops' cover and the cells walked; 2 the drops'
 // light over the screen; 3 the drops in a flat bright colour; 4 lit without the air; 5 the cover map, on or off.
@@ -73,6 +77,14 @@ private:
 	float spot_light = 1.0f;
 	Color tint = Color(0.92f, 0.96f, 1.0f);
 	float tint_share = 1.0f;
+	float splash_rate = 5.0f; // a cell's splashes a second at density 1
+	float splash_cell = 0.35f; // m
+	float splash_reach = 22.0f; // m
+	float splash_size = 1.0f;
+	float mist_density = 0.004f; // 1/m at density 1
+	Vector2 mist_scale = Vector2(35.0f, 120.0f); // m: the noise's scale across and up
+	float mist_reach = 400.0f; // m
+	float time = 0.0f; // s, for the splashes
 	RID cover;
 	Vector3 cover_centre;
 	Vector3 cover_extents = Vector3(1, 1, 1);
@@ -82,6 +94,8 @@ private:
 	RID shader_version;
 	RID pipeline;
 	RID sampler;
+	RID sampler_repeat;
+	RID mist_noise;
 	RID ubo;
 	bool initialized = false;
 
@@ -115,6 +129,14 @@ public:
 	RAINP(float, spot_light)
 	RAINP(Color, tint)
 	RAINP(float, tint_share)
+	RAINP(float, splash_rate)
+	RAINP(float, splash_cell)
+	RAINP(float, splash_reach)
+	RAINP(float, splash_size)
+	RAINP(float, mist_density)
+	RAINP(Vector2, mist_scale)
+	RAINP(float, mist_reach)
+	RAINP(float, time)
 #undef RAINP
 	void set_level_cell(int p_level, const Vector4 &p_v);
 	Vector4 get_level_cell(int p_level) const;

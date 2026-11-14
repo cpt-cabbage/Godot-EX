@@ -42,7 +42,7 @@
 #include "servers/rendering/storage/camera_attributes_storage.h"
 #include "servers/rendering/storage/render_data.h"
 
-static constexpr int RAIN_FLOATS = 160;
+static constexpr int RAIN_FLOATS = 172;
 
 void RainEffect::_ensure() {
 	if (initialized) {
@@ -65,6 +65,31 @@ void RainEffect::_ensure() {
 	ss.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	sampler = rd->sampler_create(ss);
 	ubo = rd->uniform_buffer_create(sizeof(float) * RAIN_FLOATS);
+	// The rain mist's noise: 32^3 random values, read filtered and repeating (value noise without a hash a sample).
+	RD::SamplerState rs;
+	rs.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	rs.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	rs.repeat_u = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	rs.repeat_v = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	rs.repeat_w = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	sampler_repeat = rd->sampler_create(rs);
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R8_UNORM;
+	tf.texture_type = RD::TEXTURE_TYPE_3D;
+	tf.width = 32;
+	tf.height = 32;
+	tf.depth = 32;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	Vector<uint8_t> data;
+	data.resize(32 * 32 * 32);
+	uint32_t h = 2166136261u;
+	for (int i = 0; i < data.size(); i++) {
+		h ^= uint32_t(i);
+		h *= 16777619u;
+		h ^= h >> 13;
+		data.write[i] = uint8_t(h >> 24);
+	}
+	mist_noise = rd->texture_create(tf, RD::TextureView(), Vector<Vector<uint8_t>>({ data }));
 	initialized = true;
 }
 
@@ -189,6 +214,11 @@ void RainEffect::_render_callback_native(int p_effect_callback_type, const Rende
 	static const int debug = OS::get_singleton()->get_environment("GODOT_RAIN_DEBUG").to_int();
 	v4(float(spots), CLAMP(tint_share, 0.0f, 1.0f), float(debug), 0.0f);
 	v4(tint.r, tint.g, tint.b, 0.0f);
+	v4(MAX(splash_rate, 0.0f), MAX(splash_cell, 0.05f), MAX(splash_reach, 0.0f), MAX(splash_size, 0.0f));
+	const Vector2 ms(MAX(mist_scale.x, 1.0f), MAX(mist_scale.y, 1.0f));
+	v4(MAX(mist_density, 0.0f), ms.x, ms.y, MAX(mist_reach, 0.0f));
+	// The fall so far, wrapped at the mist noise's period (32 of its cells a side), so it never jumps.
+	v4(float(Math::fmod(fall[0], 32.0 * ms.x)), float(Math::fmod(fall[1], 32.0 * ms.y)), float(Math::fmod(fall[2], 32.0 * ms.x)), time);
 	rd->buffer_update(ubo, 0, sizeof(u), u);
 
 	RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
@@ -200,7 +230,7 @@ void RainEffect::_render_callback_native(int p_effect_callback_type, const Rende
 	rd->draw_command_begin_label("Rain");
 	RD::ComputeListID list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, pipeline);
-	rd->compute_list_bind_uniform_set(list, cache->get_cache(s, 0, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, rb->get_depth_texture(0) })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, light.sky_view })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, light.cloud_panorama.is_valid() ? light.cloud_panorama : white })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, light.air_light.is_valid() ? light.air_light : white3d })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, cover_rd.is_valid() ? cover_rd : black })), RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ ubo }))), 0);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(s, 0, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, rb->get_depth_texture(0) })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 2, Vector<RID>({ sampler, light.sky_view })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>({ sampler, light.cloud_panorama.is_valid() ? light.cloud_panorama : white })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, light.air_light.is_valid() ? light.air_light : white3d })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, cover_rd.is_valid() ? cover_rd : black })), RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 6, Vector<RID>({ ubo })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 7, Vector<RID>({ sampler_repeat, mist_noise }))), 0);
 	rd->compute_list_dispatch_threads(list, size.x, size.y, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
@@ -235,6 +265,14 @@ void RainEffect::_bind_methods() {
 	RB(spot_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.001")
 	RB(tint, Variant::COLOR, PROPERTY_HINT_NONE, "")
 	RB(tint_share, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	RB(splash_rate, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,40,0.1")
+	RB(splash_cell, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.05,2,0.01,suffix:m")
+	RB(splash_reach, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,60,0.1,suffix:m")
+	RB(splash_size, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
+	RB(mist_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.0001")
+	RB(mist_scale, Variant::VECTOR2, PROPERTY_HINT_NONE, "suffix:m")
+	RB(mist_reach, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2000,1,suffix:m")
+	RB(time, Variant::FLOAT, PROPERTY_HINT_NONE, "suffix:s")
 #undef RB
 }
 
@@ -247,6 +285,8 @@ RainEffect::~RainEffect() {
 		RD *rd = RD::get_singleton();
 		rd->free_rid(ubo);
 		rd->free_rid(sampler);
+		rd->free_rid(mist_noise);
+		rd->free_rid(sampler_repeat);
 		shader.version_free(shader_version);
 	}
 }
