@@ -346,7 +346,7 @@ struct ImplementationData {
 	mat4 sdf_to_bounds;
 
 	ivec3 sdf_offset;
-	uint pad2;
+	float sdf_cutout_keep;
 
 	ivec3 sdf_size;
 	bool gi_upscale_for_msaa;

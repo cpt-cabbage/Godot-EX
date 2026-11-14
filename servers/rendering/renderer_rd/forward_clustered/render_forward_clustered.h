@@ -373,7 +373,7 @@ private:
 			float sdf_to_bounds[16];
 
 			int32_t sdf_offset[3];
-			uint32_t pad2;
+			float sdf_cutout_keep; // the share of a cut-out surface's voxels SDFGI keeps (see _render_sdfgi)
 
 			int32_t sdf_size[3];
 			uint32_t gi_upscale_for_msaa;
@@ -928,6 +928,8 @@ private:
 	void _ensure_rt_dummy_tlas();
 	RID _get_scene_shader_tlas() const;
 	bool use_rt_sdfgi_probes = false;
+	// The view's camera for SDFGI's voxel pass (see _render_sdfgi).
+	Transform3D sdfgi_view_transform;
 	bool use_rt_gi = false;
 	// The prepass wrote this frame's motion vectors for the ray-traced
 	// temporal passes (PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).

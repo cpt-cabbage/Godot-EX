@@ -4013,6 +4013,23 @@ void fragment_shader(in SceneData scene_data) {
 		vec3 local_pos = (implementation_data.sdf_to_bounds * vec4(vertex, 1.0)).xyz;
 		ivec3 grid_pos = implementation_data.sdf_offset + ivec3(local_pos * vec3(implementation_data.sdf_size));
 
+#if defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED)
+		// Godot-EX: a cut-out surface (leaves on cards) fills every voxel it
+		// touches, so a tree's crown went into the cascades as a solid block
+		// that let no sky through at any cell size. With
+		// rendering/global_illumination/sdfgi/cutout_density such surfaces
+		// keep a share of their voxels, chosen by the voxel alone so every
+		// card and all three axis passes agree on it.
+		if (implementation_data.sdf_cutout_keep < 1.0) {
+			uvec3 q = uvec3(grid_pos) * uvec3(1597334673u, 3812015801u, 2798796415u);
+			uint h = (q.x ^ q.y ^ q.z) * 1597334673u;
+			h ^= h >> 16;
+			if (float(h >> 8) * (1.0 / 16777216.0) >= implementation_data.sdf_cutout_keep) {
+				discard;
+			}
+		}
+#endif
+
 		uint albedo16 = 0x1; //solid flag
 		albedo16 |= clamp(uint(albedo.r * 31.0), 0, 31) << 11;
 		albedo16 |= clamp(uint(albedo.g * 31.0), 0, 31) << 6;

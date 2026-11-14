@@ -185,6 +185,16 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		lv.cell_span = span;
 		lv.cell = span * base_cell;
 		lv.shadows = l < p_shadow_levels;
+		// A last level of a few triangles a copy is an impostor: a card turned to the camera, which SDFGI's voxel pass
+		// (drawn along the three axes) would take for a wall the tree's size. It stays out of the voxels.
+		if (l > 0 && l == p_meshes.size() - 1 && lv.mesh.is_valid()) {
+			int64_t triangles = 0;
+			for (int s = 0; s < lv.mesh->get_surface_count(); s++) {
+				const int64_t il = lv.mesh->surface_get_array_index_len(s);
+				triangles += (il > 0 ? il : lv.mesh->surface_get_array_len(s)) / 3;
+			}
+			lv.gi = triangles > LIGHT_LEVEL_TRIANGLES;
+		}
 		lv.draw_end = lv.end;
 		lv.keep_begin = lv.begin;
 		lv.keep_end = lv.end;
@@ -429,6 +439,10 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 			rs->instance_geometry_set_shader_parameter(inst, SNAME("lod_fade"), p_level.fade);
 		}
 		rs->instance_geometry_set_cast_shadows_setting(inst, p_level.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
+		if (!p_level.gi) {
+			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, true); // still lit by the probes
+		}
 		rs->instance_set_visible(inst, p_visible);
 		kept.insert(i, inst);
 	}
@@ -656,6 +670,10 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 				rs->instance_geometry_set_shader_parameter(nc.instance, SNAME("lod_fade"), lv.fade);
 			}
 			rs->instance_geometry_set_cast_shadows_setting(nc.instance, lv.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
+			if (!lv.gi) {
+				rs->instance_geometry_set_flag(nc.instance, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+				rs->instance_geometry_set_flag(nc.instance, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, true); // still lit by the probes
+			}
 			rs->instance_set_visible(nc.instance, vis);
 			lv.cells.insert(j.key, nc);
 			c = lv.cells.getptr(j.key);

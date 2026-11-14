@@ -81,6 +81,7 @@ class InstanceField3D : public Node3D {
 		double cell = 64.0; // a draw cell's side
 		int cell_span = 1; // base cells a draw cell's side
 		bool shadows = true;
+		bool gi = true; // in SDFGI's voxels (not an impostor's card: see add_type)
 		Vector3 last_update = Vector3(Math::INF, Math::INF, Math::INF);
 		HashMap<uint64_t, DrawCell> cells;
 		HashMap<uint32_t, RID> copies; // per-copy levels: the copy's instance, by its index

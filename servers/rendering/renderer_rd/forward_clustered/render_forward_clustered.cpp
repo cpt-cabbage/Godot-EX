@@ -1644,6 +1644,8 @@ void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 		if (p_render_data->camera_attributes.is_valid()) {
 			exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
+		// The voxel pass draws with the view's camera as its main one (see _render_sdfgi).
+		sdfgi_view_transform = p_render_data->scene_data->main_cam_transform;
 		for (int i = 0; i < p_render_data->render_sdfgi_region_count; i++) {
 			sdfgi->render_region(rb, p_render_data->render_sdfgi_regions[i].region, p_render_data->render_sdfgi_regions[i].instances, exposure_normalization);
 		}
@@ -4866,6 +4868,10 @@ void RenderForwardClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_bu
 	RD::get_singleton()->draw_command_begin_label("Render SDFGI Voxel");
 
 	RenderSceneDataRD scene_data;
+	// The view's camera, for shaders that draw by their distance from it (MAIN_CAM_INV_VIEW_MATRIX: a level of detail
+	// that folds a mesh away outside its distance band). Left unset it was the world's origin, and such meshes were
+	// voxelised by how far they stood from there: a field of trees went into the cascades as nothing at all.
+	scene_data.main_cam_transform = sdfgi_view_transform;
 
 	RenderDataRD render_data;
 	render_data.scene_data = &scene_data;
@@ -4891,6 +4897,11 @@ void RenderForwardClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_bu
 		scene_state.ubo.sdf_offset[i] = p_from[i];
 		scene_state.ubo.sdf_size[i] = p_size[i];
 	}
+	// Cut-out surfaces go in porous: of the voxels one touches, the share that a medium of this density (1/m) would
+	// stop a ray in over one cell, so a crown lets through the same light at every cascade's cell size. 0: solid.
+	const float cutout_density = GLOBAL_GET("rendering/global_illumination/sdfgi/cutout_density");
+	const float cell_size = p_bounds.size.x / float(MAX(1, p_size.x));
+	scene_state.ubo.sdf_cutout_keep = cutout_density > 0.0f ? 1.0f - Math::exp(-cutout_density * cell_size) : 1.0f;
 
 	for (int i = 0; i < 3; i++) {
 		Vector3 axis;
