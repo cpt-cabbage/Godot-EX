@@ -299,13 +299,17 @@ void main() {
 					// Soft across (a Gaussian, at least 0.8 of a pixel: the streaks were hard lines, and as wide as the
 					// lens blurs it, out of focus), and as much fainter as it is wider than the drop, so its light is kept;
 					// brighter in bands along its length, as an oscillating drop's streak is (Garg and Nayar 2006).
-					float sigma = max(max(radius, params.rain.w * tc * 0.8), params.lens.x * abs(1.0 - tc / params.lens.y) * 0.5);
+					float sigma = max(max(radius, params.rain.w * tc * 1.1), params.lens.x * abs(1.0 - tc / params.lens.y) * 0.5);
 					float across = exp(-0.5 * (dist * dist) / (sigma * sigma));
 					if (dist < 3.0 * sigma && !covered(params.cam.xyz + cr)) {
 						float along = s / max(len, 1e-4);
 						float bands = 0.8 + 0.2 * sin(along * 7.0 + fract(own * 13.0) * 40.0);
-						float a = params.rain.z * cell.w * min(radius / sigma, 1.0) * 0.8 * across * bright * bands * (1.0 - along * along) * lf * near_fade;
-						a = clamp(a, 0.0, 0.95);
+						// Motion-blurred, not solid (the user, 2026-11-14: "make them feel motionblurred ... they are too solid"):
+						// a long exposure's streak fades in and out at its ends (the drop is there for part of the exposure's
+						// first and last moments at each point), and no streak covers what is behind it.
+						float ends = 1.0 - along * along;
+						float a = params.rain.z * cell.w * min(radius / sigma, 1.0) * 0.8 * across * bright * bands * ends * ends * lf * near_fade;
+						a = clamp(a, 0.0, 0.5);
 						vec3 lit = drop_lit + spot_light(params.cam.xyz + cr, dir) * params.sky.w;
 						vec3 col = lit;
 						if (params.air.y > 0.5) {
