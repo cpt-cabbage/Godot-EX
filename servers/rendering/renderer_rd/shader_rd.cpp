@@ -985,7 +985,9 @@ bool ShaderRD::shader_cache_cleanup_on_start = false;
 ShaderRD::ShaderRD() {
 	// Do not feel forced to use this, in most cases it makes little to no difference.
 	bool use_32_threads = false;
-	if (RD::get_singleton()->get_device_vendor_name() == "NVIDIA") {
+	// Godot-EX: a ShaderRD can be made with no rendering device (modules/weather's AtmosphereEffect holds its shaders
+	// as members and is made headless too, its CPU side used by itself); its shaders are only built with one.
+	if (RD::get_singleton() != nullptr && RD::get_singleton()->get_device_vendor_name() == "NVIDIA") {
 		use_32_threads = true;
 	}
 	String base_compute_define_text;
