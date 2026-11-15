@@ -127,6 +127,7 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 				rd->free_rid(clouds_rd[i]);
 				rd->free_rid(cloud_depth_rd[i]);
 				rd->free_rid(cloud_flash_rd[i]);
+				rd->free_rid(cloud_shape_rd[i]);
 			}
 			RD::TextureFormat tf;
 			tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
@@ -141,6 +142,9 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 			tf.format = RD::DATA_FORMAT_R32_SFLOAT;
 			cloud_flash_rd[i] = rd->texture_create(tf, RD::TextureView());
 			rd->texture_clear(cloud_flash_rd[i], Color(0, 0, 0, 0), 0, 1, 0, 1);
+			tf.format = RD::DATA_FORMAT_R16G16_SFLOAT;
+			cloud_shape_rd[i] = rd->texture_create(tf, RD::TextureView());
+			rd->texture_clear(cloud_shape_rd[i], Color(0, 0, 0, 0), 0, 1, 0, 1);
 		}
 		cloud_size = march;
 		cloud_prev_valid = false;
@@ -275,10 +279,11 @@ void AtmosphereEffect::_clouds_dispatch(int64_t p_list, RID p_depth, bool p_marc
 		return;
 	}
 	const int cur = cloud_frame & 1, prev = cur ^ 1;
-	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ cloud_flash_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, cloud_flash_rd[prev] })) }, cloud_size.x, cloud_size.y);
+	run(CLOUD_MARCH, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, p_depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ clouds_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, Vector<RID>({ cloud_depth_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 8, Vector<RID>({ sampler, clouds_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 9, Vector<RID>({ sampler, cloud_depth_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 12, Vector<RID>({ cloud_flash_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, cloud_flash_rd[prev] })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 14, Vector<RID>({ cloud_shape_rd[cur] })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, cloud_shape_rd[prev] })) }, cloud_size.x, cloud_size.y);
 	run(CLOUD_PANORAMA, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ cloud_panorama_rd })) }, CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
 	cloud_current = clouds_rd[cur];
 	cloud_current_depth = cloud_depth_rd[cur];
+	cloud_current_shape = cloud_shape_rd[cur];
 	cloud_prev_view_proj = cloud_view_proj;
 	cloud_prev_cam = cloud_cam;
 	cloud_prev_flash = cloud_flash_now;

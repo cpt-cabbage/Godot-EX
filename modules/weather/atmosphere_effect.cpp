@@ -729,10 +729,11 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		}
 		const RID clouds_tex = clouds_on && cloud_current.is_valid() ? cloud_current : sky_shadow_rd;
 		const RID clouds_depth_tex = clouds_on && cloud_current_depth.is_valid() ? cloud_current_depth : sky_shadow_rd;
+		const RID clouds_shape_tex = clouds_on && cloud_current_shape.is_valid() ? cloud_current_shape : sky_shadow_rd;
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RID color = rb->get_internal_texture(v);
 			RID depth = rb->get_depth_texture(v);
-			run(MODE_APPLY, { u_camera, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, sky_shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, fog_light })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, clouds_tex })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, clouds_depth_tex })) }, size.x, size.y, 1);
+			run(MODE_APPLY, { u_camera, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>({ sampler, aerial_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 5, Vector<RID>({ sampler, depth })), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, Vector<RID>({ color })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>({ sampler, sky_shadow_rd })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>({ sampler, fog_light })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, clouds_tex })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler, clouds_depth_tex })), RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 17, Vector<RID>({ sampler, clouds_shape_tex })) }, size.x, size.y, 1);
 		}
 	}
 	rd->compute_list_end();

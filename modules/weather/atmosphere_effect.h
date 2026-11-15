@@ -290,7 +290,8 @@ class AtmosphereEffect : public CompositorEffect {
 	RID noise_base_rd, noise_detail_rd;
 	RID clouds_rd[2], cloud_depth_rd[2];
 	RID cloud_flash_rd[2]; // the march's flash per unit of its strength (clouds.glsl's FLASH_COLOR), kept apart in the history
-	RID cloud_current, cloud_current_depth;
+	RID cloud_shape_rd[2]; // where in the cloud its light comes from (clouds.glsl's march_shape), for the sky lights
+	RID cloud_current, cloud_current_depth, cloud_current_shape;
 	RID cloud_panorama_rd, cloud_shadow_rd;
 	RID weather_map_rd; // RGBA16F, two layers: near and far
 	double cloud_time = 0.0;

@@ -74,6 +74,9 @@ layout(set = 0, binding = 9) uniform sampler2D history_depth;
 // The flash's light per unit of its strength, kept apart (FLASH_COLOR's note).
 layout(set = 0, binding = 12, r32f) uniform restrict writeonly image2D out_flash;
 layout(set = 0, binding = 13) uniform sampler2D history_flash;
+// Where in the cloud the light seen comes from (march_shape's note), with its history.
+layout(set = 0, binding = 14, rg16f) uniform restrict writeonly image2D out_shape;
+layout(set = 0, binding = 15) uniform sampler2D history_shape;
 #endif
 #ifdef MODE_PANORAMA
 layout(set = 0, binding = 6, rgba16f) uniform restrict writeonly image2D out_clouds;
@@ -448,6 +451,12 @@ float light_depth(vec3 w) {
 // fading over half a second, and turning the camera showed it as a lit window in the sky (the user, 2026-11-14).
 #define FLASH_COLOR vec3(0.75, 0.8, 1.0)
 float march_flash = 0.0;
+// Where in the cloud the light seen along the ray comes from, weighted as its mean distance is: x its height in the
+// cloud (0 the base, 1 the top: CloudSample.h), y the optical depth of cloud above it (the one toward the light made
+// vertical, as for the sky's light). The apply pass lights the clouds by the sky lights (atmosphere.glsl's
+// sky_lights_cloud) with them: bases lit from below and tops less, thin cloud letting a fireball above through and
+// thick cloud not. They are the cloud's, not the lights', so the history may blend them as it does the distances.
+vec2 march_shape = vec2(0.0);
 
 // The light scattered toward the camera along a ray (o, d) between t0 and t1 (m), and its transmittance; first: the
 // distance to the first cloud, mean: the light's mean distance.
@@ -456,6 +465,7 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 	float T = 1.0;
 	first = -1.0;
 	float wsum = 0.0, dsum = 0.0;
+	vec2 ssum = vec2(0.0);
 	float c = dot(d, clouds.light_dir.xyz);
 	float g = clouds.light_color.w;
 	float ms = clouds.sky.y;
@@ -526,6 +536,7 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 			float wgt = T * (1.0 - st);
 			wsum += wgt;
 			dsum += wgt * t;
+			ssum += wgt * vec2(h, tau_up);
 			T *= st;
 			if (T < 0.01) {
 				T = 0.0; // opaque: what is left would let the sun's disc through
@@ -539,6 +550,7 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 		t += dt;
 	}
 	mean = wsum > 0.0 ? dsum / wsum : t1;
+	march_shape = wsum > 0.0 ? ssum / wsum : vec2(0.0);
 	return vec4(L, T);
 }
 
@@ -783,12 +795,14 @@ void main() {
 				cur = vec4(mix(own, h_own, w) + FLASH_COLOR * clouds.lightning.w * march_flash, mix(cur.a, h.a, w));
 				front = min(front, mix(front, hd.r, w));
 				mean = mix(mean, hd.g, w);
+				march_shape = mix(march_shape, textureLod(history_shape, puv, 0.0).rg, w);
 			}
 		}
 	}
 	imageStore(out_clouds, px, cur);
 	imageStore(out_depth, px, vec4(front, cut ? -max(mean, 1.0) : mean, 0.0, 0.0));
 	imageStore(out_flash, px, vec4(march_flash));
+	imageStore(out_shape, px, vec4(march_shape, 0.0, 0.0));
 #endif
 
 #ifdef MODE_PANORAMA

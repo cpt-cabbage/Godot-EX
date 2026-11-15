@@ -81,6 +81,7 @@ layout(set = 0, binding = 12) uniform sampler2D sky_shadow;
 layout(set = 0, binding = 13) uniform sampler3D air_light;
 layout(set = 0, binding = 14) uniform sampler2D cloud_light;
 layout(set = 0, binding = 15) uniform sampler2D cloud_depth;
+layout(set = 0, binding = 17) uniform sampler2D cloud_shape; // clouds.glsl's march_shape
 layout(set = 0, binding = 4) uniform sampler3D aerial_lut;
 layout(set = 0, binding = 5) uniform sampler2D depth_texture;
 layout(set = 0, binding = 6, rgba16f) uniform restrict image2D color_image;
@@ -233,20 +234,35 @@ vec3 integrate(vec3 o, vec3 d, float t_max, int steps, vec3 l, out vec3 r_t) {
 #endif
 
 #ifdef MODE_APPLY
-// The sky lights' light scattered by the clouds at a point p among them (world, m), per unit of their opacity: each
-// light's irradiance there (its energy at 1 km over the distance in km squared, softened within 100 m), scattered
-// evenly (albedo 1, over 4 pi). A light above the clouds' top reaches their underside diffused through them
-// (sky_lights_info.z of it); one below the base lights it fully. Lightning keeps its own light in the march.
-vec3 sky_lights_cloud(vec3 p) {
+// The sky lights' light scattered by the clouds toward the camera, per unit of their opacity, at p (world, m: the
+// clouds' mean distance along the view d), where the march found the light it saw coming from `shape` (clouds.glsl's
+// march_shape: x the height in the cloud, 0 its base, 1 its top; y the optical depth of cloud above). Each light's
+// irradiance there (its energy at 1 km over the distance in km squared, softened within 100 m) times
+// - for a light below the clouds' base (impacts, fires): the base lit, the cloud above it less (by its height in the
+//   cloud: the light reaches into it through the cloud below);
+// - for one above their top (the fireballs): what comes through the cloud above, diffused (the diffusion's
+//   transmission 1 / (1 + 0.75 tau (1 - g)), g 0.8 for the clouds' own scattering), times sky_lights_info.z: thin
+//   cloud and the tops let it through, thick cores stay dim;
+// - a phase half even, half forward (Henyey-Greenstein, g 0.5): a cloud between the camera and a light glows most.
+// The light given evenly over the clouds had no shape: under many lights they stood flat and cream (2026-11-15).
+// Lightning keeps its own light in the march.
+vec3 sky_lights_cloud(vec3 p, vec3 d, vec2 shape) {
 	vec3 sum = vec3(0.0);
 	int n = min(int(camera.sky_lights_info.x), 32);
 	float base = camera.cloud_shadow.w;
 	float top = max(camera.sky_lights_info.y, base + 1.0);
+	float from_below = exp(-3.0 * clamp(shape.x, 0.0, 1.0));
+	float from_above = camera.sky_lights_info.z / (1.0 + 0.75 * max(shape.y, 0.0) * (1.0 - 0.8));
 	for (int i = 0; i < n; i++) {
 		vec4 l = camera.sky_light_pos[i];
 		vec3 r = (l.xyz - p) * 0.001;
-		float e = l.w / (dot(r, r) + 0.01);
-		sum += camera.sky_light_color[i].rgb * (e * mix(1.0, camera.sky_lights_info.z, smoothstep(base, top, l.y)));
+		float r2 = dot(r, r);
+		float e = l.w / (r2 + 0.01);
+		float reach = mix(from_below, from_above, smoothstep(base, top, l.y));
+		// The light's travel at p (from the light) against the way to the camera (-d).
+		float c = dot(-r * inversesqrt(max(r2, 1e-8)), -d);
+		float hg = (1.0 - 0.25) / pow(1.0 + 0.25 - 2.0 * 0.5 * c, 1.5); // Henyey-Greenstein g 0.5, times 4 pi
+		sum += camera.sky_light_color[i].rgb * (e * reach * mix(1.0, hg, 0.5));
 	}
 	return sum * (camera.sky_lights_energy.x / (4.0 * PI));
 }
@@ -495,6 +511,7 @@ void main() {
 		vec2 cf = cp - vec2(c0); \
 		vec4 cl = vec4(0.0); \
 		float cmean = 0.0, cwsum = 0.0; \
+		vec2 cshape = vec2(0.0); \
 		for (int cj = 0; cj < 4; cj++) { \
 			ivec2 ct = clamp(c0 + ivec2(cj & 1, cj >> 1), ivec2(0), ivec2(csz) - 1); \
 			float cb = ((cj & 1) != 0 ? cf.x : 1.0 - cf.x) * ((cj >> 1) != 0 ? cf.y : 1.0 - cf.y); \
@@ -507,6 +524,7 @@ void main() {
 			float cfr = dist > 1e11 ? 1.0 : clamp((dist - ctd.r) / max(2.0 * (abs(ctd.g) - ctd.r), 1.0), 0.0, 1.0); \
 			cl += mix(vec4(0.0, 0.0, 0.0, 1.0), texelFetch(cloud_light, ct, 0), cfr) * cwt; \
 			cmean += abs(ctd.g) * cwt; \
+			cshape += texelFetch(cloud_shape, ct, 0).rg * cwt; \
 			cwsum += cwt; \
 		} \
 		/* No texel's cloud stands in front of the scene here: none is drawn. (Each had a token weight, which the */ \
@@ -515,13 +533,14 @@ void main() {
 		if (cwsum > 1e-5) { \
 			cl /= cwsum; \
 			cmean /= cwsum; \
+			cshape /= cwsum; \
 		} else { \
 			cl = vec4(0.0, 0.0, 0.0, 1.0); \
 		} \
 		if (cl.a < 0.999) { \
 			float cw = sqrt(clamp(cmean * params.misc.x / params.radii.w, 0.0, 1.0)); \
 			vec4 apc = textureLod(aerial_lut, vec3(uv, cw), 0.0); \
-			vec3 slc = camera.sky_lights_info.x > 0.5 ? sky_lights_cloud(camera.cam_pos.xyz + view_dir * cmean) : vec3(0.0); \
+			vec3 slc = camera.sky_lights_info.x > 0.5 ? sky_lights_cloud(camera.cam_pos.xyz + view_dir * cmean, view_dir, cshape) : vec3(0.0); \
 			c.rgb = c.rgb * cl.a + ((cl.rgb + slc * (1.0 - cl.a)) * apc.a + apc.rgb * params.light.w * (1.0 - cl.a)) * camera.air_volume.z; \
 		} \
 		cl_seen = cl; \
