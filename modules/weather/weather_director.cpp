@@ -65,6 +65,9 @@ void WeatherState::blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &
 	L(exposure_compensation)
 	L(sky_light)
 	L(cloud_shadow_density)
+	L(air_anisotropy)
+	L(air_lights_anisotropy)
+	L(air_anisotropy_share)
 #undef L
 }
 
@@ -108,6 +111,9 @@ void WeatherState::_bind_methods() {
 	ADD_GROUP("Light", "");
 	P(sky_light, "0,2,0.01")
 	P(cloud_shadow_density, "0,4,0.01")
+	P(air_anisotropy, "-0.9,0.95,0.01")
+	P(air_lights_anisotropy, "-0.9,0.95,0.01")
+	P(air_anisotropy_share, "0,1,0.01")
 	ADD_GROUP("Exposure", "");
 	P(exposure_compensation, "-4,2,0.01,suffix:EV")
 #undef P
@@ -347,6 +353,9 @@ void WeatherDirector::_apply() {
 		atmosphere->set_cloud_multiscatter(current->cloud_multiscatter);
 		atmosphere->set_weather_sky_light(current->sky_light);
 		atmosphere->set_cloud_shadow_density(current->cloud_shadow_density);
+		atmosphere->set_weather_anisotropy(current->air_anisotropy);
+		atmosphere->set_weather_lights_anisotropy(current->air_lights_anisotropy);
+		atmosphere->set_weather_anisotropy_share(current->air_anisotropy_share);
 		const float h = Math::deg_to_rad(current->wind_heading);
 		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
 		// The air's mist and the rain's curtains go with the wind near the ground (they stood still to 2026-11-15).

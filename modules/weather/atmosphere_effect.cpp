@@ -186,25 +186,7 @@ void AtmosphereEffect::_ensure() {
 			}
 			fog_pipelines[i] = rd->compute_pipeline_create(fog_shader.version_get_shader(fog_version, i));
 		}
-		RD::TextureFormat tff;
-		tff.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
-		tff.texture_type = RD::TEXTURE_TYPE_3D;
-		tff.width = FOG_W;
-		tff.height = FOG_H;
-		tff.depth = FOG_Z;
-		tff.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
-		for (int i = 0; i < 2; i++) {
-			fog_media[i] = rd->texture_create(tff, RD::TextureView());
-			rd->texture_clear(fog_media[i], Color(0, 0, 0, 0), 0, 1, 0, 1);
-		}
-		fog_light = rd->texture_create(tff, RD::TextureView());
-		rd->texture_clear(fog_light, Color(0, 0, 0, 1), 0, 1, 0, 1);
-		// The ray-traced visibility, carried between a froxel's turns to trace.
-		tff.format = RD::DATA_FORMAT_R8_UNORM;
-		for (int i = 0; i < 2; i++) {
-			fog_visibility[i] = rd->texture_create(tff, RD::TextureView());
-			rd->texture_clear(fog_visibility[i], Color(1, 1, 1, 1), 0, 1, 0, 1);
-		}
+		_fog_textures();
 		fog_ubo = rd->uniform_buffer_create(sizeof(float) * FOG_FLOATS);
 	}
 	transmittance_texture.instantiate();
@@ -220,6 +202,53 @@ void AtmosphereEffect::_ensure() {
 	tables_dirty = true;
 }
 
+// The air volume's froxels at fog_size (made again when it changes: the history starts over).
+void AtmosphereEffect::_fog_textures() {
+	RD *rd = RD::get_singleton();
+	// The old ones are freed a few frames later, once what read them has the new ones: freed at once, an ID was freed
+	// twice.
+	const RID old[5] = { fog_media[0], fog_media[1], fog_visibility[0], fog_visibility[1], fog_light };
+	fog_size_built = fog_size;
+	RD::TextureFormat tff;
+	tff.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	tff.texture_type = RD::TEXTURE_TYPE_3D;
+	tff.width = fog_size.x;
+	tff.height = fog_size.y;
+	tff.depth = fog_size.z;
+	tff.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	for (int i = 0; i < 2; i++) {
+		fog_media[i] = rd->texture_create(tff, RD::TextureView());
+		rd->texture_clear(fog_media[i], Color(0, 0, 0, 0), 0, 1, 0, 1);
+	}
+	fog_light = rd->texture_create(tff, RD::TextureView());
+	rd->texture_clear(fog_light, Color(0, 0, 0, 1), 0, 1, 0, 1);
+	// The ray-traced visibility, carried between a froxel's turns to trace.
+	tff.format = RD::DATA_FORMAT_R8_UNORM;
+	for (int i = 0; i < 2; i++) {
+		fog_visibility[i] = rd->texture_create(tff, RD::TextureView());
+		rd->texture_clear(fog_visibility[i], Color(1, 1, 1, 1), 0, 1, 0, 1);
+	}
+	// A new texture each size: whatever reads it (the water's and the spray's materials) takes it again
+	// (get_air_light_texture). Re-pointed in place, their uniform sets failed for about 100 frames.
+	if (old[4].is_valid()) {
+		air_light_texture.instantiate();
+	}
+	if (air_light_texture.is_valid()) {
+		air_light_texture->set_texture_rd_rid(fog_light);
+	}
+	for (const RID &r : old) {
+		if (r.is_valid()) {
+			fog_retired.push_back(r);
+		}
+	}
+	fog_retire_frames = 8;
+	prev_valid = false;
+}
+
+void AtmosphereEffect::set_fog_size(const Vector3i &p_size) {
+	fog_size = Vector3i(CLAMP(p_size.x, 32, 640), CLAMP(p_size.y, 18, 360), CLAMP(p_size.z, 16, 256));
+}
+
 void AtmosphereEffect::_free() {
 	if (!initialized) {
 		return;
@@ -233,6 +262,10 @@ void AtmosphereEffect::_free() {
 			rd->free_rid(r);
 		}
 	}
+	for (const RID &r : fog_retired) {
+		rd->free_rid(r);
+	}
+	fog_retired.clear();
 	shader.version_free(shader_version);
 	fog_shader.version_free(fog_version);
 	_clouds_free();
@@ -443,6 +476,17 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	bool use_rt = false;
 	Projection view_proj;
 	if (fog_enabled && apply_aerial) {
+		if (fog_retire_frames > 0) {
+			fog_retire_frames--;
+		} else if (!fog_retired.is_empty()) {
+			for (const RID &r : fog_retired) {
+				rd->free_rid(r);
+			}
+			fog_retired.clear();
+		}
+		if (fog_size != fog_size_built) {
+			_fog_textures();
+		}
 		rt = RendererSceneRenderImplementation::RenderForwardClustered::get_singleton() ? RendererSceneRenderImplementation::RenderForwardClustered::get_singleton()->get_raytracing() : nullptr;
 		tlas = rt != nullptr ? rt->get_tlas() : RID();
 		use_rt = fog_rt_supported && tlas.is_valid() && fog_rt_distance > 0.0f;
@@ -465,7 +509,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(cam.origin.x, cam.origin.y, cam.origin.z, float(fog_frame % 1024));
 		v4(prev_cam.x, prev_cam.y, prev_cam.z, prev_valid && fog_history > 0.0f ? 1.0f : 0.0f);
 		v4(light_direction.x, light_direction.y, light_direction.z, light_direction.y / MAX(lh.length(), 1e-4f));
-		v4(light_color.r, light_color.g, light_color.b, fog_anisotropy);
+		v4(light_color.r, light_color.g, light_color.b, Math::lerp(fog_anisotropy, weather_anisotropy, CLAMP(weather_anisotropy_share, 0.0f, 1.0f)));
 		v4(ground_haze_density, ground_haze_height, mist_density, mist_top);
 		v4(mist_falloff, fog_noise, fog_noise_scale, float(double(OS::get_singleton()->get_ticks_usec()) * 1e-6));
 		v4(fog_albedo.r, fog_albedo.g, fog_albedo.b, fog_sky_light);
@@ -517,10 +561,10 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			const bool maps = fc != nullptr && !fc->ray_tracing_owns_local_shadows() && !bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
 			fog_shadow_atlas = atlas.is_valid() && maps ? ls->shadow_atlas_get_texture(atlas) : RID();
 			v4(float(fog_omni_count), float(fog_spot_count), fog_shadow_atlas.is_valid() ? 1.0f : 0.0f, MAX(m[38], 1e-6f));
-			v4(CLAMP(fog_lights_anisotropy, -0.9f, 0.95f), MAX(fog_lights_energy, 0.0f), 0, 0);
+			v4(CLAMP(Math::lerp(fog_lights_anisotropy, weather_lights_anisotropy, CLAMP(weather_anisotropy_share, 0.0f, 1.0f)), -0.9f, 0.95f), MAX(fog_lights_energy, 0.0f), float(CLAMP(fog_light_steps, 1, 4)), 0);
 		}
 		// The bolt's column in the air: the strike's point (the cloud base, world) and its light now.
-		const float bolt = MAX(lightning_flash, 0.0f) * MAX(lightning_air_energy, 0.0f);
+		const float bolt = MAX(lightning_flash, 0.0f) * MAX(lightning_air_energy, 0.0f) * MAX(fog_lights_energy, 0.0f);
 		v4(lightning_position.x, lightning_position.y, lightning_position.z, bolt);
 		v4(lightning_color.r, lightning_color.g, lightning_color.b, 0);
 		v4(lightning_air_end.x, lightning_air_end.y, lightning_air_end.z, lightning_air_end != Vector3() ? 1.0f : 0.0f);
@@ -623,7 +667,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			if (use_rt) {
 				rt->get_shadow_alpha_binding().bind(list, s_inject, 1);
 			}
-			rd->compute_list_dispatch_threads(list, FOG_W, FOG_H, FOG_Z); // a thread a froxel
+			rd->compute_list_dispatch_threads(list, fog_size_built.x, fog_size_built.y, fog_size_built.z); // a thread a froxel
 			rd->compute_list_add_barrier(list);
 			LocalVector<RD::Uniform> ui;
 			ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 0, Vector<RID>({ fog_ubo })));
@@ -643,7 +687,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			RID s_int = fog_shader.version_get_shader(fog_version, 2);
 			rd->compute_list_bind_compute_pipeline(list, fog_pipelines[2]);
 			rd->compute_list_bind_uniform_set(list, cache->get_cache_vec(s_int, 0, ui), 0);
-			rd->compute_list_dispatch_threads(list, FOG_W, FOG_H, 1);
+			rd->compute_list_dispatch_threads(list, fog_size_built.x, fog_size_built.y, 1);
 			rd->compute_list_add_barrier(list);
 			prev_view_proj = view_proj;
 			prev_cam = cam.origin;
@@ -769,6 +813,11 @@ void AtmosphereEffect::_bind_methods() {
 	FB(fog_canopy_shade, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
 	FB(fog_lights_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,16,0.01")
 	FB(fog_lights_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
+	FB(weather_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
+	FB(weather_lights_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
+	FB(weather_anisotropy_share, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(fog_light_steps, Variant::INT, PROPERTY_HINT_RANGE, "1,4,1")
+	FB(fog_size, Variant::VECTOR3I, PROPERTY_HINT_NONE, "")
 	FB(lightning_air_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,100000,1")
 	FB(lightning_air_end, Variant::VECTOR3, PROPERTY_HINT_NONE, "")
 	FB(canopy_haze_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.00001,suffix:/m")

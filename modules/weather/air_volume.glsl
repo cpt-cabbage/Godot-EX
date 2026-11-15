@@ -47,7 +47,7 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 canopy_frame; // the crowns' map (AtmosphereEffect::set_canopy): xy its origin (world x, z), zw 1 / its sides (m)
 	vec4 canopy_params; // x its heights' scale (m at 1), y the share of the sky a crown takes, z 1 when the map is bound, w the tallest crown (m)
 	vec4 lights; // x omni lights, y spot lights (the nearest of the renderer's), z 1 when their shadow atlas is read, w the camera's exposure
-	vec4 lights_look; // x the lights' phase's g, y their energy in the air (AtmosphereEffect.fog_lights_energy)
+	vec4 lights_look; // x the lights' phase's g, y their energy in the air (AtmosphereEffect.fog_lights_energy), z the points down a froxel they are lit at
 	vec4 bolt; // xyz a lightning strike's point at the cloud base (world), w its light now (0 between strikes)
 	vec4 bolt_color;
 	vec4 bolt_end; // xyz where the drawn bolt meets the ground (world), w 1 when given
@@ -555,11 +555,21 @@ void main() {
 		prev = dist;
 		vec4 m = texelFetch(media, ivec3(col, k), 0);
 		vec3 scatter = fog.albedo.rgb * (sun * m.r + ambient * m.g);
-		if (lit && m.a > 1e-7) {
-			scatter += fog.albedo.rgb * local_lights(vdir * dist) * m.a;
-		}
-		if (fog.bolt.w > 0.0 && m.a > 1e-7) {
-			scatter += fog.albedo.rgb * bolt_light(dcol * dist) * m.a;
+		if ((lit || fog.bolt.w > 0.0) && m.a > 1e-7) {
+			// At `steps` points down the froxel's slice (AtmosphereEffect.fog_light_steps), their mean: a lamp's light
+			// changes faster in depth near it than a slice is thick.
+			int steps = int(fog.lights_look.z);
+			vec3 local = vec3(0.0);
+			for (int j = 0; j < steps; j++) {
+				float sd = steps == 1 ? dist : slice_distance((float(k) + (float(j) + 0.5) / float(steps)) / float(size.z));
+				if (lit) {
+					local += local_lights(vdir * sd);
+				}
+				if (fog.bolt.w > 0.0) {
+					local += bolt_light(dcol * sd);
+				}
+			}
+			scatter += fog.albedo.rgb * (local / float(steps)) * m.a;
 		}
 		float st = exp(-m.a * dt);
 		L += T * (m.a > 1e-7 ? scatter * (1.0 - st) / m.a : scatter * dt);

@@ -103,6 +103,14 @@ public:
 	// (their optical depth for the shadow). AtmosphereEffect's weather_sky_light and cloud_shadow_density.
 	float sky_light = 1.0;
 	float cloud_shadow_density = 1.0;
+	// The air's phase in this weather (AtmosphereEffect's weather_anisotropy, weather_lights_anisotropy and
+	// weather_anisotropy_share): how strongly the haze, mist and rain scatter light on forward, for the sun and the sky
+	// (`air_anisotropy`) and for lamps, the flashlight and headlights (`air_lights_anisotropy`), -0.9 to 0.95, taking
+	// over the sky look's by `air_anisotropy_share` (0: the look's as they are). Higher, a beam is dimmer seen from
+	// behind its lamp (a car's headlights from the driver's seat) and brighter looking toward it.
+	float air_anisotropy = 0.7;
+	float air_lights_anisotropy = 0.2;
+	float air_anisotropy_share = 0.0;
 
 protected:
 	static void _bind_methods();
@@ -139,6 +147,9 @@ public:
 	WEATHER_PROP(exposure_compensation)
 	WEATHER_PROP(sky_light)
 	WEATHER_PROP(cloud_shadow_density)
+	WEATHER_PROP(air_anisotropy)
+	WEATHER_PROP(air_lights_anisotropy)
+	WEATHER_PROP(air_anisotropy_share)
 #undef WEATHER_PROP
 };
 

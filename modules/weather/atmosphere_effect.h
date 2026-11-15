@@ -62,7 +62,8 @@
 // The scene's omni and spot lights (the nearest FOG_MAX_LIGHTS of each, by their light_volumetric_fog_energy times
 // `fog_lights_energy`, phase g `fog_lights_anisotropy`, shadowed from their maps while those are drawn) and a lightning
 // bolt's glow (`lightning_air_energy`, from the strike's point to `lightning_air_end`) light the air in the integrate
-// pass, by this frame's light alone. Off with `fog_enabled`.
+// pass, by this frame's light alone, at `fog_light_steps` points down each froxel. The weather may take over both
+// phases (weather_anisotropy_share). `fog_size`: the froxels (a quality setting). Off with `fog_enabled`.
 //
 // The clouds (clouds.glsl, atmosphere_clouds.cpp): a layer `cloud_base` m above sea level (it may lie below the peaks),
 // as thick as its `cloud_type` makes it (layered, heaped, towering; `cloud_thickness_scale`), `cloud_cover` of the sky,
@@ -75,6 +76,7 @@
 // elevation) is how far up from the horizon the tint and recolour reach, fading as exp(-elevation / height): 10 is the
 // whole sky, 0.3 a band low down with the zenith left as it was.
 
+#include "core/templates/local_vector.h"
 #include "scene/resources/compositor.h"
 #include "scene/resources/texture_rd.h"
 #include "servers/rendering/renderer_rd/shader_rd.h"
@@ -161,10 +163,26 @@ class AtmosphereEffect : public CompositorEffect {
 	// the sun's shafts show, without whitening the open valley. A look's (SkyLook).
 	float canopy_haze_density = 0.0;
 	// The scene's omni and spot lights in the air (2026-11-15, the user: lamps, the torch and lightning lighting it):
-	// each by its own light_volumetric_fog_energy times this, 0 for none. Their own phase's g: a torch is held at the eye,
-	// its light scattered back toward it, where the haze's forward lobe (fog_anisotropy) leaves a tenth of it.
+	// each by its own light_volumetric_fog_energy times this (the lightning bolt's glow too), 0 for none. Their own
+	// phase's g: a torch is held at the eye, its light scattered back toward it, where the haze's forward lobe
+	// (fog_anisotropy) leaves a tenth of it.
 	float fog_lights_energy = 1.0;
 	float fog_lights_anisotropy = 0.2;
+	// The weather's own phase (WeatherDirector sets them from WeatherState): `weather_anisotropy` for the sun's and the
+	// sky's light and `weather_lights_anisotropy` for the scene's lights, taking over the look's (fog_anisotropy) and
+	// fog_lights_anisotropy by `weather_anisotropy_share`, 0 to 1 (0, the look's as they are: the default).
+	float weather_anisotropy = 0.7;
+	float weather_lights_anisotropy = 0.2;
+	float weather_anisotropy_share = 0.0;
+	// The volume's froxels across, down and in depth (a quality setting): 160 x 90 x 64 to 2026-11-15. Changed, the
+	// volumes are made again at the next frame and their history starts over.
+	Vector3i fog_size = Vector3i(160, 90, 64);
+	Vector3i fog_size_built;
+	LocalVector<RID> fog_retired; // the last size's volumes, freed fog_retire_frames after a change
+	int fog_retire_frames = 0;
+	// The scene's lights and the bolt are lit at this many points down each froxel (1 to 4): a lamp's light changes
+	// faster in depth near it than a froxel's slice is thick (1.25 m at 2 m, 4.4 m at 25 m).
+	int fog_light_steps = 1;
 	Color light_color = Color(1, 1, 1);
 	// The weather's (WeatherDirector sets them): its own mist layer, precipitation (rain haze near, rain shafts under the
 	// clouds), and a lightning flash glowing in the clouds round a point.
@@ -325,6 +343,7 @@ class AtmosphereEffect : public CompositorEffect {
 	Push _push(float p_camera_altitude_m, int p_width, int p_height) const;
 	void _ensure();
 	void _free();
+	void _fog_textures();
 	void _dirty() { tables_dirty = true; }
 
 protected:
@@ -345,7 +364,6 @@ public:
 	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
-	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
 	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48; // air_volume.glsl's Fog block
 	static constexpr int FOG_MAX_LIGHTS = 16; // of each kind, the nearest (the renderer's buffers are sorted by distance)
 
@@ -444,6 +462,12 @@ public:
 	FOGP(float, canopy_haze_density)
 	FOGP(float, fog_lights_energy)
 	FOGP(float, fog_lights_anisotropy)
+	FOGP(float, weather_anisotropy)
+	FOGP(float, weather_lights_anisotropy)
+	FOGP(float, weather_anisotropy_share)
+	FOGP(int, fog_light_steps)
+	void set_fog_size(const Vector3i &p_size);
+	Vector3i get_fog_size() const { return fog_size; }
 	FOGP(float, lightning_air_energy)
 	FOGP(Vector3, lightning_air_end)
 	FOGP(Color, light_color)
