@@ -42,7 +42,7 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 shadow; // xy the shadow map's origin (world x, z), z its side (m), w 1 when drawn
 	vec4 sky; // x the sky light's share, y the multiple scattering's strength, z the steps, w the light march's first step (m)
 	vec4 noise; // x the first slice the noise passes make this frame, y how many (spread over frames: a whole volume in one
-	// dispatch outlasted the driver's timeout)
+	// dispatch outlasted the driver's timeout), z the night's own light on them (radiance: AtmosphereEffect's cloud_night_light)
 	vec4 weather; // x precipitation (0-1), y the rain shafts' lowest altitude (m above sea level), z the shadow's density scale,
 	// w last frame's flash strength (lightning.w)
 	vec4 lightning; // xyz the strike's flash (world, at the cloud base), w its strength now
@@ -424,7 +424,7 @@ vec3 sky_ambient(float h) {
 	s *= clouds.light_dir.w / 12.0;
 	// Under a covered sky the light from above is cloud, not blue sky: greyer with the cover.
 	s = mix(s, vec3(dot(s, vec3(0.2126, 0.7152, 0.0722))), clamp(clouds.layer.w, 0.0, 1.0) * 0.8);
-	return s * mix(0.35, 1.0, h) * clouds.sky.x;
+	return (s * clouds.sky.x + vec3(0.8, 0.88, 1.0) * clouds.noise.z) * mix(0.35, 1.0, h);
 }
 
 // The optical depth toward the light from w: six steps, each twice the last.

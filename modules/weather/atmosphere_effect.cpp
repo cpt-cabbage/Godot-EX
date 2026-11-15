@@ -757,6 +757,7 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_wind, Variant::VECTOR3, PROPERTY_HINT_NONE, "suffix:m/s")
 	FB(cloud_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.95,0.01")
 	FB(cloud_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
+	FB(cloud_night_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.00001,or_greater")
 	FB(cloud_multiscatter, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,2,0.01")
 	FB(cloud_steps, Variant::INT, PROPERTY_HINT_RANGE, "8,256,1")
 	FB(cloud_light_step, Variant::FLOAT, PROPERTY_HINT_RANGE, "1,1000,0.1,suffix:m")

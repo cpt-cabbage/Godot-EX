@@ -212,7 +212,7 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(float(cloud_size.x), float(cloud_size.y), float(p_full.x), float(p_full.y));
 	v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, shadow_on ? 1.0f : 0.0f);
 	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
-	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), 0, 0);
+	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), MAX(cloud_night_light, 0.0f), 0);
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
 	// Last frame's flash and whether the strike stands where it stood (clouds.glsl's FLASH_COLOR: the history keeps the
 	// flash apart).

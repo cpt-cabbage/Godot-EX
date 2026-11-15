@@ -195,6 +195,9 @@ class AtmosphereEffect : public CompositorEffect {
 	Vector3 cloud_wind = Vector3(6, 0, 3);
 	float cloud_anisotropy = 0.8;
 	float cloud_sky_light = 1.0;
+	// The night's own light on the clouds (radiance, the scene's units: the sky's night glow): with the moon down they took
+	// no light at all and stood as black holes against the starlit sky.
+	float cloud_night_light = 0.0;
 	float cloud_multiscatter = 1.0;
 	int cloud_steps = 64;
 	float cloud_light_step = 40.0;
@@ -436,6 +439,7 @@ public:
 	FOGP(Vector3, cloud_wind)
 	FOGP(float, cloud_anisotropy)
 	FOGP(float, cloud_sky_light)
+	FOGP(float, cloud_night_light)
 	FOGP(float, cloud_multiscatter)
 	FOGP(int, cloud_steps)
 	FOGP(float, cloud_light_step)
