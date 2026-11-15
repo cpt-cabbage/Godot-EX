@@ -210,6 +210,8 @@ void AtmosphereEffect::_ensure() {
 	transmittance_texture->set_texture_rd_rid(transmittance_rd);
 	sky_view_texture.instantiate();
 	sky_view_texture->set_texture_rd_rid(sky_view_rd);
+	aerial_texture->set_texture_rd_rid(aerial_rd);
+	air_light_texture->set_texture_rd_rid(fog_light);
 	// The clouds' panorama for the sky's light probe (atmosphere_clouds.cpp fills it).
 	cloud_panorama_rd = tex2d(CLOUD_PANORAMA_W, CLOUD_PANORAMA_H);
 	cloud_panorama_texture->set_texture_rd_rid(cloud_panorama_rd);
@@ -297,6 +299,16 @@ Ref<Texture2D> AtmosphereEffect::get_sky_view_texture() {
 	return sky_view_texture;
 }
 
+Ref<Texture3D> AtmosphereEffect::get_aerial_texture() {
+	_ensure();
+	return aerial_texture;
+}
+
+Ref<Texture3D> AtmosphereEffect::get_air_light_texture() {
+	_ensure();
+	return air_light_texture;
+}
+
 bool AtmosphereEffect::get_rain_light(RainLight &r_light) const {
 	if (!initialized || !sky_view_rd.is_valid()) {
 		return false;
@@ -381,6 +393,8 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	// stayed as they were while a raised exposure_multiplier brightened everything else: at dusk a scene that lifts
 	// the exposure four-fold drew its clouds and haze at a quarter of their brightness against the ground.
 	m[38] = p_render_data->get_camera_attributes().is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->get_camera_attributes()) : 1.0f;
+	over_air = Vector4(fog_distance, fog_enabled && apply_aerial ? 1.0f : 0.0f, m[38], light_illuminance);
+	over_aerial = Vector4(0.001f * aerial_perspective_scale, aerial_distance, apply_aerial ? 1.0f : 0.0f, 0.0f);
 	// The clouds: their block first (it sets the shadow map's origin).
 	const bool clouds_on = apply_aerial && _clouds_prepare(cam, inv, sd->get_cam_projection() * Projection(Transform3D(cam.basis, Vector3()).affine_inverse()), size);
 	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;
@@ -650,6 +664,10 @@ Vector3 AtmosphereEffect::transmittance(float p_altitude_m, const Vector3 &p_dir
 void AtmosphereEffect::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_transmittance_texture"), &AtmosphereEffect::get_transmittance_texture);
 	ClassDB::bind_method(D_METHOD("get_sky_view_texture"), &AtmosphereEffect::get_sky_view_texture);
+	ClassDB::bind_method(D_METHOD("get_aerial_texture"), &AtmosphereEffect::get_aerial_texture);
+	ClassDB::bind_method(D_METHOD("get_air_light_texture"), &AtmosphereEffect::get_air_light_texture);
+	ClassDB::bind_method(D_METHOD("get_over_air"), &AtmosphereEffect::get_over_air);
+	ClassDB::bind_method(D_METHOD("get_over_aerial"), &AtmosphereEffect::get_over_aerial);
 	ClassDB::bind_method(D_METHOD("transmittance", "altitude", "direction"), &AtmosphereEffect::transmittance);
 	ClassDB::bind_method(D_METHOD("get_camera_altitude"), &AtmosphereEffect::get_camera_altitude);
 #define B(type, m, vt, hint)                                                                    \
@@ -772,6 +790,8 @@ void AtmosphereEffect::_bind_methods() {
 
 AtmosphereEffect::AtmosphereEffect() {
 	cloud_panorama_texture.instantiate();
+	aerial_texture.instantiate();
+	air_light_texture.instantiate();
 	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_SKY);
 }
 

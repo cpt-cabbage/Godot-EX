@@ -274,6 +274,12 @@ class AtmosphereEffect : public CompositorEffect {
 	RID transmittance_rd, multiscatter_rd, sky_view_rd, aerial_rd;
 	RID camera_ubo;
 	Ref<Texture2DRD> transmittance_texture;
+	// What the apply pass lays over the scene, for what draws after it (the transparent pass: the rivers' water,
+	// 2026-11-15): the aerial perspective's table and the air volume's light, and the pass's last frame's parameters.
+	Ref<Texture3DRD> aerial_texture;
+	Ref<Texture3DRD> air_light_texture;
+	Vector4 over_air; // the air volume's reach (m), 1 when drawn, the camera's exposure, the light's illuminance
+	Vector4 over_aerial; // km a metre times the aerial scale, the aerial table's reach (km times the scale)
 	Ref<Texture2DRD> sky_view_texture;
 	float camera_altitude = 0.0; // m, the last frame's
 
@@ -317,6 +323,13 @@ public:
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
+	// For a transparent material that wants the air over it as the scene has it (the apply pass draws before the
+	// transparent pass): colour * T + L, with the aerial table (screen uv, sqrt(km * x / y) of get_over_aerial()) and
+	// then the air volume (screen uv, sqrt(m / x) of get_over_air()); atmosphere.glsl's MODE_APPLY.
+	Ref<Texture3D> get_aerial_texture();
+	Ref<Texture3D> get_air_light_texture();
+	Vector4 get_over_air() const { return over_air; }
+	Vector4 get_over_aerial() const { return over_aerial; }
 	// The air's transmittance from an altitude (m, world y plus the offset) toward a direction, on the CPU.
 	Vector3 transmittance(float p_altitude_m, const Vector3 &p_direction) const;
 	float get_camera_altitude() const { return camera_altitude; }
