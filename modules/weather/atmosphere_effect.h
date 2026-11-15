@@ -210,6 +210,21 @@ class AtmosphereEffect : public CompositorEffect {
 	// Where the bolt meets the ground (world; the game's drawn bolt: world/valley/lightning.gd), the column's foot: from
 	// the strike's point straight down 3 km while it is zero.
 	Vector3 lightning_air_end;
+	// Sky lights (2026-11-15, the meteor shower: design/reports/meteor_story_2026-11-15.md in projectex): up to
+	// MAX_SKY_LIGHTS points (fireballs, impact flashes, fires, the orb) lighting the clouds and the clear air, set each
+	// frame by the game with set_sky_lights. Evaluated in the apply pass (atmosphere.glsl's sky_lights_*), not in the
+	// cloud march: the march's history would trail moving lights (the flash's lit window in the sky, 2026-11-14), and
+	// one strength factored out of it (FLASH_COLOR) does not hold for many moving, coloured lights. Each light's
+	// `energy` is its irradiance at 1 km (in the units of the sun's light, `light_color`), falling with the square of
+	// the distance. Lightning keeps its own path.
+	static constexpr int MAX_SKY_LIGHTS = 32;
+	PackedVector4Array sky_lights; // xyz world (m), w energy
+	PackedColorArray sky_light_colors; // rgb, a 1 when the light is also a scene light (the air volume lights it near)
+	// What a light above the clouds' top gives their underside through them (diffused), against one below the base.
+	float sky_lights_cloud_through = 0.25;
+	// The clouds' and the clear air's share of the sky lights (0 for none).
+	float sky_lights_cloud_energy = 1.0;
+	float sky_lights_air_energy = 1.0;
 	AirVolumeShaderRD fog_shader;
 	RID fog_version;
 	RID fog_pipelines[3];
@@ -356,7 +371,7 @@ public:
 	static constexpr int SKY_VIEW_W = 192, SKY_VIEW_H = 108;
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
-	static constexpr int CAMERA_FLOATS = 48; // atmosphere.glsl's Camera block
+	static constexpr int CAMERA_FLOATS = 48 + 8 + 8 * 32; // atmosphere.glsl's Camera block (the sky lights: MAX_SKY_LIGHTS)
 	static constexpr int CLOUD_FLOATS = 32 + 4 * 20; // clouds.glsl's Clouds block
 	static constexpr int CLOUD_MAP_N = 512; // the weather map's side (texels), each layer
 	static constexpr float CLOUD_MAP_NEAR = 32000.0f; // the near layer's side (m); the far one's twice the reach
@@ -481,6 +496,12 @@ public:
 	FOGP(float, lightning_flash)
 	FOGP(Color, lightning_color)
 	FOGP(float, lightning_energy)
+	FOGP(float, sky_lights_cloud_through)
+	FOGP(float, sky_lights_cloud_energy)
+	FOGP(float, sky_lights_air_energy)
+	void set_sky_lights(const PackedVector4Array &p_lights, const PackedColorArray &p_colors);
+	PackedVector4Array get_sky_lights() const { return sky_lights; }
+	PackedColorArray get_sky_light_colors() const { return sky_light_colors; }
 	FOGP(bool, clouds_enabled)
 	FOGP(float, cloud_cover)
 	FOGP(float, cloud_base)

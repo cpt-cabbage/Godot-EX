@@ -462,6 +462,30 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		const bool canopied = get_sun_shadow_canopy(canopy_rd, ground_rd, canopy_p);
 		RendererRD::Raytracing::set_sun_shadow_canopy(canopy_rd, ground_rd, canopy_p, canopied);
 	}
+	{
+		// The sky lights (atmosphere.glsl's Camera block): the count, the clouds' top, what goes through them, the clouds'
+		// and the air's energy; then the positions and the colours.
+		const int n = MIN(MIN(sky_lights.size(), sky_light_colors.size()), MAX_SKY_LIGHTS);
+		m[48] = (sky_lights_cloud_energy > 0.0f || sky_lights_air_energy > 0.0f) ? float(n) : 0.0f;
+		m[49] = get_cloud_shell().y - altitude_offset; // the clouds' highest top, world y
+		m[50] = CLAMP(sky_lights_cloud_through, 0.0f, 1.0f);
+		m[52] = MAX(sky_lights_cloud_energy, 0.0f);
+		m[53] = MAX(sky_lights_air_energy, 0.0f);
+		for (int i = 0; i < n; i++) {
+			const Vector4 l = sky_lights[i];
+			const Color c = sky_light_colors[i];
+			float *pp = m + 56 + i * 4;
+			float *pc = m + 56 + MAX_SKY_LIGHTS * 4 + i * 4;
+			pp[0] = l.x;
+			pp[1] = l.y;
+			pp[2] = l.z;
+			pp[3] = MAX(l.w, 0.0f);
+			pc[0] = c.r;
+			pc[1] = c.g;
+			pc[2] = c.b;
+			pc[3] = c.a > 0.5f ? 1.0f : 0.0f;
+		}
+	}
 	rd->buffer_update(camera_ubo, 0, sizeof(m), m);
 	// Rebuilt when the light has moved by about 0.02 degrees.
 	const bool rebuild_shadow = shadows && (shadow_dirty || light_direction.distance_to(shadow_light) > 3e-4f);
@@ -741,6 +765,11 @@ Vector3 AtmosphereEffect::transmittance(float p_altitude_m, const Vector3 &p_dir
 	return Vector3(Math::exp(-depth.x), Math::exp(-depth.y), Math::exp(-depth.z));
 }
 
+void AtmosphereEffect::set_sky_lights(const PackedVector4Array &p_lights, const PackedColorArray &p_colors) {
+	sky_lights = p_lights;
+	sky_light_colors = p_colors;
+}
+
 void AtmosphereEffect::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_transmittance_texture"), &AtmosphereEffect::get_transmittance_texture);
 	ClassDB::bind_method(D_METHOD("get_sky_view_texture"), &AtmosphereEffect::get_sky_view_texture);
@@ -834,6 +863,12 @@ void AtmosphereEffect::_bind_methods() {
 	FB(lightning_flash, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
 	FB(lightning_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
 	FB(lightning_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1000,0.1")
+	ClassDB::bind_method(D_METHOD("set_sky_lights", "lights", "colors"), &AtmosphereEffect::set_sky_lights);
+	ClassDB::bind_method(D_METHOD("get_sky_lights"), &AtmosphereEffect::get_sky_lights);
+	ClassDB::bind_method(D_METHOD("get_sky_light_colors"), &AtmosphereEffect::get_sky_light_colors);
+	FB(sky_lights_cloud_through, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(sky_lights_cloud_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,16,0.01")
+	FB(sky_lights_air_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,16,0.01")
 	ADD_GROUP("Clouds", "");
 	FB(clouds_enabled, Variant::BOOL, PROPERTY_HINT_NONE, "")
 	FB(cloud_cover, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")

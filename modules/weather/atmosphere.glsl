@@ -46,6 +46,12 @@ layout(set = 0, binding = 7, std140) uniform Camera {
 	// (MODE_APPLY: the scene's colour already holds it, so the light added here takes it too)
 	vec4 cloud_flags; // x 1 when the clouds are drawn, y 1 when their shadow map is, z the high layer's height (world y)
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
+	// The sky lights (AtmosphereEffect's set_sky_lights: fireballs, impacts, fires): x their count, y the clouds' top
+	// (world y), z what a light above the clouds gives their underside through them.
+	vec4 sky_lights_info;
+	vec4 sky_lights_energy; // x the clouds' share, y the clear air's
+	vec4 sky_light_pos[32]; // xyz world (m), w the light's irradiance at 1 km
+	vec4 sky_light_color[32]; // rgb, w 1 when it is also a scene light (the air volume lights it within its reach)
 }
 camera;
 
@@ -223,6 +229,61 @@ vec3 integrate(vec3 o, vec3 d, float t_max, int steps, vec3 l, out vec3 r_t) {
 	}
 	r_t = T;
 	return L;
+}
+#endif
+
+#ifdef MODE_APPLY
+// The sky lights' light scattered by the clouds at a point p among them (world, m), per unit of their opacity: each
+// light's irradiance there (its energy at 1 km over the distance in km squared, softened within 100 m), scattered
+// evenly (albedo 1, over 4 pi). A light above the clouds' top reaches their underside diffused through them
+// (sky_lights_info.z of it); one below the base lights it fully. Lightning keeps its own light in the march.
+vec3 sky_lights_cloud(vec3 p) {
+	vec3 sum = vec3(0.0);
+	int n = min(int(camera.sky_lights_info.x), 32);
+	float base = camera.cloud_shadow.w;
+	float top = max(camera.sky_lights_info.y, base + 1.0);
+	for (int i = 0; i < n; i++) {
+		vec4 l = camera.sky_light_pos[i];
+		vec3 r = (l.xyz - p) * 0.001;
+		float e = l.w / (dot(r, r) + 0.01);
+		sum += camera.sky_light_color[i].rgb * (e * mix(1.0, camera.sky_lights_info.z, smoothstep(base, top, l.y)));
+	}
+	return sum * (camera.sky_lights_energy.x / (4.0 * PI));
+}
+
+// The sky lights' light scattered toward the camera by the clear air along the view (d, unit) from the camera, to
+// t_split (front) and to t_end (total), m. Single scattering, even in every direction, in closed form over a line:
+// the integral of dt / (h^2 + (t - t0)^2) is atan((t - t0) / h) / h. The air's scattering is taken where the view
+// passes nearest the light (the air thins with height: a fireball 60 km up lights little air round itself). A scene
+// light starts at the air volume's reach, which lights it nearer (air_volume.glsl).
+void sky_lights_air(vec3 d, float t_split, float t_end, out vec3 front, out vec3 total) {
+	front = vec3(0.0);
+	total = vec3(0.0);
+	int n = min(int(camera.sky_lights_info.x), 32);
+	float r_cam = params.radii.z; // km
+	for (int i = 0; i < n; i++) {
+		vec4 l = camera.sky_light_pos[i];
+		vec4 col = camera.sky_light_color[i];
+		vec3 rel = l.xyz - camera.cam_pos.xyz;
+		float t0 = dot(rel, d);
+		float h = sqrt(max(dot(rel, rel) - t0 * t0, 0.0) + 2500.0); // within 50 m: the light's own size
+		float ta = (col.w > 0.5 && camera.air_volume.y > 0.5) ? camera.air_volume.x : 0.0;
+		if (ta >= t_end) {
+			continue;
+		}
+		float tc = clamp(t0, ta, t_end);
+		Medium m = medium(r_cam + d.y * tc * params.misc.x); // the air where the view passes nearest
+		vec3 sigma = (m.scatter_r + m.scatter_m) * params.misc.x; // per metre
+		float a0 = atan((ta - t0) / h);
+		float af = atan((max(t_split, ta) - t0) / h);
+		float at = atan((t_end - t0) / h);
+		vec3 k = col.rgb * sigma * (l.w * 1e6 / h); // the irradiance at 1 m over h
+		front += k * (af - a0);
+		total += k * (at - a0);
+	}
+	float g = camera.sky_lights_energy.y / (4.0 * PI);
+	front *= g;
+	total *= g;
 }
 #endif
 
@@ -417,6 +478,11 @@ void main() {
 		return;
 	}
 	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+	// The view's direction (world, unit), from the near plane.
+	vec4 rel_near = camera.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+	vec3 view_dir = normalize(rel_near.xyz / rel_near.w);
+	vec4 cl_seen = vec4(0.0, 0.0, 0.0, 1.0); // the clouds laid over this pixel (CLOUDS) and their mean distance (m)
+	float cmean_seen = 0.0;
 // The four march texels round the pixel, each weighted by its bilinear share and by whether its first cloud lies in
 // front of the pixel's scene (so a ridge's edge does not take the clouds behind it). A texel whose march the scene cut
 // short (the sign of its mean distance: clouds.glsl) holds no sky: a sky pixel leaves it out, or every crown and ridge
@@ -455,8 +521,19 @@ void main() {
 		if (cl.a < 0.999) { \
 			float cw = sqrt(clamp(cmean * params.misc.x / params.radii.w, 0.0, 1.0)); \
 			vec4 apc = textureLod(aerial_lut, vec3(uv, cw), 0.0); \
-			c.rgb = c.rgb * cl.a + (cl.rgb * apc.a + apc.rgb * params.light.w * (1.0 - cl.a)) * camera.air_volume.z; \
+			vec3 slc = camera.sky_lights_info.x > 0.5 ? sky_lights_cloud(camera.cam_pos.xyz + view_dir * cmean) : vec3(0.0); \
+			c.rgb = c.rgb * cl.a + ((cl.rgb + slc * (1.0 - cl.a)) * apc.a + apc.rgb * params.light.w * (1.0 - cl.a)) * camera.air_volume.z; \
 		} \
+		cl_seen = cl; \
+		cmean_seen = cmean; \
+	}
+	// The sky lights in the clear air along the ray to `dist` (m): what lies in front of the clouds over it, and behind
+	// them through their transmittance.
+#define SKY_LIGHTS_AIR(c, dist) \
+	if (camera.sky_lights_info.x > 0.5) { \
+		vec3 slf, slt; \
+		sky_lights_air(view_dir, cl_seen.a < 0.999 ? min(cmean_seen, dist) : dist, dist, slf, slt); \
+		c.rgb += (slf + (slt - slf) * cl_seen.a) * camera.air_volume.z; \
 	}
 	float depth = texelFetch(depth_texture, px, 0).r;
 	if (depth == 0.0) {
@@ -467,6 +544,7 @@ void main() {
 			c.rgb = max(c.rgb + textureLod(sky_shadow, uv, 0.0).rgb * params.light.w * camera.air_volume.z, vec3(0.0));
 		}
 		CLOUDS(c, 1e12)
+		SKY_LIGHTS_AIR(c, 2e5)
 		AIR_VOLUME(c, 1e9)
 		imageStore(color_image, px, c);
 		return;
@@ -481,6 +559,7 @@ void main() {
 	c.rgb = c.rgb * mix(1.0, ap.a, near) + ap.rgb * params.light.w * near * camera.air_volume.z;
 	float dist_m = dist / max(params.misc.x, 1e-12); // back to metres
 	CLOUDS(c, dist_m)
+	SKY_LIGHTS_AIR(c, dist_m)
 	AIR_VOLUME(c, dist_m)
 	imageStore(color_image, px, c);
 #endif
