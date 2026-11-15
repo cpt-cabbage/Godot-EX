@@ -86,6 +86,7 @@ class InstanceField3D : public Node3D {
 		HashMap<uint64_t, DrawCell> cells;
 		HashMap<uint32_t, RID> copies; // per-copy levels: the copy's instance, by its index
 		uint64_t copies_frame = 0;
+		uint64_t copies_disturbed = 0; // the disturbances' version its copies were made with
 	};
 
 	struct ProcCell {
@@ -179,6 +180,21 @@ class InstanceField3D : public Node3D {
 	int64_t total_copies_made = 0;
 	uint64_t total_main_usec = 0;
 
+	// Disturbances (2026-11-15, the meteor shower's impacts: projectex world/valley/impact_marks.gd): circles where the
+	// copies are blown down, x, z, radius (local m) and strength (0 to 1). Within a fifth of the radius they are gone;
+	// out to 0.6 of it laid down, the top away from the middle (as the trees round Tunguska), leaning less out to the
+	// edge. An impostor's card is hidden instead of turned, and a copy whose fall would cross a clear line (a trail kept
+	// clear) within `disturb_clear` m is hidden too. Every level takes the same, so crossfades agree.
+	struct Disturbance {
+		Vector4 circle;
+		LocalVector<Vector4> clear; // the clear lines' segments near it (x0, z0, x1, z1)
+	};
+	LocalVector<Disturbance> disturbances;
+	PackedVector2Array disturb_clear_points; // clear lines' points, a NaN point between lines
+	float disturb_clear = 4.0f;
+	uint64_t disturb_version = 0;
+	// Out: the copy's 12 floats disturbed into r_out; false: hidden.
+	bool _disturb(const float *p_x, float *r_out, bool p_card) const;
 	void _build_grid(Type &p_type);
 	void _set_bands(Type &p_type, bool p_light_last);
 	void _job(uint32_t p_index, Job *p_jobs);
@@ -214,6 +230,9 @@ public:
 	int get_type_count() const { return int(types.size()); }
 	int get_instance_count(int p_type) const;
 	void clear();
+	void set_disturbances(const PackedVector4Array &p_circles);
+	PackedVector4Array get_disturbances() const;
+	void set_disturbance_clear_lines(const PackedVector2Array &p_points, float p_clear);
 
 	// Levels crossfade instead of switching: each level but the last is drawn on past its end by this share of it, and
 	// every instance gets the shader parameter `lod_fade` (a vec4: the copy fades in from x to y metres from the viewer

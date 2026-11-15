@@ -402,6 +402,10 @@ void InstanceField3D::set_per_copy_levels(int p_levels) {
 void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transform3D &p_xf, RID p_scenario, bool p_visible) {
 	RenderingServer *rs = RS::get_singleton();
 	p_level.copies_frame++;
+	if (p_level.copies_disturbed != disturb_version) {
+		_free_copies(p_level);
+		p_level.copies_disturbed = disturb_version;
+	}
 	const float kb = MAX(0.0f, p_level.keep_begin - lead), ke = p_level.keep_end + lead;
 	const float b2 = kb * kb, e2 = ke * ke;
 	const int x0 = MAX(0, int(Math::floor((viewer.x - ke - grid_origin.x) / base_cell)));
@@ -431,6 +435,13 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 			continue;
 		}
 		const float *x = p_type.xf.ptr() + int64_t(i) * 12;
+		float moved[12];
+		if (!disturbances.is_empty()) {
+			if (!_disturb(x, moved, !p_level.gi)) {
+				continue;
+			}
+			x = moved;
+		}
 		const Transform3D t(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11]));
 		RID inst = rs->instance_create2(p_level.mesh.is_valid() ? p_level.mesh->get_rid() : RID(), p_scenario);
 		total_copies_made++;
@@ -448,6 +459,123 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 	}
 	_free_copies(p_level); // the ones left over have left the band
 	p_level.copies = kept;
+}
+
+static _FORCE_INLINE_ float seg_dist2(float p_x, float p_z, const Vector4 &p_s) {
+	const float vx = p_s.z - p_s.x, vz = p_s.w - p_s.y;
+	const float wx = p_x - p_s.x, wz = p_z - p_s.y;
+	const float l2 = vx * vx + vz * vz;
+	const float t = l2 > 1e-6f ? CLAMP((wx * vx + wz * vz) / l2, 0.0f, 1.0f) : 0.0f;
+	const float ex = wx - vx * t, ez = wz - vz * t;
+	return ex * ex + ez * ez;
+}
+
+bool InstanceField3D::_disturb(const float *p_x, float *r_out, bool p_card) const {
+	// The disturbance this copy lies deepest in.
+	const Disturbance *best = nullptr;
+	float best_f = 1.0f, rx = 0.0f, rz = 0.0f;
+	for (const Disturbance &d : disturbances) {
+		const float dx = p_x[3] - d.circle.x, dz = p_x[11] - d.circle.y;
+		const float r = d.circle.z;
+		const float dist2 = dx * dx + dz * dz;
+		if (dist2 >= r * r) {
+			continue;
+		}
+		const float f = Math::sqrt(dist2) / MAX(r, 1e-3f);
+		if (f < best_f) {
+			best_f = f;
+			best = &d;
+			rx = dx;
+			rz = dz;
+		}
+	}
+	for (int m = 0; m < 12; m++) {
+		r_out[m] = p_x[m];
+	}
+	if (best == nullptr) {
+		return true;
+	}
+	const float strength = CLAMP(best->circle.w, 0.0f, 1.0f);
+	if (best_f < 0.2f * strength) {
+		return false; // gone, at the middle
+	}
+	const float lean = strength * (best_f < 0.6f ? 1.0f : 1.0f - (best_f - 0.6f) / 0.4f);
+	if (lean <= 0.01f) {
+		return true;
+	}
+	if (p_card) {
+		return lean < 0.3f; // a card cannot lie down: only a slight lean is drawn upright
+	}
+	const float len = Math::sqrt(rx * rx + rz * rz);
+	const float ux = len > 1e-4f ? rx / len : 1.0f, uz = len > 1e-4f ? rz / len : 0.0f;
+	// Its height: the basis's up column's length (the copy's scale) times a tree's, about 10 m.
+	const float up_len = Vector3(p_x[1], p_x[5], p_x[9]).length();
+	const float fall = 10.0f * up_len * Math::sin(lean * 1.4f);
+	// A fall across a clear line: hidden instead.
+	for (const Vector4 &s : best->clear) {
+		for (int k = 0; k <= 2; k++) {
+			const float t = 0.5f * k;
+			if (seg_dist2(p_x[3] + ux * fall * t, p_x[11] + uz * fall * t, s) < disturb_clear * disturb_clear) {
+				return false;
+			}
+		}
+	}
+	// Turned about the horizontal axis across the way out, so its top goes outward (Rodrigues: up x (up x u) = u).
+	const Basis rot(Vector3(uz, 0.0f, -ux), lean * 1.4f);
+	const Basis b(p_x[0], p_x[1], p_x[2], p_x[4], p_x[5], p_x[6], p_x[8], p_x[9], p_x[10]);
+	const Basis nb = rot * b;
+	r_out[0] = nb.rows[0].x;
+	r_out[1] = nb.rows[0].y;
+	r_out[2] = nb.rows[0].z;
+	r_out[4] = nb.rows[1].x;
+	r_out[5] = nb.rows[1].y;
+	r_out[6] = nb.rows[1].z;
+	r_out[8] = nb.rows[2].x;
+	r_out[9] = nb.rows[2].y;
+	r_out[10] = nb.rows[2].z;
+	return true;
+}
+
+void InstanceField3D::set_disturbances(const PackedVector4Array &p_circles) {
+	_wait_pending(); // the jobs in flight read the list
+	disturbances.clear();
+	for (const Vector4 &c : p_circles) {
+		Disturbance d;
+		d.circle = c;
+		// The clear lines' segments that a fall from inside it could reach (its radius and a tall tree's length).
+		const float reach = c.z + 25.0f + disturb_clear;
+		for (int i = 0; i + 1 < disturb_clear_points.size(); i++) {
+			const Vector2 a = disturb_clear_points[i], b = disturb_clear_points[i + 1];
+			if (Math::is_nan(a.x) || Math::is_nan(b.x)) {
+				continue;
+			}
+			const Vector4 s(a.x, a.y, b.x, b.y);
+			if (seg_dist2(c.x, c.y, s) < reach * reach) {
+				d.clear.push_back(s);
+			}
+		}
+		disturbances.push_back(d);
+	}
+	disturb_version++;
+	// Every level filled again on the next update (the per-copy ones made again: _update_copies).
+	for (Type &t : types) {
+		for (Level &lv : t.levels) {
+			lv.last_update = Vector3(Math::INF, Math::INF, Math::INF);
+		}
+	}
+}
+
+PackedVector4Array InstanceField3D::get_disturbances() const {
+	PackedVector4Array out;
+	for (const Disturbance &d : disturbances) {
+		out.push_back(d.circle);
+	}
+	return out;
+}
+
+void InstanceField3D::set_disturbance_clear_lines(const PackedVector2Array &p_points, float p_clear) {
+	disturb_clear_points = p_points;
+	disturb_clear = MAX(p_clear, 0.0f);
 }
 
 void InstanceField3D::_free_all() {
@@ -476,9 +604,13 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 	const float kb = MAX(0.0f, lv.keep_begin - lead), ke = lv.keep_end + lead;
 	const float b2 = kb * kb, e2 = ke * ke;
 	LocalVector<float> out;
-	uint64_t h = 1469598103934665603ULL;
+	// The disturbances' version in the hash: copies turned with the same indices hash alike and were not sent again.
+	uint64_t h = 1469598103934665603ULL ^ (disturb_version * 0x9E3779B97F4A7C15ULL);
 	int count = 0;
 	const int bx0 = j.cx * lv.cell_span, bz0 = j.cz * lv.cell_span;
+	const bool disturbing = !disturbances.is_empty();
+	const bool card = !lv.gi;
+	float moved[12];
 	if (t.proc.enabled) {
 		const float share = t.proc.thin[j.level], k_scale = t.proc.thin_scale[j.level];
 		for (int bz = bz0; bz < MIN(bz0 + lv.cell_span, grid_z); bz++) {
@@ -497,6 +629,12 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 					const float d2 = dx * dx + dy * dy + dz * dz;
 					if (d2 < b2 || d2 >= e2) {
 						continue;
+					}
+					if (disturbing) {
+						if (!_disturb(x, moved, card)) {
+							continue;
+						}
+						x = moved;
 					}
 					for (int m = 0; m < 12; m++) {
 						out.push_back((m % 4 == 3) ? x[m] : x[m] * k_scale);
@@ -524,6 +662,12 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 				const float d2 = dx * dx + dy * dy + dz * dz;
 				if (d2 < b2 || d2 >= e2) {
 					continue;
+				}
+				if (disturbing) {
+					if (!_disturb(x, moved, card)) {
+						continue;
+					}
+					x = moved;
 				}
 				for (int m = 0; m < 12; m++) {
 					out.push_back(x[m]);
@@ -830,6 +974,9 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_type_count"), &InstanceField3D::get_type_count);
 	ClassDB::bind_method(D_METHOD("get_instance_count", "type"), &InstanceField3D::get_instance_count);
 	ClassDB::bind_method(D_METHOD("clear"), &InstanceField3D::clear);
+	ClassDB::bind_method(D_METHOD("set_disturbances", "circles"), &InstanceField3D::set_disturbances);
+	ClassDB::bind_method(D_METHOD("get_disturbances"), &InstanceField3D::get_disturbances);
+	ClassDB::bind_method(D_METHOD("set_disturbance_clear_lines", "points", "clear"), &InstanceField3D::set_disturbance_clear_lines);
 	ClassDB::bind_method(D_METHOD("set_level_fade", "fade"), &InstanceField3D::set_level_fade);
 	ClassDB::bind_method(D_METHOD("get_level_fade"), &InstanceField3D::get_level_fade);
 	ClassDB::bind_method(D_METHOD("set_per_copy_levels", "levels"), &InstanceField3D::set_per_copy_levels);
