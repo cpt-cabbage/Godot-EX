@@ -46,6 +46,11 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 cascades; // x 1 when the sun's shadow cascades are rendered (no ray-traced shadows)
 	vec4 canopy_frame; // the crowns' map (AtmosphereEffect::set_canopy): xy its origin (world x, z), zw 1 / its sides (m)
 	vec4 canopy_params; // x its heights' scale (m at 1), y the share of the sky a crown takes, z 1 when the map is bound, w the tallest crown (m)
+	vec4 lights; // x omni lights, y spot lights (the nearest of the renderer's), z 1 when their shadow atlas is read, w the camera's exposure
+	vec4 lights_look; // x the lights' phase's g, y their energy in the air (AtmosphereEffect.fog_lights_energy)
+	vec4 bolt; // xyz a lightning strike's point at the cloud base (world), w its light now (0 between strikes)
+	vec4 bolt_color;
+	vec4 bolt_end; // xyz where the drawn bolt meets the ground (world), w 1 when given
 }
 fog;
 
@@ -69,11 +74,14 @@ layout(set = 0, binding = 13) uniform sampler3D visibility_history;
 #include "../../servers/rendering/renderer_rd/shaders/effects/rt_alpha_inc.glsl"
 #define ALPHA_MAX_PASSES 16u
 #endif
+#if defined(MODE_INJECT) || defined(MODE_INTEGRATE)
+// The renderer's light structures (the build inlines an include once a file: one for both variants).
+#include "../../servers/rendering/renderer_rd/shaders/light_data_inc.glsl"
+#endif
 #ifdef MODE_INJECT
 // The sun's shadow cascades (the raster tier: without ray-traced shadows they are rendered), read as Godot's own
 // volumetric fog reads them: the tree shafts without rays.
 #define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS 8
-#include "../../servers/rendering/renderer_rd/shaders/light_data_inc.glsl"
 layout(set = 0, binding = 10, std140) uniform DirectionalLights {
 	DirectionalLightData data[MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS];
 }
@@ -85,6 +93,17 @@ layout(set = 0, binding = 7) uniform sampler3D media;
 layout(set = 0, binding = 8, rgba16f) uniform restrict writeonly image3D out_light;
 layout(set = 0, binding = 5) uniform sampler2D sky_view;
 layout(set = 0, binding = 14) uniform sampler2D cloud_panorama;
+// The scene's omni and spot lights (the renderer's buffers, positions and shadow matrices in this view's space), read as
+// Godot's own volumetric fog reads them (volumetric_fog_process.glsl), with their positional shadow atlas.
+layout(set = 0, binding = 16, std430) restrict readonly buffer OmniLights {
+	LightData data[];
+}
+omni_lights;
+layout(set = 0, binding = 17, std430) restrict readonly buffer SpotLights {
+	LightData data[];
+}
+spot_lights;
+layout(set = 0, binding = 18) uniform sampler2D shadow_atlas;
 #endif
 
 // What a froxel keeps from frame to frame (out_media, blended with its reprojected history): r the sun's share, the
@@ -332,6 +351,102 @@ float phase_hg(float c, float g) {
 
 #endif
 
+#ifdef MODE_INTEGRATE
+float lights_phase(float c) {
+	float g = fog.lights_look.x;
+	float g2 = g * g;
+	return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+
+// Godot's (scene_forward_lights_inc.glsl's get_omni_attenuation): to nothing at the range, by the distance's power.
+float lights_attenuation(float dist, float inv_range, float decay) {
+	float nd = dist * inv_range;
+	nd *= nd;
+	nd *= nd;
+	nd = max(1.0 - nd, 0.0);
+	nd *= nd;
+	return nd * pow(max(dist, 0.0001), -decay);
+}
+
+// The light the scene's omni and spot lights scatter toward the camera from a point in the air, per unit of extinction,
+// in the units the rest of the air is lit in (their colours carry the camera's exposure, which the apply pass gives the
+// whole volume). `vp` is the point in view space. 2026-11-15 (the user: "full volumetric lighting", then lamps, the torch
+// and lightning in it): lit here, by this frame's lights, so a swinging torch and a lightning flash leave nothing behind.
+// A light's distance is held to its size, or 0.25 m, so the slices beside a torch at the eye do not flare.
+vec3 local_lights(vec3 vp) {
+	vec3 total = vec3(0.0);
+	vec3 to_cam = -normalize(vp);
+	for (uint i = 0u; i < uint(fog.lights.x); i++) {
+		float fe = omni_lights.data[i].volumetric_fog_energy;
+		vec3 rel = omni_lights.data[i].position - vp;
+		float d = length(rel);
+		if (fe <= 0.001 || d * omni_lights.data[i].inv_radius >= 1.0) {
+			continue;
+		}
+		float att = lights_attenuation(max(d, max(omni_lights.data[i].size, 0.25)), omni_lights.data[i].inv_radius, omni_lights.data[i].attenuation);
+		float shadow = 1.0;
+		if (fog.lights.z > 0.5 && omni_lights.data[i].shadow_opacity > 0.001) {
+			vec4 uv_rect = omni_lights.data[i].atlas_rect;
+			vec3 local_vert = (omni_lights.data[i].shadow_matrix * vec4(vp, 1.0)).xyz;
+			float shadow_len = length(local_vert);
+			vec3 s = local_vert / max(shadow_len, 1e-6);
+			if (s.z >= 0.0) {
+				uv_rect.xy += omni_lights.data[i].direction.xy;
+			}
+			s.z = 1.0 + abs(s.z);
+			vec3 pos = vec3(s.xy / s.z, shadow_len - omni_lights.data[i].shadow_bias);
+			pos.z = 1.0 - pos.z * omni_lights.data[i].inv_radius;
+			pos.xy = uv_rect.xy + (pos.xy * 0.5 + 0.5) * uv_rect.zw;
+			float depth = textureLod(shadow_atlas, pos.xy, 0.0).r;
+			shadow = mix(1.0 - omni_lights.data[i].shadow_opacity, 1.0, exp(min(0.0, pos.z - depth) / omni_lights.data[i].inv_radius * 10.0)); // Godot fog's fade (INV_FOG_FADE)
+		}
+		// Phase: the angle between the light's travel (from it to the point) and the way on to the camera.
+		total += omni_lights.data[i].color * (att * shadow * fe * lights_phase(dot(-rel / max(d, 1e-6), to_cam)));
+	}
+	for (uint i = 0u; i < uint(fog.lights.y); i++) {
+		float fe = spot_lights.data[i].volumetric_fog_energy;
+		vec3 rel = spot_lights.data[i].position - vp;
+		float d = length(rel);
+		if (fe <= 0.001 || d * spot_lights.data[i].inv_radius >= 1.0) {
+			continue;
+		}
+		float att = lights_attenuation(max(d, max(spot_lights.data[i].size, 0.25)), spot_lights.data[i].inv_radius, spot_lights.data[i].attenuation);
+		float cone = spot_lights.data[i].cone_angle;
+		float scos = max(dot(-rel / max(d, 1e-6), spot_lights.data[i].direction), cone);
+		float rim = max(0.0001, (1.0 - scos) / (1.0 - cone));
+		att *= 1.0 - pow(rim, spot_lights.data[i].cone_attenuation);
+		if (att <= 0.0) {
+			continue;
+		}
+		float shadow = 1.0;
+		if (fog.lights.z > 0.5 && spot_lights.data[i].shadow_opacity > 0.001) {
+			vec4 splane = spot_lights.data[i].shadow_matrix * vec4(vp, 1.0);
+			splane.z -= spot_lights.data[i].shadow_bias;
+			float safe_w = abs(splane.w) > 1e-6 ? splane.w : (splane.w >= 0.0 ? 1e-6 : -1e-6);
+			splane /= safe_w;
+			vec2 auv = splane.xy * spot_lights.data[i].atlas_rect.zw + spot_lights.data[i].atlas_rect.xy;
+			float depth = textureLod(shadow_atlas, auv, 0.0).r;
+			shadow = mix(1.0 - spot_lights.data[i].shadow_opacity, 1.0, exp(min(0.0, splane.z - depth) / spot_lights.data[i].inv_radius * 10.0)); // Godot fog's fade (INV_FOG_FADE)
+		}
+		total += spot_lights.data[i].color * (att * shadow * fe * lights_phase(dot(-rel / max(d, 1e-6), to_cam)));
+	}
+	return total * (fog.lights_look.y / fog.lights.w);
+}
+
+// A lightning bolt's light at a point in the air (relative to the camera), per unit of extinction: a line from the
+// strike's point at the cloud base to where the drawn bolt meets the ground (or 3 km straight down: below the ground
+// it is behind the ground), its light by the square of the distance to the line, held to 5 m.
+vec3 bolt_light(vec3 rel) {
+	vec3 top = fog.bolt.xyz - fog.cam_pos.xyz;
+	vec3 foot = fog.bolt_end.w > 0.5 ? fog.bolt_end.xyz - fog.cam_pos.xyz : top - vec3(0.0, 3000.0, 0.0);
+	vec3 seg = foot - top;
+	vec3 near = top + seg * clamp(dot(rel - top, seg) / max(dot(seg, seg), 1.0), 0.0, 1.0);
+	vec3 from = rel - near;
+	float d2 = max(dot(from, from), 25.0);
+	return fog.bolt_color.rgb * (fog.bolt.w / d2 * lights_phase(dot(from * inversesqrt(d2), -normalize(rel))));
+}
+#endif
+
 void main() {
 #if defined(MODE_INJECT) || defined(MODE_INJECT_RT)
 	// A thread a froxel (the dispatch is the volume's size): a thread a column looping down it was 14400 threads, the
@@ -428,6 +543,9 @@ void main() {
 	// This frame's light on what the froxels keep (MEDIA_SUN_SCALE's note).
 	vec3 sun = fog.light_color.rgb / MEDIA_SUN_SCALE;
 	vec3 ambient = sky_ambient() * fog.albedo.w;
+	bool lit = fog.lights.x + fog.lights.y > 0.5;
+	vec3 dcol = view_dir((vec2(col) + 0.5) / vec2(size.xy));
+	vec3 vdir = mat3(fog.view) * dcol; // the column's direction in view space
 	vec3 L = vec3(0.0);
 	float T = 1.0;
 	float prev = 0.0;
@@ -437,6 +555,12 @@ void main() {
 		prev = dist;
 		vec4 m = texelFetch(media, ivec3(col, k), 0);
 		vec3 scatter = fog.albedo.rgb * (sun * m.r + ambient * m.g);
+		if (lit && m.a > 1e-7) {
+			scatter += fog.albedo.rgb * local_lights(vdir * dist) * m.a;
+		}
+		if (fog.bolt.w > 0.0 && m.a > 1e-7) {
+			scatter += fog.albedo.rgb * bolt_light(dcol * dist) * m.a;
+		}
 		float st = exp(-m.a * dt);
 		L += T * (m.a > 1e-7 ? scatter * (1.0 - st) / m.a : scatter * dt);
 		T *= st;

@@ -59,7 +59,10 @@
 // `fog_rt_distance`, ray-traced visibility with alpha-tested leaves (shafts through the trees), and by the sky (its
 // table's mean, times `fog_sky_light`, less what the trees' crowns over the point take, `fog_canopy_shade`). Each frame's point in a froxel is jittered and blended into the reprojected
 // last frame's (`fog_history`); the ray-traced visibility alone is traced a froxel in four frames and carried between.
-// Off with `fog_enabled`.
+// The scene's omni and spot lights (the nearest FOG_MAX_LIGHTS of each, by their light_volumetric_fog_energy times
+// `fog_lights_energy`, phase g `fog_lights_anisotropy`, shadowed from their maps while those are drawn) and a lightning
+// bolt's glow (`lightning_air_energy`, from the strike's point to `lightning_air_end`) light the air in the integrate
+// pass, by this frame's light alone. Off with `fog_enabled`.
 //
 // The clouds (clouds.glsl, atmosphere_clouds.cpp): a layer `cloud_base` m above sea level (it may lie below the peaks),
 // as thick as its `cloud_type` makes it (layered, heaped, towering; `cloud_thickness_scale`), `cloud_cover` of the sky,
@@ -157,6 +160,11 @@ class AtmosphereEffect : public CompositorEffect {
 	// Haze in the air under the trees' crowns (per m where they cover the sky round a point): the forest's air, where
 	// the sun's shafts show, without whitening the open valley. A look's (SkyLook).
 	float canopy_haze_density = 0.0;
+	// The scene's omni and spot lights in the air (2026-11-15, the user: lamps, the torch and lightning lighting it):
+	// each by its own light_volumetric_fog_energy times this, 0 for none. Their own phase's g: a torch is held at the eye,
+	// its light scattered back toward it, where the haze's forward lobe (fog_anisotropy) leaves a tenth of it.
+	float fog_lights_energy = 1.0;
+	float fog_lights_anisotropy = 0.2;
 	Color light_color = Color(1, 1, 1);
 	// The weather's (WeatherDirector sets them): its own mist layer, precipitation (rain haze near, rain shafts under the
 	// clouds), and a lightning flash glowing in the clouds round a point.
@@ -178,6 +186,12 @@ class AtmosphereEffect : public CompositorEffect {
 	float lightning_flash = 0.0;
 	Color lightning_color = Color(0.75, 0.8, 1.0);
 	float lightning_energy = 40.0;
+	// The bolt's glow in the air volume (2026-11-15): a column from the strike's point at the cloud base down, its light
+	// falling with the square of the distance (in the sun's units at 1 m, times the flash); 0 for none.
+	float lightning_air_energy = 2000.0;
+	// Where the bolt meets the ground (world; the game's drawn bolt: world/valley/lightning.gd), the column's foot: from
+	// the strike's point straight down 3 km while it is zero.
+	Vector3 lightning_air_end;
 	AirVolumeShaderRD fog_shader;
 	RID fog_version;
 	RID fog_pipelines[3];
@@ -188,6 +202,8 @@ class AtmosphereEffect : public CompositorEffect {
 	int fog_frame = 0;
 	RID fog_canopy_rd, fog_canopy_ground_rd; // this frame's crowns' map, when fog_canopied
 	bool fog_canopied = false;
+	uint32_t fog_omni_count = 0, fog_spot_count = 0; // this frame's lights in the air
+	RID fog_shadow_atlas; // this frame's positional shadow atlas, when read
 	bool fog_rt_supported = false;
 	// The clouds.
 	bool clouds_enabled = true;
@@ -330,7 +346,8 @@ public:
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
 	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
-	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 28; // air_volume.glsl's Fog block
+	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48; // air_volume.glsl's Fog block
+	static constexpr int FOG_MAX_LIGHTS = 16; // of each kind, the nearest (the renderer's buffers are sorted by distance)
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
@@ -425,6 +442,10 @@ public:
 	FOGP(float, fog_history)
 	FOGP(float, fog_canopy_shade)
 	FOGP(float, canopy_haze_density)
+	FOGP(float, fog_lights_energy)
+	FOGP(float, fog_lights_anisotropy)
+	FOGP(float, lightning_air_energy)
+	FOGP(Vector3, lightning_air_end)
 	FOGP(Color, light_color)
 	FOGP(float, weather_mist_density)
 	FOGP(float, weather_mist_top)

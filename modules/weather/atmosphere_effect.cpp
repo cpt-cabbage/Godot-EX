@@ -33,6 +33,7 @@
 #include "core/object/class_db.h"
 #include "servers/rendering/renderer_rd/effects/raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
@@ -502,6 +503,27 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		fog_canopied = (fog_canopy_shade > 0.0f || canopy_haze_density > 0.0f) && get_sun_shadow_canopy(fog_canopy_rd, fog_canopy_ground_rd, cp);
 		v4(cp[0], cp[1], cp[2], cp[3]);
 		v4(cp[4], fog_canopied ? cp[15] * CLAMP(fog_canopy_shade, 0.0f, 1.0f) : 0.0f, fog_canopied ? 1.0f : 0.0f, cp[14]);
+		// The scene's omni and spot lights (the renderer's buffers for this view, in its view space, nearest first), and
+		// their shadows in the positional atlas where it is rendered (not with ray-traced shadows).
+		{
+			RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();
+			const bool lit = fog_lights_energy > 0.0f;
+			fog_omni_count = lit ? MIN(ls->get_omni_light_count(), uint32_t(FOG_MAX_LIGHTS)) : 0;
+			fog_spot_count = lit ? MIN(ls->get_spot_light_count(), uint32_t(FOG_MAX_LIGHTS)) : 0;
+			const RID atlas = static_cast<const RenderDataRD *>(p_render_data)->shadow_atlas;
+			// Not while the traced direct light owns the local lights' shadows (their maps are not drawn then: the
+			// atlas holds an old frame's, or nothing): the lights are unshadowed in the air.
+			RendererSceneRenderImplementation::RenderForwardClustered *fc = RendererSceneRenderImplementation::RenderForwardClustered::get_singleton();
+			const bool maps = fc != nullptr && !fc->ray_tracing_owns_local_shadows() && !bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled"));
+			fog_shadow_atlas = atlas.is_valid() && maps ? ls->shadow_atlas_get_texture(atlas) : RID();
+			v4(float(fog_omni_count), float(fog_spot_count), fog_shadow_atlas.is_valid() ? 1.0f : 0.0f, MAX(m[38], 1e-6f));
+			v4(CLAMP(fog_lights_anisotropy, -0.9f, 0.95f), MAX(fog_lights_energy, 0.0f), 0, 0);
+		}
+		// The bolt's column in the air: the strike's point (the cloud base, world) and its light now.
+		const float bolt = MAX(lightning_flash, 0.0f) * MAX(lightning_air_energy, 0.0f);
+		v4(lightning_position.x, lightning_position.y, lightning_position.z, bolt);
+		v4(lightning_color.r, lightning_color.g, lightning_color.b, 0);
+		v4(lightning_air_end.x, lightning_air_end.y, lightning_air_end.z, lightning_air_end != Vector3() ? 1.0f : 0.0f);
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -610,6 +632,14 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			// The light, applied here (air_volume.glsl's MEDIA_SUN_SCALE): the sky table and the clouds' panorama.
 			ui.push_back(u_sky_view);
 			ui.push_back(u_panorama);
+			// The scene's lights, applied here too: this frame's, never through the history (MEDIA_SUN_SCALE's note).
+			{
+				RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();
+				ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 16, Vector<RID>({ ls->get_omni_light_buffer() })));
+				ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, Vector<RID>({ ls->get_spot_light_buffer() })));
+				RID atlas = fog_shadow_atlas.is_valid() ? fog_shadow_atlas : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+				ui.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 18, Vector<RID>({ sampler, atlas })));
+			}
 			RID s_int = fog_shader.version_get_shader(fog_version, 2);
 			rd->compute_list_bind_compute_pipeline(list, fog_pipelines[2]);
 			rd->compute_list_bind_uniform_set(list, cache->get_cache_vec(s_int, 0, ui), 0);
@@ -737,6 +767,10 @@ void AtmosphereEffect::_bind_methods() {
 	FB(fog_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "10,5000,1,suffix:m")
 	FB(fog_rt_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,5000,1,suffix:m")
 	FB(fog_canopy_shade, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(fog_lights_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,16,0.01")
+	FB(fog_lights_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
+	FB(lightning_air_energy, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,100000,1")
+	FB(lightning_air_end, Variant::VECTOR3, PROPERTY_HINT_NONE, "")
 	FB(canopy_haze_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.00001,suffix:/m")
 	FB(fog_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.98,0.01")
 	FB(light_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
