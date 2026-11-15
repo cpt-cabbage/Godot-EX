@@ -242,6 +242,10 @@ class AtmosphereEffect : public CompositorEffect {
 	int cloud_frame = 0;
 	uint64_t cloud_last_ticks = 0;
 	Vector3 cloud_offset;
+	// How far the wind has carried the air's mist and rain curtains (m): grown each frame by fog_wind, so a change of
+	// wind turns them and never jumps them (as cloud_offset).
+	uint64_t fog_last_ticks = 0;
+	Vector3 fog_offset;
 	Vector2 cloud_shadow_origin;
 	Projection cloud_view_proj, cloud_prev_view_proj;
 	Vector3 cloud_cam, cloud_prev_cam;

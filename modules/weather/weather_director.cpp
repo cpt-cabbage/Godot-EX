@@ -349,6 +349,8 @@ void WeatherDirector::_apply() {
 		atmosphere->set_cloud_shadow_density(current->cloud_shadow_density);
 		const float h = Math::deg_to_rad(current->wind_heading);
 		atmosphere->set_cloud_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * (current->wind_speed * cloud_wind_factor));
+		// The air's mist and the rain's curtains go with the wind near the ground (they stood still to 2026-11-15).
+		atmosphere->set_fog_wind(Vector3(Math::cos(h), 0.0f, Math::sin(h)) * current->wind_speed);
 		atmosphere->set_weather_mist_density(current->mist * mist_density);
 		atmosphere->set_weather_mist_top(current->mist_top - altitude_offset);
 		atmosphere->set_precipitation(current->precipitation);

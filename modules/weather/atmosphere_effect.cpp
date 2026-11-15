@@ -455,7 +455,17 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(mist_falloff, fog_noise, fog_noise_scale, float(double(OS::get_singleton()->get_ticks_usec()) * 1e-6));
 		v4(fog_albedo.r, fog_albedo.g, fog_albedo.b, fog_sky_light);
 		v4(fog_distance, use_rt ? fog_rt_distance : 0.0f, CLAMP(fog_history, 0.0f, 0.98f), shadow_softness);
-		v4(fog_wind.x, fog_wind.y, fog_wind.z, shadows ? 1.0f : 0.0f);
+		{
+			const uint64_t now = OS::get_singleton()->get_ticks_usec();
+			const double dt = fog_last_ticks == 0 ? 0.0 : MIN(double(now - fog_last_ticks) * 1e-6, 0.25);
+			fog_last_ticks = now;
+			fog_offset += fog_wind * float(dt);
+			// Wrapped far beyond any noise's scale here, so the offset keeps its precision over a long session.
+			for (int i = 0; i < 3; i++) {
+				fog_offset[i] = Math::fmod(fog_offset[i], 65536.0f);
+			}
+		}
+		v4(fog_offset.x, fog_offset.y, fog_offset.z, shadows ? 1.0f : 0.0f);
 		for (int i = 20; i < 36; i++) {
 			f[o++] = m[i]; // the shadow frame, its parameters, the terrain's rectangle and heights
 		}

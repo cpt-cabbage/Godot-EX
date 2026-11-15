@@ -33,7 +33,7 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 mist; // x the mist's falloff above its top (m), y noise amount (0-1), z noise scale (m), w time (s)
 	vec4 albedo; // rgb the haze's albedo, w the sky light's share
 	vec4 range; // x the volume's reach (m), y the ray-traced reach (m), z history weight, w the shadow edge's softness (m)
-	vec4 wind; // xyz the wind carrying the noise (m/s), w 1 when the terrain shadows
+	vec4 wind; // xyz how far the wind has carried the noise (m: AtmosphereEffect's fog_offset), w 1 when the terrain shadows
 	vec4 shadow_frame; // atmosphere.glsl's Camera block's
 	vec4 shadow_params;
 	vec4 terrain_rect;
@@ -182,7 +182,7 @@ float density(vec3 w) {
 	// The weather's mist pools below its top.
 	d += fog.weather.x * exp(-max(w.y - fog.weather.y, 0.0) / max(fog.mist.x, 0.1));
 	if (fog.mist.y > 0.0 && d > 0.0) {
-		vec3 q = (w - fog.wind.xyz * fog.mist.w) / max(fog.mist.z, 0.01);
+		vec3 q = (w - fog.wind.xyz) / max(fog.mist.z, 0.01);
 		d *= mix(1.0, smoothstep(0.25, 0.75, fbm(q)) * 2.0, fog.mist.y);
 	}
 	// Rain thickens the air (the user, 2026-11-14: "use volumetrics closer range to sell the effect ... you're relying
@@ -192,7 +192,7 @@ float density(vec3 w) {
 	// too dense to see drop by drop. The drops themselves are rain.glsl's, over the picture; here they are a medium,
 	// lit and shadowed with the rest of the air.
 	if (fog.weather.z > 0.0 && fog.weather.w > 0.0) {
-		vec3 fall = vec3(fog.wind.x, -7.0, fog.wind.z) * fog.mist.w;
+		vec3 fall = vec3(fog.wind.x, -7.0 * fog.mist.w, fog.wind.z);
 		vec3 q1 = (w - fall) / vec3(22.0, 80.0, 22.0);
 		float sheets = smoothstep(0.3, 0.75, 0.7 * value_noise(q1) + 0.3 * value_noise(q1 * 2.3 + 5.1));
 		float dist = length(w - fog.cam_pos.xyz);
