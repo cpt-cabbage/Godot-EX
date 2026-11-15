@@ -38,12 +38,14 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 shadow_params;
 	vec4 terrain_rect;
 	vec4 terrain_h; // x height_min, y height_range, z the mip for the shadow map, w 1 when the heights are bound
-	vec4 sky; // x the sky table's light illuminance, yzw unused
+	vec4 sky; // x the sky table's light illuminance, y the haze under the crowns (1/m at full cover, canopy_cover), zw unused
 	vec4 cloud_shadow; // xy the clouds' shadow map's origin (world x, z), z its side (m), w the clouds' base (world y)
 	vec4 cloud_flags; // x 1 when the clouds' shadow map is drawn, y 1 when the clouds' panorama is (the sky's light from above)
 	vec4 weather; // x the weather's mist (1/m), y its top (world y), z precipitation (0-1), w the rain's haze (1/m at 1)
 	mat4 view; // the world to the camera's view space (the cascades' matrices start there)
 	vec4 cascades; // x 1 when the sun's shadow cascades are rendered (no ray-traced shadows)
+	vec4 canopy_frame; // the crowns' map (AtmosphereEffect::set_canopy): xy its origin (world x, z), zw 1 / its sides (m)
+	vec4 canopy_params; // x its heights' scale (m at 1), y the share of the sky a crown takes, z 1 when the map is bound, w the tallest crown (m)
 }
 fog;
 
@@ -56,6 +58,7 @@ layout(set = 0, binding = 5) uniform sampler2D sky_view;
 layout(set = 0, binding = 9) uniform sampler2D cloud_shadow_map;
 #if defined(MODE_INJECT) || defined(MODE_INJECT_RT)
 layout(set = 0, binding = 14) uniform sampler2D cloud_panorama;
+layout(set = 0, binding = 15) uniform sampler2D canopy;
 #endif
 #endif
 #ifdef MODE_INJECT_RT
@@ -85,7 +88,8 @@ layout(set = 0, binding = 14) uniform sampler2D cloud_panorama;
 #endif
 
 // What a froxel keeps from frame to frame (out_media, blended with its reprojected history): r the sun's share, the
-// extinction times the light's visibility and phase (times MEDIA_SUN_SCALE, for half floats), a the extinction. No
+// extinction times the light's visibility and phase (times MEDIA_SUN_SCALE, for half floats), g the sky's share, the
+// extinction times the share of the sky the crowns round it leave open (canopy_sky), a the extinction. No
 // light: the integrate pass lights them with this frame's sun and sky. While the history held the light itself, a
 // lightning flash (the sky's light through the clouds' panorama) stayed in the froxels the view had held when it struck,
 // fading over half a second, and turning the camera showed it as a lit window in the air, with the wet ground's
@@ -208,6 +212,42 @@ float density(vec3 w) {
 }
 
 #include "../../servers/rendering/renderer_rd/shaders/effects/sun_modulator_inc.glsl"
+
+// How much of the sky round a point in the air the trees' crowns cover, 0 to 1 (2026-11-15, the user: "full volumetric
+// lighting ... with light shafts through trees"). Lit by the whole sky, the air under a closed canopy glowed as grey as
+// the open valley's and the sun's shafts had nothing dark to stand in; and haze thick enough to show them there
+// whitened the valley beyond. The air under crowns takes the sky's light by their share (canopy_params.y) and holds
+// haze of its own (sky.y per m at full cover). Taps on a disc round the point, turned each frame (the history averages
+// them): the share of them whose crown's top stands above the point. 0 above the tallest crown, outside the map, or
+// with none bound.
+float canopy_cover(vec3 w, float frame_angle) {
+	if (fog.canopy_params.z < 0.5) {
+		return 0.0;
+	}
+	float ground = ground_height(w);
+	if (w.y - ground > fog.canopy_params.w) {
+		return 0.0;
+	}
+	float blocked = 0.0;
+	const int N = 9;
+	for (int i = 0; i < N; i++) {
+		// The centre, then two rings (about 3 and 7 m): the crowns overhead and the near ones that hide the low sky.
+		float r = i == 0 ? 0.0 : (i < 5 ? 3.0 : 7.0);
+		float a = frame_angle + float(i) * 2.39996323; // golden angle
+		vec2 xz = w.xz + r * vec2(cos(a), sin(a));
+		vec2 uv = (xz - fog.canopy_frame.xy) * fog.canopy_frame.zw;
+		if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+			continue;
+		}
+		float top = textureLod(canopy, uv, 0.0).r * fog.canopy_params.x;
+		if (top <= 0.0) {
+			continue;
+		}
+		float gt = i == 0 ? ground : ground_height(vec3(xz.x, w.y, xz.y));
+		blocked += smoothstep(-1.0, 1.0, gt + top - w.y);
+	}
+	return blocked / float(N);
+}
 
 float cloud_visibility(vec3 w) {
 	if (fog.cloud_flags.x < 0.5) {
@@ -334,8 +374,10 @@ void main() {
 	vec3 d = view_dir(uv);
 	float dist = slice_distance(w);
 	vec3 p = fog.cam_pos.xyz + d * dist;
-	float sigma = density(p);
+	float cover = canopy_cover(p, 6.2831853 * fract(frame * 0.618034 + hash13(vec3(cell) + 7.0)));
+	float sigma = density(p) + fog.sky.y * cover;
 	float sun_share = 0.0;
+	float sky_share = 0.0;
 #ifdef MODE_INJECT_RT
 	// The ray-traced light a froxel in four frames, by work group (8 x 8 columns: threads skipped within a group wait for
 	// its tracing ones), a 2 x 2 pattern of groups turning each frame: between, a group carries the visibility it had
@@ -365,11 +407,12 @@ void main() {
 		}
 #endif
 		sun_share = sigma * vis * phase_hg(dot(d, fog.light_dir.xyz), fog.light_color.w) * MEDIA_SUN_SCALE;
+		sky_share = sigma * (1.0 - fog.canopy_params.y * cover);
 	}
 #ifdef MODE_INJECT_RT
 	imageStore(out_visibility, cell, vec4(seen));
 #endif
-	vec4 cur = vec4(sun_share, 0.0, 0.0, sigma);
+	vec4 cur = vec4(sun_share, sky_share, 0.0, sigma);
 	if (have) {
 		cur = mix(cur, h, clamp(fog.range.z, 0.0, 0.98));
 	}
@@ -393,7 +436,7 @@ void main() {
 		float dt = dist - prev;
 		prev = dist;
 		vec4 m = texelFetch(media, ivec3(col, k), 0);
-		vec3 scatter = fog.albedo.rgb * (sun * m.r + ambient * m.a);
+		vec3 scatter = fog.albedo.rgb * (sun * m.r + ambient * m.g);
 		float st = exp(-m.a * dt);
 		L += T * (m.a > 1e-7 ? scatter * (1.0 - st) / m.a : scatter * dt);
 		T *= st;

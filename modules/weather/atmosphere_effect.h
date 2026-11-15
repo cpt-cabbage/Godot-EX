@@ -57,7 +57,7 @@
 // below the world height `mist_top`, thinning over `mist_falloff` above it), broken by wind-carried noise; lit by
 // `light_color` (TimeOfDay3D sets it: the light's colour and energy) through the terrain's shadow map and, within
 // `fog_rt_distance`, ray-traced visibility with alpha-tested leaves (shafts through the trees), and by the sky (its
-// table's mean, times `fog_sky_light`). Each frame's point in a froxel is jittered and blended into the reprojected
+// table's mean, times `fog_sky_light`, less what the trees' crowns over the point take, `fog_canopy_shade`). Each frame's point in a froxel is jittered and blended into the reprojected
 // last frame's (`fog_history`); the ray-traced visibility alone is traced a froxel in four frames and carried between.
 // Off with `fog_enabled`.
 //
@@ -151,6 +151,12 @@ class AtmosphereEffect : public CompositorEffect {
 	float fog_distance = 800.0;
 	float fog_rt_distance = 400.0;
 	float fog_history = 0.9;
+	// How much the trees' crowns (set_canopy) take of the sky's light in the air under them, 0 to 1 (times the crowns'
+	// own opacity): at 0 the air under a canopy is lit by the whole sky, as before 2026-11-15.
+	float fog_canopy_shade = 1.0;
+	// Haze in the air under the trees' crowns (per m where they cover the sky round a point): the forest's air, where
+	// the sun's shafts show, without whitening the open valley. A look's (SkyLook).
+	float canopy_haze_density = 0.0;
 	Color light_color = Color(1, 1, 1);
 	// The weather's (WeatherDirector sets them): its own mist layer, precipitation (rain haze near, rain shafts under the
 	// clouds), and a lightning flash glowing in the clouds round a point.
@@ -180,6 +186,8 @@ class AtmosphereEffect : public CompositorEffect {
 	RID fog_light;
 	RID fog_ubo;
 	int fog_frame = 0;
+	RID fog_canopy_rd, fog_canopy_ground_rd; // this frame's crowns' map, when fog_canopied
+	bool fog_canopied = false;
 	bool fog_rt_supported = false;
 	// The clouds.
 	bool clouds_enabled = true;
@@ -322,7 +330,7 @@ public:
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
 	static constexpr int FOG_W = 160, FOG_H = 90, FOG_Z = 64;
-	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 20; // air_volume.glsl's Fog block
+	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 28; // air_volume.glsl's Fog block
 
 	Ref<Texture2D> get_transmittance_texture();
 	Ref<Texture2D> get_sky_view_texture();
@@ -415,6 +423,8 @@ public:
 	FOGP(float, fog_distance)
 	FOGP(float, fog_rt_distance)
 	FOGP(float, fog_history)
+	FOGP(float, fog_canopy_shade)
+	FOGP(float, canopy_haze_density)
 	FOGP(Color, light_color)
 	FOGP(float, weather_mist_density)
 	FOGP(float, weather_mist_top)

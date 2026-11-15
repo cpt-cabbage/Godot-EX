@@ -39,7 +39,7 @@
 // orange in mie_tint so the haze around the sun glows, and `sky_recolor` (a curve over the same heights, 0 to 1) so the
 // tint replaces the sky's blue rather than darkening it to brown; `sky_tint_height` keeps them to a band above the
 // horizon (radians; 10 is the whole sky). The air volume's haze and mist (AtmosphereEffect's ground_haze_*, mist_*,
-// fog_anisotropy) are a look's too.
+// fog_anisotropy, canopy_haze_density) are a look's too.
 
 #include "core/io/resource.h"
 #include "scene/resources/curve.h"
@@ -72,6 +72,7 @@ class SkyLook : public Resource {
 	float mist_top = 0.0;
 	float mist_falloff = 60.0;
 	float fog_anisotropy = 0.6;
+	float canopy_haze_density = 0.0; // haze under the trees' crowns (per m at full cover)
 
 protected:
 	static void _bind_methods();
@@ -111,5 +112,6 @@ public:
 	PROP(float, mist_top)
 	PROP(float, mist_falloff)
 	PROP(float, fog_anisotropy)
+	PROP(float, canopy_haze_density)
 #undef PROP
 };

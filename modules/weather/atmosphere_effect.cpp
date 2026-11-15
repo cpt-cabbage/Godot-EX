@@ -484,7 +484,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			f[o++] = m[i]; // the shadow frame, its parameters, the terrain's rectangle and heights
 		}
 		f[o - 1] = heights_rd.is_valid() ? 1.0f : 0.0f;
-		v4(light_illuminance, 0, 0, 0);
+		v4(light_illuminance, MAX(canopy_haze_density, 0.0f), 0, 0); // the crowns' haze is read where their map is bound
 		v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset);
 		v4(cloud_shadows_on ? 1.0f : 0.0f, clouds_on && cloud_panorama_rd.is_valid() ? 1.0f : 0.0f, 0, 0);
 		v4(weather_mist_density, weather_mist_top, precipitation, MAX(rain_haze, 0.0f));
@@ -497,6 +497,11 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		}
 		const bool cascades = !use_rt && !bool(GLOBAL_GET("rendering/ray_tracing/raytraced_shadows/enabled")) && RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture().is_valid();
 		v4(cascades ? 1.0f : 0.0f, 0, 0, 0);
+		// The crowns' map, for the sky's light under them (air_volume.glsl's canopy_sky).
+		float cp[16] = {};
+		fog_canopied = (fog_canopy_shade > 0.0f || canopy_haze_density > 0.0f) && get_sun_shadow_canopy(fog_canopy_rd, fog_canopy_ground_rd, cp);
+		v4(cp[0], cp[1], cp[2], cp[3]);
+		v4(cp[4], fog_canopied ? cp[15] * CLAMP(fog_canopy_shade, 0.0f, 1.0f) : 0.0f, fog_canopied ? 1.0f : 0.0f, cp[14]);
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -574,6 +579,7 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 			// The clouds' panorama: the sky's light from above under them (a frame late: the march makes it after this).
 			const RD::Uniform u_panorama(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>({ sampler, cloud_panorama_rd.is_valid() ? cloud_panorama_rd : shadow_rd }));
 			u.push_back(u_panorama);
+			u.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>({ sampler_mip, fog_canopied ? fog_canopy_rd : shadow_rd })));
 			const int inject = use_rt ? 1 : 0;
 			if (use_rt) {
 				u.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 6, Vector<RID>({ tlas })));
@@ -730,6 +736,8 @@ void AtmosphereEffect::_bind_methods() {
 	FB(fog_sky_light, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,4,0.01")
 	FB(fog_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "10,5000,1,suffix:m")
 	FB(fog_rt_distance, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,5000,1,suffix:m")
+	FB(fog_canopy_shade, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,1,0.01")
+	FB(canopy_haze_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.00001,suffix:/m")
 	FB(fog_history, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.98,0.01")
 	FB(light_color, Variant::COLOR, PROPERTY_HINT_NONE, "")
 	ADD_GROUP("Weather", "");

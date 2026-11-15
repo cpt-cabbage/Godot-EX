@@ -79,6 +79,7 @@ void SkyLook::apply(const Ref<AtmosphereEffect> &p_atmosphere, float p_sun_eleva
 	p_atmosphere->set_mist_top(mist_top);
 	p_atmosphere->set_mist_falloff(mist_falloff);
 	p_atmosphere->set_fog_anisotropy(fog_anisotropy);
+	p_atmosphere->set_canopy_haze_density(canopy_haze_density);
 	p_atmosphere->set_sky_recolor(get_sky_recolor_at(p_sun_elevation));
 }
 
@@ -116,5 +117,6 @@ void SkyLook::_bind_methods() {
 	B(mist_top, Variant::FLOAT, PROPERTY_HINT_RANGE, "-5000,5000,0.1,suffix:m")
 	B(mist_falloff, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.1,2000,0.1,suffix:m")
 	B(fog_anisotropy, Variant::FLOAT, PROPERTY_HINT_RANGE, "-0.9,0.95,0.01")
+	B(canopy_haze_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,0.1,0.00001,suffix:/m")
 #undef B
 }
