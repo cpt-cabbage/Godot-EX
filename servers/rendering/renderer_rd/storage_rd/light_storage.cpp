@@ -1184,7 +1184,24 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 	r_directional_light_soft_shadows = false;
 
-	for (int i = 0; i < (int)p_lights.size(); i++) {
+	// Godot-EX: the directional lights that cast shadows are packed first. The scene shader lays the ray-traced sun
+	// shadow on directional light 0, and the traced pass takes the first shadowed directional light, so an unshadowed
+	// one earlier in the list (the meteor shower's far light, 2026-11-15) took the moon's shadow and left the moon
+	// unshadowed.
+	LocalVector<int> light_order;
+	light_order.reserve(p_lights.size());
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < (int)p_lights.size(); i++) {
+			LightInstance *li = light_instance_owner.get_or_null(p_lights[i]);
+			Light *l = li ? light_owner.get_or_null(li->light) : nullptr;
+			const bool first = l != nullptr && l->type == RSE::LIGHT_DIRECTIONAL && l->shadow;
+			if (first == (pass == 0)) {
+				light_order.push_back(i);
+			}
+		}
+	}
+
+	for (int i : light_order) {
 		LightInstance *light_instance = light_instance_owner.get_or_null(p_lights[i]);
 		if (!light_instance) {
 			continue;
