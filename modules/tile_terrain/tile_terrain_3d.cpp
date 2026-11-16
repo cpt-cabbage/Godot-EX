@@ -602,7 +602,7 @@ void TileTerrain3D::_paint_masks(uint8_t *p_pixels, int p_level, const Vector2i 
 	const int step = 1 << p_level;
 	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
 		const PaintPage &pg = kv.value;
-		if (pg.mask_values.is_empty()) {
+		if (pg.values[PAINT_MASKS].is_empty()) {
 			continue;
 		}
 		const int pc0 = kv.key.x * PAINT_PAGE, pr0 = kv.key.y * PAINT_PAGE;
@@ -612,8 +612,8 @@ void TileTerrain3D::_paint_masks(uint8_t *p_pixels, int p_level, const Vector2i 
 			const int r = p_origin.y + y * step - pr0;
 			for (int x = x0; x <= x1; x++) {
 				const int col = p_origin.x + x * step - pc0;
-				const uint8_t *v = pg.mask_values.ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
-				const uint8_t *wt = pg.mask_weights.ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				const uint8_t *v = pg.values[PAINT_MASKS].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				const uint8_t *wt = pg.weights[PAINT_MASKS].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
 				uint8_t *px = p_pixels + (int64_t(y) * CLIP_SIZE + x) * 4;
 				for (int ch = 0; ch < 4; ch++) {
 					if (wt[ch] != 0) {
@@ -640,16 +640,19 @@ void TileTerrain3D::_painted_sample(int p_column, int p_row, uint8_t *r_mask, ui
 		return;
 	}
 	const int64_t at = (int64_t(p_row - key.y * PAINT_PAGE) * PAINT_PAGE + (p_column - key.x * PAINT_PAGE)) * 4;
-	if (r_mask != nullptr && !pg->mask_values.is_empty()) {
+	if (r_mask != nullptr && !pg->values[PAINT_MASKS].is_empty()) {
 		for (int ch = 0; ch < 4; ch++) {
-			const int v = pg->mask_values[at + ch], wt = pg->mask_weights[at + ch];
+			const int v = pg->values[PAINT_MASKS][at + ch], wt = pg->weights[PAINT_MASKS][at + ch];
 			if (wt != 0) {
 				r_mask[ch] = uint8_t(int(r_mask[ch]) + ((v - int(r_mask[ch])) * wt + (v >= r_mask[ch] ? 127 : -127)) / 255);
 			}
 		}
 	}
-	if (r_user != nullptr && !pg->user.is_empty()) {
-		memcpy(r_user, pg->user.ptr() + at, 4);
+	if (r_user != nullptr && !pg->values[PAINT_USER].is_empty()) {
+		for (int ch = 0; ch < 4; ch++) {
+			const int v = pg->values[PAINT_USER][at + ch], wt = pg->weights[PAINT_USER][at + ch];
+			r_user[ch] = uint8_t(128 + ((v - 128) * wt + (v >= 128 ? 127 : -127)) / 255);
+		}
 	}
 }
 
@@ -665,7 +668,7 @@ Ref<Image> TileTerrain3D::_clip_user(int p_level, const Vector2i &p_origin) cons
 	}
 	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
 		const PaintPage &pg = kv.value;
-		if (pg.user.is_empty()) {
+		if (pg.values[PAINT_USER].is_empty()) {
 			continue;
 		}
 		const int pc0 = kv.key.x * PAINT_PAGE, pr0 = kv.key.y * PAINT_PAGE;
@@ -675,35 +678,134 @@ Ref<Image> TileTerrain3D::_clip_user(int p_level, const Vector2i &p_origin) cons
 			const int r = p_origin.y + y * step - pr0;
 			for (int x = x0; x <= x1; x++) {
 				const int col = p_origin.x + x * step - pc0;
-				memcpy(w + (int64_t(y) * CLIP_SIZE + x) * 4, pg.user.ptr() + (int64_t(r) * PAINT_PAGE + col) * 4, 4);
+				const uint8_t *v = pg.values[PAINT_USER].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				const uint8_t *wt = pg.weights[PAINT_USER].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				uint8_t *px = w + (int64_t(y) * CLIP_SIZE + x) * 4;
+				for (int ch = 0; ch < 4; ch++) {
+					px[ch] = uint8_t(128 + ((int(v[ch]) - 128) * int(wt[ch]) + (v[ch] >= 128 ? 127 : -127)) / 255);
+				}
 			}
 		}
 	}
 	return image;
 }
 
-void TileTerrain3D::set_paint_page(const Vector2i &p_page, const PackedByteArray &p_mask_values, const PackedByteArray &p_mask_weights, const PackedByteArray &p_user) {
+void TileTerrain3D::set_paint_page(const Vector2i &p_page, PaintSet p_set, const PackedByteArray &p_values, const PackedByteArray &p_weights) {
 	const int64_t full = int64_t(PAINT_PAGE) * PAINT_PAGE * 4;
-	ERR_FAIL_COND_MSG(p_mask_values.size() != p_mask_weights.size() || (p_mask_values.size() != 0 && p_mask_values.size() != full) || (p_user.size() != 0 && p_user.size() != full),
+	ERR_FAIL_INDEX(int(p_set), 2);
+	ERR_FAIL_COND_MSG(p_values.size() != p_weights.size() || (p_values.size() != 0 && p_values.size() != full),
 			"TileTerrain3D: a paint page's arrays are PAINT_PAGE * PAINT_PAGE * 4 bytes, or empty");
 	MutexLock lock(paint_mutex);
 	paint_revision++;
-	if (p_mask_values.is_empty() && p_user.is_empty()) {
-		paint_pages.erase(p_page);
+	if (p_values.is_empty()) {
+		PaintPage *pg = paint_pages.getptr(p_page);
+		if (pg != nullptr) {
+			pg->values[p_set].clear();
+			pg->weights[p_set].clear();
+			if (pg->values[0].is_empty() && pg->values[1].is_empty()) {
+				paint_pages.erase(p_page);
+			}
+		}
 		return;
 	}
 	PaintPage &pg = paint_pages[p_page];
-	pg.mask_values.resize(uint32_t(p_mask_values.size()));
-	pg.mask_weights.resize(uint32_t(p_mask_weights.size()));
-	pg.user.resize(uint32_t(p_user.size()));
-	if (!p_mask_values.is_empty()) {
-		memcpy(pg.mask_values.ptr(), p_mask_values.ptr(), size_t(full));
-		memcpy(pg.mask_weights.ptr(), p_mask_weights.ptr(), size_t(full));
-	}
-	if (!p_user.is_empty()) {
-		memcpy(pg.user.ptr(), p_user.ptr(), size_t(full));
+	pg.values[p_set].resize(uint32_t(full));
+	pg.weights[p_set].resize(uint32_t(full));
+	memcpy(pg.values[p_set].ptr(), p_values.ptr(), size_t(full));
+	memcpy(pg.weights[p_set].ptr(), p_weights.ptr(), size_t(full));
+	if (p_set == PAINT_USER) {
 		paint_has_user = true;
 	}
+}
+
+Array TileTerrain3D::get_paint_page(const Vector2i &p_page, PaintSet p_set) const {
+	PackedByteArray values, weights;
+	Array out;
+	ERR_FAIL_INDEX_V(int(p_set), 2, out);
+	MutexLock lock(paint_mutex);
+	const PaintPage *pg = paint_pages.getptr(p_page);
+	if (pg != nullptr && !pg->values[p_set].is_empty()) {
+		values.resize(pg->values[p_set].size());
+		weights.resize(pg->weights[p_set].size());
+		memcpy(values.ptrw(), pg->values[p_set].ptr(), pg->values[p_set].size());
+		memcpy(weights.ptrw(), pg->weights[p_set].ptr(), pg->weights[p_set].size());
+	}
+	out.push_back(values);
+	out.push_back(weights);
+	return out;
+}
+
+TypedArray<Vector2i> TileTerrain3D::get_paint_pages() const {
+	TypedArray<Vector2i> out;
+	MutexLock lock(paint_mutex);
+	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+		out.push_back(kv.key);
+	}
+	return out;
+}
+
+Rect2i TileTerrain3D::paint_stamp(PaintSet p_set, int p_channel, const Vector2 &p_centre, float p_radius, float p_hardness, float p_strength, float p_value, bool p_erase) {
+	ERR_FAIL_INDEX_V(int(p_set), 2, Rect2i());
+	ERR_FAIL_INDEX_V(p_channel, 4, Rect2i());
+	if (p_radius <= 0.0f || p_strength <= 0.0f || samples <= 0) {
+		return Rect2i();
+	}
+	const float hardness = CLAMP(p_hardness, 0.0f, 0.999f);
+	const float strength = MIN(p_strength, 1.0f);
+	const float value = CLAMP(p_value, 0.0f, 1.0f) * 255.0f;
+	const int c0 = MAX(int(Math::floor(p_centre.x - p_radius)), 0), c1 = MIN(int(Math::ceil(p_centre.x + p_radius)), samples - 1);
+	const int r0 = MAX(int(Math::floor(p_centre.y - p_radius)), 0), r1 = MIN(int(Math::ceil(p_centre.y + p_radius)), samples - 1);
+	if (c0 > c1 || r0 > r1) {
+		return Rect2i();
+	}
+	const size_t full = size_t(PAINT_PAGE) * PAINT_PAGE * 4;
+	MutexLock lock(paint_mutex);
+	paint_revision++;
+	for (int py = r0 / PAINT_PAGE; py <= r1 / PAINT_PAGE; py++) {
+		for (int px = c0 / PAINT_PAGE; px <= c1 / PAINT_PAGE; px++) {
+			const Vector2i key(px, py);
+			PaintPage *pg = paint_pages.getptr(key);
+			if (pg == nullptr || pg->values[p_set].is_empty()) {
+				if (p_erase) {
+					continue; // nothing painted there
+				}
+				PaintPage &made = paint_pages[key];
+				made.values[p_set].resize(uint32_t(full));
+				made.weights[p_set].resize(uint32_t(full));
+				memset(made.values[p_set].ptr(), p_set == PAINT_USER ? 128 : 0, full);
+				memset(made.weights[p_set].ptr(), 0, full);
+				pg = &made;
+			}
+			uint8_t *vals = pg->values[p_set].ptr();
+			uint8_t *wts = pg->weights[p_set].ptr();
+			for (int r = MAX(r0, py * PAINT_PAGE); r <= MIN(r1, py * PAINT_PAGE + PAINT_PAGE - 1); r++) {
+				for (int col = MAX(c0, px * PAINT_PAGE); col <= MIN(c1, px * PAINT_PAGE + PAINT_PAGE - 1); col++) {
+					const float d = Vector2(float(col) - p_centre.x, float(r) - p_centre.y).length() / p_radius;
+					if (d >= 1.0f) {
+						continue;
+					}
+					float fall = d <= hardness ? 1.0f : 1.0f - (d - hardness) / (1.0f - hardness);
+					fall = fall * fall * (3.0f - 2.0f * fall);
+					const float a = strength * fall;
+					const int64_t at = (int64_t(r - py * PAINT_PAGE) * PAINT_PAGE + (col - px * PAINT_PAGE)) * 4 + p_channel;
+					const float w0 = wts[at] / 255.0f;
+					if (p_erase) {
+						wts[at] = uint8_t(w0 * (1.0f - a) * 255.0f + 0.5f);
+					} else {
+						const float nw = w0 + a * (1.0f - w0);
+						if (nw > 0.0f) {
+							vals[at] = uint8_t(CLAMP((float(vals[at]) * w0 * (1.0f - a) + value * a) / nw, 0.0f, 255.0f) + 0.5f);
+						}
+						wts[at] = uint8_t(MIN(nw, 1.0f) * 255.0f + 0.5f);
+					}
+				}
+			}
+		}
+	}
+	if (p_set == PAINT_USER && !p_erase) {
+		paint_has_user = true;
+	}
+	return Rect2i(c0, r0, c1 - c0 + 1, r1 - r0 + 1);
 }
 
 void TileTerrain3D::clear_paint() {
@@ -1466,7 +1568,12 @@ void TileTerrain3D::_notification(int p_what) {
 }
 
 void TileTerrain3D::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("set_paint_page", "page", "mask_values", "mask_weights", "user"), &TileTerrain3D::set_paint_page);
+	ClassDB::bind_method(D_METHOD("set_paint_page", "page", "set", "values", "weights"), &TileTerrain3D::set_paint_page);
+	ClassDB::bind_method(D_METHOD("get_paint_page", "page", "set"), &TileTerrain3D::get_paint_page);
+	ClassDB::bind_method(D_METHOD("get_paint_pages"), &TileTerrain3D::get_paint_pages);
+	ClassDB::bind_method(D_METHOD("paint_stamp", "set", "channel", "centre", "radius", "hardness", "strength", "value", "erase"), &TileTerrain3D::paint_stamp);
+	BIND_ENUM_CONSTANT(PAINT_MASKS);
+	BIND_ENUM_CONSTANT(PAINT_USER);
 	ClassDB::bind_method(D_METHOD("clear_paint"), &TileTerrain3D::clear_paint);
 	ClassDB::bind_method(D_METHOD("refresh_paint", "rect", "far"), &TileTerrain3D::refresh_paint, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("get_paint_page_size"), &TileTerrain3D::get_paint_page_size);
