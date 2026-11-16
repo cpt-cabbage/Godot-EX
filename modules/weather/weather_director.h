@@ -46,6 +46,13 @@
 // wilder toward the top.
 // `current` is the weather now, surprises included, for everything that reads it.
 //
+// Overrides (2026-11-16, for weather tied to a place: projectex's Weather And Time Volumes): add_override(state,
+// weight, groups) lays a weather over the director's own for this frame's worth of calls (clear_overrides() first,
+// then one call for each, the lowest first): `weight` of the way from what is there to `state`, in the groups given
+// only (WeatherState's GROUP_*: the wind, the clouds, the mist, the precipitation, the cloud look, the light, the
+// exposure), before the surprises. The transition, the target and the cycle that drives them are untouched under it
+// (get_base()), so taking the overrides away gives the director's own weather back at once.
+//
 // The weather on the ground (2026-11-09): the temperature falls `lapse_rate` degrees a km above the valley floor (where
 // `temperature` is), so snow lies above `get_snow_line()` (1 degree) and frost above `get_freeze_line()` (0), in world
 // y. `wetness` builds while it rains (`wet_build` seconds to soak at full rain) and dries over `dry_time` (slower under
@@ -116,8 +123,21 @@ protected:
 	static void _bind_methods();
 
 public:
+	// The values' groups, as the Inspector shows them (blend_groups, WeatherDirector::add_override).
+	enum Group {
+		GROUP_WIND = 1,
+		GROUP_CLOUDS = 2,
+		GROUP_MIST = 4,
+		GROUP_PRECIPITATION = 8,
+		GROUP_CLOUD_LOOK = 16,
+		GROUP_LIGHT = 32,
+		GROUP_EXPOSURE = 64,
+		GROUP_ALL = 127,
+	};
 	// Every value of p_a and p_b mixed at p_t (the heading by the shorter way round).
 	void blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t);
+	// The same in the groups given (GROUP_* flags) only; the other groups' values are p_a's. p_a may be this state.
+	void blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t, int p_groups);
 	void copy_from(const Ref<WeatherState> &p_other);
 
 #define WEATHER_PROP(m)                \
@@ -153,6 +173,8 @@ public:
 #undef WEATHER_PROP
 };
 
+VARIANT_ENUM_CAST(WeatherState::Group);
+
 class WeatherTrigger3D;
 
 class WeatherDirector : public Node {
@@ -174,7 +196,13 @@ class WeatherDirector : public Node {
 	Ref<WeatherState> from_state;
 	Ref<WeatherState> target;
 	Ref<WeatherState> blended; // from -> target
-	Ref<WeatherState> current; // blended + surprises
+	Ref<WeatherState> current; // blended + overrides + surprises
+	struct Override {
+		Ref<WeatherState> state;
+		float weight = 0.0;
+		int groups = WeatherState::GROUP_ALL;
+	};
+	LocalVector<Override> overrides;
 	float transition_time = 0.0;
 	float transition_length = 0.0;
 	bool transitioning = false;
@@ -231,6 +259,12 @@ public:
 	void set_state_now(const Ref<WeatherState> &p_state);
 	Ref<WeatherState> get_current() const { return current; }
 	Ref<WeatherState> get_target() const { return target; }
+	// The director's own weather, under the overrides and the surprises.
+	Ref<WeatherState> get_base() const { return blended; }
+	// Weathers laid over the director's own, in the order added (above).
+	void clear_overrides() { overrides.clear(); }
+	void add_override(const Ref<WeatherState> &p_state, float p_weight, int p_groups = WeatherState::GROUP_ALL);
+	int get_override_count() const { return overrides.size(); }
 	bool is_transitioning() const { return transitioning; }
 	float get_effective_volatility() const;
 	// Advance by p_delta seconds now (tests; the director does it each frame).
