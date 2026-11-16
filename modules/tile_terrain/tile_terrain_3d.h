@@ -244,6 +244,10 @@ public:
 	void update_lods(const Vector3 &p_position);
 	void update_collision_now();
 	Dictionary get_stats() const;
+	// A surface that lies under the terrain everywhere, for occlusion culling (an ArrayOccluder3D's arrays: vertices in
+	// the node's space, indices): a grid of level `lod`'s chunks, each corner at the lowest sample of the chunks that
+	// meet there, less `margin` m. A mountain hides what stands behind it; what it hides is not drawn.
+	Array get_occluder(int p_lod, float p_margin) const;
 
 	TileTerrain3D();
 	~TileTerrain3D();

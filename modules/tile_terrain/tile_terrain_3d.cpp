@@ -986,6 +986,51 @@ Rect2 TileTerrain3D::get_bounds() const {
 	return Rect2(float(origin_north), float(origin_east), float(samples * spacing), float(samples * spacing));
 }
 
+Array TileTerrain3D::get_occluder(int p_lod, float p_margin) const {
+	Array out;
+	ERR_FAIL_COND_V(!loaded, out);
+	const int lod = CLAMP(p_lod, 0, max_lod);
+	const int n = chunks_per_side[lod];
+	const double side = double(chunk_quads) * double(1 << lod) * spacing;
+	const double extent = double(samples - 1) * spacing;
+	PackedVector3Array vertices;
+	vertices.resize((n + 1) * (n + 1));
+	Vector3 *vw = vertices.ptrw();
+	const LocalVector<Vector2> &range = chunk_range[lod];
+	for (int z = 0; z <= n; z++) {
+		for (int x = 0; x <= n; x++) {
+			float low = Math::INF;
+			for (int dz = -1; dz <= 0; dz++) {
+				for (int dx = -1; dx <= 0; dx++) {
+					const int cx = x + dx, cz = z + dz;
+					if (cx >= 0 && cz >= 0 && cx < n && cz < n) {
+						low = MIN(low, range[cz * n + cx].x);
+					}
+				}
+			}
+			vw[z * (n + 1) + x] = Vector3(float(origin_north + MIN(x * side, extent)), low - p_margin, float(origin_east + MIN(z * side, extent)));
+		}
+	}
+	PackedInt32Array indices;
+	indices.resize(n * n * 6);
+	int32_t *iw = indices.ptrw();
+	for (int z = 0; z < n; z++) {
+		for (int x = 0; x < n; x++) {
+			const int a = z * (n + 1) + x, b = a + 1, c = a + (n + 1), d = c + 1;
+			int32_t *q = iw + (z * n + x) * 6;
+			q[0] = a;
+			q[1] = c;
+			q[2] = b;
+			q[3] = b;
+			q[4] = c;
+			q[5] = d;
+		}
+	}
+	out.push_back(vertices);
+	out.push_back(indices);
+	return out;
+}
+
 Dictionary TileTerrain3D::get_stats() const {
 	Dictionary d;
 	d["loaded"] = loaded;
@@ -1100,6 +1145,7 @@ void TileTerrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_lods", "position"), &TileTerrain3D::update_lods);
 	ClassDB::bind_method(D_METHOD("update_collision_now"), &TileTerrain3D::update_collision_now);
 	ClassDB::bind_method(D_METHOD("get_stats"), &TileTerrain3D::get_stats);
+	ClassDB::bind_method(D_METHOD("get_occluder", "lod", "margin"), &TileTerrain3D::get_occluder);
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "data_path", PROPERTY_HINT_DIR), "set_data_path", "get_data_path");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "material", PROPERTY_HINT_RESOURCE_TYPE, "ShaderMaterial,StandardMaterial3D"), "set_material", "get_material");
