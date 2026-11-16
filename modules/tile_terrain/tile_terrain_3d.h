@@ -130,6 +130,21 @@ private:
 	String masks_path;
 	Ref<Texture2DArray> clip_heights;
 	Ref<Texture2DArray> clip_masks;
+	// The ground's slopes, worked out here once and not from four to twelve height reads a pixel in a material
+	// (2026-11-16; projectex's ground read them in the depth pass and again in the colour pass: 1.4 ms of a 4K frame
+	// from the air). A window a level as the heights', RGBA16, each value a slope s (m a m) as s / (1 + |s|), halved and
+	// lifted by a half (a reader: e = 2 v - 1, s = e / (1 - |e|)): no slope is cut off, a cliff's face of 20 or 200 m a m
+	// keeps its own (held at 8, as first built, the sunlit faces from the air fell otherwise: 0.06 % of the valley's
+	// samples, its steepest faces), and level ground has steps of 0.00003. R, G the rise along X and Z across one
+	// sample of the level each way; B, A the same through a
+	// Sobel stencil two samples each way and three rows wide, which averages out the heights' own 3 cm steps (what a
+	// material wants within reach of a low light). The far map's: R, G alone, as half floats, with its mipmaps.
+	// Global shader parameters terrain_slopes_clip and terrain_slopes_far.
+	Ref<Texture2DArray> clip_slopes;
+	Ref<ImageTexture> slope_texture; // the far map's
+	Ref<Image> far_slopes_image;
+	Ref<Image> _clip_slopes(int p_level, const Vector2i &p_origin) const;
+	void _build_far_slopes();
 	Vector2i clip_origin[3]; // each level's first sample (column, row); a multiple of its step
 	uint64_t clip_updates = 0;
 	double clip_update_ms = 0.0;
@@ -143,13 +158,14 @@ private:
 		WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
 		Ref<Image> heights;
 		Ref<Image> masks;
+		Ref<Image> slopes;
 	};
 	ClipBuild clip_builds[3];
 	void _clip_job(void *p_build);
 	void _finish_clip_builds(bool p_wait_all);
 	Ref<Image> _clip_heights(int p_level, const Vector2i &p_origin) const;
 	Ref<Image> _clip_masks(int p_level, const Vector2i &p_origin) const;
-	void _publish_globals();
+	void _publish_globals(bool p_textures = true);
 	int max_lod = 0;
 	// Each level's chunks' lowest and highest sample (metres), for their boxes: [lod][z * n + x].
 	LocalVector<LocalVector<Vector2>> chunk_range;

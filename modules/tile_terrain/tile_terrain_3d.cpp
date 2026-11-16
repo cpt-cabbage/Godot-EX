@@ -281,6 +281,11 @@ Error TileTerrain3D::_load() {
 		_save_derived(derived_path, stamp);
 	}
 	height_texture = ImageTexture::create_from_image(far_heights_image);
+	if (far_slopes_image.is_null()) {
+		_build_far_slopes(); // (from the far heights alone: a moment, not kept in the file)
+	}
+	slope_texture = ImageTexture::create_from_image(far_slopes_image);
+	far_slopes_image.unref();
 	mask_texture.unref();
 	if (far_masks_image.is_valid()) {
 		mask_texture = ImageTexture::create_from_image(far_masks_image);
@@ -372,6 +377,8 @@ void TileTerrain3D::register_globals() {
 	registered = true;
 	rs->global_shader_parameter_add("terrain_heights_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
 	rs->global_shader_parameter_add("terrain_masks_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
+	rs->global_shader_parameter_add("terrain_slopes_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
+	rs->global_shader_parameter_add("terrain_slopes_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_heights_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_masks_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_clip_01", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
@@ -563,6 +570,59 @@ Ref<Image> TileTerrain3D::_clip_masks(int p_level, const Vector2i &p_origin) con
 	return image;
 }
 
+// A level's window of slopes (see the header): at each of its samples, the rise along X and Z across one of the
+// level's samples each way, and the same through the Sobel stencil two of them each way.
+Ref<Image> TileTerrain3D::_clip_slopes(int p_level, const Vector2i &p_origin) const {
+	const int step = 1 << p_level;
+	Ref<Image> image = Image::create_empty(CLIP_SIZE, CLIP_SIZE, false, Image::FORMAT_RGBA16);
+	uint16_t *w = (uint16_t *)image->ptrw();
+	const float to_m = float(height_range / 65535.0);
+	const float across = to_m / float(2.0 * step * spacing);
+	const int far = 2 * step;
+	const float sobel = to_m / float(8.0 * far * spacing);
+	const int last = samples - 1;
+#define TT_H(m_c, m_r) float(heights[int64_t(CLAMP(m_r, 0, last)) * samples + CLAMP(m_c, 0, last)])
+#define TT_PACK(m_v) uint16_t(((m_v) / (1.0f + Math::abs(m_v)) * 0.5f + 0.5f) * 65535.0f + 0.5f)
+	for (int y = 0; y < CLIP_SIZE; y++) {
+		const int r = p_origin.y + y * step;
+		for (int x = 0; x < CLIP_SIZE; x++) {
+			const int c = p_origin.x + x * step;
+			uint16_t *o = w + (int64_t(y) * CLIP_SIZE + x) * 4;
+			o[0] = TT_PACK((TT_H(c + step, r) - TT_H(c - step, r)) * across);
+			o[1] = TT_PACK((TT_H(c, r + step) - TT_H(c, r - step)) * across);
+			const float a = TT_H(c - far, r - far), b = TT_H(c, r - far), d = TT_H(c + far, r - far);
+			const float e = TT_H(c - far, r), g = TT_H(c + far, r);
+			const float h = TT_H(c - far, r + far), i = TT_H(c, r + far), j = TT_H(c + far, r + far);
+			o[2] = TT_PACK(((d + 2.0f * g + j) - (a + 2.0f * e + h)) * sobel);
+			o[3] = TT_PACK(((h + 2.0f * i + j) - (a + 2.0f * b + d)) * sobel);
+		}
+	}
+#undef TT_PACK
+#undef TT_H
+	return image;
+}
+
+// The far map's slopes: across one of its samples each way, from its own (averaged) heights, with mipmaps.
+void TileTerrain3D::_build_far_slopes() {
+	ERR_FAIL_COND(far_heights_image.is_null());
+	const int n = far_heights_image->get_width();
+	const uint16_t *h = (const uint16_t *)far_heights_image->ptr(); // the first level comes first
+	Ref<Image> image = Image::create_empty(n, n, false, Image::FORMAT_RGF);
+	float *w = (float *)image->ptrw();
+	const float across = float(height_range / 65535.0) / float(2.0 * FAR_STEP * spacing);
+	for (int y = 0; y < n; y++) {
+		const int ya = MAX(y - 1, 0), yb = MIN(y + 1, n - 1);
+		for (int x = 0; x < n; x++) {
+			const int xa = MAX(x - 1, 0), xb = MIN(x + 1, n - 1);
+			w[(int64_t(y) * n + x) * 2] = (float(h[int64_t(y) * n + xb]) - float(h[int64_t(y) * n + xa])) * across;
+			w[(int64_t(y) * n + x) * 2 + 1] = (float(h[int64_t(yb) * n + x]) - float(h[int64_t(ya) * n + x])) * across;
+		}
+	}
+	image->generate_mipmaps();
+	image->convert(Image::FORMAT_RGH);
+	far_slopes_image = image;
+}
+
 // Each level's window centred on the camera (local position), its origin snapped to an eighth of the window: re-made
 // when the camera has moved that far.
 void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
@@ -570,7 +630,7 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 	const double col = (p_local.x - origin_north) / spacing;
 	const double row = (p_local.z - origin_east) / spacing;
 	bool changed = false;
-	Vector<Ref<Image>> h_layers, m_layers;
+	Vector<Ref<Image>> h_layers, m_layers, s_layers;
 	const bool now = p_force || clip_heights.is_null();
 	if (!now) {
 		_finish_clip_builds(false);
@@ -605,11 +665,14 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 	for (int level = 0; level < CLIP_LEVELS; level++) {
 		h_layers.push_back(_clip_heights(level, clip_origin[level]));
 		m_layers.push_back(_clip_masks(level, clip_origin[level]));
+		s_layers.push_back(_clip_slopes(level, clip_origin[level]));
 	}
 	clip_heights.instantiate();
 	clip_heights->create_from_images(h_layers);
 	clip_masks.instantiate();
 	clip_masks->create_from_images(m_layers);
+	clip_slopes.instantiate();
+	clip_slopes->create_from_images(s_layers);
 	clip_updates++;
 	clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 	_publish_globals();
@@ -619,6 +682,7 @@ void TileTerrain3D::_clip_job(void *p_build) {
 	ClipBuild *b = (ClipBuild *)p_build;
 	b->heights = _clip_heights(b->level, b->origin);
 	b->masks = _clip_masks(b->level, b->origin);
+	b->slopes = _clip_slopes(b->level, b->origin);
 }
 
 // Finished builds go up, a level a frame (its two layers and its origin together, so a shader never reads one with the
@@ -641,8 +705,11 @@ void TileTerrain3D::_finish_clip_builds(bool p_wait_all) {
 		const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
 		clip_heights->update_layer(b.heights, b.level);
 		clip_masks->update_layer(b.masks, b.level);
+		clip_slopes->update_layer(b.slopes, b.level);
 		clip_origin[b.level] = b.origin;
-		_publish_globals();
+		// (the frames alone: the textures are the same ones with a layer sent again, and setting a texture global makes
+		// every material that reads it bind its textures anew, the ground's, the blades' and every plant's)
+		_publish_globals(false);
 		clip_updates++;
 		clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 		b = ClipBuild();
@@ -650,13 +717,17 @@ void TileTerrain3D::_finish_clip_builds(bool p_wait_all) {
 	}
 }
 
-void TileTerrain3D::_publish_globals() {
+void TileTerrain3D::_publish_globals(bool p_textures) {
 	register_globals();
 	RenderingServer *rs = RS::get_singleton();
-	rs->global_shader_parameter_set("terrain_heights_clip", clip_heights);
-	rs->global_shader_parameter_set("terrain_masks_clip", clip_masks);
-	rs->global_shader_parameter_set("terrain_heights_far", height_texture);
-	rs->global_shader_parameter_set("terrain_masks_far", mask_texture);
+	if (p_textures) {
+		rs->global_shader_parameter_set("terrain_heights_clip", clip_heights);
+		rs->global_shader_parameter_set("terrain_masks_clip", clip_masks);
+		rs->global_shader_parameter_set("terrain_slopes_clip", clip_slopes);
+		rs->global_shader_parameter_set("terrain_heights_far", height_texture);
+		rs->global_shader_parameter_set("terrain_masks_far", mask_texture);
+		rs->global_shader_parameter_set("terrain_slopes_far", slope_texture);
+	}
 	rs->global_shader_parameter_set("terrain_clip_01", Vector4(clip_origin[0].x, clip_origin[0].y, clip_origin[1].x, clip_origin[1].y));
 	rs->global_shader_parameter_set("terrain_clip_2", Vector4(clip_origin[2].x, clip_origin[2].y, CLIP_SIZE, FAR_STEP));
 	rs->global_shader_parameter_set("terrain_frame", Vector4(origin_north, origin_east, spacing, samples));
