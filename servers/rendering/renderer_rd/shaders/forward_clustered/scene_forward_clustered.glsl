@@ -895,20 +895,26 @@ void main() {
 	// render_mode static_motion_vectors: the vertex as it stands now, seen by last frame's camera (the camera's motion
 	// alone; the shader's own animation is left out, and vertex() has run once). A shader that writes PREV_VERTEX has
 	// said where the vertex stood: that point, seen by last frame's camera.
+	// From this frame's view space to last frame's without passing through world space: the two cameras' places are
+	// taken from each other first. Kilometres from the origin a world position is a fraction of a millimetre coarse,
+	// which near the camera is a fraction of a pixel of noise in every vertex's motion, and a temporal upscaler
+	// blurs what jitters so (projectex's blades of grass 3 km out; a camera standing still gives the point itself).
 	{
 		mat4 inv_view_now = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
 				scene_data_block.data.inv_view_matrix[1],
 				scene_data_block.data.inv_view_matrix[2],
 				vec4(0.0, 0.0, 0.0, 1.0)));
-		mat4 view_before = transpose(mat4(scene_data_block.prev_data.view_matrix[0],
-				scene_data_block.prev_data.view_matrix[1],
-				scene_data_block.prev_data.view_matrix[2],
+		mat4 inv_view_before = transpose(mat4(scene_data_block.prev_data.inv_view_matrix[0],
+				scene_data_block.prev_data.inv_view_matrix[1],
+				scene_data_block.prev_data.inv_view_matrix[2],
 				vec4(0.0, 0.0, 0.0, 1.0)));
 #if defined(PREV_VERTEX_USED) && !defined(STATIC_MOTION_VECTORS)
-		prev_screen_position = scene_data_block.prev_data.projection_matrix * (view_before * (inv_view_now * vec4(prev_vertex_view, 1.0)));
+		vec3 view_point = prev_vertex_view;
 #else
-		prev_screen_position = scene_data_block.prev_data.projection_matrix * (view_before * (inv_view_now * vec4(vertex_interp, 1.0)));
+		vec3 view_point = vertex_interp;
 #endif
+		vec3 from_camera_before = mat3(inv_view_now) * view_point + (inv_view_now[3].xyz - inv_view_before[3].xyz);
+		prev_screen_position = scene_data_block.prev_data.projection_matrix * vec4(transpose(mat3(inv_view_before)) * from_camera_before, 1.0);
 	}
 #endif
 }
