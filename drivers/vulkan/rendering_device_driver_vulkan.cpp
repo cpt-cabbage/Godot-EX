@@ -5438,6 +5438,10 @@ bool RenderingDeviceDriverVulkan::pipeline_cache_create(const Vector<uint8_t> &p
 		}
 	}
 
+	// The driver has its own copy now: the file's bytes are not held for the run (Godot-EX, 2026-11-16: a project's
+	// cache of 549 MB stood in memory twice from the first second). The header stays; a save makes the buffer again.
+	pipelines_cache.buffer.resize(sizeof(PipelineCacheHeader));
+
 	return true;
 }
 
@@ -5479,7 +5483,10 @@ Vector<uint8_t> RenderingDeviceDriverVulkan::pipeline_cache_serialize() {
 	header->data_size = pipelines_cache.current_size;
 	header->data_hash = hash_murmur3_buffer(pipelines_cache.buffer.ptr() + sizeof(PipelineCacheHeader), pipelines_cache.current_size);
 
-	return pipelines_cache.buffer;
+	// The caller's to write and drop: only the header is kept between saves.
+	Vector<uint8_t> blob = pipelines_cache.buffer;
+	pipelines_cache.buffer.resize(sizeof(PipelineCacheHeader));
+	return blob;
 }
 
 /*******************/

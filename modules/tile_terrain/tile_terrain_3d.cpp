@@ -179,15 +179,16 @@ Error TileTerrain3D::_load() {
 	ERR_FAIL_COND_V_MSG(samples < 2 || samples > 16384 || spacing <= 0.0, ERR_FILE_CORRUPT, "TileTerrain3D: bad samples or spacing in " + meta_path);
 	const int64_t count = int64_t(samples) * samples;
 
-	// Heights: the CPU copy (chunks, collision, get_height) and a 16-bit texture with a mip chain averaged here
-	// (Image's own mipmapper has no 16-bit path).
-	{
-		Ref<FileAccess> f = FileAccess::open(data_path.path_join(String(meta["heights"])), FileAccess::READ);
-		ERR_FAIL_COND_V_MSG(f.is_null(), ERR_FILE_NOT_FOUND, "TileTerrain3D: cannot open the heights");
-		ERR_FAIL_COND_V_MSG(int64_t(f->get_length()) != count * 2, ERR_FILE_CORRUPT, "TileTerrain3D: the heights file is not samples^2 x 2 bytes");
-		heights.resize(count);
-		f->get_buffer((uint8_t *)heights.ptrw(), count * 2);
+	// Heights: the file mapped (chunks, collision, get_height read it where they need it).
+	const String heights_path = data_path.path_join(String(meta["heights"]));
+	heights = nullptr;
+	heights_file = MappedFile::open_shared(heights_path);
+	ERR_FAIL_COND_V_MSG(heights_file.is_null(), ERR_FILE_NOT_FOUND, "TileTerrain3D: cannot open the heights");
+	if (int64_t(heights_file->get_size()) != count * 2) {
+		heights_file.unref();
+		ERR_FAIL_V_MSG(ERR_FILE_CORRUPT, "TileTerrain3D: the heights file is not samples^2 x 2 bytes");
 	}
+	heights = (const uint16_t *)heights_file->ptr();
 	// Masks: read from their file as the windows need them (and once for the far map), not kept.
 	masks_path = String();
 	if (meta.has("masks")) {
@@ -199,8 +200,6 @@ Error TileTerrain3D::_load() {
 			WARN_PRINT("TileTerrain3D: no masks (missing, or not samples^2 x 4 bytes)");
 		}
 	}
-	_build_far();
-	_update_clip(Vector3(origin_north + spacing * samples * 0.5, 0.0, origin_east + spacing * samples * 0.5), true);
 
 	// The quadtree's levels and each chunk's height range.
 	chunks_per_side.clear();
@@ -212,62 +211,83 @@ Error TileTerrain3D::_load() {
 		chunks_per_side.push_back(n);
 	}
 	max_lod = int(chunks_per_side.size()) - 1;
-	chunk_range.resize(chunks_per_side.size());
-	{
-		const int n0 = chunks_per_side[0];
-		LocalVector<Vector2> &r0 = chunk_range[0];
-		r0.resize(n0 * n0);
-		for (Vector2 &v : r0) {
-			v = Vector2(Math::INF, -Math::INF);
-		}
-		// Rows in parallel bands of chunks.
-		struct Ctx {
-			const TileTerrain3D *t;
-			LocalVector<Vector2> *r0;
-			int n0;
-		} ctx{ this, &r0, n0 };
-		auto band = [](void *p_ctx, uint32_t p_band) {
-			Ctx *c = (Ctx *)p_ctx;
-			const int q = c->t->chunk_quads;
-			const int s = c->t->samples;
-			for (int row = p_band * q; row <= MIN(int(p_band + 1) * q, s - 1); row++) {
-				const uint16_t *line = c->t->heights.ptr() + int64_t(row) * s;
-				for (int cx = 0; cx < c->n0; cx++) {
-					uint16_t lo = 65535, hi = 0;
-					for (int col = cx * q; col <= MIN((cx + 1) * q, s - 1); col++) {
-						lo = MIN(lo, line[col]);
-						hi = MAX(hi, line[col]);
-					}
-					Vector2 &v = (*c->r0)[int64_t(p_band) * c->n0 + cx];
-					v.x = MIN(v.x, float(c->t->height_min + c->t->height_range * lo / 65535.0));
-					v.y = MAX(v.y, float(c->t->height_min + c->t->height_range * hi / 65535.0));
-				}
-			}
-		};
-		WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_native_group_task(band, &ctx, n0, -1, true, "TileTerrain3D ranges");
-		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
+	// The far maps and each chunk's range and error: from their file while it is these heights' and masks', else worked
+	// out from every sample and kept.
+	uint64_t stamp = hash_djb2_one_64(uint64_t(samples), hash_djb2_one_64(uint64_t(chunk_quads), hash_djb2_one_64(uint64_t(FAR_STEP), 0x7474643031ULL)));
+	stamp = hash_djb2_one_64(heights_file->get_size(), hash_djb2_one_64(FileAccess::get_modified_time(heights_path), stamp));
+	if (!masks_path.is_empty()) {
+		stamp = hash_djb2_one_64(FileAccess::get_modified_time(masks_path), stamp);
 	}
-	for (int l = 1; l <= max_lod; l++) {
-		const int nc = chunks_per_side[l], nf = chunks_per_side[l - 1];
-		chunk_range[l].resize(nc * nc);
-		for (int z = 0; z < nc; z++) {
-			for (int x = 0; x < nc; x++) {
-				Vector2 v(Math::INF, -Math::INF);
-				for (int dz = 0; dz < 2; dz++) {
-					for (int dx = 0; dx < 2; dx++) {
-						const int fx = x * 2 + dx, fz = z * 2 + dz;
-						if (fx < nf && fz < nf) {
-							const Vector2 &f = chunk_range[l - 1][fz * nf + fx];
-							v.x = MIN(v.x, f.x);
-							v.y = MAX(v.y, f.y);
+	stamp = hash_djb2_one_64(uint64_t(float(height_min) * 1000.0 + 1e6), hash_djb2_one_64(uint64_t(float(height_range) * 1000.0), hash_djb2_one_64(uint64_t(spacing * 1e6), stamp)));
+	const String derived_path = data_path.path_join("terrain_derived.bin");
+	if (!_load_derived(derived_path, stamp)) {
+		_build_far();
+		chunk_range.resize(chunks_per_side.size());
+		{
+			const int n0 = chunks_per_side[0];
+			LocalVector<Vector2> &r0 = chunk_range[0];
+			r0.resize(n0 * n0);
+			for (Vector2 &v : r0) {
+				v = Vector2(Math::INF, -Math::INF);
+			}
+			// Rows in parallel bands of chunks.
+			struct Ctx {
+				const TileTerrain3D *t;
+				LocalVector<Vector2> *r0;
+				int n0;
+			} ctx{ this, &r0, n0 };
+			auto band = [](void *p_ctx, uint32_t p_band) {
+				Ctx *c = (Ctx *)p_ctx;
+				const int q = c->t->chunk_quads;
+				const int s = c->t->samples;
+				for (int row = p_band * q; row <= MIN(int(p_band + 1) * q, s - 1); row++) {
+					const uint16_t *line = c->t->heights + int64_t(row) * s;
+					for (int cx = 0; cx < c->n0; cx++) {
+						uint16_t lo = 65535, hi = 0;
+						for (int col = cx * q; col <= MIN((cx + 1) * q, s - 1); col++) {
+							lo = MIN(lo, line[col]);
+							hi = MAX(hi, line[col]);
+						}
+						Vector2 &v = (*c->r0)[int64_t(p_band) * c->n0 + cx];
+						v.x = MIN(v.x, float(c->t->height_min + c->t->height_range * lo / 65535.0));
+						v.y = MAX(v.y, float(c->t->height_min + c->t->height_range * hi / 65535.0));
+					}
+				}
+			};
+			WorkerThreadPool::GroupID g = WorkerThreadPool::get_singleton()->add_native_group_task(band, &ctx, n0, -1, true, "TileTerrain3D ranges");
+			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(g);
+		}
+		for (int l = 1; l <= max_lod; l++) {
+			const int nc = chunks_per_side[l], nf = chunks_per_side[l - 1];
+			chunk_range[l].resize(nc * nc);
+			for (int z = 0; z < nc; z++) {
+				for (int x = 0; x < nc; x++) {
+					Vector2 v(Math::INF, -Math::INF);
+					for (int dz = 0; dz < 2; dz++) {
+						for (int dx = 0; dx < 2; dx++) {
+							const int fx = x * 2 + dx, fz = z * 2 + dz;
+							if (fx < nf && fz < nf) {
+								const Vector2 &f = chunk_range[l - 1][fz * nf + fx];
+								v.x = MIN(v.x, f.x);
+								v.y = MAX(v.y, f.y);
+							}
 						}
 					}
+					chunk_range[l][z * nc + x] = v;
 				}
-				chunk_range[l][z * nc + x] = v;
 			}
 		}
+		_build_errors();
+		_save_derived(derived_path, stamp);
 	}
-	_build_errors();
+	height_texture = ImageTexture::create_from_image(far_heights_image);
+	mask_texture.unref();
+	if (far_masks_image.is_valid()) {
+		mask_texture = ImageTexture::create_from_image(far_masks_image);
+	}
+	far_heights_image.unref();
+	far_masks_image.unref();
+	_update_clip(Vector3(origin_north + spacing * samples * 0.5, 0.0, origin_east + spacing * samples * 0.5), true);
 	print_verbose(vformat("TileTerrain3D: %d x %d samples at %.4f m, %d levels, loaded in %.2f s", samples, samples, spacing, max_lod + 1, (OS::get_singleton()->get_ticks_usec() - t0) / 1e6));
 	return OK;
 }
@@ -299,7 +319,7 @@ void TileTerrain3D::_build_errors() {
 			const int step = 1 << c->lod, half = step >> 1;
 			const int span = t->chunk_quads * step;
 			const int last = t->samples - 1;
-			const uint16_t *h = t->heights.ptr();
+			const uint16_t *h = t->heights;
 			const int64_t s = t->samples;
 			const float to_m = float(t->height_range / 65535.0);
 			// A midpoint's distance (squared) to the line through its edge's ends: the height's difference `dv`, the ends'
@@ -381,9 +401,9 @@ void TileTerrain3D::_build_far() {
 			}
 		}
 		image->generate_mipmaps();
-		height_texture = ImageTexture::create_from_image(image);
+		far_heights_image = image;
 	}
-	mask_texture.unref();
+	far_masks_image.unref();
 	if (!masks_path.is_empty()) {
 		Ref<FileAccess> f = FileAccess::open(masks_path, FileAccess::READ);
 		Ref<Image> image = Image::create_empty(n, n, false, Image::FORMAT_RGBA8);
@@ -414,8 +434,90 @@ void TileTerrain3D::_build_far() {
 			}
 		}
 		image->generate_mipmaps();
-		mask_texture = ImageTexture::create_from_image(image);
+		far_masks_image = image;
 	}
+}
+
+bool TileTerrain3D::_load_derived(const String &p_path, uint64_t p_stamp) {
+	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ);
+	if (f.is_null() || f->get_32() != 0x31445454 || f->get_64() != p_stamp) { // "TTD1"
+		return false;
+	}
+	const int n = (samples + FAR_STEP - 1) / FAR_STEP;
+	Ref<Image> images[2];
+	const Image::Format formats[2] = { Image::FORMAT_R16, Image::FORMAT_RGBA8 };
+	for (int i = 0; i < 2; i++) {
+		const uint64_t bytes = f->get_64();
+		if (bytes == 0) {
+			continue;
+		}
+		if (bytes != uint64_t(Image::get_image_data_size(n, n, formats[i], true))) {
+			return false;
+		}
+		Vector<uint8_t> data;
+		data.resize(int64_t(bytes));
+		if (f->get_buffer(data.ptrw(), bytes) != bytes) {
+			return false;
+		}
+		images[i] = Image::create_from_data(n, n, true, formats[i], data);
+	}
+	if (images[0].is_null() || (images[1].is_null() != masks_path.is_empty())) {
+		return false;
+	}
+	if (int(f->get_32()) != int(chunks_per_side.size())) {
+		return false;
+	}
+	LocalVector<LocalVector<Vector2>> ranges;
+	LocalVector<LocalVector<float>> errors;
+	ranges.resize(chunks_per_side.size());
+	errors.resize(chunks_per_side.size());
+	for (uint32_t l = 0; l < chunks_per_side.size(); l++) {
+		const uint32_t count = uint32_t(chunks_per_side[l] * chunks_per_side[l]);
+		if (f->get_32() != count) {
+			return false;
+		}
+		ranges[l].resize(count);
+		errors[l].resize(count);
+		if (f->get_buffer((uint8_t *)ranges[l].ptr(), uint64_t(count) * sizeof(Vector2)) != uint64_t(count) * sizeof(Vector2) ||
+				f->get_buffer((uint8_t *)errors[l].ptr(), uint64_t(count) * sizeof(float)) != uint64_t(count) * sizeof(float)) {
+			return false;
+		}
+	}
+	if (f->get_32() != 0x444e4554) { // "TEND": the file is whole
+		return false;
+	}
+	far_heights_image = images[0];
+	far_masks_image = images[1];
+	chunk_range = ranges;
+	chunk_error = errors;
+	return true;
+}
+
+void TileTerrain3D::_save_derived(const String &p_path, uint64_t p_stamp) const {
+	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::WRITE);
+	if (f.is_null()) {
+		return; // (a data folder that cannot be written: worked out again at the next start)
+	}
+	f->store_32(0x31445454);
+	f->store_64(p_stamp);
+	const Ref<Image> images[2] = { far_heights_image, far_masks_image };
+	for (int i = 0; i < 2; i++) {
+		if (images[i].is_null()) {
+			f->store_64(0);
+			continue;
+		}
+		const Vector<uint8_t> data = images[i]->get_data();
+		f->store_64(uint64_t(data.size()));
+		f->store_buffer(data.ptr(), uint64_t(data.size()));
+	}
+	f->store_32(uint32_t(chunks_per_side.size()));
+	for (uint32_t l = 0; l < chunks_per_side.size(); l++) {
+		const uint32_t count = chunk_range[l].size();
+		f->store_32(count);
+		f->store_buffer((const uint8_t *)chunk_range[l].ptr(), uint64_t(count) * sizeof(Vector2));
+		f->store_buffer((const uint8_t *)chunk_error[l].ptr(), uint64_t(count) * sizeof(float));
+	}
+	f->store_32(0x444e4554);
 }
 
 // A level's window of heights: CLIP_SIZE^2 samples every 2^level from p_origin, clamped to the map.
@@ -425,7 +527,7 @@ Ref<Image> TileTerrain3D::_clip_heights(int p_level, const Vector2i &p_origin) c
 	uint16_t *w = (uint16_t *)image->ptrw();
 	for (int y = 0; y < CLIP_SIZE; y++) {
 		const int r = CLAMP(p_origin.y + y * step, 0, samples - 1);
-		const uint16_t *row = heights.ptr() + int64_t(r) * samples;
+		const uint16_t *row = heights + int64_t(r) * samples;
 		for (int x = 0; x < CLIP_SIZE; x++) {
 			w[int64_t(y) * CLIP_SIZE + x] = row[CLAMP(p_origin.x + x * step, 0, samples - 1)];
 		}

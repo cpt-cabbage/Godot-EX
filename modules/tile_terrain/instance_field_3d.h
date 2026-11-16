@@ -52,6 +52,8 @@
 // copy has a random rank: a level draws only the copies whose rank is under its `thin` share, scaled up by
 // 1/sqrt(share) (at most 1.25x: larger, they read as coarse sticks) to keep some of the cover, so far levels draw fewer, larger tufts.
 
+#include "mapped_file.h"
+
 #include "core/math/vector4.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
@@ -102,7 +104,9 @@ class InstanceField3D : public Node3D {
 		float scale_max = 1.0;
 		float align = 1.0; // 0 upright, 1 the terrain's normal
 		uint32_t seed = 0;
-		PackedByteArray map; // weights 0-255, rows along Z, columns along X
+		PackedByteArray map_bytes; // the weights given as an array, or
+		Ref<MappedFile> map_file; // as a file, mapped: read near the viewer only, and one file serves every type on it
+		const uint8_t *map = nullptr; // weights 0-255, rows along Z, columns along X
 		int map_width = 0;
 		int map_height = 0;
 		Vector2 map_origin; // X, Z of sample (0, 0)
@@ -124,7 +128,28 @@ class InstanceField3D : public Node3D {
 		Procedural proc;
 		LocalVector<float> xf; // 12 floats a copy, MultiMesh's 3D layout (basis rows, each with the origin's component)
 		LocalVector<uint32_t> order; // copies sorted by base cell
-		LocalVector<uint32_t> cell_start; // base cell c's copies are order[cell_start[c] .. cell_start[c + 1]]
+		// The base cells that hold copies, in order, and where each one's copies start in `order` (with one more entry at
+		// the end): cell_ids[e]'s copies are order[cell_first[e] .. cell_first[e + 1]]. To 2026-11-16 every cell of the grid
+		// had a start, 1 MB a type whatever it held: 105 MB for the valley's hundred types.
+		LocalVector<uint32_t> cell_ids;
+		LocalVector<uint32_t> cell_first;
+		// The entries [r_from, r_to) of the cells p_first to p_last (a row's stretch of the grid).
+		_FORCE_INLINE_ void entries(uint32_t p_first, uint32_t p_last, uint32_t &r_from, uint32_t &r_to) const {
+			uint32_t lo = 0, hi = cell_ids.size();
+			while (lo < hi) {
+				const uint32_t mid = (lo + hi) >> 1;
+				if (cell_ids[mid] < p_first) {
+					lo = mid + 1;
+				} else {
+					hi = mid;
+				}
+			}
+			r_from = lo;
+			while (lo < cell_ids.size() && cell_ids[lo] <= p_last) {
+				lo++;
+			}
+			r_to = lo;
+		}
 		LocalVector<Level> levels;
 		bool visible = true;
 	};
@@ -195,6 +220,8 @@ class InstanceField3D : public Node3D {
 	uint64_t disturb_version = 0;
 	// Out: the copy's 12 floats disturbed into r_out; false: hidden.
 	bool _disturb(const float *p_x, float *r_out, bool p_card) const;
+	int _add_procedural(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+			float p_density, float p_scale_min, float p_scale_max, float p_align, const uint8_t *p_map, int64_t p_map_size, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed);
 	void _build_grid(Type &p_type);
 	void _set_bands(Type &p_type, bool p_light_last);
 	void _job(uint32_t p_index, Job *p_jobs);
@@ -224,6 +251,9 @@ public:
 	// A type made near the viewer from a weight map (see above); `thin`, one per level, the share of copies it draws.
 	int add_procedural_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
 			float p_density, float p_scale_min, float p_scale_max, float p_align, const PackedByteArray &p_map, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed);
+	// The same with the weight map as a file of bytes (rows of `map_width`), mapped and not read into memory.
+	int add_procedural_type_file(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+			float p_density, float p_scale_min, float p_scale_max, float p_align, const String &p_map_path, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed);
 	// The ground procedural types stand on (a TileTerrain3D).
 	void set_terrain(Node *p_terrain);
 	void set_type_visible(int p_type, bool p_visible);

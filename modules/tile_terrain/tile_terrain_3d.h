@@ -53,6 +53,8 @@
 // Collision: a Jolt heightfield of `collision_samples` a side, at the data's own samples, that follows
 // `collision_target` (the walker). Its triangles, the level-0 chunks' and get_height() split each cell the same way.
 
+#include "mapped_file.h"
+
 #include "core/object/worker_thread_pool.h"
 #include "scene/3d/node_3d.h"
 #include "scene/resources/image_texture.h"
@@ -113,7 +115,15 @@ private:
 	double origin_east = 0.0; // world Z of row 0
 	double height_min = 0.0;
 	double height_range = 1.0;
-	Vector<uint16_t> heights; // [row (east, Z)][column (north, X)]
+	// [row (east, Z)][column (north, X)]: the file itself, mapped (mapped_file.h; to 2026-11-16 read whole, 0.5 GB held)
+	Ref<MappedFile> heights_file;
+	const uint16_t *heights = nullptr;
+	// What is worked out from every sample (the far maps, each chunk's range and error), kept in a file beside the data
+	// and read back while the heights and masks are the same files (their sizes and times): a start read 1.5 GB for them.
+	bool _load_derived(const String &p_path, uint64_t p_stamp);
+	void _save_derived(const String &p_path, uint64_t p_stamp) const;
+	Ref<Image> far_heights_image;
+	Ref<Image> far_masks_image;
 	Ref<ImageTexture> height_texture; // the far map's
 	Ref<ImageTexture> mask_texture; // the far map's
 	// The streamed windows round the camera.

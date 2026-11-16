@@ -8902,6 +8902,17 @@ Vector<uint8_t> RenderingDevice::_load_pipeline_cache() {
 	DirAccess::make_dir_recursive_absolute(pipeline_cache_file_path.get_base_dir());
 
 	if (FileAccess::exists(pipeline_cache_file_path)) {
+		// A cache only grows: every pipeline of every shader ever compiled stays in it (a project in development changes
+		// its shaders daily), the driver holds all of it in memory, and it is written whole at each save. Past the limit
+		// it is left unread: this run compiles what it uses and its cache replaces the file (Godot-EX, 2026-11-16).
+		const int64_t max_mb = GLOBAL_GET("rendering/rendering_device/pipeline_cache/max_size_mb");
+		if (max_mb > 0) {
+			Ref<FileAccess> f = FileAccess::open(pipeline_cache_file_path, FileAccess::READ);
+			if (f.is_valid() && int64_t(f->get_length()) > max_mb * 1024 * 1024) {
+				print_line(vformat("The pipeline cache (%d MiB) is over rendering/rendering_device/pipeline_cache/max_size_mb (%d): started again.", int64_t(f->get_length()) / (1024 * 1024), max_mb));
+				return Vector<uint8_t>();
+			}
+		}
 		Error file_error;
 		Vector<uint8_t> file_data = FileAccess::get_file_as_bytes(pipeline_cache_file_path, &file_error);
 		return file_data;

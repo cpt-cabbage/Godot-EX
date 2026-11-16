@@ -35,6 +35,7 @@
 #include "core/object/class_db.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
+#include "core/templates/sort_array.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/main/viewport.h"
 #include "scene/resources/3d/world_3d.h"
@@ -151,27 +152,28 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 		}
 		cell_of.push_back(uint32_t(cz * grid_x + cx));
 	}
-	// Counting sort by base cell.
-	const uint32_t cells = uint32_t(grid_x) * uint32_t(grid_z);
-	t.cell_start.resize(cells + 1);
-	for (uint32_t &c : t.cell_start) {
-		c = 0;
-	}
-	for (uint32_t c : cell_of) {
-		t.cell_start[c + 1]++;
-	}
-	for (uint32_t c = 0; c < cells; c++) {
-		t.cell_start[c + 1] += t.cell_start[c];
-	}
+	// The copies sorted by base cell, and the cells that hold any.
 	t.order.resize(cell_of.size());
-	LocalVector<uint32_t> fill;
-	fill.resize(cells);
-	for (uint32_t c = 0; c < cells; c++) {
-		fill[c] = t.cell_start[c];
-	}
 	for (uint32_t i = 0; i < cell_of.size(); i++) {
-		t.order[fill[cell_of[i]]++] = i;
+		t.order[i] = i;
 	}
+	struct ByCell {
+		const uint32_t *cell_of = nullptr;
+		_FORCE_INLINE_ bool operator()(uint32_t p_a, uint32_t p_b) const { return cell_of[p_a] != cell_of[p_b] ? cell_of[p_a] < cell_of[p_b] : p_a < p_b; }
+	};
+	if (!t.order.is_empty()) {
+		SortArray<uint32_t, ByCell> sorter;
+		sorter.compare.cell_of = cell_of.ptr();
+		sorter.sort(t.order.ptr(), t.order.size());
+	}
+	for (uint32_t k = 0; k < t.order.size(); k++) {
+		const uint32_t c = cell_of[t.order[k]];
+		if (t.cell_ids.is_empty() || t.cell_ids[t.cell_ids.size() - 1] != c) {
+			t.cell_ids.push_back(c);
+			t.cell_first.push_back(k);
+		}
+	}
+	t.cell_first.push_back(t.order.size());
 	t.levels.resize(p_meshes.size());
 	for (int l = 0; l < p_meshes.size(); l++) {
 		Level &lv = t.levels[l];
@@ -206,7 +208,27 @@ int InstanceField3D::add_type(const String &p_name, const TypedArray<Mesh> &p_me
 
 int InstanceField3D::add_procedural_type(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
 		float p_density, float p_scale_min, float p_scale_max, float p_align, const PackedByteArray &p_map, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed) {
-	ERR_FAIL_COND_V(p_map_width <= 0 || p_map.size() % p_map_width != 0, -1);
+	const int index = _add_procedural(p_name, p_meshes, p_ends, p_shadow_levels, p_thin, p_density, p_scale_min, p_scale_max, p_align, p_map.ptr(), p_map.size(), p_map_width, p_map_origin, p_map_spacing, p_seed);
+	if (index >= 0) {
+		types[index].proc.map_bytes = p_map; // (shared with the caller's array, not copied)
+	}
+	return index;
+}
+
+int InstanceField3D::add_procedural_type_file(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+		float p_density, float p_scale_min, float p_scale_max, float p_align, const String &p_map_path, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed) {
+	Ref<MappedFile> file = MappedFile::open_shared(p_map_path);
+	ERR_FAIL_COND_V_MSG(file.is_null(), -1, "InstanceField3D: cannot open the weight map " + p_map_path);
+	const int index = _add_procedural(p_name, p_meshes, p_ends, p_shadow_levels, p_thin, p_density, p_scale_min, p_scale_max, p_align, file->ptr(), int64_t(file->get_size()), p_map_width, p_map_origin, p_map_spacing, p_seed);
+	if (index >= 0) {
+		types[index].proc.map_file = file;
+	}
+	return index;
+}
+
+int InstanceField3D::_add_procedural(const String &p_name, const TypedArray<Mesh> &p_meshes, const PackedFloat32Array &p_ends, int p_shadow_levels, const PackedFloat32Array &p_thin,
+		float p_density, float p_scale_min, float p_scale_max, float p_align, const uint8_t *p_map, int64_t p_map_size, int p_map_width, const Vector2 &p_map_origin, float p_map_spacing, int p_seed) {
+	ERR_FAIL_COND_V(p_map_width <= 0 || p_map == nullptr || p_map_size % p_map_width != 0, -1);
 	const int index = add_type(p_name, p_meshes, p_ends, p_shadow_levels, PackedFloat32Array());
 	ERR_FAIL_COND_V(index < 0, -1);
 	Type &t = types[index];
@@ -220,7 +242,7 @@ int InstanceField3D::add_procedural_type(const String &p_name, const TypedArray<
 	pr.seed = uint32_t(p_seed);
 	pr.map = p_map;
 	pr.map_width = p_map_width;
-	pr.map_height = p_map.size() / p_map_width;
+	pr.map_height = int(p_map_size / p_map_width);
 	pr.map_origin = p_map_origin;
 	pr.map_spacing = MAX(p_map_spacing, 0.01f);
 	pr.reach = p_ends.is_empty() ? 0.0f : p_ends[p_ends.size() - 1];
@@ -259,7 +281,7 @@ void InstanceField3D::_gen_cell(uint32_t p_index, GenJob *p_jobs) {
 	uint32_t state = hash_murmur3_one_32(pr.seed, hash_murmur3_one_32(uint32_t(cx), hash_murmur3_one_32(uint32_t(cz))));
 	const float expected = pr.density * float(base_cell * base_cell);
 	const int n = int(expected) + (pcg01(state) < expected - Math::floor(expected) ? 1 : 0);
-	const uint8_t *map = pr.map.ptr();
+	const uint8_t *map = pr.map;
 	for (int i = 0; i < n; i++) {
 		const float px = float(grid_origin.x + (cx + pcg01(state)) * base_cell);
 		const float pz = float(grid_origin.y + (cz + pcg01(state)) * base_cell);
@@ -414,9 +436,10 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + ke - grid_origin.y) / base_cell)));
 	LocalVector<uint32_t> in_band;
 	for (int bz = z0; bz <= z1; bz++) {
-		for (int bx = x0; bx <= x1; bx++) {
-			const uint32_t c = uint32_t(bz * grid_x + bx);
-			for (uint32_t k = p_type.cell_start[c]; k < p_type.cell_start[c + 1]; k++) {
+		uint32_t e0, e1;
+		p_type.entries(uint32_t(bz * grid_x + x0), uint32_t(bz * grid_x + x1), e0, e1);
+		for (uint32_t e = e0; e < e1; e++) {
+			for (uint32_t k = p_type.cell_first[e]; k < p_type.cell_first[e + 1]; k++) {
 				const uint32_t i = p_type.order[k];
 				const float *x = p_type.xf.ptr() + int64_t(i) * 12;
 				const float dx = x[3] - viewer.x, dy = x[7] - viewer.y, dz = x[11] - viewer.z;
@@ -653,9 +676,11 @@ void InstanceField3D::_job(uint32_t p_index, Job *p_jobs) {
 		return;
 	}
 	for (int bz = bz0; bz < MIN(bz0 + lv.cell_span, grid_z); bz++) {
-		for (int bx = bx0; bx < MIN(bx0 + lv.cell_span, grid_x); bx++) {
-			const uint32_t c = uint32_t(bz * grid_x + bx);
-			for (uint32_t k = t.cell_start[c]; k < t.cell_start[c + 1]; k++) {
+		uint32_t e0, e1;
+		t.entries(uint32_t(bz * grid_x + bx0), uint32_t(bz * grid_x + MIN(bx0 + lv.cell_span, grid_x) - 1), e0, e1);
+		for (uint32_t e = e0; e < e1; e++) {
+			const uint32_t c = t.cell_ids[e];
+			for (uint32_t k = t.cell_first[e]; k < t.cell_first[e + 1]; k++) {
 				const uint32_t i = t.order[k];
 				const float *x = t.xf.ptr() + int64_t(i) * 12;
 				const float dx = x[3] - viewer.x, dy = x[7] - viewer.y, dz = x[11] - viewer.z;
@@ -969,6 +994,7 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cell_share"), &InstanceField3D::get_cell_share);
 	ClassDB::bind_method(D_METHOD("add_type", "name", "meshes", "ends", "shadow_levels", "placements"), &InstanceField3D::add_type);
 	ClassDB::bind_method(D_METHOD("add_procedural_type", "name", "meshes", "ends", "shadow_levels", "thin", "density", "scale_min", "scale_max", "align", "map", "map_width", "map_origin", "map_spacing", "seed"), &InstanceField3D::add_procedural_type);
+	ClassDB::bind_method(D_METHOD("add_procedural_type_file", "name", "meshes", "ends", "shadow_levels", "thin", "density", "scale_min", "scale_max", "align", "map_path", "map_width", "map_origin", "map_spacing", "seed"), &InstanceField3D::add_procedural_type_file);
 	ClassDB::bind_method(D_METHOD("set_terrain", "terrain"), &InstanceField3D::set_terrain);
 	ClassDB::bind_method(D_METHOD("set_type_visible", "type", "visible"), &InstanceField3D::set_type_visible);
 	ClassDB::bind_method(D_METHOD("get_type_count"), &InstanceField3D::get_type_count);
