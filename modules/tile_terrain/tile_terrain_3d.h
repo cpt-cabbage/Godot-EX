@@ -155,20 +155,22 @@ private:
 	// paint_stamp() is the brush (a round stamp toward a value, or erasing the weight); set_paint_page() and
 	// get_paint_page() are for keeping pages in files and for undo; refresh_paint() shows what changed.
 	struct PaintPage {
-		LocalVector<uint8_t> values[2]; // [set]: PAINT_PAGE^2 RGBA, or empty
-		LocalVector<uint8_t> weights[2];
+		LocalVector<uint8_t> values[3]; // [set]: PAINT_PAGE^2 RGBA, or empty
+		LocalVector<uint8_t> weights[3];
 	};
 	HashMap<Vector2i, PaintPage> paint_pages;
 	mutable BinaryMutex paint_mutex; // the windows are read on a worker
 	uint32_t paint_revision = 0;
-	bool paint_has_user = false;
-	Ref<Texture2DArray> clip_user;
-	Ref<ImageTexture> user_texture; // the far map's
+	// The sets that are streamed as they are (not laid over the masks): [0] the user's (PAINT_USER), [1] the ground
+	// layers' (PAINT_LAYERS: terrain_layers_clip, terrain_layers_far; 2026-11-16, projectex's layer stack).
+	bool paint_has_streamed[2] = { false, false };
+	Ref<Texture2DArray> clip_streamed[2];
+	Ref<ImageTexture> streamed_texture[2]; // the far maps'
 	Ref<Image> far_masks_paint; // the far masks as drawn, kept from the first patch on
-	Ref<Image> far_user_image;
+	Ref<Image> far_streamed_image[2];
 	void _paint_masks(uint8_t *p_pixels, int p_level, const Vector2i &p_origin) const;
-	void _painted_sample(int p_column, int p_row, uint8_t *r_mask, uint8_t *r_user) const;
-	Ref<Image> _clip_user(int p_level, const Vector2i &p_origin) const;
+	void _painted_sample(int p_column, int p_row, uint8_t *r_mask, uint8_t *r_user, uint8_t *r_layers = nullptr) const;
+	Ref<Image> _clip_streamed(int p_level, const Vector2i &p_origin, int p_stream) const;
 	void _patch_far(const Rect2i &p_rect);
 	void _upload_far();
 	void _build_far_slopes();
@@ -186,7 +188,7 @@ private:
 		Ref<Image> heights;
 		Ref<Image> masks;
 		Ref<Image> slopes;
-		Ref<Image> user;
+		Ref<Image> streamed[2];
 		uint32_t paint_revision = 0;
 	};
 	ClipBuild clip_builds[3];
@@ -293,6 +295,7 @@ public:
 	enum PaintSet {
 		PAINT_MASKS,
 		PAINT_USER,
+		PAINT_LAYERS,
 	};
 	void set_paint_page(const Vector2i &p_page, PaintSet p_set, const PackedByteArray &p_values, const PackedByteArray &p_weights);
 	// [values, weights] (empty arrays where the page has none of the set).
@@ -309,6 +312,7 @@ public:
 	// The masks at a sample as drawn (the file's with the paint), and the user's channels there.
 	Color get_painted_mask(int p_column, int p_row) const;
 	Color get_user_channels(int p_column, int p_row) const;
+	Color get_layer_channels(int p_column, int p_row) const;
 	// The paint laid over a mask value read elsewhere (a script that has the file open), and whether any page holds
 	// any of a rect of samples.
 	Color paint_over(int p_column, int p_row, const Color &p_base) const;
