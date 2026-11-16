@@ -34,6 +34,8 @@
 
 #include "atmosphere_effect.h"
 
+#include "core/object/callable_mp.h"
+
 #include "core/os/os.h"
 #include "servers/rendering/renderer_rd/effects/raytracing.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -58,6 +60,46 @@ float AtmosphereEffect::cloud_type_thickness(float p_type) {
 
 float AtmosphereEffect::get_cloud_thickness() const {
 	return cloud_type_thickness(cloud_type) * cloud_thickness_scale;
+}
+
+void AtmosphereEffect::_cloud_shadow_read(const Vector<uint8_t> &p_data) {
+	MutexLock lock(cloud_read_mutex);
+	cloud_read_data = p_data;
+	cloud_read_frame = cloud_read_frame_pending;
+	cloud_read_light = cloud_read_light_pending;
+	cloud_read_pending = false;
+}
+
+float AtmosphereEffect::get_sun_through_clouds(const Vector3 &p_position, float p_radius) {
+	cloud_read_wanted.set(240); // frames the map is still read back for after the last call
+	MutexLock lock(cloud_read_mutex);
+	if (!cloud_read_applies) {
+		return 1.0f;
+	}
+	if (cloud_read_data.size() != CLOUD_SHADOW_N * CLOUD_SHADOW_N * 8 || cloud_read_frame.z <= 0.0f) {
+		return 1.0f;
+	}
+	// sun_modulator_visibility's read, for points under the clouds: each lies on the ray toward the light through a
+	// point of the map's plane, and takes R (the transmittance along that ray) times A (a high layer's).
+	const Vector3 l = cloud_read_light;
+	const float h = p_position.y - cloud_read_frame.w;
+	const Vector3 q = p_position - l * (h / MAX(l.y, 0.02f));
+	const float texel = cloud_read_frame.z / CLOUD_SHADOW_N;
+	const int cx = int(Math::floor((q.x - cloud_read_frame.x) / texel));
+	const int cy = int(Math::floor((q.z - cloud_read_frame.y) / texel));
+	const int r = int(Math::ceil(MAX(p_radius, 0.0f) / texel)) + 1; // (and a texel more: the mask reads between texels)
+	if (cx - r < 0 || cy - r < 0 || cx + r >= CLOUD_SHADOW_N || cy + r >= CLOUD_SHADOW_N) {
+		return 1.0f; // past the map the light is not dimmed
+	}
+	const uint16_t *d = (const uint16_t *)cloud_read_data.ptr();
+	float most = 0.0f;
+	for (int y = cy - r; y <= cy + r; y++) {
+		const uint16_t *row = d + (int64_t(y) * CLOUD_SHADOW_N + (cx - r)) * 4;
+		for (int x = 0; x <= 2 * r; x++) {
+			most = MAX(most, Math::half_to_float(row[x * 4]) * Math::half_to_float(row[x * 4 + 3]));
+		}
+	}
+	return CLAMP(most, 0.0f, 1.0f);
 }
 
 Vector2 AtmosphereEffect::get_cloud_shell() const {
@@ -105,7 +147,7 @@ void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
 		ts.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT; // clouds.glsl's MODE_SHADOW: the transmittance and where the cloud stands
 		ts.width = CLOUD_SHADOW_N;
 		ts.height = CLOUD_SHADOW_N;
-		ts.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		ts.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT; // (read back: get_sun_through_clouds)
 		cloud_shadow_rd = rd->texture_create(ts, RD::TextureView());
 		rd->texture_clear(cloud_shadow_rd, Color(1, 0, 0, 1), 0, 1, 0, 1);
 		RD::TextureFormat tm;
@@ -276,6 +318,18 @@ void AtmosphereEffect::_clouds_dispatch(int64_t p_list, RID p_depth, bool p_marc
 		// haze and the air volume read it).
 		run(CLOUD_MAP, { u_ubo, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 1, Vector<RID>({ weather_map_rd })) }, CLOUD_MAP_N, CLOUD_MAP_N);
 		run(CLOUD_SHADOW, { u_ubo, u_base, u_detail, u_sky, u_map, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, Vector<RID>({ cloud_shadow_rd })) }, CLOUD_SHADOW_N, CLOUD_SHADOW_N);
+		// For get_sun_through_clouds, while it is called: the map back to the CPU every eighth frame.
+		if (cloud_read_wanted.get() > 0) {
+			cloud_read_wanted.decrement();
+			if (!cloud_read_pending && (cloud_frame & 7) == 0) {
+				cloud_read_pending = true;
+				cloud_read_frame_pending = Vector4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, get_cloud_shell().x - altitude_offset);
+				cloud_read_light_pending = light_direction;
+				if (rd->texture_get_data_async(cloud_shadow_rd, 0, callable_mp(this, &AtmosphereEffect::_cloud_shadow_read)) != OK) {
+					cloud_read_pending = false;
+				}
+			}
+		}
 		return;
 	}
 	const int cur = cloud_frame & 1, prev = cur ^ 1;

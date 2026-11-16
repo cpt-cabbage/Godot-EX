@@ -432,6 +432,10 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 	// The clouds: their block first (it sets the shadow map's origin).
 	const bool clouds_on = apply_aerial && _clouds_prepare(cam, inv, sd->get_cam_projection() * Projection(Transform3D(cam.basis, Vector3()).affine_inverse()), size);
 	const bool cloud_shadows_on = clouds_on && cloud_shadows && light_direction.y > 0.02f;
+	{
+		MutexLock lock(cloud_read_mutex);
+		cloud_read_applies = cloud_shadows_on;
+	}
 	m[40] = clouds_on ? 1.0f : 0.0f;
 	rain_clouds_on = clouds_on && cloud_panorama_rd.is_valid();
 	m[41] = cloud_shadows_on ? 1.0f : 0.0f;
@@ -909,6 +913,7 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_high_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,8,0.01")
 	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
 	ClassDB::bind_method(D_METHOD("get_cloud_shell"), &AtmosphereEffect::get_cloud_shell);
+	ClassDB::bind_method(D_METHOD("get_sun_through_clouds", "position", "radius"), &AtmosphereEffect::get_sun_through_clouds);
 	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);
 #undef FB
 	ClassDB::bind_method(D_METHOD("set_apply_aerial", "apply"), &AtmosphereEffect::set_apply_aerial);

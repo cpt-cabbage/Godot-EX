@@ -76,7 +76,9 @@
 // elevation) is how far up from the horizon the tint and recolour reach, fading as exp(-elevation / height): 10 is the
 // whole sky, 0.3 a band low down with the zenith left as it was.
 
+#include "core/os/mutex.h"
 #include "core/templates/local_vector.h"
+#include "core/templates/safe_refcount.h"
 #include "scene/resources/compositor.h"
 #include "scene/resources/texture_rd.h"
 #include "servers/rendering/renderer_rd/shader_rd.h"
@@ -308,6 +310,16 @@ class AtmosphereEffect : public CompositorEffect {
 	uint64_t fog_last_ticks = 0;
 	Vector3 fog_offset;
 	Vector2 cloud_shadow_origin;
+	// The clouds' shadow map read back for get_sun_through_clouds (2026-11-16): asked for every eighth frame while
+	// something calls it, arriving a few frames on with the frame and the light it was drawn for.
+	Mutex cloud_read_mutex;
+	Vector<uint8_t> cloud_read_data;
+	Vector4 cloud_read_frame, cloud_read_frame_pending; // xy the map's corner (world x, z), z its side, w its plane (world y)
+	Vector3 cloud_read_light, cloud_read_light_pending; // toward the light
+	bool cloud_read_pending = false;
+	bool cloud_read_applies = false; // the clouds' shadow is on the light now
+	SafeNumeric<uint32_t> cloud_read_wanted;
+	void _cloud_shadow_read(const Vector<uint8_t> &p_data);
 	Projection cloud_view_proj, cloud_prev_view_proj;
 	Vector3 cloud_cam, cloud_prev_cam;
 	bool cloud_prev_valid = false;
@@ -548,6 +560,13 @@ public:
 	float get_cloud_thickness() const;
 	// The shell the clouds can fill (m above sea level): x its bottom, y its height.
 	Vector2 get_cloud_shell() const;
+	// The most of the light (the sun's, or the moon's) that reaches any ground within `p_radius` m of `p_position`
+	// through the clouds, 0 to 1: the largest value of their shadow map there, as the sun's mask and the air read it
+	// (sun_modulator_inc.glsl), a few frames old (the map is read back every eighth frame while this is called). 1 with
+	// no clouds, with their shadows off, and before the first map has come back. For what need not be drawn while no
+	// light arrives: a game shortens its shadow cascades under a closed sky by it, and has them back before a break in
+	// the cloud reaches the camera (the radius: the cascades' reach and what the wind carries meanwhile).
+	float get_sun_through_clouds(const Vector3 &p_position, float p_radius);
 	// The clouds over the whole sky round the camera (equirectangular: rgb their light, a the transmittance).
 	Ref<Texture2D> get_cloud_panorama_texture();
 	// For RainEffect (rain_effect.h), after this frame's pass: what lights a drop (the sky's and the clouds' light from
