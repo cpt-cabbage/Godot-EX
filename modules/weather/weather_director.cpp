@@ -37,37 +37,41 @@
 // WeatherState
 
 void WeatherState::blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t) {
+	blend_groups(p_a, p_b, p_t, GROUP_ALL);
+}
+
+void WeatherState::blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t, int p_groups) {
 	ERR_FAIL_COND(p_a.is_null() || p_b.is_null());
 	const float t = CLAMP(p_t, 0.0f, 1.0f);
-	float dh = Math::fposmod(p_b->wind_heading - p_a->wind_heading + 180.0f, 360.0f) - 180.0f;
-	wind_heading = p_a->wind_heading + dh * t;
-#define L(m) m = Math::lerp(p_a->m, p_b->m, t);
-	L(wind_speed)
-	L(gust_strength)
-	L(turbulence)
-	L(cloud_cover)
-	L(cloud_base)
-	L(cloud_type)
-	L(high_cover)
-	L(high_type)
-	L(mist)
-	L(mist_top)
-	L(precipitation)
-	L(temperature)
-	L(lightning)
-	L(cloud_density)
-	L(cloud_thickness_scale)
-	L(cloud_erosion)
-	L(cloud_shear)
-	L(cloud_variation)
-	L(cloud_type_spread)
-	L(cloud_multiscatter)
-	L(exposure_compensation)
-	L(sky_light)
-	L(cloud_shadow_density)
-	L(air_anisotropy)
-	L(air_lights_anisotropy)
-	L(air_anisotropy_share)
+	const float dh = Math::fposmod(p_b->wind_heading - p_a->wind_heading + 180.0f, 360.0f) - 180.0f;
+	wind_heading = p_a->wind_heading + ((p_groups & GROUP_WIND) ? dh * t : 0.0f);
+#define L(m, g) m = (p_groups & g) ? Math::lerp(p_a->m, p_b->m, t) : p_a->m;
+	L(wind_speed, GROUP_WIND)
+	L(gust_strength, GROUP_WIND)
+	L(turbulence, GROUP_WIND)
+	L(cloud_cover, GROUP_CLOUDS)
+	L(cloud_base, GROUP_CLOUDS)
+	L(cloud_type, GROUP_CLOUDS)
+	L(high_cover, GROUP_CLOUDS)
+	L(high_type, GROUP_CLOUDS)
+	L(mist, GROUP_MIST)
+	L(mist_top, GROUP_MIST)
+	L(precipitation, GROUP_PRECIPITATION)
+	L(temperature, GROUP_PRECIPITATION)
+	L(lightning, GROUP_PRECIPITATION)
+	L(cloud_density, GROUP_CLOUD_LOOK)
+	L(cloud_thickness_scale, GROUP_CLOUD_LOOK)
+	L(cloud_erosion, GROUP_CLOUD_LOOK)
+	L(cloud_shear, GROUP_CLOUD_LOOK)
+	L(cloud_variation, GROUP_CLOUD_LOOK)
+	L(cloud_type_spread, GROUP_CLOUD_LOOK)
+	L(cloud_multiscatter, GROUP_CLOUD_LOOK)
+	L(exposure_compensation, GROUP_EXPOSURE)
+	L(sky_light, GROUP_LIGHT)
+	L(cloud_shadow_density, GROUP_LIGHT)
+	L(air_anisotropy, GROUP_LIGHT)
+	L(air_lights_anisotropy, GROUP_LIGHT)
+	L(air_anisotropy_share, GROUP_LIGHT)
 #undef L
 }
 
@@ -77,6 +81,15 @@ void WeatherState::copy_from(const Ref<WeatherState> &p_other) {
 
 void WeatherState::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("blend", "a", "b", "t"), &WeatherState::blend);
+	ClassDB::bind_method(D_METHOD("blend_groups", "a", "b", "t", "groups"), &WeatherState::blend_groups);
+	BIND_ENUM_CONSTANT(GROUP_WIND);
+	BIND_ENUM_CONSTANT(GROUP_CLOUDS);
+	BIND_ENUM_CONSTANT(GROUP_MIST);
+	BIND_ENUM_CONSTANT(GROUP_PRECIPITATION);
+	BIND_ENUM_CONSTANT(GROUP_CLOUD_LOOK);
+	BIND_ENUM_CONSTANT(GROUP_LIGHT);
+	BIND_ENUM_CONSTANT(GROUP_EXPOSURE);
+	BIND_ENUM_CONSTANT(GROUP_ALL);
 	ClassDB::bind_method(D_METHOD("copy_from", "other"), &WeatherState::copy_from);
 #define P(m, hint)                                                                         \
 	ClassDB::bind_method(D_METHOD("set_" #m, "value"), &WeatherState::set_##m);             \
@@ -157,6 +170,17 @@ void WeatherDirector::transition_to(const Ref<WeatherState> &p_state, float p_se
 	if (!transitioning) {
 		blended->copy_from(target);
 	}
+}
+
+void WeatherDirector::add_override(const Ref<WeatherState> &p_state, float p_weight, int p_groups) {
+	if (p_state.is_null() || p_weight <= 0.0f || (p_groups & WeatherState::GROUP_ALL) == 0) {
+		return;
+	}
+	Override o;
+	o.state = p_state;
+	o.weight = MIN(p_weight, 1.0f);
+	o.groups = p_groups;
+	overrides.push_back(o);
 }
 
 void WeatherDirector::set_state_now(const Ref<WeatherState> &p_state) {
@@ -318,6 +342,9 @@ void WeatherDirector::_lightning() {
 
 void WeatherDirector::_apply() {
 	current->copy_from(blended);
+	for (const Override &o : overrides) {
+		current->blend_groups(current, o.state, o.weight, o.groups);
+	}
 	const float now = float(clock);
 	float turn = 0.0f;
 	for (const Surprise &s : surprises) {
@@ -418,6 +445,10 @@ void WeatherDirector::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_state_now", "state"), &WeatherDirector::set_state_now);
 	ClassDB::bind_method(D_METHOD("get_current"), &WeatherDirector::get_current);
 	ClassDB::bind_method(D_METHOD("get_target"), &WeatherDirector::get_target);
+	ClassDB::bind_method(D_METHOD("get_base"), &WeatherDirector::get_base);
+	ClassDB::bind_method(D_METHOD("clear_overrides"), &WeatherDirector::clear_overrides);
+	ClassDB::bind_method(D_METHOD("add_override", "state", "weight", "groups"), &WeatherDirector::add_override, DEFVAL(int(WeatherState::GROUP_ALL)));
+	ClassDB::bind_method(D_METHOD("get_override_count"), &WeatherDirector::get_override_count);
 	ClassDB::bind_method(D_METHOD("is_transitioning"), &WeatherDirector::is_transitioning);
 	ClassDB::bind_method(D_METHOD("get_effective_volatility"), &WeatherDirector::get_effective_volatility);
 	ClassDB::bind_method(D_METHOD("step", "delta"), &WeatherDirector::step);
