@@ -56,6 +56,8 @@
 #include "mapped_file.h"
 
 #include "core/object/worker_thread_pool.h"
+#include "core/os/mutex.h"
+#include "core/templates/hash_map.h"
 #include "scene/3d/node_3d.h"
 #include "scene/resources/image_texture.h"
 #include "scene/resources/texture.h"
@@ -144,6 +146,30 @@ private:
 	Ref<ImageTexture> slope_texture; // the far map's
 	Ref<Image> far_slopes_image;
 	Ref<Image> _clip_slopes(int p_level, const Vector2i &p_origin) const;
+	// Paint (2026-11-16; projectex's brushes: what is painted in the editor is laid over the masks here, as a window
+	// is read, so every shader that reads them takes it, near and far, at no cost to the frame). Pages of PAINT_PAGE
+	// samples a side, only where something was painted: for the masks a value and a weight a channel (the weight 0
+	// leaves the file's byte, 255 replaces it with the value), and four channels of the user's own (128 "as built"),
+	// streamed as the masks are: the global shader parameters terrain_user_clip and terrain_user_far (1 x 1 until a
+	// page has any). set_paint_page() then refresh_paint() over the samples that changed.
+	struct PaintPage {
+		LocalVector<uint8_t> mask_values; // PAINT_PAGE^2 RGBA, or empty
+		LocalVector<uint8_t> mask_weights;
+		LocalVector<uint8_t> user; // PAINT_PAGE^2 RGBA, or empty
+	};
+	HashMap<Vector2i, PaintPage> paint_pages;
+	mutable BinaryMutex paint_mutex; // the windows are read on a worker
+	uint32_t paint_revision = 0;
+	bool paint_has_user = false;
+	Ref<Texture2DArray> clip_user;
+	Ref<ImageTexture> user_texture; // the far map's
+	Ref<Image> far_masks_paint; // the far masks as drawn, kept from the first patch on
+	Ref<Image> far_user_image;
+	void _paint_masks(uint8_t *p_pixels, int p_level, const Vector2i &p_origin) const;
+	void _painted_sample(int p_column, int p_row, uint8_t *r_mask, uint8_t *r_user) const;
+	Ref<Image> _clip_user(int p_level, const Vector2i &p_origin) const;
+	void _patch_far(const Rect2i &p_rect);
+	void _upload_far();
 	void _build_far_slopes();
 	Vector2i clip_origin[3]; // each level's first sample (column, row); a multiple of its step
 	uint64_t clip_updates = 0;
@@ -159,6 +185,8 @@ private:
 		Ref<Image> heights;
 		Ref<Image> masks;
 		Ref<Image> slopes;
+		Ref<Image> user;
+		uint32_t paint_revision = 0;
 	};
 	ClipBuild clip_builds[3];
 	void _clip_job(void *p_build);
@@ -255,6 +283,19 @@ public:
 	int get_samples() const { return samples; }
 	Ref<Texture2D> get_height_texture() const { return height_texture; }
 	Ref<Texture2D> get_mask_texture() const { return mask_texture; }
+
+	// Paint (above). A page's three arrays are PAINT_PAGE * PAINT_PAGE * 4 bytes each or empty; all empty takes the
+	// page away. refresh_paint: the windows that hold any of p_rect (samples: column, row) read again, and with p_far
+	// the far maps' texels (leave it for a stroke's end: it sends the whole far map). An empty rect is everything.
+	static constexpr int PAINT_PAGE = 128;
+	void set_paint_page(const Vector2i &p_page, const PackedByteArray &p_mask_values, const PackedByteArray &p_mask_weights, const PackedByteArray &p_user);
+	void clear_paint();
+	void refresh_paint(const Rect2i &p_rect, bool p_far = true);
+	int get_paint_page_size() const { return PAINT_PAGE; }
+	int get_paint_page_count() const { return paint_pages.size(); }
+	// The masks at a sample as drawn (the file's with the paint), and the user's channels there.
+	Color get_painted_mask(int p_column, int p_row) const;
+	Color get_user_channels(int p_column, int p_row) const;
 
 	// Choose and build the chunks for a viewer at p_position now (follow_camera does this each frame).
 	void update_lods(const Vector3 &p_position);
