@@ -56,6 +56,7 @@
 
 #include "core/math/vector4.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "core/object/worker_thread_pool.h"
 #include "scene/3d/node_3d.h"
@@ -69,6 +70,7 @@ class InstanceField3D : public Node3D {
 		RID instance;
 		uint64_t hash = 0;
 		uint64_t used = 0;
+		bool still = false; // INSTANCE_FLAG_STATIC_MOTION_VECTORS as last set
 	};
 
 	struct Level {
@@ -87,6 +89,7 @@ class InstanceField3D : public Node3D {
 		Vector3 last_update = Vector3(Math::INF, Math::INF, Math::INF);
 		HashMap<uint64_t, DrawCell> cells;
 		HashMap<uint32_t, RID> copies; // per-copy levels: the copy's instance, by its index
+		HashSet<uint32_t> copies_still; // those with INSTANCE_FLAG_STATIC_MOTION_VECTORS set
 		uint64_t copies_frame = 0;
 		uint64_t copies_disturbed = 0; // the disturbances' version its copies were made with
 	};
@@ -172,6 +175,13 @@ class InstanceField3D : public Node3D {
 	int grid_z = 0;
 	int per_copy_levels = 0;
 	float level_fade = 0.0;
+	// Copies this far from the viewer and further are still for the renderer's motion vectors
+	// (RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS: a shader that sways them by TIME is not run twice a vertex for them);
+	// a cell by its nearest point, a per-copy level's copy by itself. 0: none (every swaying copy is in the motion pass).
+	float still_motion_from = 0.0f;
+	// Cells that cast shadows keep a copy of their buffer in memory, which the ray-traced scene asks for (_apply_jobs).
+	// false while nothing is ray-traced: the copies are not kept (they were, 48 bytes a copy drawn, on any tier).
+	bool ray_traced_copies = true;
 	// A level's draw cells are the first power of two of base cells at least this share of the level's end across. A cell
 	// is one MultiMesh, drawn whole when any of it is in view: at a half (to 2026-11-11) a level was four to nine cells
 	// round the viewer and a view 90 degrees wide drew 26 M triangles of the 19 M inside it; at a quarter the valley's
@@ -272,6 +282,10 @@ public:
 	// the viewer out, so the shader must also draw nothing of a copy outside its window.
 	void set_level_fade(float p_fade);
 	float get_level_fade() const { return level_fade; }
+	void set_still_motion_from(float p_distance) { still_motion_from = MAX(p_distance, 0.0f); }
+	float get_still_motion_from() const { return still_motion_from; }
+	void set_ray_traced_copies(bool p_keep) { ray_traced_copies = p_keep; }
+	bool get_ray_traced_copies() const { return ray_traced_copies; }
 	void set_per_copy_levels(int p_levels);
 	int get_per_copy_levels() const { return per_copy_levels; }
 	void set_follow_camera(bool p_follow) { follow_camera = p_follow; }

@@ -122,6 +122,10 @@ void RenderGeometryInstanceBase::set_use_dynamic_gi(bool p_enable) {
 	_mark_dirty();
 }
 
+void RenderGeometryInstanceBase::set_static_motion_vectors(bool p_enable) {
+	data->static_motion_vectors = p_enable; // (read as the render lists are filled: nothing to rebuild)
+}
+
 void RenderGeometryInstanceBase::set_instance_shader_uniforms_offset(int32_t p_offset) {
 	shader_uniforms_offset = p_offset;
 

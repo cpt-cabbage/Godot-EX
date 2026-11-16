@@ -407,6 +407,7 @@ void InstanceField3D::_free_copies(Level &p_level) {
 		RS::get_singleton()->free_rid(E.value);
 	}
 	p_level.copies.clear();
+	p_level.copies_still.clear();
 }
 
 void InstanceField3D::set_level_fade(float p_fade) {
@@ -435,6 +436,8 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 	const int z0 = MAX(0, int(Math::floor((viewer.z - ke - grid_origin.y) / base_cell)));
 	const int z1 = MIN(grid_z - 1, int(Math::floor((viewer.z + ke - grid_origin.y) / base_cell)));
 	LocalVector<uint32_t> in_band;
+	LocalVector<bool> in_band_still;
+	const float still2 = still_motion_from * still_motion_from;
 	for (int bz = z0; bz <= z1; bz++) {
 		uint32_t e0, e1;
 		p_type.entries(uint32_t(bz * grid_x + x0), uint32_t(bz * grid_x + x1), e0, e1);
@@ -446,13 +449,22 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 				const float d2 = dx * dx + dy * dy + dz * dz;
 				if (d2 >= b2 && d2 < e2) {
 					in_band.push_back(i);
+					in_band_still.push_back(still_motion_from > 0.0f && d2 >= still2);
 				}
 			}
 		}
 	}
 	HashMap<uint32_t, RID> kept;
-	for (uint32_t i : in_band) {
+	HashSet<uint32_t> kept_still;
+	for (uint32_t n = 0; n < in_band.size(); n++) {
+		const uint32_t i = in_band[n];
 		if (HashMap<uint32_t, RID>::Iterator it = p_level.copies.find(i)) {
+			if (in_band_still[n] != p_level.copies_still.has(i)) {
+				rs->instance_geometry_set_flag(it->value, RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS, in_band_still[n]);
+			}
+			if (in_band_still[n]) {
+				kept_still.insert(i);
+			}
 			kept.insert(i, it->value);
 			p_level.copies.remove(it);
 			continue;
@@ -477,11 +489,16 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
 			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, true); // still lit by the probes
 		}
+		if (in_band_still[n]) {
+			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS, true);
+			kept_still.insert(i);
+		}
 		rs->instance_set_visible(inst, p_visible);
 		kept.insert(i, inst);
 	}
 	_free_copies(p_level); // the ones left over have left the band
 	p_level.copies = kept;
+	p_level.copies_still = kept_still;
 }
 
 static _FORCE_INLINE_ float seg_dist2(float p_x, float p_z, const Vector4 &p_s) {
@@ -848,9 +865,20 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 			c = lv.cells.getptr(j.key);
 		}
 		c->used = p_frame;
+		{
+			// Still for the motion vectors where its nearest point is still_motion_from away (see the header).
+			const double side = lv.cell_span * base_cell;
+			const double cx0 = grid_origin.x + j.cx * side, cz0 = grid_origin.y + j.cz * side;
+			const double dx = double(viewer.x) - CLAMP(double(viewer.x), cx0, cx0 + side), dz = double(viewer.z) - CLAMP(double(viewer.z), cz0, cz0 + side);
+			const bool still = still_motion_from > 0.0f && dx * dx + dz * dz >= double(still_motion_from) * still_motion_from;
+			if (still != c->still) {
+				rs->instance_geometry_set_flag(c->instance, RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS, still);
+				c->still = still;
+			}
+		}
 		if (c->hash != j.hash) {
 			rs->multimesh_allocate_data(c->multimesh, j.count, RSE::MULTIMESH_TRANSFORM_3D);
-			if (lv.shadows) {
+			if (lv.shadows && ray_traced_copies) {
 				// A level that casts shadows is in the ray-traced scene, which asks a MultiMesh for each copy's transform.
 				// The renderer keeps no copy of a buffer set whole: at the first such question it read the buffer back
 				// from the GPU, flushing the frame and waiting for every frame in flight, once for each cell a refill
@@ -1005,6 +1033,10 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_disturbance_clear_lines", "points", "clear"), &InstanceField3D::set_disturbance_clear_lines);
 	ClassDB::bind_method(D_METHOD("set_level_fade", "fade"), &InstanceField3D::set_level_fade);
 	ClassDB::bind_method(D_METHOD("get_level_fade"), &InstanceField3D::get_level_fade);
+	ClassDB::bind_method(D_METHOD("set_still_motion_from", "distance"), &InstanceField3D::set_still_motion_from);
+	ClassDB::bind_method(D_METHOD("get_still_motion_from"), &InstanceField3D::get_still_motion_from);
+	ClassDB::bind_method(D_METHOD("set_ray_traced_copies", "keep"), &InstanceField3D::set_ray_traced_copies);
+	ClassDB::bind_method(D_METHOD("get_ray_traced_copies"), &InstanceField3D::get_ray_traced_copies);
 	ClassDB::bind_method(D_METHOD("set_per_copy_levels", "levels"), &InstanceField3D::set_per_copy_levels);
 	ClassDB::bind_method(D_METHOD("get_per_copy_levels"), &InstanceField3D::get_per_copy_levels);
 	ClassDB::bind_method(D_METHOD("set_follow_camera", "follow"), &InstanceField3D::set_follow_camera);
@@ -1016,6 +1048,8 @@ void InstanceField3D::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "level_fade", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_level_fade", "get_level_fade");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "per_copy_levels", PROPERTY_HINT_RANGE, "0,8,1"), "set_per_copy_levels", "get_per_copy_levels");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "still_motion_from", PROPERTY_HINT_RANGE, "0,1000,0.5,or_greater,suffix:m"), "set_still_motion_from", "get_still_motion_from");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ray_traced_copies"), "set_ray_traced_copies", "get_ray_traced_copies");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_camera"), "set_follow_camera", "get_follow_camera");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "focus_position", PROPERTY_HINT_NONE, "suffix:m"), "set_focus_position", "get_focus_position");
 }

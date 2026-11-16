@@ -914,6 +914,7 @@ struct HitSceneDataBlock {
 HitSceneDataBlock scene_data_block;
 #define SCENE_DATA_FLAGS_IN_SHADOW_PASS 0u
 #define IN_DEPTH_PASS false
+#define PREV_TIME_VALUE global_time // (a material's PREV_TIME: a hit has no frame before)
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 #define OUTPUT_IS_MULTIVIEW false
@@ -1074,6 +1075,9 @@ void main() {
 #endif
 #ifdef POINT_SIZE_USED
 	float point_size = 1.0;
+#endif
+#ifdef PREV_VERTEX_USED
+	vec3 prev_vertex_given = vertex; // (a material's PREV_VERTEX: nothing here reads it)
 #endif
 	{
 #CODE : VERTEX

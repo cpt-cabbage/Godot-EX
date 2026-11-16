@@ -57,6 +57,7 @@ public:
 	virtual void set_transparency(float p_transparency) = 0;
 	virtual void set_use_baked_light(bool p_enable) = 0;
 	virtual void set_use_dynamic_gi(bool p_enable) = 0;
+	virtual void set_static_motion_vectors(bool p_enable) = 0;
 	virtual void set_use_lightmap(RID p_lightmap_instance, const Rect2 &p_lightmap_uv_scale, int p_lightmap_slice_index) = 0;
 	virtual void set_lightmap_capture(const Color *p_sh9) = 0;
 	virtual void set_instance_shader_uniforms_offset(int32_t p_offset) = 0;
@@ -125,6 +126,7 @@ public:
 
 		bool use_baked_light = false;
 		bool use_dynamic_gi = false;
+		bool static_motion_vectors = false;
 		bool cast_double_sided_shadows = false;
 		bool casts_shadows = true;
 		// True if any surface participates in the shadow pass. Alpha-blended
@@ -167,6 +169,7 @@ public:
 	virtual void set_transparency(float p_transparency) override;
 	virtual void set_use_baked_light(bool p_enable) override;
 	virtual void set_use_dynamic_gi(bool p_enable) override;
+	virtual void set_static_motion_vectors(bool p_enable) override;
 	virtual void set_instance_shader_uniforms_offset(int32_t p_offset) override;
 	virtual void set_cast_double_sided_shadows(bool p_enable) override;
 	virtual void set_casts_shadows(bool p_casts_shadows) override;

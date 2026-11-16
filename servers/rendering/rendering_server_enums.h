@@ -808,6 +808,11 @@ enum InstanceFlags {
 	INSTANCE_FLAG_USE_DYNAMIC_GI,
 	INSTANCE_FLAG_DRAW_NEXT_FRAME_IF_VISIBLE,
 	INSTANCE_FLAG_IGNORE_OCCLUSION_CULLING,
+	// Godot-EX: the instance's materials' own animation (a shader that reads TIME in vertex()) is left out of its motion
+	// vectors, as the shader render mode static_motion_vectors does for a whole shader: its surfaces are drawn with the
+	// still ones, not in the motion pass, where vertex() runs twice a vertex. For copies whose animation is too small
+	// to matter on screen (plants in wind past a few tens of metres).
+	INSTANCE_FLAG_STATIC_MOTION_VECTORS,
 	INSTANCE_FLAG_MAX,
 };
 

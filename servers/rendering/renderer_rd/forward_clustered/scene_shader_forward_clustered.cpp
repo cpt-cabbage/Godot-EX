@@ -101,6 +101,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	uses_alpha_antialiasing = false;
 	uses_blend_alpha = false;
 	uses_depth_prepass_alpha = false;
+	uses_static_motion_vectors = false;
 	uses_discard = false;
 	uses_roughness = false;
 	uses_normal = false;
@@ -165,6 +166,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.usage_flag_pointers["ALPHA_ANTIALIASING_EDGE"] = &uses_alpha_antialiasing;
 	actions.usage_flag_pointers["ALPHA_TEXTURE_COORDINATE"] = &uses_alpha_antialiasing;
 	actions.render_mode_flags["depth_prepass_alpha"] = &uses_depth_prepass_alpha;
+	actions.render_mode_flags["static_motion_vectors"] = &uses_static_motion_vectors;
 
 	actions.usage_flag_pointers["SSS_STRENGTH"] = &uses_sss;
 	actions.usage_flag_pointers["SSS_TRANSMITTANCE_DEPTH"] = &uses_transmittance;
@@ -329,6 +331,9 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 }
 
 bool SceneShaderForwardClustered::ShaderData::is_animated() const {
+	if (uses_static_motion_vectors) {
+		return false;
+	}
 	return (uses_fragment_time && uses_discard) || (uses_vertex_time && uses_vertex);
 }
 
@@ -864,6 +869,8 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["UV2"] = "uv2_interp";
 		actions.renames["COLOR"] = "color_interp";
 		actions.renames["POINT_SIZE"] = "point_size";
+		actions.renames["PREV_VERTEX"] = "prev_vertex_given";
+		actions.renames["PREV_TIME"] = "PREV_TIME_VALUE";
 		actions.renames["INSTANCE_ID"] = "INSTANCE_INDEX";
 		actions.renames["VERTEX_ID"] = "VERTEX_INDEX";
 		actions.renames["Z_CLIP_SCALE"] = "z_clip_scale";
@@ -1001,6 +1008,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.usage_defines["MODEL_MATRIX"] = "#define MODEL_MATRIX_USED\n";
 
 		actions.usage_defines["POINT_SIZE"] = "#define POINT_SIZE_USED\n";
+		actions.usage_defines["PREV_VERTEX"] = "#define PREV_VERTEX_USED\n";
 		actions.usage_defines["POINT_COORD"] = "#define POINT_COORD_USED\n";
 
 		actions.usage_defines["DISCARD"] = "#define DISCARD_USED\n";
@@ -1015,6 +1023,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.render_mode_defines["cull_disabled"] = "#define DO_SIDE_CHECK\n";
 		actions.render_mode_defines["particle_trails"] = "#define USE_PARTICLE_TRAILS\n";
 		actions.render_mode_defines["depth_prepass_alpha"] = "#define USE_OPAQUE_PREPASS\n";
+		actions.render_mode_defines["static_motion_vectors"] = "#define STATIC_MOTION_VECTORS\n";
 		// The blend modes whose output does not vanish with the source alpha
 		// (see ALPHA_ZERO_DISCARD in the shader).
 		actions.render_mode_defines["blend_mul"] = "#define BLEND_MUL_USED\n";

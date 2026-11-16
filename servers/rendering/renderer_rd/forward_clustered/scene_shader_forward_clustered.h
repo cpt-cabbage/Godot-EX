@@ -267,6 +267,14 @@ public:
 		bool uses_alpha_clip = false;
 		bool uses_alpha_antialiasing = false;
 		bool uses_depth_prepass_alpha = false;
+		// render_mode static_motion_vectors (Godot-EX, 2026-11-16): the shader's vertex animation is left out of its
+		// motion vectors. A shader that reads TIME in vertex() is drawn in the motion pass and runs vertex() twice a
+		// vertex, for the frame before and for this one; with the mode its surfaces count as still (the camera's
+		// motion alone, as the ground's), and where a pass writes motion for everything the vertex runs once and last
+		// frame's position is this frame's seen by last frame's camera. For animation too small to matter on screen
+		// (far foliage in wind): projectex's valley spent 11 of 30 ms in the motion pass. Not for surfaces whose
+		// instance moves.
+		bool uses_static_motion_vectors = false;
 		bool uses_discard = false;
 		bool uses_roughness = false;
 		bool uses_normal = false;

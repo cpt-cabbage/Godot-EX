@@ -422,6 +422,7 @@ public:
 		float lod_bias;
 
 		bool ignore_occlusion_culling;
+		bool static_motion_vectors = false;
 		bool ignore_all_culling;
 
 		Vector<RID> materials;

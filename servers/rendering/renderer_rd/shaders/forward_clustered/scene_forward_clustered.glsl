@@ -135,6 +135,14 @@ layout(set = MATERIAL_UNIFORM_SET, binding = 0, std140) uniform MaterialUniforms
 
 float global_time;
 
+// PREV_TIME (Godot-EX): last frame's TIME, for a vertex() that gives PREV_VERTEX.
+#define PREV_TIME_VALUE scene_data_block.prev_data.time
+
+#if defined(MOTION_VECTORS) && defined(PREV_VERTEX_USED)
+// PREV_VERTEX (Godot-EX): the shader's own account of where the vertex stood last frame, in this frame's view space.
+vec3 prev_vertex_view;
+#endif
+
 #ifdef MODE_DUAL_PARABOLOID
 
 layout(location = 9) out float dp_clip;
@@ -454,9 +462,25 @@ void vertex_shader(vec3 vertex_input,
 	float point_size = 1.0;
 #endif
 
+#ifdef PREV_VERTEX_USED
+	vec3 prev_vertex_given = vertex;
+#endif
+
 	{
 #CODE : VERTEX
 	}
+
+#ifdef PREV_VERTEX_USED
+	// Into view space as VERTEX is below (a pass with no motion vectors never reads it, and the compiler drops what made it).
+#if !defined(SKIP_TRANSFORM_USED) && !defined(VERTEX_WORLD_COORDS_USED)
+	prev_vertex_given = (modelview * vec4(prev_vertex_given, 1.0)).xyz;
+#elif !defined(SKIP_TRANSFORM_USED)
+	prev_vertex_given = (read_view_matrix * vec4(prev_vertex_given, 1.0)).xyz;
+#endif
+#ifdef MOTION_VECTORS
+	prev_vertex_view = prev_vertex_given;
+#endif
+#endif
 
 	float roughness = roughness_highp;
 #ifdef NORMAL_USED
@@ -782,7 +806,7 @@ void main() {
 
 	instance_index_interp = instance_index;
 
-#ifdef MOTION_VECTORS
+#if defined(MOTION_VECTORS) && !defined(STATIC_MOTION_VECTORS) && !defined(PREV_VERTEX_USED)
 	// Previous vertex.
 	vec3 prev_vertex;
 #ifdef NORMAL_USED
@@ -822,7 +846,7 @@ void main() {
 			instances.data[instance_index].prev_model_precision.xyz,
 #endif
 			prev_screen_position);
-#else
+#elif !defined(MOTION_VECTORS)
 	// Unused output.
 	vec4 screen_position;
 #endif
@@ -866,6 +890,27 @@ void main() {
 #endif
 
 			screen_position);
+
+#if defined(MOTION_VECTORS) && (defined(STATIC_MOTION_VECTORS) || defined(PREV_VERTEX_USED))
+	// render_mode static_motion_vectors: the vertex as it stands now, seen by last frame's camera (the camera's motion
+	// alone; the shader's own animation is left out, and vertex() has run once). A shader that writes PREV_VERTEX has
+	// said where the vertex stood: that point, seen by last frame's camera.
+	{
+		mat4 inv_view_now = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
+				scene_data_block.data.inv_view_matrix[1],
+				scene_data_block.data.inv_view_matrix[2],
+				vec4(0.0, 0.0, 0.0, 1.0)));
+		mat4 view_before = transpose(mat4(scene_data_block.prev_data.view_matrix[0],
+				scene_data_block.prev_data.view_matrix[1],
+				scene_data_block.prev_data.view_matrix[2],
+				vec4(0.0, 0.0, 0.0, 1.0)));
+#if defined(PREV_VERTEX_USED) && !defined(STATIC_MOTION_VECTORS)
+		prev_screen_position = scene_data_block.prev_data.projection_matrix * (view_before * (inv_view_now * vec4(prev_vertex_view, 1.0)));
+#else
+		prev_screen_position = scene_data_block.prev_data.projection_matrix * (view_before * (inv_view_now * vec4(vertex_interp, 1.0)));
+#endif
+	}
+#endif
 }
 
 #[fragment]

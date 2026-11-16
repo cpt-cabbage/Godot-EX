@@ -1520,7 +1520,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					if (uses_gi) {
 						surf->sort.uses_forward_gi = 1;
 					}
-				} else if (p_using_motion_pass && (uses_motion || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR))) {
+				} else if (p_using_motion_pass && (uses_motion || ((surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR) && !inst->data->static_motion_vectors))) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_MOTION_VECTORS;
 					render_list[RENDER_LIST_MOTION].add_element(surf);
 				} else {
