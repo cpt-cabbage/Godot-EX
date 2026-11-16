@@ -35,7 +35,8 @@
 // into the process and held for the run, though a frame reads a few megabytes of them round the viewer. Mapped, only
 // the pages touched are in memory, they are the file cache's and not the process's own, and several users of one file
 // share them (MappedFile::open_shared). Where a file cannot be mapped (inside a pack, or the call fails) it is read
-// whole as before.
+// whole as before, and in the editor always: a mapped file cannot be written over while it is held, and the editor
+// stays open while a project's tools write its data again. A running game does hold them: close it before an import.
 
 #include "core/object/ref_counted.h"
 #include "core/string/ustring.h"

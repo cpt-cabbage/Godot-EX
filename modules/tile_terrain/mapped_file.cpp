@@ -30,6 +30,7 @@
 
 #include "mapped_file.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/io/file_access.h"
 #include "core/os/mutex.h"
@@ -51,8 +52,11 @@ static HashMap<String, MappedFile *> mapped_files;
 Error MappedFile::open(const String &p_path) {
 	close();
 	const String global = ProjectSettings::get_singleton()->globalize_path(p_path);
+	// Not in the editor: a mapped file cannot be written over (Windows refuses to truncate one), and the editor stays
+	// open with the scene in it while a project's tools write its data again. There the file is read whole, as it was.
+	const bool map_it = !Engine::get_singleton()->is_editor_hint();
 #ifdef WINDOWS_ENABLED
-	HANDLE fh = CreateFileW((LPCWSTR)global.utf16().get_data(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+	HANDLE fh = map_it ? CreateFileW((LPCWSTR)global.utf16().get_data(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr) : INVALID_HANDLE_VALUE;
 	if (fh != INVALID_HANDLE_VALUE) {
 		LARGE_INTEGER length;
 		if (GetFileSizeEx(fh, &length) && length.QuadPart > 0) {
@@ -74,7 +78,7 @@ Error MappedFile::open(const String &p_path) {
 		CloseHandle(fh);
 	}
 #else
-	const int f = ::open(global.utf8().get_data(), O_RDONLY);
+	const int f = map_it ? ::open(global.utf8().get_data(), O_RDONLY) : -1;
 	if (f >= 0) {
 		struct stat st;
 		if (fstat(f, &st) == 0 && st.st_size > 0) {
