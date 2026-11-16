@@ -398,16 +398,53 @@ void InstanceField3D::_free_cell(DrawCell &p_cell) {
 	if (p_cell.multimesh.is_valid()) {
 		rs->free_rid(p_cell.multimesh);
 	}
+	if (p_cell.proxy_instance.is_valid()) {
+		rs->free_rid(p_cell.proxy_instance);
+	}
+	if (p_cell.proxy_multimesh.is_valid()) {
+		rs->free_rid(p_cell.proxy_multimesh);
+	}
 	p_cell.instance = RID();
 	p_cell.multimesh = RID();
+	p_cell.proxy_instance = RID();
+	p_cell.proxy_multimesh = RID();
+}
+
+// The level whose mesh casts p_level's shadows (see shadow_proxy), or -1 where the level casts its own or none.
+int InstanceField3D::_proxy_level(const Type &p_type, uint32_t p_level) const {
+	if (shadow_proxy <= 0 || !p_type.levels[p_level].shadows) {
+		return -1;
+	}
+	uint32_t target = p_level;
+	for (uint32_t l = p_level + 1; l < p_type.levels.size() && l <= p_level + uint32_t(shadow_proxy); l++) {
+		if (p_type.levels[l].mesh.is_null() || !p_type.levels[l].gi) { // (an impostor's card casts nothing like a tree)
+			break;
+		}
+		target = l;
+	}
+	return target == p_level ? -1 : int(target);
+}
+
+void InstanceField3D::set_shadow_proxy(int p_levels) {
+	p_levels = CLAMP(p_levels, 0, 4);
+	if (p_levels == shadow_proxy) {
+		return;
+	}
+	_wait_pending();
+	shadow_proxy = p_levels;
+	_free_all(); // every cell and copy is made again, with its caster or without
 }
 
 void InstanceField3D::_free_copies(Level &p_level) {
 	for (KeyValue<uint32_t, RID> &E : p_level.copies) {
 		RS::get_singleton()->free_rid(E.value);
 	}
+	for (KeyValue<uint32_t, RID> &E : p_level.copy_proxies) {
+		RS::get_singleton()->free_rid(E.value);
+	}
 	p_level.copies.clear();
 	p_level.copies_still.clear();
+	p_level.copy_proxies.clear();
 }
 
 void InstanceField3D::set_level_fade(float p_fade) {
@@ -456,9 +493,15 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 	}
 	HashMap<uint32_t, RID> kept;
 	HashSet<uint32_t> kept_still;
+	HashMap<uint32_t, RID> kept_proxies;
+	const int proxy = _proxy_level(p_type, uint32_t(&p_level - p_type.levels.ptr()));
 	for (uint32_t n = 0; n < in_band.size(); n++) {
 		const uint32_t i = in_band[n];
 		if (HashMap<uint32_t, RID>::Iterator it = p_level.copies.find(i)) {
+			if (HashMap<uint32_t, RID>::Iterator pit = p_level.copy_proxies.find(i)) {
+				kept_proxies.insert(i, pit->value);
+				p_level.copy_proxies.remove(pit);
+			}
 			if (in_band_still[n] != p_level.copies_still.has(i)) {
 				rs->instance_geometry_set_flag(it->value, RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS, in_band_still[n]);
 			}
@@ -484,10 +527,23 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 		if (level_fade > 0.0f) {
 			rs->instance_geometry_set_shader_parameter(inst, SNAME("lod_fade"), p_level.fade);
 		}
-		rs->instance_geometry_set_cast_shadows_setting(inst, p_level.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
+		rs->instance_geometry_set_cast_shadows_setting(inst, p_level.shadows && proxy < 0 ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
 		if (!p_level.gi) {
 			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
 			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, true); // still lit by the probes
+		}
+		if (proxy >= 0) {
+			// Its shadow from the coarser level's mesh (shadow_proxy): in the shadow maps only, and out of the bounce
+			// light's voxels, where the copy itself already is.
+			RID caster = rs->instance_create2(p_type.levels[proxy].mesh->get_rid(), p_scenario);
+			rs->instance_set_transform(caster, p_xf * t);
+			if (level_fade > 0.0f) {
+				rs->instance_geometry_set_shader_parameter(caster, SNAME("lod_fade"), p_level.fade);
+			}
+			rs->instance_geometry_set_cast_shadows_setting(caster, RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
+			rs->instance_geometry_set_flag(caster, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+			rs->instance_set_visible(caster, p_visible);
+			kept_proxies.insert(i, caster);
 		}
 		if (in_band_still[n]) {
 			rs->instance_geometry_set_flag(inst, RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS, true);
@@ -499,6 +555,7 @@ void InstanceField3D::_update_copies(Type &p_type, Level &p_level, const Transfo
 	_free_copies(p_level); // the ones left over have left the band
 	p_level.copies = kept;
 	p_level.copies_still = kept_still;
+	p_level.copy_proxies = kept_proxies;
 }
 
 static _FORCE_INLINE_ float seg_dist2(float p_x, float p_z, const Vector4 &p_s) {
@@ -855,12 +912,26 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 			if (level_fade > 0.0f) {
 				rs->instance_geometry_set_shader_parameter(nc.instance, SNAME("lod_fade"), lv.fade);
 			}
-			rs->instance_geometry_set_cast_shadows_setting(nc.instance, lv.shadows ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
+			const int proxy = _proxy_level(types[j.type], j.level);
+			rs->instance_geometry_set_cast_shadows_setting(nc.instance, lv.shadows && proxy < 0 ? RSE::SHADOW_CASTING_SETTING_ON : RSE::SHADOW_CASTING_SETTING_OFF);
 			if (!lv.gi) {
 				rs->instance_geometry_set_flag(nc.instance, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
 				rs->instance_geometry_set_flag(nc.instance, RSE::INSTANCE_FLAG_USE_DYNAMIC_GI, true); // still lit by the probes
 			}
 			rs->instance_set_visible(nc.instance, vis);
+			if (proxy >= 0) {
+				// The cell's shadow from the coarser level's mesh (shadow_proxy), in the shadow maps only.
+				nc.proxy_multimesh = rs->multimesh_create();
+				rs->multimesh_set_mesh(nc.proxy_multimesh, types[j.type].levels[proxy].mesh->get_rid());
+				nc.proxy_instance = rs->instance_create2(nc.proxy_multimesh, scenario);
+				rs->instance_set_transform(nc.proxy_instance, xf);
+				if (level_fade > 0.0f) {
+					rs->instance_geometry_set_shader_parameter(nc.proxy_instance, SNAME("lod_fade"), lv.fade);
+				}
+				rs->instance_geometry_set_cast_shadows_setting(nc.proxy_instance, RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
+				rs->instance_geometry_set_flag(nc.proxy_instance, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+				rs->instance_set_visible(nc.proxy_instance, vis);
+			}
 			lv.cells.insert(j.key, nc);
 			c = lv.cells.getptr(j.key);
 		}
@@ -888,6 +959,10 @@ void InstanceField3D::_apply_jobs(LocalVector<Job> &jobs, const LocalVector<Vect
 				rs->multimesh_instance_set_transform(c->multimesh, 0, Transform3D());
 			}
 			rs->multimesh_set_buffer(c->multimesh, j.buffer);
+			if (c->proxy_multimesh.is_valid()) {
+				rs->multimesh_allocate_data(c->proxy_multimesh, j.count, RSE::MULTIMESH_TRANSFORM_3D);
+				rs->multimesh_set_buffer(c->proxy_multimesh, j.buffer);
+			}
 			c->hash = j.hash;
 			uploads++;
 			total_upload_bytes += int64_t(j.count) * 48;
@@ -978,8 +1053,15 @@ void InstanceField3D::_notification(int p_what) {
 						const float *x = t.xf.ptr() + int64_t(E.key) * 12;
 						RS::get_singleton()->instance_set_transform(E.value, xf * Transform3D(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11])));
 					}
+					for (KeyValue<uint32_t, RID> &E : lv.copy_proxies) {
+						const float *x = t.xf.ptr() + int64_t(E.key) * 12;
+						RS::get_singleton()->instance_set_transform(E.value, xf * Transform3D(Basis(x[0], x[1], x[2], x[4], x[5], x[6], x[8], x[9], x[10]), Vector3(x[3], x[7], x[11])));
+					}
 					for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 						RS::get_singleton()->instance_set_transform(E.value.instance, xf);
+						if (E.value.proxy_instance.is_valid()) {
+							RS::get_singleton()->instance_set_transform(E.value.proxy_instance, xf);
+						}
 					}
 				}
 			}
@@ -991,8 +1073,14 @@ void InstanceField3D::_notification(int p_what) {
 					for (KeyValue<uint32_t, RID> &E : lv.copies) {
 						RS::get_singleton()->instance_set_visible(E.value, vis);
 					}
+					for (KeyValue<uint32_t, RID> &E : lv.copy_proxies) {
+						RS::get_singleton()->instance_set_visible(E.value, vis);
+					}
 					for (KeyValue<uint64_t, DrawCell> &E : lv.cells) {
 						RS::get_singleton()->instance_set_visible(E.value.instance, vis);
+						if (E.value.proxy_instance.is_valid()) {
+							RS::get_singleton()->instance_set_visible(E.value.proxy_instance, vis);
+						}
 					}
 				}
 			}
@@ -1035,6 +1123,8 @@ void InstanceField3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_level_fade"), &InstanceField3D::get_level_fade);
 	ClassDB::bind_method(D_METHOD("set_still_motion_from", "distance"), &InstanceField3D::set_still_motion_from);
 	ClassDB::bind_method(D_METHOD("get_still_motion_from"), &InstanceField3D::get_still_motion_from);
+	ClassDB::bind_method(D_METHOD("set_shadow_proxy", "levels"), &InstanceField3D::set_shadow_proxy);
+	ClassDB::bind_method(D_METHOD("get_shadow_proxy"), &InstanceField3D::get_shadow_proxy);
 	ClassDB::bind_method(D_METHOD("set_ray_traced_copies", "keep"), &InstanceField3D::set_ray_traced_copies);
 	ClassDB::bind_method(D_METHOD("get_ray_traced_copies"), &InstanceField3D::get_ray_traced_copies);
 	ClassDB::bind_method(D_METHOD("set_per_copy_levels", "levels"), &InstanceField3D::set_per_copy_levels);
@@ -1050,6 +1140,7 @@ void InstanceField3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "per_copy_levels", PROPERTY_HINT_RANGE, "0,8,1"), "set_per_copy_levels", "get_per_copy_levels");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "still_motion_from", PROPERTY_HINT_RANGE, "0,1000,0.5,or_greater,suffix:m"), "set_still_motion_from", "get_still_motion_from");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ray_traced_copies"), "set_ray_traced_copies", "get_ray_traced_copies");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "shadow_proxy", PROPERTY_HINT_RANGE, "0,4,1"), "set_shadow_proxy", "get_shadow_proxy");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "follow_camera"), "set_follow_camera", "get_follow_camera");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "focus_position", PROPERTY_HINT_NONE, "suffix:m"), "set_focus_position", "get_focus_position");
 }

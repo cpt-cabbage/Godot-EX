@@ -71,6 +71,8 @@ class InstanceField3D : public Node3D {
 		uint64_t hash = 0;
 		uint64_t used = 0;
 		bool still = false; // INSTANCE_FLAG_STATIC_MOTION_VECTORS as last set
+		RID proxy_multimesh; // shadow_proxy: the same copies as a coarser level's mesh, casting the cell's shadow
+		RID proxy_instance;
 	};
 
 	struct Level {
@@ -90,6 +92,7 @@ class InstanceField3D : public Node3D {
 		HashMap<uint64_t, DrawCell> cells;
 		HashMap<uint32_t, RID> copies; // per-copy levels: the copy's instance, by its index
 		HashSet<uint32_t> copies_still; // those with INSTANCE_FLAG_STATIC_MOTION_VECTORS set
+		HashMap<uint32_t, RID> copy_proxies; // shadow_proxy: each copy's shadow caster, by its index
 		uint64_t copies_frame = 0;
 		uint64_t copies_disturbed = 0; // the disturbances' version its copies were made with
 	};
@@ -179,6 +182,14 @@ class InstanceField3D : public Node3D {
 	// (RSE::INSTANCE_FLAG_STATIC_MOTION_VECTORS: a shader that sways them by TIME is not run twice a vertex for them);
 	// a cell by its nearest point, a per-copy level's copy by itself. 0: none (every swaying copy is in the motion pass).
 	float still_motion_from = 0.0f;
+	// A level that casts shadows casts them with the mesh of the level this many coarser (a shadow proxy: the copies
+	// drawn a second time for the shadow maps only, the level's own instances casting none), down to the last mesh
+	// level, never an impostor. A sun's cascades draw every caster again, some in two or three of them: a wood's
+	// shadows were 30 M triangles a frame for 15 M in view, and a shadow map's texel is centimetres to decimetres, far
+	// coarser than the nearest level's leaves. 0: each level casts its own mesh. Not for a ray-traced scene, which is
+	// made of the instances that cast.
+	int shadow_proxy = 0;
+	int _proxy_level(const Type &p_type, uint32_t p_level) const;
 	// Cells that cast shadows keep a copy of their buffer in memory, which the ray-traced scene asks for (_apply_jobs).
 	// false while nothing is ray-traced: the copies are not kept (they were, 48 bytes a copy drawn, on any tier).
 	bool ray_traced_copies = true;
@@ -285,6 +296,8 @@ public:
 	void set_still_motion_from(float p_distance) { still_motion_from = MAX(p_distance, 0.0f); }
 	float get_still_motion_from() const { return still_motion_from; }
 	void set_ray_traced_copies(bool p_keep) { ray_traced_copies = p_keep; }
+	void set_shadow_proxy(int p_levels);
+	int get_shadow_proxy() const { return shadow_proxy; }
 	bool get_ray_traced_copies() const { return ray_traced_copies; }
 	void set_per_copy_levels(int p_levels);
 	int get_per_copy_levels() const { return per_copy_levels; }
