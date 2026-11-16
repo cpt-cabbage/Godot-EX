@@ -948,6 +948,29 @@ Color TileTerrain3D::get_painted_mask(int p_column, int p_row) const {
 	return Color(m[0] / 255.0f, m[1] / 255.0f, m[2] / 255.0f, m[3] / 255.0f);
 }
 
+Color TileTerrain3D::paint_over(int p_column, int p_row, const Color &p_base) const {
+	uint8_t m[4] = { uint8_t(CLAMP(p_base.r, 0.0f, 1.0f) * 255.0f + 0.5f), uint8_t(CLAMP(p_base.g, 0.0f, 1.0f) * 255.0f + 0.5f),
+		uint8_t(CLAMP(p_base.b, 0.0f, 1.0f) * 255.0f + 0.5f), uint8_t(CLAMP(p_base.a, 0.0f, 1.0f) * 255.0f + 0.5f) };
+	MutexLock lock(paint_mutex);
+	_painted_sample(p_column, p_row, m, nullptr);
+	return Color(m[0] / 255.0f, m[1] / 255.0f, m[2] / 255.0f, m[3] / 255.0f);
+}
+
+bool TileTerrain3D::has_paint_in(const Rect2i &p_rect) const {
+	MutexLock lock(paint_mutex);
+	if (paint_pages.is_empty()) {
+		return false;
+	}
+	for (int py = _tt_floor_div(p_rect.position.y, PAINT_PAGE); py <= _tt_floor_div(p_rect.position.y + p_rect.size.y - 1, PAINT_PAGE); py++) {
+		for (int px = _tt_floor_div(p_rect.position.x, PAINT_PAGE); px <= _tt_floor_div(p_rect.position.x + p_rect.size.x - 1, PAINT_PAGE); px++) {
+			if (paint_pages.has(Vector2i(px, py))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 Color TileTerrain3D::get_user_channels(int p_column, int p_row) const {
 	uint8_t u[4];
 	MutexLock lock(paint_mutex);
@@ -1580,6 +1603,8 @@ void TileTerrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_paint_page_count"), &TileTerrain3D::get_paint_page_count);
 	ClassDB::bind_method(D_METHOD("get_painted_mask", "column", "row"), &TileTerrain3D::get_painted_mask);
 	ClassDB::bind_method(D_METHOD("get_user_channels", "column", "row"), &TileTerrain3D::get_user_channels);
+	ClassDB::bind_method(D_METHOD("paint_over", "column", "row", "base"), &TileTerrain3D::paint_over);
+	ClassDB::bind_method(D_METHOD("has_paint_in", "rect"), &TileTerrain3D::has_paint_in);
 	ClassDB::bind_method(D_METHOD("set_data_path", "path"), &TileTerrain3D::set_data_path);
 	ClassDB::bind_method(D_METHOD("get_data_path"), &TileTerrain3D::get_data_path);
 	ClassDB::bind_method(D_METHOD("set_material", "material"), &TileTerrain3D::set_material);

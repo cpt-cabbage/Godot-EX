@@ -309,6 +309,10 @@ public:
 	// The masks at a sample as drawn (the file's with the paint), and the user's channels there.
 	Color get_painted_mask(int p_column, int p_row) const;
 	Color get_user_channels(int p_column, int p_row) const;
+	// The paint laid over a mask value read elsewhere (a script that has the file open), and whether any page holds
+	// any of a rect of samples.
+	Color paint_over(int p_column, int p_row, const Color &p_base) const;
+	bool has_paint_in(const Rect2i &p_rect) const;
 
 	// Choose and build the chunks for a viewer at p_position now (follow_camera does this each frame).
 	void update_lods(const Vector3 &p_position);
