@@ -2295,6 +2295,7 @@ void RenderingServer::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("texture_set_path", "texture", "path"), &RenderingServer::texture_set_path);
 	ClassDB::bind_method(D_METHOD("texture_get_path", "texture"), &RenderingServer::texture_get_path);
+	ClassDB::bind_method(D_METHOD("texture_debug_usage"), &RenderingServer::_texture_debug_usage_bind);
 
 	ClassDB::bind_method(D_METHOD("texture_get_format", "texture"), &RenderingServer::texture_get_format);
 
