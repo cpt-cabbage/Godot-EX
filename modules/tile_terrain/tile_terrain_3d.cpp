@@ -292,7 +292,20 @@ Error TileTerrain3D::_load() {
 	}
 	far_heights_image.unref();
 	far_masks_image.unref();
+	far_masks_paint.unref();
+	far_user_image.unref();
+	{
+		Ref<Image> neutral = Image::create_empty(1, 1, false, Image::FORMAT_RGBA8);
+		neutral->fill(Color(128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0));
+		user_texture = ImageTexture::create_from_image(neutral);
+	}
 	_update_clip(Vector3(origin_north + spacing * samples * 0.5, 0.0, origin_east + spacing * samples * 0.5), true);
+	if (!paint_pages.is_empty()) { // (pages set before the data: the windows have them, the far maps here)
+		for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+			_patch_far(Rect2i(kv.key * PAINT_PAGE, Vector2i(PAINT_PAGE, PAINT_PAGE)));
+		}
+		_upload_far();
+	}
 	print_verbose(vformat("TileTerrain3D: %d x %d samples at %.4f m, %d levels, loaded in %.2f s", samples, samples, spacing, max_lod + 1, (OS::get_singleton()->get_ticks_usec() - t0) / 1e6));
 	return OK;
 }
@@ -379,6 +392,8 @@ void TileTerrain3D::register_globals() {
 	rs->global_shader_parameter_add("terrain_masks_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
 	rs->global_shader_parameter_add("terrain_slopes_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
 	rs->global_shader_parameter_add("terrain_slopes_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
+	rs->global_shader_parameter_add("terrain_user_clip", RSE::GLOBAL_VAR_TYPE_SAMPLER2DARRAY, RID());
+	rs->global_shader_parameter_add("terrain_user_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_heights_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_masks_far", RSE::GLOBAL_VAR_TYPE_SAMPLER2D, RID());
 	rs->global_shader_parameter_add("terrain_clip_01", RSE::GLOBAL_VAR_TYPE_VEC4, Vector4());
@@ -567,7 +582,400 @@ Ref<Image> TileTerrain3D::_clip_masks(int p_level, const Vector2i &p_origin) con
 			memcpy(w + (int64_t(y) * CLIP_SIZE + x) * 4, row.ptr() + int64_t(c) * 4, 4);
 		}
 	}
+	{
+		MutexLock lock(paint_mutex);
+		_paint_masks(w, p_level, p_origin);
+	}
 	return image;
+}
+
+static inline int _tt_ceil_div(int p_a, int p_b) {
+	return p_a >= 0 ? (p_a + p_b - 1) / p_b : -((-p_a) / p_b);
+}
+
+static inline int _tt_floor_div(int p_a, int p_b) {
+	return p_a >= 0 ? p_a / p_b : -((-p_a + p_b - 1) / p_b);
+}
+
+// The paint's pages laid over a window of masks (see the header): each page's samples that the window holds.
+void TileTerrain3D::_paint_masks(uint8_t *p_pixels, int p_level, const Vector2i &p_origin) const {
+	const int step = 1 << p_level;
+	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+		const PaintPage &pg = kv.value;
+		if (pg.values[PAINT_MASKS].is_empty()) {
+			continue;
+		}
+		const int pc0 = kv.key.x * PAINT_PAGE, pr0 = kv.key.y * PAINT_PAGE;
+		const int x0 = MAX(0, _tt_ceil_div(pc0 - p_origin.x, step)), x1 = MIN(CLIP_SIZE - 1, _tt_floor_div(pc0 + PAINT_PAGE - 1 - p_origin.x, step));
+		const int y0 = MAX(0, _tt_ceil_div(pr0 - p_origin.y, step)), y1 = MIN(CLIP_SIZE - 1, _tt_floor_div(pr0 + PAINT_PAGE - 1 - p_origin.y, step));
+		for (int y = y0; y <= y1; y++) {
+			const int r = p_origin.y + y * step - pr0;
+			for (int x = x0; x <= x1; x++) {
+				const int col = p_origin.x + x * step - pc0;
+				const uint8_t *v = pg.values[PAINT_MASKS].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				const uint8_t *wt = pg.weights[PAINT_MASKS].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				uint8_t *px = p_pixels + (int64_t(y) * CLIP_SIZE + x) * 4;
+				for (int ch = 0; ch < 4; ch++) {
+					if (wt[ch] != 0) {
+						px[ch] = uint8_t(int(px[ch]) + ((int(v[ch]) - int(px[ch])) * int(wt[ch]) + (v[ch] >= px[ch] ? 127 : -127)) / 255);
+					}
+				}
+			}
+		}
+	}
+}
+
+// One sample as drawn: r_mask holds the file's bytes coming in and the painted ones going out; r_user the user's
+// channels there (128 with none). The caller holds paint_mutex.
+void TileTerrain3D::_painted_sample(int p_column, int p_row, uint8_t *r_mask, uint8_t *r_user) const {
+	if (r_user != nullptr) {
+		r_user[0] = r_user[1] = r_user[2] = r_user[3] = 128;
+	}
+	if (paint_pages.is_empty()) {
+		return;
+	}
+	const Vector2i key(_tt_floor_div(p_column, PAINT_PAGE), _tt_floor_div(p_row, PAINT_PAGE));
+	const PaintPage *pg = paint_pages.getptr(key);
+	if (pg == nullptr) {
+		return;
+	}
+	const int64_t at = (int64_t(p_row - key.y * PAINT_PAGE) * PAINT_PAGE + (p_column - key.x * PAINT_PAGE)) * 4;
+	if (r_mask != nullptr && !pg->values[PAINT_MASKS].is_empty()) {
+		for (int ch = 0; ch < 4; ch++) {
+			const int v = pg->values[PAINT_MASKS][at + ch], wt = pg->weights[PAINT_MASKS][at + ch];
+			if (wt != 0) {
+				r_mask[ch] = uint8_t(int(r_mask[ch]) + ((v - int(r_mask[ch])) * wt + (v >= r_mask[ch] ? 127 : -127)) / 255);
+			}
+		}
+	}
+	if (r_user != nullptr && !pg->values[PAINT_USER].is_empty()) {
+		for (int ch = 0; ch < 4; ch++) {
+			const int v = pg->values[PAINT_USER][at + ch], wt = pg->weights[PAINT_USER][at + ch];
+			r_user[ch] = uint8_t(128 + ((v - 128) * wt + (v >= 128 ? 127 : -127)) / 255);
+		}
+	}
+}
+
+// A level's window of the user's channels: 128 ("as built") but where a page has them.
+Ref<Image> TileTerrain3D::_clip_user(int p_level, const Vector2i &p_origin) const {
+	const int step = 1 << p_level;
+	Ref<Image> image = Image::create_empty(CLIP_SIZE, CLIP_SIZE, false, Image::FORMAT_RGBA8);
+	uint8_t *w = image->ptrw();
+	memset(w, 128, size_t(CLIP_SIZE) * CLIP_SIZE * 4);
+	MutexLock lock(paint_mutex);
+	if (!paint_has_user) {
+		return image;
+	}
+	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+		const PaintPage &pg = kv.value;
+		if (pg.values[PAINT_USER].is_empty()) {
+			continue;
+		}
+		const int pc0 = kv.key.x * PAINT_PAGE, pr0 = kv.key.y * PAINT_PAGE;
+		const int x0 = MAX(0, _tt_ceil_div(pc0 - p_origin.x, step)), x1 = MIN(CLIP_SIZE - 1, _tt_floor_div(pc0 + PAINT_PAGE - 1 - p_origin.x, step));
+		const int y0 = MAX(0, _tt_ceil_div(pr0 - p_origin.y, step)), y1 = MIN(CLIP_SIZE - 1, _tt_floor_div(pr0 + PAINT_PAGE - 1 - p_origin.y, step));
+		for (int y = y0; y <= y1; y++) {
+			const int r = p_origin.y + y * step - pr0;
+			for (int x = x0; x <= x1; x++) {
+				const int col = p_origin.x + x * step - pc0;
+				const uint8_t *v = pg.values[PAINT_USER].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				const uint8_t *wt = pg.weights[PAINT_USER].ptr() + (int64_t(r) * PAINT_PAGE + col) * 4;
+				uint8_t *px = w + (int64_t(y) * CLIP_SIZE + x) * 4;
+				for (int ch = 0; ch < 4; ch++) {
+					px[ch] = uint8_t(128 + ((int(v[ch]) - 128) * int(wt[ch]) + (v[ch] >= 128 ? 127 : -127)) / 255);
+				}
+			}
+		}
+	}
+	return image;
+}
+
+void TileTerrain3D::set_paint_page(const Vector2i &p_page, PaintSet p_set, const PackedByteArray &p_values, const PackedByteArray &p_weights) {
+	const int64_t full = int64_t(PAINT_PAGE) * PAINT_PAGE * 4;
+	ERR_FAIL_INDEX(int(p_set), 2);
+	ERR_FAIL_COND_MSG(p_values.size() != p_weights.size() || (p_values.size() != 0 && p_values.size() != full),
+			"TileTerrain3D: a paint page's arrays are PAINT_PAGE * PAINT_PAGE * 4 bytes, or empty");
+	MutexLock lock(paint_mutex);
+	paint_revision++;
+	if (p_values.is_empty()) {
+		PaintPage *pg = paint_pages.getptr(p_page);
+		if (pg != nullptr) {
+			pg->values[p_set].clear();
+			pg->weights[p_set].clear();
+			if (pg->values[0].is_empty() && pg->values[1].is_empty()) {
+				paint_pages.erase(p_page);
+			}
+		}
+		return;
+	}
+	PaintPage &pg = paint_pages[p_page];
+	pg.values[p_set].resize(uint32_t(full));
+	pg.weights[p_set].resize(uint32_t(full));
+	memcpy(pg.values[p_set].ptr(), p_values.ptr(), size_t(full));
+	memcpy(pg.weights[p_set].ptr(), p_weights.ptr(), size_t(full));
+	if (p_set == PAINT_USER) {
+		paint_has_user = true;
+	}
+}
+
+Array TileTerrain3D::get_paint_page(const Vector2i &p_page, PaintSet p_set) const {
+	PackedByteArray values, weights;
+	Array out;
+	ERR_FAIL_INDEX_V(int(p_set), 2, out);
+	MutexLock lock(paint_mutex);
+	const PaintPage *pg = paint_pages.getptr(p_page);
+	if (pg != nullptr && !pg->values[p_set].is_empty()) {
+		values.resize(pg->values[p_set].size());
+		weights.resize(pg->weights[p_set].size());
+		memcpy(values.ptrw(), pg->values[p_set].ptr(), pg->values[p_set].size());
+		memcpy(weights.ptrw(), pg->weights[p_set].ptr(), pg->weights[p_set].size());
+	}
+	out.push_back(values);
+	out.push_back(weights);
+	return out;
+}
+
+TypedArray<Vector2i> TileTerrain3D::get_paint_pages() const {
+	TypedArray<Vector2i> out;
+	MutexLock lock(paint_mutex);
+	for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+		out.push_back(kv.key);
+	}
+	return out;
+}
+
+Rect2i TileTerrain3D::paint_stamp(PaintSet p_set, int p_channel, const Vector2 &p_centre, float p_radius, float p_hardness, float p_strength, float p_value, bool p_erase) {
+	ERR_FAIL_INDEX_V(int(p_set), 2, Rect2i());
+	ERR_FAIL_INDEX_V(p_channel, 4, Rect2i());
+	if (p_radius <= 0.0f || p_strength <= 0.0f || samples <= 0) {
+		return Rect2i();
+	}
+	const float hardness = CLAMP(p_hardness, 0.0f, 0.999f);
+	const float strength = MIN(p_strength, 1.0f);
+	const float value = CLAMP(p_value, 0.0f, 1.0f) * 255.0f;
+	const int c0 = MAX(int(Math::floor(p_centre.x - p_radius)), 0), c1 = MIN(int(Math::ceil(p_centre.x + p_radius)), samples - 1);
+	const int r0 = MAX(int(Math::floor(p_centre.y - p_radius)), 0), r1 = MIN(int(Math::ceil(p_centre.y + p_radius)), samples - 1);
+	if (c0 > c1 || r0 > r1) {
+		return Rect2i();
+	}
+	const size_t full = size_t(PAINT_PAGE) * PAINT_PAGE * 4;
+	MutexLock lock(paint_mutex);
+	paint_revision++;
+	for (int py = r0 / PAINT_PAGE; py <= r1 / PAINT_PAGE; py++) {
+		for (int px = c0 / PAINT_PAGE; px <= c1 / PAINT_PAGE; px++) {
+			const Vector2i key(px, py);
+			PaintPage *pg = paint_pages.getptr(key);
+			if (pg == nullptr || pg->values[p_set].is_empty()) {
+				if (p_erase) {
+					continue; // nothing painted there
+				}
+				PaintPage &made = paint_pages[key];
+				made.values[p_set].resize(uint32_t(full));
+				made.weights[p_set].resize(uint32_t(full));
+				memset(made.values[p_set].ptr(), p_set == PAINT_USER ? 128 : 0, full);
+				memset(made.weights[p_set].ptr(), 0, full);
+				pg = &made;
+			}
+			uint8_t *vals = pg->values[p_set].ptr();
+			uint8_t *wts = pg->weights[p_set].ptr();
+			for (int r = MAX(r0, py * PAINT_PAGE); r <= MIN(r1, py * PAINT_PAGE + PAINT_PAGE - 1); r++) {
+				for (int col = MAX(c0, px * PAINT_PAGE); col <= MIN(c1, px * PAINT_PAGE + PAINT_PAGE - 1); col++) {
+					const float d = Vector2(float(col) - p_centre.x, float(r) - p_centre.y).length() / p_radius;
+					if (d >= 1.0f) {
+						continue;
+					}
+					float fall = d <= hardness ? 1.0f : 1.0f - (d - hardness) / (1.0f - hardness);
+					fall = fall * fall * (3.0f - 2.0f * fall);
+					const float a = strength * fall;
+					const int64_t at = (int64_t(r - py * PAINT_PAGE) * PAINT_PAGE + (col - px * PAINT_PAGE)) * 4 + p_channel;
+					const float w0 = wts[at] / 255.0f;
+					if (p_erase) {
+						wts[at] = uint8_t(w0 * (1.0f - a) * 255.0f + 0.5f);
+					} else {
+						const float nw = w0 + a * (1.0f - w0);
+						if (nw > 0.0f) {
+							vals[at] = uint8_t(CLAMP((float(vals[at]) * w0 * (1.0f - a) + value * a) / nw, 0.0f, 255.0f) + 0.5f);
+						}
+						wts[at] = uint8_t(MIN(nw, 1.0f) * 255.0f + 0.5f);
+					}
+				}
+			}
+		}
+	}
+	if (p_set == PAINT_USER && !p_erase) {
+		paint_has_user = true;
+	}
+	return Rect2i(c0, r0, c1 - c0 + 1, r1 - r0 + 1);
+}
+
+void TileTerrain3D::clear_paint() {
+	LocalVector<Vector2i> keys;
+	{
+		MutexLock lock(paint_mutex);
+		for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+			keys.push_back(kv.key);
+		}
+		paint_pages.clear();
+		paint_revision++;
+	}
+	if (keys.is_empty() || !loaded) {
+		return;
+	}
+	refresh_paint(Rect2i(), false);
+	for (const Vector2i &k : keys) {
+		_patch_far(Rect2i(k * PAINT_PAGE, Vector2i(PAINT_PAGE, PAINT_PAGE)));
+	}
+	_upload_far();
+}
+
+void TileTerrain3D::refresh_paint(const Rect2i &p_rect, bool p_far) {
+	if (!loaded || clip_masks.is_null() || clip_user.is_null()) {
+		return;
+	}
+	for (int level = 0; level < CLIP_LEVELS; level++) {
+		const int step = 1 << level;
+		const Rect2i window(clip_origin[level], Vector2i(CLIP_SIZE * step, CLIP_SIZE * step));
+		if (p_rect.has_area() && !window.intersects(p_rect)) {
+			continue;
+		}
+		clip_masks->update_layer(_clip_masks(level, clip_origin[level]), level);
+		clip_user->update_layer(_clip_user(level, clip_origin[level]), level);
+	}
+	if (p_far) {
+		if (p_rect.has_area()) {
+			_patch_far(p_rect);
+		} else {
+			LocalVector<Vector2i> keys;
+			{
+				MutexLock lock(paint_mutex);
+				for (const KeyValue<Vector2i, PaintPage> &kv : paint_pages) {
+					keys.push_back(kv.key);
+				}
+			}
+			for (const Vector2i &k : keys) {
+				_patch_far(Rect2i(k * PAINT_PAGE, Vector2i(PAINT_PAGE, PAINT_PAGE)));
+			}
+		}
+		_upload_far();
+	}
+}
+
+// The far maps' texels that hold any of p_rect (samples) worked out again: the masks from their file with the paint,
+// the user's channels from the pages, each texel the mean of its FAR_STEP^2 samples.
+void TileTerrain3D::_patch_far(const Rect2i &p_rect) {
+	if (!loaded || mask_texture.is_null() || masks_path.is_empty()) {
+		return;
+	}
+	const int n = (samples + FAR_STEP - 1) / FAR_STEP;
+	if (far_masks_paint.is_null()) {
+		far_masks_paint = mask_texture->get_image();
+		ERR_FAIL_COND(far_masks_paint.is_null() || far_masks_paint->get_width() != n);
+	}
+	MutexLock lock(paint_mutex);
+	if (paint_has_user && far_user_image.is_null()) {
+		far_user_image = Image::create_empty(n, n, false, Image::FORMAT_RGBA8);
+		memset(far_user_image->ptrw(), 128, size_t(n) * n * 4);
+	}
+	const int x0 = CLAMP(_tt_floor_div(p_rect.position.x, FAR_STEP), 0, n - 1), x1 = CLAMP(_tt_floor_div(p_rect.position.x + p_rect.size.x - 1, FAR_STEP), 0, n - 1);
+	const int y0 = CLAMP(_tt_floor_div(p_rect.position.y, FAR_STEP), 0, n - 1), y1 = CLAMP(_tt_floor_div(p_rect.position.y + p_rect.size.y - 1, FAR_STEP), 0, n - 1);
+	Ref<FileAccess> f = FileAccess::open(masks_path, FileAccess::READ);
+	ERR_FAIL_COND(f.is_null());
+	const int c0 = x0 * FAR_STEP, c1 = MIN((x1 + 1) * FAR_STEP, samples) - 1;
+	LocalVector<uint8_t> row;
+	row.resize(uint32_t(c1 - c0 + 1) * 4);
+	LocalVector<uint32_t> sums; // a far row's texels: four masks, four of the user's, a count
+	sums.resize(uint32_t(x1 - x0 + 1) * 9);
+	uint8_t *wm = far_masks_paint->ptrw();
+	uint8_t *wu = far_user_image.is_valid() ? far_user_image->ptrw() : nullptr;
+	for (int y = y0; y <= y1; y++) {
+		memset(sums.ptr(), 0, sums.size() * sizeof(uint32_t));
+		for (int r = y * FAR_STEP; r < MIN((y + 1) * FAR_STEP, samples); r++) {
+			f->seek(uint64_t((int64_t(r) * samples + c0) * 4));
+			f->get_buffer(row.ptr(), row.size());
+			for (int col = c0; col <= c1; col++) {
+				uint8_t user[4];
+				uint8_t *m = row.ptr() + int64_t(col - c0) * 4;
+				_painted_sample(col, r, m, user);
+				uint32_t *s = sums.ptr() + (col / FAR_STEP - x0) * 9;
+				for (int ch = 0; ch < 4; ch++) {
+					s[ch] += m[ch];
+					s[4 + ch] += user[ch];
+				}
+				s[8]++;
+			}
+		}
+		for (int x = x0; x <= x1; x++) {
+			const uint32_t *s = sums.ptr() + (x - x0) * 9;
+			const uint32_t k = MAX(s[8], 1u);
+			for (int ch = 0; ch < 4; ch++) {
+				wm[(int64_t(y) * n + x) * 4 + ch] = uint8_t(s[ch] / k);
+				if (wu != nullptr) {
+					wu[(int64_t(y) * n + x) * 4 + ch] = uint8_t(s[4 + ch] / k);
+				}
+			}
+		}
+	}
+}
+
+// The patched far maps sent to the card, with their mipmaps made again.
+void TileTerrain3D::_upload_far() {
+	if (far_masks_paint.is_valid() && mask_texture.is_valid()) {
+		far_masks_paint->generate_mipmaps();
+		mask_texture->update(far_masks_paint);
+	}
+	if (far_user_image.is_valid()) {
+		far_user_image->generate_mipmaps();
+		if (user_texture.is_valid() && user_texture->get_width() == far_user_image->get_width()) {
+			user_texture->update(far_user_image);
+		} else {
+			user_texture = ImageTexture::create_from_image(far_user_image);
+			RS::get_singleton()->global_shader_parameter_set("terrain_user_far", user_texture);
+		}
+	}
+}
+
+Color TileTerrain3D::get_painted_mask(int p_column, int p_row) const {
+	ERR_FAIL_COND_V(!loaded || masks_path.is_empty(), Color());
+	p_column = CLAMP(p_column, 0, samples - 1);
+	p_row = CLAMP(p_row, 0, samples - 1);
+	Ref<FileAccess> f = FileAccess::open(masks_path, FileAccess::READ);
+	ERR_FAIL_COND_V(f.is_null(), Color());
+	uint8_t m[4];
+	f->seek(uint64_t((int64_t(p_row) * samples + p_column) * 4));
+	f->get_buffer(m, 4);
+	MutexLock lock(paint_mutex);
+	_painted_sample(p_column, p_row, m, nullptr);
+	return Color(m[0] / 255.0f, m[1] / 255.0f, m[2] / 255.0f, m[3] / 255.0f);
+}
+
+Color TileTerrain3D::paint_over(int p_column, int p_row, const Color &p_base) const {
+	uint8_t m[4] = { uint8_t(CLAMP(p_base.r, 0.0f, 1.0f) * 255.0f + 0.5f), uint8_t(CLAMP(p_base.g, 0.0f, 1.0f) * 255.0f + 0.5f),
+		uint8_t(CLAMP(p_base.b, 0.0f, 1.0f) * 255.0f + 0.5f), uint8_t(CLAMP(p_base.a, 0.0f, 1.0f) * 255.0f + 0.5f) };
+	MutexLock lock(paint_mutex);
+	_painted_sample(p_column, p_row, m, nullptr);
+	return Color(m[0] / 255.0f, m[1] / 255.0f, m[2] / 255.0f, m[3] / 255.0f);
+}
+
+bool TileTerrain3D::has_paint_in(const Rect2i &p_rect) const {
+	MutexLock lock(paint_mutex);
+	if (paint_pages.is_empty()) {
+		return false;
+	}
+	for (int py = _tt_floor_div(p_rect.position.y, PAINT_PAGE); py <= _tt_floor_div(p_rect.position.y + p_rect.size.y - 1, PAINT_PAGE); py++) {
+		for (int px = _tt_floor_div(p_rect.position.x, PAINT_PAGE); px <= _tt_floor_div(p_rect.position.x + p_rect.size.x - 1, PAINT_PAGE); px++) {
+			if (paint_pages.has(Vector2i(px, py))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+Color TileTerrain3D::get_user_channels(int p_column, int p_row) const {
+	uint8_t u[4];
+	MutexLock lock(paint_mutex);
+	_painted_sample(p_column, p_row, nullptr, u);
+	return Color(u[0] / 255.0f, u[1] / 255.0f, u[2] / 255.0f, u[3] / 255.0f);
 }
 
 // A level's window of slopes (see the header): at each of its samples, the rise along X and Z across one of the
@@ -630,7 +1038,7 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 	const double col = (p_local.x - origin_north) / spacing;
 	const double row = (p_local.z - origin_east) / spacing;
 	bool changed = false;
-	Vector<Ref<Image>> h_layers, m_layers, s_layers;
+	Vector<Ref<Image>> h_layers, m_layers, s_layers, u_layers;
 	const bool now = p_force || clip_heights.is_null();
 	if (!now) {
 		_finish_clip_builds(false);
@@ -653,6 +1061,7 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 			b.active = true;
 			b.level = level;
 			b.origin = want;
+			b.paint_revision = paint_revision;
 			b.task = WorkerThreadPool::get_singleton()->add_template_task(this, &TileTerrain3D::_clip_job, (void *)&b, true, "TileTerrain3D window");
 		}
 	}
@@ -666,6 +1075,7 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 		h_layers.push_back(_clip_heights(level, clip_origin[level]));
 		m_layers.push_back(_clip_masks(level, clip_origin[level]));
 		s_layers.push_back(_clip_slopes(level, clip_origin[level]));
+		u_layers.push_back(_clip_user(level, clip_origin[level]));
 	}
 	clip_heights.instantiate();
 	clip_heights->create_from_images(h_layers);
@@ -673,6 +1083,8 @@ void TileTerrain3D::_update_clip(const Vector3 &p_local, bool p_force) {
 	clip_masks->create_from_images(m_layers);
 	clip_slopes.instantiate();
 	clip_slopes->create_from_images(s_layers);
+	clip_user.instantiate();
+	clip_user->create_from_images(u_layers);
 	clip_updates++;
 	clip_update_ms = double(OS::get_singleton()->get_ticks_usec() - t0) / 1000.0;
 	_publish_globals();
@@ -683,6 +1095,7 @@ void TileTerrain3D::_clip_job(void *p_build) {
 	b->heights = _clip_heights(b->level, b->origin);
 	b->masks = _clip_masks(b->level, b->origin);
 	b->slopes = _clip_slopes(b->level, b->origin);
+	b->user = _clip_user(b->level, b->origin);
 }
 
 // Finished builds go up, a level a frame (its two layers and its origin together, so a shader never reads one with the
@@ -703,8 +1116,13 @@ void TileTerrain3D::_finish_clip_builds(bool p_wait_all) {
 		}
 		WorkerThreadPool::get_singleton()->wait_for_task_completion(b.task);
 		const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
+		if (b.paint_revision != paint_revision) { // painted while it was being read: its masks again, with the paint as it is
+			b.masks = _clip_masks(b.level, b.origin);
+			b.user = _clip_user(b.level, b.origin);
+		}
 		clip_heights->update_layer(b.heights, b.level);
 		clip_masks->update_layer(b.masks, b.level);
+		clip_user->update_layer(b.user, b.level);
 		clip_slopes->update_layer(b.slopes, b.level);
 		clip_origin[b.level] = b.origin;
 		// (the frames alone: the textures are the same ones with a layer sent again, and setting a texture global makes
@@ -726,6 +1144,8 @@ void TileTerrain3D::_publish_globals(bool p_textures) {
 		rs->global_shader_parameter_set("terrain_slopes_clip", clip_slopes);
 		rs->global_shader_parameter_set("terrain_heights_far", height_texture);
 		rs->global_shader_parameter_set("terrain_masks_far", mask_texture);
+		rs->global_shader_parameter_set("terrain_user_clip", clip_user);
+		rs->global_shader_parameter_set("terrain_user_far", user_texture);
 		rs->global_shader_parameter_set("terrain_slopes_far", slope_texture);
 	}
 	rs->global_shader_parameter_set("terrain_clip_01", Vector4(clip_origin[0].x, clip_origin[0].y, clip_origin[1].x, clip_origin[1].y));
@@ -1171,6 +1591,20 @@ void TileTerrain3D::_notification(int p_what) {
 }
 
 void TileTerrain3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_paint_page", "page", "set", "values", "weights"), &TileTerrain3D::set_paint_page);
+	ClassDB::bind_method(D_METHOD("get_paint_page", "page", "set"), &TileTerrain3D::get_paint_page);
+	ClassDB::bind_method(D_METHOD("get_paint_pages"), &TileTerrain3D::get_paint_pages);
+	ClassDB::bind_method(D_METHOD("paint_stamp", "set", "channel", "centre", "radius", "hardness", "strength", "value", "erase"), &TileTerrain3D::paint_stamp);
+	BIND_ENUM_CONSTANT(PAINT_MASKS);
+	BIND_ENUM_CONSTANT(PAINT_USER);
+	ClassDB::bind_method(D_METHOD("clear_paint"), &TileTerrain3D::clear_paint);
+	ClassDB::bind_method(D_METHOD("refresh_paint", "rect", "far"), &TileTerrain3D::refresh_paint, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("get_paint_page_size"), &TileTerrain3D::get_paint_page_size);
+	ClassDB::bind_method(D_METHOD("get_paint_page_count"), &TileTerrain3D::get_paint_page_count);
+	ClassDB::bind_method(D_METHOD("get_painted_mask", "column", "row"), &TileTerrain3D::get_painted_mask);
+	ClassDB::bind_method(D_METHOD("get_user_channels", "column", "row"), &TileTerrain3D::get_user_channels);
+	ClassDB::bind_method(D_METHOD("paint_over", "column", "row", "base"), &TileTerrain3D::paint_over);
+	ClassDB::bind_method(D_METHOD("has_paint_in", "rect"), &TileTerrain3D::has_paint_in);
 	ClassDB::bind_method(D_METHOD("set_data_path", "path"), &TileTerrain3D::set_data_path);
 	ClassDB::bind_method(D_METHOD("get_data_path"), &TileTerrain3D::get_data_path);
 	ClassDB::bind_method(D_METHOD("set_material", "material"), &TileTerrain3D::set_material);
