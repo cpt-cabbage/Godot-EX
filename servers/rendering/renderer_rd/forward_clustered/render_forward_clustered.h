@@ -934,6 +934,7 @@ private:
 	// The prepass wrote this frame's motion vectors for the ray-traced
 	// temporal passes (PASS_MODE_DEPTH_NORMAL_ROUGHNESS_MOTION).
 	bool rt_velocity_current = false;
+	bool material_feedback_frame = true; // whether this frame writes texture streaming's feedback (rendering/textures/streaming/feedback_frame_interval)
 	static bool _prepass_motion_enabled();
 	// The opaque pass's separate-specular outputs carry the merged colour and
 	// the GI's diffuse target this frame (_render_scene).

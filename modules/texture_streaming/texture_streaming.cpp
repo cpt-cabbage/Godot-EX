@@ -227,6 +227,7 @@ void TextureStreaming::register_project_settings() {
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/textures/streaming/memory_budget_enabled"), false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/streaming/memory_budget_mb"), 512);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/streaming/max_ops_per_second"), 200);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/streaming/feedback_frame_interval", PROPERTY_HINT_RANGE, "1,16,1"), 1);
 
 	// Mip level settings: 0 = full resolution (best quality), higher = lower resolution
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/streaming/min_lod", PROPERTY_HINT_RANGE, "0,13,1"), 0);

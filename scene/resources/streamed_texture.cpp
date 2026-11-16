@@ -347,6 +347,17 @@ Error StreamedTexture2D::_load_internal(const String &p_path, bool p_load_settin
 		Error header_err = _parse_header(p_path, header, header_file);
 		ERR_FAIL_COND_V(header_err != OK, header_err);
 		_current_mip.store(_get_initial_streaming_mip(header.streaming_min, header.streaming_max));
+	} else if (!use_streaming && base_level > 0) {
+		// Not streamed: from the base level (set_base_level), but never under 64 pixels a side.
+		StreamedTextureFileHeader header;
+		Ref<FileAccess> header_file;
+		if (_parse_header(p_path, header, header_file) == OK) {
+			int level = MIN(base_level, int(header.num_mipmaps));
+			while (level > 0 && (MIN(header.width, header.height) >> level) < 64u) {
+				level--;
+			}
+			_current_mip.store(uint8_t(level));
+		}
 	}
 
 	StreamedTexture2DLoadData load_data;
@@ -448,7 +459,24 @@ void StreamedTexture2D::reload_from_file() {
 	load(path);
 }
 
+int StreamedTexture2D::base_level = 0;
+
+void StreamedTexture2D::set_base_level(int p_level) {
+	base_level = CLAMP(p_level, 0, MAX_LOD_LEVEL);
+}
+
+int StreamedTexture2D::get_base_level() {
+	return base_level;
+}
+
+Error StreamedTexture2D::save_image(const String &p_path, const Ref<Image> &p_image, int p_streaming_min, int p_streaming_max) {
+	return _save_data(p_path, p_image, 0, uint32_t(MAX(p_streaming_min, 0)), uint32_t(MAX(p_streaming_max, 0)));
+}
+
 void StreamedTexture2D::_bind_methods() {
+	ClassDB::bind_static_method("StreamedTexture2D", D_METHOD("save_image", "path", "image", "streaming_min", "streaming_max"), &StreamedTexture2D::save_image, DEFVAL(0), DEFVAL(0));
+	ClassDB::bind_static_method("StreamedTexture2D", D_METHOD("set_base_level", "level"), &StreamedTexture2D::set_base_level);
+	ClassDB::bind_static_method("StreamedTexture2D", D_METHOD("get_base_level"), &StreamedTexture2D::get_base_level);
 	ClassDB::bind_method(D_METHOD("load", "path"), &StreamedTexture2D::load);
 	ClassDB::bind_method(D_METHOD("get_load_path"), &StreamedTexture2D::get_load_path);
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "load_path", PROPERTY_HINT_FILE, "*.stex"), "load", "get_load_path");

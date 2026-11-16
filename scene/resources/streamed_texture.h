@@ -44,6 +44,7 @@ class StreamedTexture2D : public Texture2D {
 
 	// Maximum LOD level supported (13 = ~8192px down to 1px)
 	static constexpr int MAX_LOD_LEVEL = 13;
+	static int base_level;
 
 	struct StreamedTexture2DLoadData {
 		uint32_t width = 0;
@@ -131,6 +132,16 @@ protected:
 public:
 	static TextureFormatRoughnessRequestCallback request_roughness_callback;
 	static TextureFormatRequestCallback request_normal_callback;
+
+	// Godot-EX: an image written as a streamed texture's file (its mipmaps as they are, compressed or not), for
+	// textures a project builds itself, outside the importer. streaming_min and streaming_max as the importer's:
+	// the finest and the coarsest level kept, each one more than the level (0: the project's setting).
+	static Error save_image(const String &p_path, const Ref<Image> &p_image, int p_streaming_min = 0, int p_streaming_max = 0);
+	// Godot-EX: the level streamed textures load from while streaming is off (0 the whole texture, 1 half its size
+	// each way, a quarter of its memory, ...): a texture quality setting with no cost a frame, for textures loaded
+	// after it is set. A texture smaller than 2^level * 64 pixels keeps more of itself.
+	static void set_base_level(int p_level);
+	static int get_base_level();
 
 	void set_max_lod_override(int p_max_lod);
 	int get_max_lod_override() const;

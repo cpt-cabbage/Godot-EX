@@ -542,7 +542,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		pipeline_specialization.multimesh_format_2d = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
 		pipeline_specialization.multimesh_has_color = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
 		pipeline_specialization.multimesh_has_custom_data = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
-		pipeline_specialization.material_feedback = p_params->use_material_feedback && surf->material->material_feedback_rid.is_valid();
+		pipeline_specialization.material_feedback = p_params->use_material_feedback && material_feedback_frame && surf->material->material_feedback_rid.is_valid();
 
 		if constexpr (p_pass_mode == PASS_MODE_COLOR) {
 			pipeline_specialization.use_light_soft_shadows = element_info.uses_softshadow;
@@ -2786,6 +2786,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// get info about our rendering effects
 	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
+
+	// Texture streaming's feedback (the level each streamed texture is seen at) written by one frame in so many
+	// (Godot-EX, rendering/textures/streaming/feedback_frame_interval): the streamer answers over seconds, and writing
+	// it from every fragment of every frame cost projectex's valley 0.4 to 0.9 ms at 4K.
+	{
+		const int interval = GLOBAL_GET_CACHED(int, "rendering/textures/streaming/feedback_frame_interval");
+		material_feedback_frame = interval <= 1 || (RSG::rasterizer->get_frame_number() % uint64_t(interval)) == 0;
+	}
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
