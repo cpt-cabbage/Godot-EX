@@ -134,9 +134,9 @@ private:
 	// (2026-11-16; projectex's ground read them in the depth pass and again in the colour pass: 1.4 ms of a 4K frame
 	// from the air). A window a level as the heights', RGBA16, each value a slope s (m a m) as s / (1 + |s|), halved and
 	// lifted by a half (a reader: e = 2 v - 1, s = e / (1 - |e|)): no slope is cut off, a cliff's face of 20 or 200 m a m
-	// keeps its own (held at 8, as first built, the sunlit faces from the air fell otherwise: 0.06 % of the valley's
-	// samples, its steepest faces), and level ground has steps of 0.00003. R, G the rise along X and Z across one
-	// sample of the level each way; B, A the same through a
+	// keeps its own (0.06 % of projectex's valley's samples are over 8), and level ground has steps of 0.00003. R, G the
+	// rise along X and Z across one sample of the level each way (the slope of the cell that starts at the sample, one
+	// sample wide, was tried for sharper far ground and came out softer); B, A the same through a
 	// Sobel stencil two samples each way and three rows wide, which averages out the heights' own 3 cm steps (what a
 	// material wants within reach of a low light). The far map's: R, G alone, as half floats, with its mipmaps.
 	// Global shader parameters terrain_slopes_clip and terrain_slopes_far.
