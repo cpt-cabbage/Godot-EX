@@ -579,7 +579,8 @@ public:
 	//   cover's amount (0-1) + 2 * its mode (0 add, 1 multiply, 2 replace), type's amount, base's amount, thickness's
 	//     amount. With a base of its own (its amount over 0) a volume's cloud is a deck apart: the layer's own cloud
 	//     thins to nothing half way into its falloff and the volume's begins there (two bases blended made a ramp).
-	//   the high layer's cover (0-1), its amount + 2 * its mode, and two spare
+	//   the high layer's cover (0-1), its amount + 2 * its mode, and two the engine fills (its lowest base and
+	//     highest top)
 	void set_cloud_volumes(const PackedFloat32Array &p_volumes);
 	// Mist volumes (2026-11-17): places in the air volume with mist of their own, lit and shadowed as the rest of the
 	// air is (the sun through the terrain's and the clouds' shadows and the trees, the lights, the sky). Seen as far as

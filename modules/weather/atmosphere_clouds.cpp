@@ -312,12 +312,25 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	for (int i = 0; i < volume_count; i++) {
 		high_volumes = high_volumes || cloud_volumes[i * CLOUD_VOLUME_FLOATS + 17] > 0.0f;
 	}
-	// (y: the weather's own lowest base, which the clouds' lean is measured from, and the march's bottom for a ray
-	// that passes no volume with a lower base: from the shell's bottom a lower volume moved every cloud in the sky
-	// downwind as it came on, and turned them to grain. z: 1 when a volume changes the high layer.)
-	v4(float(volume_count), cloud_base - cloud_base_spread - 60.0f, high_volumes ? 1.0f : 0.0f, 0);
-	for (int i = 0; i < volume_count * CLOUD_VOLUME_FLOATS; i++) {
-		f[o++] = cloud_volumes[i];
+	// (y, w: the weather's own lowest base and highest top, which the clouds' lean is measured from and a ray that
+	// passes no volume reaching past them is marched between: from the whole shell's extent a lower or a taller volume
+	// moved every cloud in the sky downwind as it came on, and turned them to grain. z: 1 when a volume changes the high
+	// layer.)
+	const float own_bottom = cloud_base - cloud_base_spread - 60.0f;
+	const float own_top = cloud_base + cloud_base_spread + 60.0f + cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
+	v4(float(volume_count), own_bottom, high_volumes ? 1.0f : 0.0f, own_top);
+	for (int i = 0; i < volume_count; i++) {
+		const float *v = cloud_volumes + i * CLOUD_VOLUME_FLOATS;
+		for (int k = 0; k < CLOUD_VOLUME_FLOATS - 2; k++) {
+			f[o++] = v[k];
+		}
+		// Its own lowest base and highest top (as get_cloud_shell works them out), for the march to know which rays it
+		// reaches past the weather's own layer for.
+		const float base = v[14] > 0.0f ? v[10] : cloud_base;
+		const float type = v[13] > 0.0f ? MAX(v[9], cloud_type) : cloud_type;
+		const float scale = v[15] > 0.0f ? MAX(v[11], cloud_thickness_scale) : cloud_thickness_scale;
+		f[o++] = base - cloud_base_spread - 60.0f;
+		f[o++] = base + cloud_base_spread + 60.0f + cloud_type_thickness(type + cloud_type_spread + 0.1f) * scale * 1.3f;
 	}
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;

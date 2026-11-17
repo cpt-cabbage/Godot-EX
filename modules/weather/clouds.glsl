@@ -52,10 +52,11 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1), z 1 when the strike stands where it did last frame
 	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
 	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
-	vec4 volume_count; // x how many cloud volumes follow, y the weather's own lowest base (m above sea level: the lean's zero), z 1 when one changes the high layer
+	vec4 volume_count; // x how many cloud volumes follow, y the weather's own lowest base (m above sea level: the lean's zero), z 1 when one changes the high layer, w the weather's own highest top
 	// The cloud volumes (AtmosphereEffect::set_cloud_volumes), five vec4 each: centre xz and half sizes; the turn's cos and
 	// sin, the shape (+ 2: it drifts with the clouds), the falloff; cover, type, base, thickness scale; their amounts
-	// (the cover's with its mode); the high layer's cover and its amount with its mode.
+	// (the cover's with its mode); the high layer's cover, its amount with its mode, the volume's lowest base and
+	// highest top.
 	vec4 volumes[80];
 }
 clouds;
@@ -241,6 +242,7 @@ vec4 weather_field(vec2 f, vec2 xz) {
 	// The cloud volumes change what the weather gives here, before the clouds are made of it: a cover of none clears
 	// the cells, more of it grows and merges them, as the weather's own does.
 	int volume_n = min(int(clouds.volume_count.x), 16);
+	float forced = 0.0; // how far a volume has set the cover here
 	for (int i = 0; i < volume_n; i++) {
 		float w = volume_weight(i, xz);
 		if (w <= 0.0) {
@@ -248,6 +250,7 @@ vec4 weather_field(vec2 f, vec2 xz) {
 		}
 		vec4 v = clouds.volumes[i * 5 + 2];
 		vec4 m = clouds.volumes[i * 5 + 3];
+		forced = max(forced, min(m.x - 2.0 * floor(m.x * 0.5), 1.0) * w);
 		if (m.z > 0.0) {
 			// A base of its own: a deck apart. Half way into the falloff the layer's own cloud has thinned to nothing;
 			// from there in, the volume's own grows at its base, with its type and thickness whole.
@@ -326,6 +329,9 @@ vec4 weather_field(vec2 f, vec2 xz) {
 	float sheetiness = 1.0 - smoothstep(0.3, 0.55, t_local);
 	float cov = mix(best, sheet, sheetiness);
 	cov = max(cov, smoothstep(0.65, 1.0, c) * (0.75 + 0.25 * sheet_n)); // an overcast merges them
+	// Where a volume has set the cover to none, none: the weather's own clear sky keeps a few small clouds (a quarter
+	// of the cells live at a cover of 0), which a hole made by a volume would keep too.
+	cov *= mix(1.0, smoothstep(0.0, 0.03, cover), forced);
 	float t = mix(best_t, t_local, sheetiness);
 	float th = mix(best_th, type_thickness(t) * thickness_scale, sheetiness);
 	return vec4(cov, clamp(t, 0.0, 1.0), base_local + best_b * (1.0 - sheetiness), th);
@@ -610,15 +616,19 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 	return vec4(L, T);
 }
 
-// The ray's stretch through the layer (from the camera), at most reach m: x start, y end; y <= x when it misses.
-// Whether a ray's track over the ground passes a cloud volume whose base is under the weather's own: only such a ray
-// is marched from the shell's lowered bottom (from there every ray's steps grew long through the clear air under the
-// weather's own cloud, and the whole sky turned to grain).
-bool ray_low(vec3 o, vec3 d, float reach) {
+// Whether a ray's track over the ground passes a cloud volume that reaches past the weather's own layer: only such a
+// ray is marched through the whole shell (through it every ray's steps grew long in the clear air between the
+// weather's own cloud and the shell's edge, and the whole sky turned to grain).
+// (As a number: 1 when it passes one that reaches lower, 2 one that reaches higher, 3 both. A taller volume did the
+// same from above.)
+int ray_reach(vec3 o, vec3 d, float reach) {
 	int n = min(int(clouds.volume_count.x), 16);
 	float len2 = dot(d.xz, d.xz);
+	int found = 0;
 	for (int i = 0; i < n; i++) {
-		if (clouds.volumes[i * 5 + 3].z <= 0.0 || clouds.volumes[i * 5 + 2].z >= clouds.volume_count.y) {
+		vec4 e = clouds.volumes[i * 5 + 4];
+		int past = (e.z < clouds.volume_count.y - 1.0 ? 1 : 0) + (e.w > clouds.volume_count.w + 1.0 ? 2 : 0);
+		if (past == 0 || (found | past) == found) {
 			continue;
 		}
 		vec4 a = clouds.volumes[i * 5];
@@ -626,10 +636,10 @@ bool ray_low(vec3 o, vec3 d, float reach) {
 		vec2 rel = c - o.xz;
 		float t = len2 > 1e-8 ? clamp(dot(rel, d.xz) / len2, 0.0, reach) : 0.0;
 		if (length(rel - d.xz * t) < max(a.z, a.w) * 1.45) {
-			return true;
+			found |= past;
 		}
 	}
-	return false;
+	return found;
 }
 
 // The ray's stretch between two altitudes (m above sea level), at most reach m: x start, y end; y <= x when it misses.
@@ -662,37 +672,68 @@ vec2 shell_span(vec3 o, vec3 d, float reach, float base, float top) {
 	return vec2(t0, min(t1, reach));
 }
 
-// The ray's stretch through the layer: from the shell's lowered bottom for a ray that passes a lowered volume (low),
-// from the weather's own for the rest.
-vec2 layer_span(vec3 o, vec3 d, float reach, bool low) {
-	float bottom = low ? clouds.layer.x : max(clouds.layer.x, clouds.volume_count.y);
-	float base = clouds.weather.x > 0.01 ? clouds.weather.y : bottom; // the rain shafts' bottom when it rains
-	return shell_span(o, d, reach, base, clouds.layer.x + clouds.layer.y);
+// The weather's own layer, and the whole shell with the volumes that reach past it.
+float own_bottom() {
+	return max(clouds.layer.x, clouds.volume_count.y);
 }
 
-// Two stretches of one ray marched each with its own steps, the nearer first, and laid one behind the other: for a
-// ray through a lowered cloud volume (the lowered part, and the weather's own layer over it). Marched as one, the
-// clear air between them took most of the steps and both turned to grain.
-vec4 march_two(vec3 o, vec3 d, vec2 near, vec2 far, int steps_near, int steps_far, float jitter, out float first, out float mean) {
-	float f1, m1;
-	vec4 a = march(o, d, near.x, near.y, steps_near, jitter, f1, m1);
-	if (a.a <= 0.0) {
-		first = f1;
-		mean = m1;
-		return a;
+float own_top() {
+	return min(clouds.layer.x + clouds.layer.y, clouds.volume_count.w);
+}
+
+// The ray's stretch through the layer: the whole shell for a ray that passes a volume reaching past the weather's own
+// layer (past: ray_reach's), the weather's own layer for the rest.
+vec2 layer_span(vec3 o, vec3 d, float reach, int past) {
+	float bottom = (past & 1) != 0 ? clouds.layer.x : own_bottom();
+	float top = (past & 2) != 0 ? clouds.layer.x + clouds.layer.y : own_top();
+	float base = clouds.weather.x > 0.01 ? clouds.weather.y : bottom; // the rain shafts' bottom when it rains
+	return shell_span(o, d, reach, base, top);
+}
+
+// Up to three stretches of one ray (the part under the weather's own layer, the layer, the part over it), each marched
+// with the steps its length asks for, nearest first, and laid one behind the other. Marched as one, the clear air
+// between a lowered or a taller volume and the weather's own cloud took most of the steps and both turned to grain.
+vec4 march_stretches(vec3 o, vec3 d, vec2 spans[3], int full, float jitter, out float first, out float mean) {
+	// Nearest first.
+	for (int i = 0; i < 2; i++) {
+		for (int j = 0; j < 2 - i; j++) {
+			bool a_ok = spans[j].y > spans[j].x, b_ok = spans[j + 1].y > spans[j + 1].x;
+			if (b_ok && (!a_ok || spans[j + 1].x < spans[j].x)) {
+				vec2 s = spans[j];
+				spans[j] = spans[j + 1];
+				spans[j + 1] = s;
+			}
+		}
 	}
-	float flash1 = march_flash;
-	vec2 shape1 = march_shape;
-	march_flash = 0.0;
-	float f2, m2;
-	vec4 b = march(o, d, far.x, far.y, steps_far, jitter, f2, m2);
-	float w1 = 1.0 - a.a;
-	float w2 = a.a * (1.0 - b.a);
-	march_flash = flash1 + a.a * march_flash;
-	march_shape = (w1 * shape1 + w2 * march_shape) / max(w1 + w2, 1e-5);
-	first = f1 >= 0.0 ? f1 : f2;
-	mean = w1 + w2 > 1e-5 ? (w1 * m1 + w2 * m2) / (w1 + w2) : m2;
-	return vec4(a.rgb + a.a * b.rgb, a.a * b.a);
+	vec3 L = vec3(0.0);
+	float T = 1.0;
+	float flash = 0.0;
+	vec2 shape = vec2(0.0);
+	float wsum = 0.0, msum = 0.0;
+	first = -1.0;
+	mean = 1e9;
+	for (int i = 0; i < 3; i++) {
+		if (spans[i].y <= spans[i].x || T <= 0.0) {
+			continue;
+		}
+		int steps = clamp(int(float(full) * clamp((spans[i].y - spans[i].x) / 4000.0, 0.25, 1.0)), 16, full);
+		march_flash = 0.0;
+		float f, m;
+		vec4 c = march(o, d, spans[i].x, spans[i].y, steps, jitter, f, m);
+		float w = T * (1.0 - c.a);
+		L += T * c.rgb;
+		flash += T * march_flash;
+		shape += w * march_shape;
+		msum += w * m;
+		wsum += w;
+		first = first >= 0.0 ? first : f;
+		mean = m; // (the last stretch's end, if nothing is met at all)
+		T *= c.a;
+	}
+	march_flash = flash;
+	march_shape = wsum > 1e-5 ? shape / wsum : vec2(0.0);
+	mean = wsum > 1e-5 ? msum / wsum : mean;
+	return vec4(L, T);
 }
 
 // The high layer's share of cloud at a point of it (world x, z): cirrus fibres along the wind, hooked by a slow wave,
@@ -844,14 +885,14 @@ void main() {
 		vec4 rel = clouds.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		scene = length(rel.xyz / rel.w);
 	}
-	bool low = ray_low(o, d, clouds.planet.z);
-	vec2 span = layer_span(o, d, min(clouds.planet.z, scene), low);
+	int past = ray_reach(o, d, clouds.planet.z);
+	vec2 span = layer_span(o, d, min(clouds.planet.z, scene), past);
 	// Cut short by the scene: every pixel under this texel holds something nearer than where the clouds go on to (a
 	// crown close by, a ridge). Kept with the texel (the sign of its mean distance): what it holds is not the sky's
 	// cloud, for the apply pass's sky pixels beside it and for the history of a texel the sky shows through later.
 	bool cut = false;
 	if (scene < 1e11) {
-		vec2 whole = layer_span(o, d, clouds.planet.z, low);
+		vec2 whole = layer_span(o, d, clouds.planet.z, past);
 		cut = whole.y > max(whole.x, scene) || d.y > 0.0;
 	}
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
@@ -862,22 +903,15 @@ void main() {
 		// Fewer steps for short stretches.
 		int full = steps;
 		steps = clamp(int(float(full) * clamp((span.y - span.x) / 4000.0, 0.25, 1.0)), 16, full);
-		// Through a lowered volume (not in rain, whose shafts fill the air under the layer anyway): the lowered part and
-		// the weather's own layer as two stretches, each with the steps its length asks for.
-		vec2 under = vec2(0.0, -1.0), own = vec2(0.0, -1.0);
-		if (low && clouds.weather.x < 0.01) {
-			float own_bottom = max(clouds.layer.x, clouds.volume_count.y);
-			under = shell_span(o, d, min(clouds.planet.z, scene), clouds.layer.x, own_bottom);
-			own = shell_span(o, d, min(clouds.planet.z, scene), own_bottom, clouds.layer.x + clouds.layer.y);
-		}
-		if (under.y > under.x && own.y > own.x) {
-			int steps_under = clamp(int(float(full) * clamp((under.y - under.x) / 4000.0, 0.25, 1.0)), 16, full);
-			int steps_own = clamp(int(float(full) * clamp((own.y - own.x) / 4000.0, 0.25, 1.0)), 16, full);
-			if (under.x <= own.x) {
-				cur = march_two(o, d, under, own, steps_under, steps_own, jitter, first, mean);
-			} else {
-				cur = march_two(o, d, own, under, steps_own, steps_under, jitter, first, mean);
-			}
+		// Through a volume that reaches past the weather's own layer (not in rain, whose shafts fill the air under the
+		// layer anyway): the part under it, the layer and the part over it as stretches of their own.
+		if (past != 0 && clouds.weather.x < 0.01) {
+			float limit = min(clouds.planet.z, scene);
+			vec2 spans[3];
+			spans[0] = (past & 1) != 0 ? shell_span(o, d, limit, clouds.layer.x, own_bottom()) : vec2(0.0, -1.0);
+			spans[1] = shell_span(o, d, limit, own_bottom(), own_top());
+			spans[2] = (past & 2) != 0 ? shell_span(o, d, limit, own_top(), clouds.layer.x + clouds.layer.y) : vec2(0.0, -1.0);
+			cur = march_stretches(o, d, spans, full, jitter, first, mean);
 		} else {
 			cur = march(o, d, span.x, span.y, steps, jitter, first, mean);
 		}
@@ -958,7 +992,7 @@ void main() {
 	float theta = uv.y * PI;
 	vec3 d = vec3(sin(theta) * sin(phi), cos(theta), -sin(theta) * cos(phi));
 	vec3 o = clouds.cam_pos.xyz;
-	vec2 span = layer_span(o, d, clouds.planet.z, ray_low(o, d, clouds.planet.z));
+	vec2 span = layer_span(o, d, clouds.planet.z, ray_reach(o, d, clouds.planet.z));
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
 	float first = -1.0, mean = 1e9;
 	if (span.y > span.x) {
