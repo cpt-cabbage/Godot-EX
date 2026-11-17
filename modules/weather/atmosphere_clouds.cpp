@@ -276,16 +276,7 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(planet_radius * 1000.0f, altitude_offset, cloud_reach, CLAMP(cloud_history, 0.0f, 0.97f));
 	v4(float(cloud_size.x), float(cloud_size.y), float(p_full.x), float(p_full.y));
 	v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, shadow_on ? 1.0f : 0.0f);
-	// The steps for the layer as the weather has it; where cloud volumes make the shell taller (a lower base, a thicker
-	// cloud) the march gets as many more, so that a step stays as long as it was (with the same number over a taller
-	// shell every cloud in the sky turned to grain: 2026-11-17).
-	const float own_top = cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
-	const float own_height = 2.0f * (cloud_base_spread + 60.0f) + own_top;
-	float taller = CLAMP(shell.y / MAX(own_height, 1.0f), 1.0f, 3.0f);
-	if (OS::get_singleton()->has_environment("GODOT_CLOUD_STEPS_FLAT")) { // (the spike's switch, to compare: out before a merge)
-		taller = 1.0f;
-	}
-	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(int(Math::round(cloud_steps * taller)), 8, 256)), cloud_light_step);
+	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
 	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), MAX(cloud_night_light, 0.0f), 0);
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
 	// Last frame's flash and whether the strike stands where it stood (clouds.glsl's FLASH_COLOR: the history keeps the
@@ -308,9 +299,14 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(wdir.x, wdir.y, cloud_shear, cloud_rise);
 	v4(CLAMP(cloud_high_cover, 0.0f, 1.0f), cloud_high_altitude, CLAMP(cloud_high_type, 0.0f, 1.0f), cloud_high_density);
 	const int volume_count = cloud_volume_count;
-	// (y: the weather's own lowest base, which the clouds' lean is measured from: from the shell's bottom a volume
-	// with a lower base moved every cloud in the sky downwind as it came on.)
-	v4(float(volume_count), cloud_base - cloud_base_spread - 60.0f, 0, 0);
+	bool high_volumes = false;
+	for (int i = 0; i < volume_count; i++) {
+		high_volumes = high_volumes || cloud_volumes[i * CLOUD_VOLUME_FLOATS + 17] > 0.0f;
+	}
+	// (y: the weather's own lowest base, which the clouds' lean is measured from, and the march's bottom for a ray
+	// that passes no volume with a lower base: from the shell's bottom a lower volume moved every cloud in the sky
+	// downwind as it came on, and turned them to grain. z: 1 when a volume changes the high layer.)
+	v4(float(volume_count), cloud_base - cloud_base_spread - 60.0f, high_volumes ? 1.0f : 0.0f, 0);
 	for (int i = 0; i < volume_count * CLOUD_VOLUME_FLOATS; i++) {
 		f[o++] = cloud_volumes[i];
 	}

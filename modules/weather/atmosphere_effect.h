@@ -299,7 +299,7 @@ class AtmosphereEffect : public CompositorEffect {
 	double cloud_time = 0.0;
 	Ref<Texture2DRD> cloud_panorama_texture;
 	RID cloud_ubo;
-	float cloud_volumes[16 * 16] = {}; // CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS (declared below)
+	float cloud_volumes[16 * 20] = {}; // CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS (declared below)
 	int cloud_volume_count = 0;
 	bool cloud_noise_ready = false;
 	int cloud_noise_slice = -1; // the next base noise slice to make; -1 the detail volume first
@@ -388,7 +388,7 @@ public:
 	static constexpr int SHADOW_N = 2048;
 	static constexpr int CAMERA_FLOATS = 48 + 8 + 8 * 32; // atmosphere.glsl's Camera block (the sky lights: MAX_SKY_LIGHTS)
 	static constexpr int CLOUD_VOLUMES = 16; // the cloud volumes the weather map takes
-	static constexpr int CLOUD_VOLUME_FLOATS = 16; // a volume: four vec4 (set_cloud_volumes)
+	static constexpr int CLOUD_VOLUME_FLOATS = 20; // a volume: five vec4 (set_cloud_volumes)
 	static constexpr int CLOUD_FLOATS = 32 + 4 * 21 + CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS; // clouds.glsl's Clouds block
 	static constexpr int CLOUD_MAP_N = 512; // the weather map's side (texels), each layer
 	static constexpr float CLOUD_MAP_NEAR = 32000.0f; // the near layer's side (m); the far one's twice the reach
@@ -565,12 +565,17 @@ public:
 	// The shell the clouds can fill (m above sea level): x its bottom, y its height.
 	Vector2 get_cloud_shell() const;
 	// Cloud volumes (2026-11-17): places where the layer differs from the weather's, laid on the weather map, so they
-	// are seen from afar, cast the clouds' shadow and light the sky's probe like any cloud. Up to CLOUD_VOLUMES, 16
+	// are seen from afar, cast the clouds' shadow and light the sky's probe like any cloud. Up to CLOUD_VOLUMES, 20
 	// floats each:
-	//   centre x, centre z (world m), half size x, half size z (m)
-	//   cos and sin of the turn about y (world to the volume), shape (0 ellipse, 1 box), falloff (the outer share, 0-1)
+	//   centre x, centre z (world m; of a drifting one: in the clouds' own frame, the world less cloud_offset), half
+	//     size x, half size z (m)
+	//   cos and sin of the turn about y (world to the volume), shape (0 ellipse, 1 box) + 2 if it drifts with the
+	//     clouds, falloff (the outer share, 0-1)
 	//   cover (0-1), type (0-1), base (m above sea level), thickness scale
-	//   cover's amount (0-1) + 2 * its mode (0 add, 1 multiply, 2 replace), type's amount, base's amount, thickness's amount
+	//   cover's amount (0-1) + 2 * its mode (0 add, 1 multiply, 2 replace), type's amount, base's amount, thickness's
+	//     amount. With a base of its own (its amount over 0) a volume's cloud is a deck apart: the layer's own cloud
+	//     thins to nothing half way into its falloff and the volume's begins there (two bases blended made a ramp).
+	//   the high layer's cover (0-1), its amount + 2 * its mode, and two spare
 	void set_cloud_volumes(const PackedFloat32Array &p_volumes);
 	int get_cloud_volume_count() const { return cloud_volume_count; }
 	// The most of the light (the sun's, or the moon's) that reaches any ground within `p_radius` m of `p_position`

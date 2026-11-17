@@ -52,10 +52,11 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1), z 1 when the strike stands where it did last frame
 	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
 	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
-	vec4 volume_count; // x how many cloud volumes follow, y the weather's own lowest base (m above sea level: the lean's zero)
-	// The cloud volumes (AtmosphereEffect::set_cloud_volumes), four vec4 each: centre xz and half sizes; the turn's cos and
-	// sin, the shape, the falloff; cover, type, base, thickness scale; their amounts (the cover's with its mode).
-	vec4 volumes[64];
+	vec4 volume_count; // x how many cloud volumes follow, y the weather's own lowest base (m above sea level: the lean's zero), z 1 when one changes the high layer
+	// The cloud volumes (AtmosphereEffect::set_cloud_volumes), five vec4 each: centre xz and half sizes; the turn's cos and
+	// sin, the shape (+ 2: it drifts with the clouds), the falloff; cover, type, base, thickness scale; their amounts
+	// (the cover's with its mode); the high layer's cover and its amount with its mode.
+	vec4 volumes[80];
 }
 clouds;
 
@@ -182,6 +183,26 @@ float vnoise(vec2 p) {
 float vfbm(vec2 p) {
 	return vnoise(p) * 0.5333 + vnoise(p * 2.03 + 17.1) * 0.2667 + vnoise(p * 4.07 + 41.7) * 0.1333 + vnoise(p * 8.11 + 73.3) * 0.0667;
 }
+
+// A cloud volume's weight at a world point (x, z): 1 inside, falling to 0 over its falloff at its edge. One that
+// drifts stands in the clouds' own frame (the world less the wind's carry).
+float volume_weight(int i, vec2 xz) {
+	vec4 a = clouds.volumes[i * 5];
+	vec4 b = clouds.volumes[i * 5 + 1];
+	bool drifts = b.z >= 2.0;
+	float box = b.z - (drifts ? 2.0 : 0.0);
+	vec2 d = (drifts ? xz - clouds.wind.xz : xz) - a.xy;
+	vec2 q = vec2(d.x * b.x + d.y * b.y, d.y * b.x - d.x * b.y) / max(a.zw, vec2(1.0));
+	float u = box > 0.5 ? max(abs(q.x), abs(q.y)) : length(q);
+	return 1.0 - smoothstep(1.0 - clamp(b.w, 0.001, 1.0), 1.0, u);
+}
+
+// A cover with a volume's laid on: its value by its mode (0 add, 1 multiply, 2 replace) and amount.
+float volume_cover(float cover, float value, float packed, float w) {
+	float mode = floor(packed * 0.5);
+	float amount = (packed - 2.0 * mode) * w;
+	return mode < 0.5 ? cover + value * amount : (mode < 1.5 ? cover * mix(1.0, value, amount) : mix(cover, value, amount));
+}
 #endif
 
 #ifdef MODE_MAP
@@ -210,16 +231,6 @@ float cell_radius(float c) {
 	return min(rs[6] + (c - 0.65) * 0.6, 0.85);
 }
 
-// A cloud volume's weight at a world point (x, z): 1 inside, falling to 0 over its falloff at its edge.
-float volume_weight(int i, vec2 xz) {
-	vec4 a = clouds.volumes[i * 4];
-	vec4 b = clouds.volumes[i * 4 + 1];
-	vec2 d = xz - a.xy;
-	vec2 q = vec2(d.x * b.x + d.y * b.y, d.y * b.x - d.x * b.y) / max(a.zw, vec2(1.0));
-	float u = b.z > 0.5 ? max(abs(q.x), abs(q.y)) : length(q);
-	return 1.0 - smoothstep(1.0 - clamp(b.w, 0.001, 1.0), 1.0, u);
-}
-
 // The weather at a point of the field (the world less the wind's carry, m; `xz` the same point in the world, where
 // the cloud volumes stand): cover, type, base, thickness.
 vec4 weather_field(vec2 f, vec2 xz) {
@@ -235,13 +246,23 @@ vec4 weather_field(vec2 f, vec2 xz) {
 		if (w <= 0.0) {
 			continue;
 		}
-		vec4 v = clouds.volumes[i * 4 + 2];
-		vec4 m = clouds.volumes[i * 4 + 3];
-		float mode = floor(m.x * 0.5);
-		float amount = (m.x - 2.0 * mode) * w;
-		cover = mode < 0.5 ? cover + v.x * amount : (mode < 1.5 ? cover * mix(1.0, v.x, amount) : mix(cover, v.x, amount));
+		vec4 v = clouds.volumes[i * 5 + 2];
+		vec4 m = clouds.volumes[i * 5 + 3];
+		if (m.z > 0.0) {
+			// A base of its own: a deck apart. Half way into the falloff the layer's own cloud has thinned to nothing;
+			// from there in, the volume's own grows at its base, with its type and thickness whole.
+			if (w < 0.5) {
+				cover *= 1.0 - smoothstep(0.0, 0.5, w);
+				continue;
+			}
+			cover = volume_cover(cover, v.x, m.x, 1.0) * smoothstep(0.5, 1.0, w);
+			mean_type = mix(mean_type, v.y, m.y);
+			layer_base = mix(layer_base, v.z, m.z);
+			thickness_scale = mix(thickness_scale, v.w, m.w);
+			continue;
+		}
+		cover = volume_cover(cover, v.x, m.x, w);
 		mean_type = mix(mean_type, v.y, m.y * w);
-		layer_base = mix(layer_base, v.z, m.z * w);
 		thickness_scale = mix(thickness_scale, v.w, m.w * w);
 	}
 	cover = clamp(cover, 0.0, 1.0);
@@ -590,8 +611,30 @@ vec4 march(vec3 o, vec3 d, float t0, float t1, int steps, float jitter, out floa
 }
 
 // The ray's stretch through the layer (from the camera), at most reach m: x start, y end; y <= x when it misses.
-vec2 layer_span(vec3 o, vec3 d, float reach) {
-	float base = clouds.weather.x > 0.01 ? clouds.weather.y : clouds.layer.x; // the rain shafts' bottom when it rains
+// Whether a ray's track over the ground passes a cloud volume whose base is under the weather's own: only such a ray
+// is marched from the shell's lowered bottom (from there every ray's steps grew long through the clear air under the
+// weather's own cloud, and the whole sky turned to grain).
+bool ray_low(vec3 o, vec3 d, float reach) {
+	int n = min(int(clouds.volume_count.x), 16);
+	float len2 = dot(d.xz, d.xz);
+	for (int i = 0; i < n; i++) {
+		if (clouds.volumes[i * 5 + 3].z <= 0.0 || clouds.volumes[i * 5 + 2].z >= clouds.volume_count.y) {
+			continue;
+		}
+		vec4 a = clouds.volumes[i * 5];
+		vec2 c = a.xy + (clouds.volumes[i * 5 + 1].z >= 2.0 ? clouds.wind.xz : vec2(0.0));
+		vec2 rel = c - o.xz;
+		float t = len2 > 1e-8 ? clamp(dot(rel, d.xz) / len2, 0.0, reach) : 0.0;
+		if (length(rel - d.xz * t) < max(a.z, a.w) * 1.45) {
+			return true;
+		}
+	}
+	return false;
+}
+
+vec2 layer_span(vec3 o, vec3 d, float reach, bool low) {
+	float bottom = low ? clouds.layer.x : max(clouds.layer.x, clouds.volume_count.y);
+	float base = clouds.weather.x > 0.01 ? clouds.weather.y : bottom; // the rain shafts' bottom when it rains
 	float Rb = clouds.planet.x + base;
 	float Rt = clouds.planet.x + clouds.layer.x + clouds.layer.y;
 	float a = altitude(o);
@@ -624,6 +667,17 @@ vec2 layer_span(vec3 o, vec3 d, float reach) {
 // or rows of altocumulus puffs; patchy over tens of kilometres.
 float high_density(vec2 xz) {
 	float cover = clouds.high.x;
+	// The cloud volumes that change the high layer where they stand.
+	if (clouds.volume_count.z > 0.5) {
+		int n = min(int(clouds.volume_count.x), 16);
+		for (int i = 0; i < n; i++) {
+			vec4 h = clouds.volumes[i * 5 + 4];
+			if (h.y > 0.0) {
+				cover = volume_cover(cover, h.x, h.y, volume_weight(i, xz));
+			}
+		}
+		cover = clamp(cover, 0.0, 1.0);
+	}
 	if (cover <= 0.001) {
 		return 0.0;
 	}
@@ -646,7 +700,7 @@ float high_density(vec2 xz) {
 // its distance (or -1).
 vec4 high_layer(vec3 o, vec3 d, float limit, out float dist) {
 	dist = -1.0;
-	if (clouds.high.x <= 0.001 || altitude(o) > clouds.high.y) {
+	if ((clouds.high.x <= 0.001 && clouds.volume_count.z < 0.5) || altitude(o) > clouds.high.y) {
 		return vec4(0.0, 0.0, 0.0, 1.0);
 	}
 	if (sphere_hits(o, d, clouds.planet.x).x > 0.0) {
@@ -674,7 +728,7 @@ vec4 high_layer(vec3 o, vec3 d, float limit, out float dist) {
 // The high layer's transmittance to the light from a point below it.
 float high_shadow(vec3 w) {
 	vec3 l = clouds.light_dir.xyz;
-	if (clouds.high.x <= 0.001 || l.y <= 0.02) {
+	if ((clouds.high.x <= 0.001 && clouds.volume_count.z < 0.5) || l.y <= 0.02) {
 		return 1.0;
 	}
 	float up = clouds.high.y - clouds.planet.y - w.y;
@@ -758,13 +812,14 @@ void main() {
 		vec4 rel = clouds.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
 		scene = length(rel.xyz / rel.w);
 	}
-	vec2 span = layer_span(o, d, min(clouds.planet.z, scene));
+	bool low = ray_low(o, d, clouds.planet.z);
+	vec2 span = layer_span(o, d, min(clouds.planet.z, scene), low);
 	// Cut short by the scene: every pixel under this texel holds something nearer than where the clouds go on to (a
 	// crown close by, a ridge). Kept with the texel (the sign of its mean distance): what it holds is not the sky's
 	// cloud, for the apply pass's sky pixels beside it and for the history of a texel the sky shows through later.
 	bool cut = false;
 	if (scene < 1e11) {
-		vec2 whole = layer_span(o, d, clouds.planet.z);
+		vec2 whole = layer_span(o, d, clouds.planet.z, low);
 		cut = whole.y > max(whole.x, scene) || d.y > 0.0;
 	}
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
@@ -774,6 +829,12 @@ void main() {
 		int steps = int(clouds.sky.z);
 		// Fewer steps for short stretches.
 		steps = clamp(int(float(steps) * clamp((span.y - span.x) / 4000.0, 0.25, 1.0)), 16, steps);
+		if (low) {
+			// Through a lowered volume the ray is longer than it would be through the weather's own cloud: as many more
+			// steps, so that a step is no longer (up to three times).
+			vec2 own = layer_span(o, d, min(clouds.planet.z, scene), false);
+			steps = int(float(steps) * clamp((span.y - span.x) / max(own.y - own.x, 500.0), 1.0, 3.0));
+		}
 		cur = march(o, d, span.x, span.y, steps, jitter, first, mean);
 	}
 	add_high_layer(o, d, scene, cur, first, mean);
@@ -852,7 +913,7 @@ void main() {
 	float theta = uv.y * PI;
 	vec3 d = vec3(sin(theta) * sin(phi), cos(theta), -sin(theta) * cos(phi));
 	vec3 o = clouds.cam_pos.xyz;
-	vec2 span = layer_span(o, d, clouds.planet.z);
+	vec2 span = layer_span(o, d, clouds.planet.z, ray_low(o, d, clouds.planet.z));
 	vec4 cur = vec4(0.0, 0.0, 0.0, 1.0);
 	float first = -1.0, mean = 1e9;
 	if (span.y > span.x) {
