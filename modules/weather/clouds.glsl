@@ -52,7 +52,7 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1), z 1 when the strike stands where it did last frame
 	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
 	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
-	vec4 volume_count; // x how many cloud volumes follow
+	vec4 volume_count; // x how many cloud volumes follow, y the weather's own lowest base (m above sea level: the lean's zero)
 	// The cloud volumes (AtmosphereEffect::set_cloud_volumes), four vec4 each: centre xz and half sizes; the turn's cos and
 	// sin, the shape, the falloff; cover, type, base, thickness scale; their amounts (the cover's with its mode).
 	vec4 volumes[64];
@@ -376,7 +376,7 @@ CloudSample cloud_sample(vec3 w, bool cheap) {
 	float a = altitude(w);
 	// Lean: the wind grows with height, so a cloud's top runs ahead of its base (read where it came from).
 	vec3 ws = w;
-	ws.xz -= clouds.motion.xy * (clouds.motion.z * max(a - clouds.layer.x, 0.0));
+	ws.xz -= clouds.motion.xy * (clouds.motion.z * max(a - clouds.volume_count.y, 0.0));
 	// Torn outlines: where the map is read wanders by up to a quarter of a cell over a few kilometres (the map's cones
 	// alone gave every cloud a round, convex outline: blobs, against the photos' ragged masses).
 	vec3 wn = textureLod(noise_base, (ws - clouds.wind.xyz) / (clouds.shape.y * 2.5), 0.0).gba;
