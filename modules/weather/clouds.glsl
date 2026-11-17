@@ -1021,23 +1021,38 @@ void main() {
 		// Jittered per texel (fixed in the world, as the map's origin snaps): steps aligned across texels showed as
 		// blocks in the shadow where a step of a thick shell crossed a thin cloud.
 		const int N = 40;
-		float dt = len / float(N);
 		float jitter = hash1(uvec3(uvec2(ivec2(floor(xz / (clouds.shadow.z / vec2(size))))), 29u));
+		// The ray in stretches, each with its own steps (as the view's rays: march_stretches): the weather's own layer
+		// always; the shell under it and over it (a cloud volume with a lower base or a higher top) only where the
+		// ray's track passes such a volume. Marched whole in one run of steps, a volume three times as thick
+		// anywhere in the sky made every texel's steps three times as long, and the ordinary clouds' shadows thinned.
+		vec3 from = vec3(xz.x, base_y, xz.y);
+		int past = ray_reach(from, l, len);
+		float u_low = clamp((own_bottom() - clouds.layer.x) / max(clouds.layer.y, 1.0), 0.0, 1.0);
+		float u_high = clamp((own_top() - clouds.layer.x) / max(clouds.layer.y, 1.0), u_low, 1.0);
+		vec2 stretches[3] = vec2[3](vec2((past & 1) != 0 ? 0.0 : u_low, u_low), vec2(u_low, u_high), vec2(u_high, (past & 2) != 0 ? 1.0 : u_high));
 		float tau = 0.0, tau_u = 0.0, tau_uu = 0.0;
-		for (int i = 0; i < N; i++) {
-			float u = (float(i) + jitter) / float(N); // the share of the layer's height
-			vec3 p = vec3(xz.x, base_y, xz.y) + l * (u * len);
-			// The shapes the eye sees (eroded): the uneroded ones cast a fuller shadow than the clouds overhead.
-			float dtau = cloud_density(p, false) * dt;
-			tau += dtau;
-			tau_u += dtau * u;
-			tau_uu += dtau * u * u;
+		for (int k = 0; k < 3; k++) {
+			float span = stretches[k].y - stretches[k].x;
+			if (span < 1e-4) {
+				continue;
+			}
+			float dt = span * len / float(N);
+			for (int i = 0; i < N; i++) {
+				float u = stretches[k].x + span * (float(i) + jitter) / float(N); // the share of the shell's height
+				vec3 p = from + l * (u * len);
+				// The shapes the eye sees (eroded): the uneroded ones cast a fuller shadow than the clouds overhead.
+				float dtau = cloud_density(p, false) * dt;
+				tau += dtau;
+				tau_u += dtau * u;
+				tau_uu += dtau * u * u;
+			}
 		}
 		shade.r = exp(-tau * clouds.weather.z); // the weather's shadow density scales the optical depth
 		if (tau > 1e-4) {
 			float mean_u = tau_u / tau;
 			shade.g = mean_u * clouds.layer.y;
-			shade.b = (sqrt(3.0 * max(tau_uu / tau - mean_u * mean_u, 0.0)) + 0.5 / float(N)) * clouds.layer.y;
+			shade.b = (sqrt(3.0 * max(tau_uu / tau - mean_u * mean_u, 0.0)) * clouds.layer.y + 0.5 / float(N) * (u_high - u_low) * clouds.layer.y);
 		}
 		shade.a = pow(high_shadow(vec3(xz.x, base_y, xz.y)), clouds.weather.z);
 	}
