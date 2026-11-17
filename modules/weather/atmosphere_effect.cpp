@@ -596,6 +596,11 @@ void AtmosphereEffect::_render_callback_native(int p_effect_callback_type, const
 		v4(lightning_position.x, lightning_position.y, lightning_position.z, bolt);
 		v4(lightning_color.r, lightning_color.g, lightning_color.b, 0);
 		v4(lightning_air_end.x, lightning_air_end.y, lightning_air_end.z, lightning_air_end != Vector3() ? 1.0f : 0.0f);
+		const int mist_count = mist_volume_count;
+		v4(float(mist_count), 0, 0, 0);
+		for (int i = 0; i < mist_count * MIST_VOLUME_FLOATS; i++) {
+			f[o++] = mist_volumes[i];
+		}
 		rd->buffer_update(fog_ubo, 0, sizeof(f), f);
 	}
 
@@ -914,6 +919,8 @@ void AtmosphereEffect::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
 	ClassDB::bind_method(D_METHOD("get_cloud_shell"), &AtmosphereEffect::get_cloud_shell);
 	ClassDB::bind_method(D_METHOD("set_cloud_volumes", "volumes"), &AtmosphereEffect::set_cloud_volumes);
+	ClassDB::bind_method(D_METHOD("set_mist_volumes", "volumes"), &AtmosphereEffect::set_mist_volumes);
+	ClassDB::bind_method(D_METHOD("get_mist_volume_count"), &AtmosphereEffect::get_mist_volume_count);
 	ClassDB::bind_method(D_METHOD("get_cloud_volume_count"), &AtmosphereEffect::get_cloud_volume_count);
 	ClassDB::bind_method(D_METHOD("get_sun_through_clouds", "position", "radius"), &AtmosphereEffect::get_sun_through_clouds);
 	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);

@@ -119,6 +119,15 @@ Vector2 AtmosphereEffect::get_cloud_shell() const {
 	return Vector2(bottom, ceiling - bottom);
 }
 
+void AtmosphereEffect::set_mist_volumes(const PackedFloat32Array &p_volumes) {
+	static_assert(sizeof(mist_volumes) == sizeof(float) * MIST_VOLUMES * MIST_VOLUME_FLOATS, "mist_volumes holds MIST_VOLUMES volumes");
+	const int n = MIN(int(p_volumes.size() / MIST_VOLUME_FLOATS), int(MIST_VOLUMES));
+	for (int i = 0; i < n * MIST_VOLUME_FLOATS; i++) {
+		mist_volumes[i] = p_volumes[i];
+	}
+	mist_volume_count = n;
+}
+
 void AtmosphereEffect::set_cloud_volumes(const PackedFloat32Array &p_volumes) {
 	static_assert(sizeof(cloud_volumes) == sizeof(float) * CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS, "cloud_volumes holds CLOUD_VOLUMES volumes");
 	const int n = MIN(int(p_volumes.size() / CLOUD_VOLUME_FLOATS), int(CLOUD_VOLUMES));

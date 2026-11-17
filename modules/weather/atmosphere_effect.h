@@ -301,6 +301,8 @@ class AtmosphereEffect : public CompositorEffect {
 	RID cloud_ubo;
 	float cloud_volumes[16 * 20] = {}; // CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS (declared below)
 	int cloud_volume_count = 0;
+	float mist_volumes[8 * 16] = {}; // MIST_VOLUMES * MIST_VOLUME_FLOATS (declared below)
+	int mist_volume_count = 0;
 	bool cloud_noise_ready = false;
 	int cloud_noise_slice = -1; // the next base noise slice to make; -1 the detail volume first
 	Size2i cloud_size;
@@ -396,7 +398,9 @@ public:
 	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
-	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48; // air_volume.glsl's Fog block
+	static constexpr int MIST_VOLUMES = 8; // the mist volumes the air volume takes
+	static constexpr int MIST_VOLUME_FLOATS = 16; // a volume: four vec4 (set_mist_volumes)
+	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48 + 4 + MIST_VOLUMES * MIST_VOLUME_FLOATS; // air_volume.glsl's Fog block
 	static constexpr int FOG_MAX_LIGHTS = 16; // of each kind, the nearest (the renderer's buffers are sorted by distance)
 
 	Ref<Texture2D> get_transmittance_texture();
@@ -577,6 +581,16 @@ public:
 	//     thins to nothing half way into its falloff and the volume's begins there (two bases blended made a ramp).
 	//   the high layer's cover (0-1), its amount + 2 * its mode, and two spare
 	void set_cloud_volumes(const PackedFloat32Array &p_volumes);
+	// Mist volumes (2026-11-17): places in the air volume with mist of their own, lit and shadowed as the rest of the
+	// air is (the sun through the terrain's and the clouds' shadows and the trees, the lights, the sky). Seen as far as
+	// the air volume reaches (fog_distance). Up to MIST_VOLUMES, 16 floats each:
+	//   three rows of the world-to-volume transform (xyz, and the translation in w): a point inside is within 1 of the
+	//     centre in the volume's own space
+	//   density (extinction, 1/m: 0.006 is about 500 m of sight; with mode 1 a factor, 0 clearing the air's own mist
+	//     there), shape (0 sphere, 1 box, 2 cylinder) + 4 * mode (0 add, 1 multiply), falloff (the outer share, 0-1),
+	//     noise (0-1: how much the air's own noise breaks it up)
+	void set_mist_volumes(const PackedFloat32Array &p_volumes);
+	int get_mist_volume_count() const { return mist_volume_count; }
 	int get_cloud_volume_count() const { return cloud_volume_count; }
 	// The most of the light (the sun's, or the moon's) that reaches any ground within `p_radius` m of `p_position`
 	// through the clouds, 0 to 1: the largest value of their shadow map there, as the sun's mask and the air read it
