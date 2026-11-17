@@ -51,7 +51,13 @@ void WeatherState::blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherS
 	if (looks) {
 		p_b->_look_shares(shares, t);
 	}
-	look_mix = shares;
+	if (shares.size() == 1) {
+		// One look alone (a copy, a blend's end): it is the state's own.
+		cloud_look = shares[0].look;
+		look_mix.clear();
+	} else {
+		look_mix = shares;
+	}
 	const float dh = Math::fposmod(p_b->wind_heading - p_a->wind_heading + 180.0f, 360.0f) - 180.0f;
 	wind_heading = p_a->wind_heading + ((p_groups & GROUP_WIND) ? dh * t : 0.0f);
 #define L(m, g) m = (p_groups & g) ? Math::lerp(p_a->m, p_b->m, t) : p_a->m;

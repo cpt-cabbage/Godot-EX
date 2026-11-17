@@ -150,7 +150,11 @@ public:
 	void blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t, int p_groups);
 	void copy_from(const Ref<WeatherState> &p_other);
 
-	void set_cloud_look(const Ref<Resource> &p_look) { cloud_look = p_look; }
+	// (a look set on a state is the whole of it: the shares a blend left are dropped)
+	void set_cloud_look(const Ref<Resource> &p_look) {
+		cloud_look = p_look;
+		look_mix.clear();
+	}
 	Ref<Resource> get_cloud_look() const { return cloud_look; }
 	// The looks that make up this state and their shares (they sum to 1): [[look or null, weight], ...].
 	Array get_look_mix() const;
