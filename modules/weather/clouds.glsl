@@ -52,6 +52,10 @@ layout(set = 0, binding = 0, std140) uniform Clouds {
 	vec4 life; // x the cells' lifetime (s), y the cover's regional variation (0-1), z 1 when the strike stands where it did last frame
 	vec4 motion; // xy the wind's direction (x, z), z the lean (m downwind per m up), w the billows' rise (m/s)
 	vec4 high; // the high layer: x its cover, y its altitude (m above sea level), z its type (0 cirrus, 1 altocumulus), w its optical depth at full
+	vec4 volume_count; // x how many cloud volumes follow
+	// The cloud volumes (AtmosphereEffect::set_cloud_volumes), four vec4 each: centre xz and half sizes; the turn's cos and
+	// sin, the shape, the falloff; cover, type, base, thickness scale; their amounts (the cover's with its mode).
+	vec4 volumes[64];
 }
 clouds;
 
@@ -206,17 +210,48 @@ float cell_radius(float c) {
 	return min(rs[6] + (c - 0.65) * 0.6, 0.85);
 }
 
-// The weather at a point of the field (the world less the wind's carry, m): cover, type, base, thickness.
-vec4 weather_field(vec2 f) {
+// A cloud volume's weight at a world point (x, z): 1 inside, falling to 0 over its falloff at its edge.
+float volume_weight(int i, vec2 xz) {
+	vec4 a = clouds.volumes[i * 4];
+	vec4 b = clouds.volumes[i * 4 + 1];
+	vec2 d = xz - a.xy;
+	vec2 q = vec2(d.x * b.x + d.y * b.y, d.y * b.x - d.x * b.y) / max(a.zw, vec2(1.0));
+	float u = b.z > 0.5 ? max(abs(q.x), abs(q.y)) : length(q);
+	return 1.0 - smoothstep(1.0 - clamp(b.w, 0.001, 1.0), 1.0, u);
+}
+
+// The weather at a point of the field (the world less the wind's carry, m; `xz` the same point in the world, where
+// the cloud volumes stand): cover, type, base, thickness.
+vec4 weather_field(vec2 f, vec2 xz) {
 	float cover = clouds.layer.w;
 	float mean_type = clouds.layer.z;
+	float layer_base = clouds.field.x;
+	float thickness_scale = clouds.field.y;
+	// The cloud volumes change what the weather gives here, before the clouds are made of it: a cover of none clears
+	// the cells, more of it grows and merges them, as the weather's own does.
+	int volume_n = min(int(clouds.volume_count.x), 16);
+	for (int i = 0; i < volume_n; i++) {
+		float w = volume_weight(i, xz);
+		if (w <= 0.0) {
+			continue;
+		}
+		vec4 v = clouds.volumes[i * 4 + 2];
+		vec4 m = clouds.volumes[i * 4 + 3];
+		float mode = floor(m.x * 0.5);
+		float amount = (m.x - 2.0 * mode) * w;
+		cover = mode < 0.5 ? cover + v.x * amount : (mode < 1.5 ? cover * mix(1.0, v.x, amount) : mix(cover, v.x, amount));
+		mean_type = mix(mean_type, v.y, m.y * w);
+		layer_base = mix(layer_base, v.z, m.z * w);
+		thickness_scale = mix(thickness_scale, v.w, m.w * w);
+	}
+	cover = clamp(cover, 0.0, 1.0);
 	// Regions: some clear, some clumped; the cover's lift there heaps the clouds higher.
 	float region = vfbm_evolving(f / clouds.shape.w, 0.0);
 	float c = clamp(cover + (region * 2.0 - 1.0) * clouds.life.y * 2.0 * min(cover, 1.0 - cover), 0.0, 1.0);
 	float region_t = vfbm_evolving(f / (clouds.shape.w * 0.7), 91.7) * 2.0 - 1.0;
 	float t_local = mean_type + region_t * clouds.field.z + (c - cover) * 0.3;
 	float region_b = vfbm_evolving(f / (clouds.shape.w * 1.3), 53.1) * 2.0 - 1.0;
-	float base_local = clouds.field.x + region_b * clouds.field.w;
+	float base_local = layer_base + region_b * clouds.field.w;
 
 	// Cumulus: a cloud a cell, alive by the cover, its size, type, height and phase of life its own.
 	float cell = clouds.map_far.w;
@@ -255,7 +290,7 @@ vec4 weather_field(vec2 f) {
 			wt += wgt * tc;
 			// Its height: its type's, with its width (a small young or dying cloud tall was a pillar) and a little of its
 			// own; at most its width (heaped cloud is about as tall as wide, a tower taller).
-			float thc = type_thickness(tc) * clouds.field.y * (0.55 + 0.45 * size + 0.3 * hash1(h + uvec3(0, 0, 6))) * mix(0.3, 1.0, grow);
+			float thc = type_thickness(tc) * thickness_scale * (0.55 + 0.45 * size + 0.3 * hash1(h + uvec3(0, 0, 6))) * mix(0.3, 1.0, grow);
 			float aspect = mix(0.7, 2.5, smoothstep(0.75, 1.0, tc));
 			wth += wgt * min(thc, aspect * 2.0 * r * cell);
 			wb += wgt * (hash1(h + uvec3(0, 0, 7)) - 0.5) * 80.0;
@@ -271,7 +306,7 @@ vec4 weather_field(vec2 f) {
 	float cov = mix(best, sheet, sheetiness);
 	cov = max(cov, smoothstep(0.65, 1.0, c) * (0.75 + 0.25 * sheet_n)); // an overcast merges them
 	float t = mix(best_t, t_local, sheetiness);
-	float th = mix(best_th, type_thickness(t) * clouds.field.y, sheetiness);
+	float th = mix(best_th, type_thickness(t) * thickness_scale, sheetiness);
 	return vec4(cov, clamp(t, 0.0, 1.0), base_local + best_b * (1.0 - sheetiness), th);
 }
 #endif
@@ -695,7 +730,7 @@ void main() {
 		vec2 origin = layer == 0 ? clouds.map_near.xy : clouds.map_far.xy;
 		float side = layer == 0 ? clouds.map_near.z : clouds.map_near.w;
 		vec2 xz = origin + (vec2(px) + 0.5) / vec2(size) * side;
-		imageStore(out_map, ivec3(px, layer), weather_field(xz - clouds.wind.xz));
+		imageStore(out_map, ivec3(px, layer), weather_field(xz - clouds.wind.xz, xz));
 	}
 #endif
 

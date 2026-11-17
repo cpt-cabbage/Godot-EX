@@ -105,8 +105,27 @@ float AtmosphereEffect::get_sun_through_clouds(const Vector3 &p_position, float 
 Vector2 AtmosphereEffect::get_cloud_shell() const {
 	// The tallest a cell can be: the type's spread, the cover's lift of it (0.1), the cell's own (1.3 times).
 	const float top = cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
-	const float bottom = cloud_base - cloud_base_spread - 60.0f;
-	return Vector2(bottom, cloud_base + cloud_base_spread + 60.0f + top - bottom);
+	float bottom = cloud_base - cloud_base_spread - 60.0f;
+	float ceiling = cloud_base + cloud_base_spread + 60.0f + top;
+	// The cloud volumes' own bases, types and thicknesses: the shell holds the lowest base and the highest top of all.
+	for (int i = 0; i < cloud_volume_count; i++) {
+		const float *v = cloud_volumes + i * CLOUD_VOLUME_FLOATS;
+		const float base = v[14] > 0.0f ? v[10] : cloud_base;
+		const float type = v[13] > 0.0f ? MAX(v[9], cloud_type) : cloud_type;
+		const float scale = v[15] > 0.0f ? MAX(v[11], cloud_thickness_scale) : cloud_thickness_scale;
+		bottom = MIN(bottom, base - cloud_base_spread - 60.0f);
+		ceiling = MAX(ceiling, base + cloud_base_spread + 60.0f + cloud_type_thickness(type + cloud_type_spread + 0.1f) * scale * 1.3f);
+	}
+	return Vector2(bottom, ceiling - bottom);
+}
+
+void AtmosphereEffect::set_cloud_volumes(const PackedFloat32Array &p_volumes) {
+	static_assert(sizeof(cloud_volumes) == sizeof(float) * CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS, "cloud_volumes holds CLOUD_VOLUMES volumes");
+	const int n = MIN(int(p_volumes.size() / CLOUD_VOLUME_FLOATS), int(CLOUD_VOLUMES));
+	for (int i = 0; i < n * CLOUD_VOLUME_FLOATS; i++) {
+		cloud_volumes[i] = p_volumes[i];
+	}
+	cloud_volume_count = n;
 }
 
 void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
@@ -257,7 +276,13 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	v4(planet_radius * 1000.0f, altitude_offset, cloud_reach, CLAMP(cloud_history, 0.0f, 0.97f));
 	v4(float(cloud_size.x), float(cloud_size.y), float(p_full.x), float(p_full.y));
 	v4(cloud_shadow_origin.x, cloud_shadow_origin.y, cloud_shadow_size, shadow_on ? 1.0f : 0.0f);
-	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(cloud_steps, 8, 256)), cloud_light_step);
+	// The steps for the layer as the weather has it; where cloud volumes make the shell taller (a lower base, a thicker
+	// cloud) the march gets as many more, so that a step stays as long as it was (with the same number over a taller
+	// shell every cloud in the sky turned to grain: 2026-11-17).
+	const float own_top = cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
+	const float own_height = 2.0f * (cloud_base_spread + 60.0f) + own_top;
+	const float taller = CLAMP(shell.y / MAX(own_height, 1.0f), 1.0f, 3.0f);
+	v4(cloud_sky_light, cloud_multiscatter, float(CLAMP(int(Math::round(cloud_steps * taller)), 8, 256)), cloud_light_step);
 	v4(float(MAX(cloud_noise_slice, 0)), float(cloud_noise_slice < 0 ? CLOUD_NOISE_DETAIL_N : CLOUD_NOISE_SLICES), MAX(cloud_night_light, 0.0f), 0);
 	// The weather: rain shafts below the base (down to the valley floor, about the world's y 0 less 400 m), and the flash.
 	// Last frame's flash and whether the strike stands where it stood (clouds.glsl's FLASH_COLOR: the history keeps the
@@ -279,6 +304,11 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	const Vector2 wdir = Vector2(cloud_wind.x, cloud_wind.z).length() > 0.01f ? Vector2(cloud_wind.x, cloud_wind.z).normalized() : Vector2(1, 0);
 	v4(wdir.x, wdir.y, cloud_shear, cloud_rise);
 	v4(CLAMP(cloud_high_cover, 0.0f, 1.0f), cloud_high_altitude, CLAMP(cloud_high_type, 0.0f, 1.0f), cloud_high_density);
+	const int volume_count = cloud_volume_count;
+	v4(float(volume_count), 0, 0, 0);
+	for (int i = 0; i < volume_count * CLOUD_VOLUME_FLOATS; i++) {
+		f[o++] = cloud_volumes[i];
+	}
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;

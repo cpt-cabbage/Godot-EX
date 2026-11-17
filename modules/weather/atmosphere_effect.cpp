@@ -913,6 +913,8 @@ void AtmosphereEffect::_bind_methods() {
 	FB(cloud_high_density, Variant::FLOAT, PROPERTY_HINT_RANGE, "0,8,0.01")
 	ClassDB::bind_method(D_METHOD("get_cloud_thickness"), &AtmosphereEffect::get_cloud_thickness);
 	ClassDB::bind_method(D_METHOD("get_cloud_shell"), &AtmosphereEffect::get_cloud_shell);
+	ClassDB::bind_method(D_METHOD("set_cloud_volumes", "volumes"), &AtmosphereEffect::set_cloud_volumes);
+	ClassDB::bind_method(D_METHOD("get_cloud_volume_count"), &AtmosphereEffect::get_cloud_volume_count);
 	ClassDB::bind_method(D_METHOD("get_sun_through_clouds", "position", "radius"), &AtmosphereEffect::get_sun_through_clouds);
 	ClassDB::bind_method(D_METHOD("get_cloud_panorama_texture"), &AtmosphereEffect::get_cloud_panorama_texture);
 #undef FB
