@@ -43,6 +43,21 @@ void WeatherState::blend(const Ref<WeatherState> &p_a, const Ref<WeatherState> &
 void WeatherState::blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t, int p_groups) {
 	ERR_FAIL_COND(p_a.is_null() || p_b.is_null());
 	const float t = CLAMP(p_t, 0.0f, 1.0f);
+	// The looks' shares (worked out first: p_a may be this state): p_a's and p_b's by the blend where the cloud look
+	// is among the groups, p_a's alone where it is not.
+	LocalVector<LookShare> shares;
+	const bool looks = (p_groups & GROUP_CLOUD_LOOK) != 0;
+	p_a->_look_shares(shares, looks ? 1.0f - t : 1.0f);
+	if (looks) {
+		p_b->_look_shares(shares, t);
+	}
+	if (shares.size() == 1) {
+		// One look alone (a copy, a blend's end): it is the state's own.
+		cloud_look = shares[0].look;
+		look_mix.clear();
+	} else {
+		look_mix = shares;
+	}
 	const float dh = Math::fposmod(p_b->wind_heading - p_a->wind_heading + 180.0f, 360.0f) - 180.0f;
 	wind_heading = p_a->wind_heading + ((p_groups & GROUP_WIND) ? dh * t : 0.0f);
 #define L(m, g) m = (p_groups & g) ? Math::lerp(p_a->m, p_b->m, t) : p_a->m;
@@ -75,6 +90,44 @@ void WeatherState::blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherS
 #undef L
 }
 
+void WeatherState::_look_shares(LocalVector<LookShare> &r_out, float p_scale) const {
+	if (p_scale <= 0.0001f) {
+		return;
+	}
+	auto add = [&](const Ref<Resource> &p_look, float p_weight) {
+		for (LookShare &s : r_out) {
+			if (s.look == p_look) {
+				s.weight += p_weight;
+				return;
+			}
+		}
+		LookShare s;
+		s.look = p_look;
+		s.weight = p_weight;
+		r_out.push_back(s);
+	};
+	if (look_mix.is_empty()) {
+		add(cloud_look, p_scale);
+		return;
+	}
+	for (const LookShare &s : look_mix) {
+		add(s.look, s.weight * p_scale);
+	}
+}
+
+Array WeatherState::get_look_mix() const {
+	LocalVector<LookShare> shares;
+	_look_shares(shares, 1.0f);
+	Array out;
+	for (const LookShare &s : shares) {
+		Array one;
+		one.push_back(s.look);
+		one.push_back(s.weight);
+		out.push_back(one);
+	}
+	return out;
+}
+
 void WeatherState::copy_from(const Ref<WeatherState> &p_other) {
 	blend(p_other, p_other, 0.0f);
 }
@@ -91,6 +144,9 @@ void WeatherState::_bind_methods() {
 	BIND_ENUM_CONSTANT(GROUP_EXPOSURE);
 	BIND_ENUM_CONSTANT(GROUP_ALL);
 	ClassDB::bind_method(D_METHOD("copy_from", "other"), &WeatherState::copy_from);
+	ClassDB::bind_method(D_METHOD("set_cloud_look", "look"), &WeatherState::set_cloud_look);
+	ClassDB::bind_method(D_METHOD("get_cloud_look"), &WeatherState::get_cloud_look);
+	ClassDB::bind_method(D_METHOD("get_look_mix"), &WeatherState::get_look_mix);
 #define P(m, hint)                                                                         \
 	ClassDB::bind_method(D_METHOD("set_" #m, "value"), &WeatherState::set_##m);             \
 	ClassDB::bind_method(D_METHOD("get_" #m), &WeatherState::get_##m);                      \
@@ -121,6 +177,7 @@ void WeatherState::_bind_methods() {
 	P(cloud_variation, "0,1,0.01")
 	P(cloud_type_spread, "0,0.5,0.01")
 	P(cloud_multiscatter, "0,2,0.01")
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "cloud_look", PROPERTY_HINT_RESOURCE_TYPE, "CloudLook"), "set_cloud_look", "get_cloud_look");
 	ADD_GROUP("Light", "");
 	P(sky_light, "0,2,0.01")
 	P(cloud_shadow_density, "0,4,0.01")

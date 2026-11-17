@@ -299,6 +299,10 @@ class AtmosphereEffect : public CompositorEffect {
 	double cloud_time = 0.0;
 	Ref<Texture2DRD> cloud_panorama_texture;
 	RID cloud_ubo;
+	float cloud_volumes[16 * 20] = {}; // CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS (declared below)
+	int cloud_volume_count = 0;
+	float mist_volumes[8 * 16] = {}; // MIST_VOLUMES * MIST_VOLUME_FLOATS (declared below)
+	int mist_volume_count = 0;
 	bool cloud_noise_ready = false;
 	int cloud_noise_slice = -1; // the next base noise slice to make; -1 the detail volume first
 	Size2i cloud_size;
@@ -385,14 +389,18 @@ public:
 	static constexpr int AERIAL_W = 160, AERIAL_H = 90, AERIAL_Z = 64;
 	static constexpr int SHADOW_N = 2048;
 	static constexpr int CAMERA_FLOATS = 48 + 8 + 8 * 32; // atmosphere.glsl's Camera block (the sky lights: MAX_SKY_LIGHTS)
-	static constexpr int CLOUD_FLOATS = 32 + 4 * 20; // clouds.glsl's Clouds block
+	static constexpr int CLOUD_VOLUMES = 16; // the cloud volumes the weather map takes
+	static constexpr int CLOUD_VOLUME_FLOATS = 20; // a volume: five vec4 (set_cloud_volumes)
+	static constexpr int CLOUD_FLOATS = 32 + 4 * 21 + CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS; // clouds.glsl's Clouds block
 	static constexpr int CLOUD_MAP_N = 512; // the weather map's side (texels), each layer
 	static constexpr float CLOUD_MAP_NEAR = 32000.0f; // the near layer's side (m); the far one's twice the reach
 	static constexpr int CLOUD_NOISE_SLICES = 8; // base noise slices made a frame
 	static constexpr int CLOUD_NOISE_BASE_N = 128, CLOUD_NOISE_DETAIL_N = 32;
 	static constexpr int CLOUD_PANORAMA_W = 256, CLOUD_PANORAMA_H = 128;
 	static constexpr int CLOUD_SHADOW_N = 512;
-	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48; // air_volume.glsl's Fog block
+	static constexpr int MIST_VOLUMES = 8; // the mist volumes the air volume takes
+	static constexpr int MIST_VOLUME_FLOATS = 16; // a volume: four vec4 (set_mist_volumes)
+	static constexpr int FOG_FLOATS = 32 + 4 * 18 + 48 + 4 + MIST_VOLUMES * MIST_VOLUME_FLOATS; // air_volume.glsl's Fog block
 	static constexpr int FOG_MAX_LIGHTS = 16; // of each kind, the nearest (the renderer's buffers are sorted by distance)
 
 	Ref<Texture2D> get_transmittance_texture();
@@ -560,6 +568,31 @@ public:
 	float get_cloud_thickness() const;
 	// The shell the clouds can fill (m above sea level): x its bottom, y its height.
 	Vector2 get_cloud_shell() const;
+	// Cloud volumes (2026-11-17): places where the layer differs from the weather's, laid on the weather map, so they
+	// are seen from afar, cast the clouds' shadow and light the sky's probe like any cloud. Up to CLOUD_VOLUMES, 20
+	// floats each:
+	//   centre x, centre z (world m; of a drifting one: in the clouds' own frame, the world less cloud_offset), half
+	//     size x, half size z (m)
+	//   cos and sin of the turn about y (world to the volume), shape (0 ellipse, 1 box) + 2 if it drifts with the
+	//     clouds, falloff (the outer share, 0-1)
+	//   cover (0-1), type (0-1), base (m above sea level), thickness scale
+	//   cover's amount (0-1) + 2 * its mode (0 add, 1 multiply, 2 replace), type's amount, base's amount, thickness's
+	//     amount. With a base of its own (its amount over 0) a volume's cloud is a deck apart: the layer's own cloud
+	//     thins to nothing half way into its falloff and the volume's begins there (two bases blended made a ramp).
+	//   the high layer's cover (0-1), its amount + 2 * its mode, and two the engine fills (its lowest base and
+	//     highest top)
+	void set_cloud_volumes(const PackedFloat32Array &p_volumes);
+	// Mist volumes (2026-11-17): places in the air volume with mist of their own, lit and shadowed as the rest of the
+	// air is (the sun through the terrain's and the clouds' shadows and the trees, the lights, the sky). Seen as far as
+	// the air volume reaches (fog_distance). Up to MIST_VOLUMES, 16 floats each:
+	//   three rows of the world-to-volume transform (xyz, and the translation in w): a point inside is within 1 of the
+	//     centre in the volume's own space
+	//   density (extinction, 1/m: 0.006 is about 500 m of sight; with mode 1 a factor, 0 clearing the air's own mist
+	//     there), shape (0 sphere, 1 box, 2 cylinder) + 4 * mode (0 add, 1 multiply), falloff (the outer share, 0-1),
+	//     noise (0-1: how much the air's own noise breaks it up)
+	void set_mist_volumes(const PackedFloat32Array &p_volumes);
+	int get_mist_volume_count() const { return mist_volume_count; }
+	int get_cloud_volume_count() const { return cloud_volume_count; }
 	// The most of the light (the sun's, or the moon's) that reaches any ground within `p_radius` m of `p_position`
 	// through the clouds, 0 to 1: the largest value of their shadow map there, as the sun's mask and the air read it
 	// (sun_modulator_inc.glsl), a few frames old (the map is read back every eighth frame while this is called). 1 with

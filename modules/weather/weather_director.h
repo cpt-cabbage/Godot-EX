@@ -118,6 +118,16 @@ public:
 	float air_anisotropy = 0.7;
 	float air_lights_anisotropy = 0.2;
 	float air_anisotropy_share = 0.0;
+	// The weather's own look (2026-11-17): a resource of the game's (projectex: a CloudLook, the atmosphere's cloud
+	// settings this weather changes). The engine does not read it; it carries which looks make up a blended state and
+	// by how much (get_look_mix), through transitions and overrides, for the game to lay them on.
+	Ref<Resource> cloud_look;
+	struct LookShare {
+		Ref<Resource> look; // null: no look of its own (the game's base)
+		float weight = 0.0;
+	};
+	LocalVector<LookShare> look_mix; // of a blended state; empty on an authored one (its own look, whole)
+	void _look_shares(LocalVector<LookShare> &r_out, float p_scale) const;
 
 protected:
 	static void _bind_methods();
@@ -140,6 +150,14 @@ public:
 	void blend_groups(const Ref<WeatherState> &p_a, const Ref<WeatherState> &p_b, float p_t, int p_groups);
 	void copy_from(const Ref<WeatherState> &p_other);
 
+	// (a look set on a state is the whole of it: the shares a blend left are dropped)
+	void set_cloud_look(const Ref<Resource> &p_look) {
+		cloud_look = p_look;
+		look_mix.clear();
+	}
+	Ref<Resource> get_cloud_look() const { return cloud_look; }
+	// The looks that make up this state and their shares (they sum to 1): [[look or null, weight], ...].
+	Array get_look_mix() const;
 #define WEATHER_PROP(m)                \
 	void set_##m(float p_v) { m = p_v; } \
 	float get_##m() const { return m; }

@@ -51,6 +51,10 @@ layout(set = 0, binding = 0, std140) uniform Fog {
 	vec4 bolt; // xyz a lightning strike's point at the cloud base (world), w its light now (0 between strikes)
 	vec4 bolt_color;
 	vec4 bolt_end; // xyz where the drawn bolt meets the ground (world), w 1 when given
+	vec4 mist_count; // x how many mist volumes follow
+	// The mist volumes (AtmosphereEffect::set_mist_volumes), four vec4 each: three rows of the world-to-volume
+	// transform; density, the shape (+ 4: it multiplies), the falloff, the noise's share.
+	vec4 mist_volumes[32];
 }
 fog;
 
@@ -204,9 +208,44 @@ float density(vec3 w) {
 	d += fog.ground.z * exp(-max(w.y - fog.ground.w, 0.0) / max(fog.mist.x, 0.1));
 	// The weather's mist pools below its top.
 	d += fog.weather.x * exp(-max(w.y - fog.weather.y, 0.0) / max(fog.mist.x, 0.1));
+	// The air's noise, worked out once where anything wants it (the mist above, a mist volume below).
+	float broken = -1.0;
 	if (fog.mist.y > 0.0 && d > 0.0) {
 		vec3 q = (w - fog.wind.xyz) / max(fog.mist.z, 0.01);
-		d *= mix(1.0, smoothstep(0.25, 0.75, fbm(q)) * 2.0, fog.mist.y);
+		broken = smoothstep(0.25, 0.75, fbm(q)) * 2.0;
+		d *= mix(1.0, broken, fog.mist.y);
+	}
+	// Mist volumes: mist of their own where they stand (added, each broken up by the same noise as much as it asks),
+	// or the air's own mist thinned there (multiplied).
+	int mist_n = min(int(fog.mist_count.x), 8);
+	for (int i = 0; i < mist_n; i++) {
+		vec4 r0 = fog.mist_volumes[i * 4];
+		vec4 r1 = fog.mist_volumes[i * 4 + 1];
+		vec4 r2 = fog.mist_volumes[i * 4 + 2];
+		vec3 q = vec3(dot(r0.xyz, w) + r0.w, dot(r1.xyz, w) + r1.w, dot(r2.xyz, w) + r2.w);
+		if (any(greaterThan(abs(q), vec3(1.0)))) {
+			continue;
+		}
+		vec4 p = fog.mist_volumes[i * 4 + 3];
+		bool multiplies = p.y >= 4.0;
+		float shape = p.y - (multiplies ? 4.0 : 0.0);
+		float u = shape < 0.5 ? length(q) : (shape < 1.5 ? max(max(abs(q.x), abs(q.y)), abs(q.z)) : max(length(q.xz), abs(q.y)));
+		float wgt = 1.0 - smoothstep(1.0 - clamp(p.z, 0.001, 1.0), 1.0, u);
+		if (wgt <= 0.0) {
+			continue;
+		}
+		if (multiplies) {
+			d *= mix(1.0, max(p.x, 0.0), wgt);
+			continue;
+		}
+		float own = max(p.x, 0.0) * wgt;
+		if (p.w > 0.0) {
+			if (broken < 0.0) {
+				broken = smoothstep(0.25, 0.75, fbm((w - fog.wind.xyz) / max(fog.mist.z, 0.01))) * 2.0;
+			}
+			own *= mix(1.0, broken, clamp(p.w, 0.0, 1.0));
+		}
+		d += own;
 	}
 	// Rain thickens the air (the user, 2026-11-14: "use volumetrics closer range to sell the effect ... you're relying
 	// on particles too much"): a veil everywhere, curtains tens of metres across that fall at the drops' speed and

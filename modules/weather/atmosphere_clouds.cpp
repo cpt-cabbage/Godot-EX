@@ -105,8 +105,36 @@ float AtmosphereEffect::get_sun_through_clouds(const Vector3 &p_position, float 
 Vector2 AtmosphereEffect::get_cloud_shell() const {
 	// The tallest a cell can be: the type's spread, the cover's lift of it (0.1), the cell's own (1.3 times).
 	const float top = cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
-	const float bottom = cloud_base - cloud_base_spread - 60.0f;
-	return Vector2(bottom, cloud_base + cloud_base_spread + 60.0f + top - bottom);
+	float bottom = cloud_base - cloud_base_spread - 60.0f;
+	float ceiling = cloud_base + cloud_base_spread + 60.0f + top;
+	// The cloud volumes' own bases, types and thicknesses: the shell holds the lowest base and the highest top of all.
+	for (int i = 0; i < cloud_volume_count; i++) {
+		const float *v = cloud_volumes + i * CLOUD_VOLUME_FLOATS;
+		const float base = v[14] > 0.0f ? v[10] : cloud_base;
+		const float type = v[13] > 0.0f ? MAX(v[9], cloud_type) : cloud_type;
+		const float scale = v[15] > 0.0f ? MAX(v[11], cloud_thickness_scale) : cloud_thickness_scale;
+		bottom = MIN(bottom, base - cloud_base_spread - 60.0f);
+		ceiling = MAX(ceiling, base + cloud_base_spread + 60.0f + cloud_type_thickness(type + cloud_type_spread + 0.1f) * scale * 1.3f);
+	}
+	return Vector2(bottom, ceiling - bottom);
+}
+
+void AtmosphereEffect::set_mist_volumes(const PackedFloat32Array &p_volumes) {
+	static_assert(sizeof(mist_volumes) == sizeof(float) * MIST_VOLUMES * MIST_VOLUME_FLOATS, "mist_volumes holds MIST_VOLUMES volumes");
+	const int n = MIN(int(p_volumes.size() / MIST_VOLUME_FLOATS), int(MIST_VOLUMES));
+	for (int i = 0; i < n * MIST_VOLUME_FLOATS; i++) {
+		mist_volumes[i] = p_volumes[i];
+	}
+	mist_volume_count = n;
+}
+
+void AtmosphereEffect::set_cloud_volumes(const PackedFloat32Array &p_volumes) {
+	static_assert(sizeof(cloud_volumes) == sizeof(float) * CLOUD_VOLUMES * CLOUD_VOLUME_FLOATS, "cloud_volumes holds CLOUD_VOLUMES volumes");
+	const int n = MIN(int(p_volumes.size() / CLOUD_VOLUME_FLOATS), int(CLOUD_VOLUMES));
+	for (int i = 0; i < n * CLOUD_VOLUME_FLOATS; i++) {
+		cloud_volumes[i] = p_volumes[i];
+	}
+	cloud_volume_count = n;
 }
 
 void AtmosphereEffect::_clouds_ensure(const Size2i &p_full) {
@@ -279,6 +307,31 @@ bool AtmosphereEffect::_clouds_prepare(const Transform3D &p_cam, const Projectio
 	const Vector2 wdir = Vector2(cloud_wind.x, cloud_wind.z).length() > 0.01f ? Vector2(cloud_wind.x, cloud_wind.z).normalized() : Vector2(1, 0);
 	v4(wdir.x, wdir.y, cloud_shear, cloud_rise);
 	v4(CLAMP(cloud_high_cover, 0.0f, 1.0f), cloud_high_altitude, CLAMP(cloud_high_type, 0.0f, 1.0f), cloud_high_density);
+	const int volume_count = cloud_volume_count;
+	bool high_volumes = false;
+	for (int i = 0; i < volume_count; i++) {
+		high_volumes = high_volumes || cloud_volumes[i * CLOUD_VOLUME_FLOATS + 17] > 0.0f;
+	}
+	// (y, w: the weather's own lowest base and highest top, which the clouds' lean is measured from and a ray that
+	// passes no volume reaching past them is marched between: from the whole shell's extent a lower or a taller volume
+	// moved every cloud in the sky downwind as it came on, and turned them to grain. z: 1 when a volume changes the high
+	// layer.)
+	const float own_bottom = cloud_base - cloud_base_spread - 60.0f;
+	const float own_top = cloud_base + cloud_base_spread + 60.0f + cloud_type_thickness(cloud_type + cloud_type_spread + 0.1f) * cloud_thickness_scale * 1.3f;
+	v4(float(volume_count), own_bottom, high_volumes ? 1.0f : 0.0f, own_top);
+	for (int i = 0; i < volume_count; i++) {
+		const float *v = cloud_volumes + i * CLOUD_VOLUME_FLOATS;
+		for (int k = 0; k < CLOUD_VOLUME_FLOATS - 2; k++) {
+			f[o++] = v[k];
+		}
+		// Its own lowest base and highest top (as get_cloud_shell works them out), for the march to know which rays it
+		// reaches past the weather's own layer for.
+		const float base = v[14] > 0.0f ? v[10] : cloud_base;
+		const float type = v[13] > 0.0f ? MAX(v[9], cloud_type) : cloud_type;
+		const float scale = v[15] > 0.0f ? MAX(v[11], cloud_thickness_scale) : cloud_thickness_scale;
+		f[o++] = base - cloud_base_spread - 60.0f;
+		f[o++] = base + cloud_base_spread + 60.0f + cloud_type_thickness(type + cloud_type_spread + 0.1f) * scale * 1.3f;
+	}
 	rd->buffer_update(cloud_ubo, 0, sizeof(f), f);
 	cloud_view_proj = p_view_proj;
 	cloud_cam = p_cam.origin;
